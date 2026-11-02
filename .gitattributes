@@ -1,0 +1,3 @@
+# 源码与证据采用 LF，保证跨平台检出和哈希核验一致。
+* text=auto eol=lf
+*.tgz binary

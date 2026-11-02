@@ -1,0 +1,279 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { createSourceRouter } from '../src/core/source-adapters.mjs';
+import { GrokSearchError } from '../src/core/errors.mjs';
+
+const baseConfig = () => ({
+  tavily_api_url: 'https://tavily.test/', tavily_api_key: 'tvly-key', tavily_enabled: true,
+  exa_api_url: 'https://exa.test', exa_api_key: 'exa-key', exa_enabled: true,
+  tinyfish_search_api_url: 'https://tinyfish.test/search', tinyfish_api_key: '', tinyfish_enabled: true,
+  firecrawl_api_url: 'https://firecrawl.test', firecrawl_api_key: 'fc-key', firecrawl_enabled: true,
+  fallback_sources: 5, timeout_seconds: 60, github_token: '',
+});
+const asFields = values => ({ fields: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value }])) });
+const prefsOf = (value = {}) => ({ value: { githubEnabled: true, ...value } });
+// Supplementary sources are switched in the shared config, exactly where
+// grok-search-rs reads them; plugin preferences no longer gate them.
+const without = (config, ...ids) => ({ ...config, ...Object.fromEntries(ids.map(id => [`${id}_enabled`, false])) });
+const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+
+function router({ config = baseConfig(), prefs = prefsOf(), fetchImpl }) {
+  const calls = [];
+  const instance = createSourceRouter({
+    getConfig: () => asFields(config), getPreferences: () => prefs,
+    fetchImpl: async (url, init) => { calls.push({ url, init }); return fetchImpl(url, init, calls.length); },
+  });
+  return { instance, calls };
+}
+
+test('request contracts follow grok-search-rs v0.1.26 for every source', async () => {
+  const config = { ...baseConfig(), tinyfish_api_key: 'tf-key' };
+  const { instance, calls } = router({ config, fetchImpl: async () => json({}, 503) });
+  await assert.rejects(() => instance.search({ query: 'hello world', maxResults: 3 }),
+    error => error.code === 'SOURCE_ALL_FAILED');
+  const [tavily, exa, tinyfish, firecrawl] = calls;
+  assert.equal(tavily.url, 'https://tavily.test/search');
+  assert.equal(tavily.init.method, 'POST');
+  assert.equal(tavily.init.headers.authorization, 'Bearer tvly-key');
+  assert.deepEqual(JSON.parse(tavily.init.body), { query: 'hello world', max_results: 3, include_answer: false });
+  assert.equal(exa.url, 'https://exa.test/search');
+  assert.equal(exa.init.headers['x-api-key'], 'exa-key');
+  assert.deepEqual(JSON.parse(exa.init.body), { query: 'hello world', numResults: 3 });
+  assert.equal(tinyfish.init.method, 'GET');
+  assert.equal(tinyfish.init.body, undefined);
+  assert.equal(tinyfish.init.headers['X-API-Key'], 'tf-key');
+  assert.equal(new URL(tinyfish.url).pathname, '/search');
+  assert.equal(new URL(tinyfish.url).searchParams.get('query'), 'hello world');
+  assert.equal(firecrawl.url, 'https://firecrawl.test/v2/search');
+  assert.equal(firecrawl.init.headers.authorization, 'Bearer fc-key');
+  assert.deepEqual(JSON.parse(firecrawl.init.body), { query: 'hello world', limit: 3 });
+  assert.ok(calls.every(call => call.init.redirect === 'error'));
+});
+
+test('firecrawl keeps an explicit /v1 or /v2 base and reads data.web first', async () => {
+  for (const [base, expected] of [['https://fc.test/v1', 'https://fc.test/v1/search'], ['https://fc.test/gw/v2/', 'https://fc.test/gw/v2/search']]) {
+    const config = without({ ...baseConfig(), firecrawl_api_url: base }, 'tavily', 'exa');
+    const { instance, calls } = router({ config,
+      fetchImpl: async () => json({ data: { web: [{ url: 'https://example.com/a', title: 'A', description: 'alpha' }] } }) });
+    const result = await instance.search({ query: 'q' });
+    assert.equal(calls[0].url, expected);
+    assert.equal(result.search_provider, 'firecrawl');
+    assert.deepEqual(result.sources, [{ url: 'https://example.com/a', title: 'A', snippet: 'alpha' }]);
+  }
+});
+
+test('tavily drops low-score results and rotates keys only on key-scoped status', async () => {
+  const config = without({ ...baseConfig(), tavily_api_key: ' k1, k2 ,,k3' }, 'exa', 'firecrawl');
+  const rotating = router({ config, fetchImpl: async (_url, init) =>
+    init.headers.authorization === 'Bearer k1' ? json({}, 429)
+      : json({ results: [{ url: 'https://low.example', score: 0.05 }, { url: 'https://high.example', title: 'H', content: 'c', score: 0.8 }, 'https://bare.example'] }) });
+  const result = await rotating.instance.search({ query: 'q' });
+  assert.deepEqual(rotating.calls.map(call => call.init.headers.authorization), ['Bearer k1', 'Bearer k2']);
+  assert.deepEqual(result.sources.map(source => source.url), ['https://high.example', 'https://bare.example']);
+  assert.equal(result.sources[0].snippet, 'c');
+
+  const serverError = router({ config, fetchImpl: async () => json({}, 500) });
+  await assert.rejects(() => serverError.instance.search({ query: 'q' }), error => error.code === 'SOURCE_ALL_FAILED'
+    && error.details.failures[0].code === 'HTTP_500');
+  assert.equal(serverError.calls.length, 1, 'a non key-scoped failure must not try the next key');
+});
+
+test('only tavily splits comma separated keys', async () => {
+  const config = without({ ...baseConfig(), exa_api_key: 'exa,with,commas' }, 'tavily');
+  const { instance, calls } = router({ config,
+    fetchImpl: async () => json({ results: [{ url: 'https://exa.example', summary: 's', publishedDate: '2026-01-01' }] }) });
+  const result = await instance.search({ query: 'q' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].init.headers['x-api-key'], 'exa,with,commas');
+  assert.deepEqual(result.sources, [{ url: 'https://exa.example', snippet: 's', publishedAt: '2026-01-01' }]);
+});
+
+test('unusable result URLs do not count as success or prevent the next source', async () => {
+  const invalid = [
+    'https://[invalid-url',
+    'https://synthetic-user:synthetic-pass@example.invalid/private',
+    { url: 'https://[invalid-object', title: 'Malformed URL' },
+    { url: 'https://synthetic-user@example.invalid/private', title: 'Credential URL' },
+  ];
+  const { instance, calls } = router({ fetchImpl: async url => json({
+    results: url.includes('tavily') ? invalid : [{ url: 'https://example.com/valid', title: 'Valid' }],
+  }) });
+  const diagnosis = await instance.diagnoseProvider('tavily');
+  assert.equal(diagnosis.status, 'empty');
+  assert.equal(diagnosis.code, 'EMPTY');
+  assert.equal(diagnosis.keys[0].results, undefined);
+  calls.length = 0;
+  const result = await instance.search({ query: 'offline URL validation' });
+  assert.deepEqual(calls.map(call => new URL(call.url).hostname), ['tavily.test', 'exa.test']);
+  assert.equal(result.search_provider, 'exa');
+  assert.equal(result.sources[0].url, 'https://example.com/valid');
+  assert.equal(result.diagnostic.failures[0].code, 'EMPTY');
+  assert.ok(!JSON.stringify(result).includes('synthetic-pass'));
+});
+
+test('each source filters unsafe URLs before applying the result limit', async () => {
+  for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
+    const config = without({ ...baseConfig(), tinyfish_api_key: 'tf-key' },
+      ...['tavily', 'exa', 'tinyfish', 'firecrawl'].filter(id => id !== provider));
+    const rows = [{ url: 'https://[invalid' }, { url: 'https://user:pass@example.invalid' },
+      { url: 'https://example.com/valid', title: 'Valid' }];
+    const { instance } = router({ config, fetchImpl: async () =>
+      json(provider === 'firecrawl' ? { data: { web: rows } } : { results: rows }) });
+    const result = await instance.search({ query: 'offline URL validation', maxResults: 1 });
+    assert.equal(result.search_provider, provider);
+    assert.deepEqual(result.sources, [{ url: 'https://example.com/valid', title: 'Valid' }]);
+  }
+});
+
+test('invalid URLs from every source fail explicitly instead of returning empty success', async () => {
+  const { instance } = router({ fetchImpl: async () => json({ results: ['https://[invalid'] }) });
+  await assert.rejects(instance.search({ query: 'offline URL validation' }), error =>
+    error.code === 'SOURCE_ALL_FAILED' && error.details.failures.length === 3
+    && error.details.failures.every(row => row.code === 'EMPTY'));
+});
+
+test('diagnosis covers every key, skips disabled sources and separates empty from failure', async () => {
+  const config = without({ ...baseConfig(), tavily_api_key: 'good,bad' }, 'firecrawl');
+  const { instance, calls } = router({ config,
+    fetchImpl: async (url, init) => {
+      if (url.includes('tavily')) return init.headers.authorization === 'Bearer bad' ? json({ detail: 'SECRET-BODY' }, 401)
+        : json({ results: [{ url: 'https://ok.example', score: 0.9 }] });
+      return json({ results: [] });
+    } });
+  const tavily = await instance.diagnoseProvider('tavily');
+  assert.equal(tavily.status, 'ok');
+  assert.equal(tavily.partial, true);
+  assert.equal(tavily.keyCount, 2);
+  assert.deepEqual(tavily.keys.map(key => key.status), ['ok', 'failed']);
+  assert.equal(tavily.keys[1].code, 'HTTP_401');
+  assert.equal(tavily.keys[1].httpStatus, 401);
+  assert.ok(!JSON.stringify(tavily).includes('SECRET-BODY'));
+  assert.ok(!JSON.stringify(tavily).includes('good') && !JSON.stringify(tavily).includes('Bearer'));
+  const exa = await instance.diagnoseProvider('exa');
+  assert.equal(exa.status, 'empty');
+  assert.equal(exa.code, 'EMPTY');
+  const tinyfish = await instance.diagnoseProvider('tinyfish');
+  assert.equal(tinyfish.status, 'not-configured');
+  const firecrawl = await instance.diagnoseProvider('firecrawl');
+  assert.equal(firecrawl.status, 'disabled');
+  assert.equal(calls.filter(call => call.url.includes('firecrawl') || call.url.includes('tinyfish')).length, 0);
+  await assert.rejects(() => instance.diagnoseProvider('unknown'), error => error.code === 'SOURCE_UNKNOWN');
+});
+
+test('github diagnosis reports anonymous use, token failure and never sends an empty token', async () => {
+  const anonymous = router({ fetchImpl: async () => json({ resources: { core: { limit: 60, remaining: 59 } } }) });
+  const open = await anonymous.instance.diagnoseProvider('github');
+  assert.equal(open.status, 'ok');
+  assert.equal(open.authenticated, false);
+  assert.equal(open.limit, 60);
+  assert.equal(anonymous.calls[0].url, 'https://api.github.com/rate_limit');
+  assert.equal(anonymous.calls[0].init.headers.authorization, undefined);
+
+  const config = { ...baseConfig(), github_token: 'ghp_bad' };
+  const rejected = router({ config, fetchImpl: async () => json({ message: 'Bad credentials ghp_bad' }, 401) });
+  const failed = await rejected.instance.diagnoseProvider('github');
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.httpStatus, 401);
+  assert.match(failed.message, /Token/);
+  assert.ok(!JSON.stringify(failed).includes('ghp_bad'));
+
+  const disabled = router({ prefs: prefsOf({ githubEnabled: false }), fetchImpl: async () => json({}) });
+  assert.equal((await disabled.instance.diagnoseProvider('github')).status, 'disabled');
+  assert.equal(disabled.calls.length, 0);
+});
+
+test('fallback results are capped by fallback_sources and keep provider metadata', async () => {
+  const config = { ...baseConfig(), fallback_sources: 2 };
+  const { instance, calls } = router({ config, fetchImpl: async url => url.includes('tavily') ? json({}, 401)
+    : json({ results: [1, 2, 3, 4].map(index => ({ url: `https://exa.example/${index}` })) }) });
+  const result = await instance.search({ query: 'q', maxResults: 5 });
+  assert.equal(result.search_provider, 'exa');
+  assert.equal(result.fallback_used, true);
+  assert.equal(result.sources.length, 2);
+  assert.equal(JSON.parse(calls[1].init.body).numResults, 2);
+  assert.deepEqual(result.diagnostic.failures, [{ provider: 'tavily', code: 'HTTP_401', httpStatus: 401, message: 'API Key 无效或已失效。' }]);
+});
+
+test('fallback serializes within shared character budget without routing metadata consuming it', async () => {
+  const { instance } = router({ config: { ...baseConfig(), response_max_chars: 500 },
+    fetchImpl: async () => json({ results: [{ url: 'https://a.test', title: 'x'.repeat(200),
+      content: '\\"🙂'.repeat(2000), score: .8 }] }) });
+  const answer = await instance.search({ query: 'budget', maxResults: 1 });
+  assert.ok(JSON.stringify(answer).length <= 500);
+  assert.equal(answer.truncated, true);
+  assert.equal(answer.search_provider, 'tavily');
+  assert.equal(answer.fallback_used, true);
+  assert.deepEqual(Object.keys(answer), ['content', 'sources', 'truncated']);
+  const bad = router({ config: { ...baseConfig(), response_max_chars: 0 },
+    fetchImpl: async () => { throw new Error('must not run'); } });
+  await assert.rejects(bad.instance.search({ query: 'q' }), { code: 'GROK_CONFIG_INVALID' });
+  assert.equal(bad.calls.length, 0);
+});
+
+test('network, redirect, invalid URL and oversized responses fail closed with fixed messages', async () => {
+  const onlyTavily = without(baseConfig(), 'exa', 'firecrawl');
+  const network = router({ config: onlyTavily, fetchImpl: async () => {
+    throw Object.assign(new TypeError('fetch failed https://tavily.test?key=tvly-key'), { cause: { code: 'ENOTFOUND' } });
+  } });
+  await assert.rejects(() => network.instance.search({ query: 'q' }), error => {
+    const failure = error.details.failures[0];
+    return error.code === 'SOURCE_ALL_FAILED' && failure.code === 'NETWORK' && !failure.message.includes('tvly-key');
+  });
+  const diagnosis = await network.instance.diagnoseProvider('tavily');
+  assert.equal(diagnosis.keys[0].cause, 'ENOTFOUND');
+
+  const invalid = router({ config: { ...onlyTavily, tavily_api_url: 'file:///etc/passwd' },
+    fetchImpl: async () => json({}) });
+  assert.equal((await invalid.instance.diagnoseProvider('tavily')).code, 'URL_INVALID');
+  await assert.rejects(() => invalid.instance.search({ query: 'q' }), error => error.code === 'SOURCE_NOT_CONFIGURED');
+  assert.equal(invalid.calls.length, 0);
+
+  const huge = router({ config: onlyTavily, fetchImpl: async () => new Response('x'.repeat(2 * 1024 * 1024 + 16)) });
+  assert.equal((await huge.instance.diagnoseProvider('tavily')).code, 'RESPONSE_TOO_LARGE');
+});
+
+test('an empty query and a fully unconfigured router are explicit errors', async () => {
+  const config = { ...baseConfig(), tavily_api_key: '', exa_api_key: '', firecrawl_api_key: '' };
+  const { instance, calls } = router({ config, fetchImpl: async () => json({}) });
+  assert.equal(instance.snapshot().available, false);
+  await assert.rejects(() => instance.search({ query: '  ' }), error => error.code === 'SOURCE_QUERY_INVALID');
+  await assert.rejects(() => instance.search({ query: 'q' }), error => error.code === 'SOURCE_NOT_CONFIGURED');
+  assert.equal(calls.length, 0);
+});
+
+test('config and preference failures are not disguised as missing keys or default switches', async () => {
+  for (const which of ['configuration', 'preferences']) {
+    let requests = 0;
+    const error = new GrokSearchError(which === 'configuration' ? 'CONFIG_PARSE_FAILED' : 'PREFERENCES_READ_FAILED',
+      which === 'configuration' ? '配置语法无效。' : '偏好无法读取。');
+    const instance = createSourceRouter({
+      getConfig: () => { if (which === 'configuration') throw error; return asFields(baseConfig()); },
+      getPreferences: () => { if (which === 'preferences') throw error; return prefsOf(); },
+      fetchImpl: async () => { requests++; return json({}); },
+    });
+    assert.throws(instance.snapshot, caught => caught === error);
+    await assert.rejects(instance.search({ query: 'q' }), caught => caught === error);
+    await assert.rejects(instance.diagnoseProvider('exa'), caught => caught === error);
+    await assert.rejects(instance.diagnoseProvider('github'), caught => caught === error);
+    assert.equal(requests, 0);
+  }
+});
+
+test('the chain order and on/off come from the shared source_providers and *_enabled fields', async () => {
+  const ok = json({ results: [{ url: 'https://served.example', score: 0.9 }] });
+  // An explicit list sets the order and excludes unnamed sources, as grok-search-rs does.
+  const ordered = router({ config: { ...baseConfig(), source_providers: ['firecrawl', 'exa'] },
+    fetchImpl: async url => url.includes('firecrawl') ? json({}, 503) : json({ results: [{ url: 'https://exa.example' }] }) });
+  assert.deepEqual(ordered.instance.snapshot().order, ['firecrawl', 'exa', 'tavily', 'tinyfish']);
+  assert.equal(ordered.instance.snapshot().states.tavily, 'disabled');
+  const result = await ordered.instance.search({ query: 'q' });
+  assert.equal(result.search_provider, 'exa');
+  assert.deepEqual(ordered.calls.map(call => new URL(call.url).hostname), ['firecrawl.test', 'exa.test']);
+  // The environment form is a comma separated list; an unknown name is ignored.
+  const csv = router({ config: { ...baseConfig(), source_providers: ' exa , unknown,tavily' }, fetchImpl: async () => ok.clone() });
+  assert.deepEqual(csv.instance.snapshot().enabled, ['exa', 'tavily']);
+  // Old plugin-private order/on-off fields cannot create a second chain.
+  const legacy = router({ prefs: { value: { sourceOrder: ['firecrawl', 'exa', 'tinyfish', 'tavily'],
+    sourceEnabled: { tavily: false, exa: false, tinyfish: false, firecrawl: false } } }, fetchImpl: async () => ok.clone() });
+  assert.deepEqual(legacy.instance.snapshot().enabled, ['tavily', 'exa', 'firecrawl']);
+});

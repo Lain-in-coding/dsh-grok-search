@@ -1,0 +1,75 @@
+<section class="route-card" id="routeCard" data-layout="wide" aria-labelledby="routeTitle">
+  <div class="rc-head">
+    <div class="rc-title">
+      <h3 id="routeTitle">搜索路由</h3>
+      <span class="pill" id="statusPill" data-s="load"><i class="pill-dot" aria-hidden="true"></i><span id="statusText">读取配置…</span></span>
+    </div>
+    <div class="rc-actions">
+      <div class="strip-slot" id="stripSlot"><div><div class="strip" id="strip" role="group" aria-label="搜索顺序与最近验证状态"></div></div></div>
+      <button type="button" class="btn" id="testBtn"></button>
+      <div class="popover" id="testPop" role="dialog" aria-modal="false" aria-labelledby="testPopTitle" hidden>
+        <p class="pop-title" id="testPopTitle">测试全部已开启的搜索来源？</p>
+        <p class="pop-text">会逐一测试已开启的搜索来源及其 Key，各次测试会消耗相应额度。</p>
+        <div class="pop-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-pop="cancel">取消</button>
+          <button type="button" class="btn btn-primary btn-sm" data-pop="go">开始测试</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="banner-slot" id="bannerSlot"></div>
+  <div class="stage" id="stage" data-layout="wide" role="group" aria-label="搜索路由图">
+    <svg class="wires" id="wires" aria-hidden="true"></svg>
+    <div class="col-agent" id="colAgent">
+      <div class="node node-dsh" id="nodeDsh" title="宿主：DeepSeek Harness 的 web_search 工具">
+        <span class="port" data-port="dsh-out"></span>
+        <span class="port" data-port="dsh-alt"></span>
+        <img class="node-logo" data-logo="dsh" alt="">
+        <span class="node-name">DeepSeek Harness</span>
+        <span class="node-meta">web_search</span>
+      </div>
+      <div class="node node-official" id="nodeOfficial" aria-hidden="true">
+        <span class="port" data-port="off-in"></span>
+        <img class="node-logo" data-logo="deepseek" alt="">
+        <span class="off-text">
+          <span class="node-name">DeepSeek 官方搜索</span>
+          <span class="node-meta">内置 · 已恢复</span>
+        </span>
+      </div>
+    </div>
+    <div class="col-hub">
+      <button type="button" class="node node-hub" id="nodeHub" aria-label="Grok Search RS 设置">
+        <span class="port" data-port="hub-in"></span>
+        <span class="port" data-port="hub-out"></span>
+        <span class="hub-glyph" id="hubGlyph" aria-hidden="true"></span>
+        <span class="hub-text">
+          <span class="node-name">Grok Search RS</span>
+          <span class="node-meta" id="hubMeta">准备中…</span>
+        </span>
+        <span class="hub-pill" id="hubPill"><span id="hubPillText">按顺序</span><span aria-hidden="true">›</span></span>
+      </button>
+    </div>
+    <div class="col-list" id="colList">
+      <div class="rgroup" data-group="primary">
+        <div class="rg-label">主搜索</div>
+        <div class="rg-rows" id="rowsPrimary"></div>
+      </div>
+      <div class="rgroup" data-group="supp">
+        <div class="rg-label">补充来源 <span class="rg-hint">拖动排序</span></div>
+        <div class="rg-rows" id="rowsSupp"></div>
+      </div>
+      <div class="rgroup" data-group="extract">
+        <div class="rg-label">专用抽取</div>
+        <div class="rg-rows" id="rowsExtract"></div>
+      </div>
+    </div>
+  </div>
+  <footer class="rc-foot">
+    <span class="cf-label">配置文件</span>
+    <code class="cf-path" id="cfgPath"></code>
+    <span class="tag" id="cfgTag"></span>
+    <span class="cf-spacer"></span>
+    <button type="button" class="btn btn-ghost btn-sm" data-open="file">打开文件</button>
+    <button type="button" class="btn btn-ghost btn-sm" data-open="folder">打开文件夹</button>
+  </footer>
+</section>

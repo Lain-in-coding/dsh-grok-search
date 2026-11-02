@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.1.0",
+  "channel": "首个公开版本：npm latest（next 同版本入口）与 GitHub Release 使用同一个安装包",
+  "supportPolicy": "正式支持承诺只覆盖 targets 所列组合与其已披露的验证范围。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；版本号不表示表外环境、真实付费接口或所有故障组合已通过。",
+  "platforms": [
+    { "platform": "win32", "arch": "x64", "host": "Desktop" },
+    { "platform": "darwin", "arch": "arm64", "host": "Desktop" },
+    { "platform": "linux", "arch": "x64", "host": "CLI/Web" }
+  ],
+  "bundles": [
+    {
+      "package": "dsh-grok-search",
+      "components": ["grok-search-program", "grok-search-core", "grok-search-control", "grok-search-settings-ui", "grok-search-route-verifier", "grok-search-recovery"],
+      "note": "一个安装包，内部组件统一管理；DSH 插件页只显示 dsh-grok-search 一个插件"
+    }
+  ],
+  "targets": [
+    {
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.2",
+      "verification": "自动化测试通过：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.3",
+      "verification": "自动化测试通过：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.2",
+      "verification": "自动化测试通过（GitHub 托管的 macOS 15 Apple Silicon）：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.3",
+      "verification": "自动化测试通过（GitHub 托管的 macOS 15 Apple Silicon）：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "dsh": "0.2.1-rc.2",
+      "verification": "自动化测试通过（WSL Ubuntu 22.04）：安装与逐文件核对、Web 设置页与共享配置、搜索与网页抓取及聊天不受影响、插件即时启停、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "dsh": "0.2.1-rc.3",
+      "verification": "自动化测试通过（WSL Ubuntu 22.04）：安装与逐文件核对、Web 设置页与共享配置、搜索与网页抓取及聊天不受影响、插件即时启停、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "dsh": "0.2.1-rc.4",
+      "verification": "自动化测试通过（WSL Ubuntu 22.04）：安装与逐文件核对、Web 设置页与共享配置、搜索与网页抓取及聊天不受影响、插件即时启停、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    }
+  ],
+  "realKeyVerification": {
+    "win32-x64": "作者用真实 Key 实测 Grok 主搜索返回结果；自动化测试另用真实 Key 完成只用补充来源的搜索（由 Tavily 返回结果）",
+    "darwin-arm64": "尚未做真实付费接口验收",
+    "linux-x64": "尚未做真实付费接口验收"
+  },
+  "versionPolicy": "每个入口至少保留最新可用版本和前一个已验证版本，各入口的版本号不要求同步。DSH 发布新版本后，要等插件发布把它加入版本范围的新版本才能使用；已发布的插件版本不会改动，旧版插件仍可按版本号安装。package.json 中的 engines.dsh 是所有目标版本的并集，不区分系统和入口：能安装不等于已验证，只有 targets 列出的组合及其 verification 范围属于支持承诺。",
+  "unsupported": [
+    "macOS Intel（darwin-x64）",
+    "Windows ARM（win32-arm64）",
+    "官方 Linux Desktop（官方未提供）",
+    "Windows 与 macOS 上的 DSH CLI/Web（可能可以安装，但未验证）",
+    "DSH 0.2.2-alpha.2（不在 engines.dsh 范围内，安装会被拒绝）"
+  ],
+  "notTested": [
+    "原生 Linux（非 WSL）上用 npm 全局安装 DSH CLI 的完整路径",
+    "macOS 和 Linux 上的真实付费接口",
+    "开发时的任意源码热替换",
+    "多文件写入中途崩溃，以及所有并发请求组合",
+    "DSH 官方联网网页抓取及其费用预期"
+  ]
+}

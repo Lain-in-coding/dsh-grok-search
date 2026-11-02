@@ -352,6 +352,11 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
         if (outcome.status === 'ok') {
           const maxChars = config.response_max_chars === undefined ? 45_000 : Math.min(500_000, config.response_max_chars);
           const mapped = mapSearchResult({ content: '', sources: outcome.sources }, { maxResults: limit, maxChars });
+          if (mapped.sources.length === 0) {
+            failures.push({ provider: source.id, code: 'OUTPUT_LIMIT',
+              message: '回复字符上限无法容纳搜索链接，请调大上限。' });
+            continue;
+          }
           Object.defineProperties(mapped, {
             search_provider: { value: source.id }, fallback_used: { value: true }, fallback_reason: { value: reason },
             diagnostic: { value: { provider: source.id, failures } },

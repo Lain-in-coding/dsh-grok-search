@@ -1188,6 +1188,7 @@ const NETWORK_ERRORS = {
   CERT_HAS_EXPIRED: ['TLS', '证书已过期'],
   UNABLE_TO_VERIFY_LEAF_SIGNATURE: ['TLS', '证书校验失败'],
   INVALID_RESPONSE: ['响应', '响应格式异常'], RESPONSE_TOO_LARGE: ['响应', '响应超过上限'],
+  OUTPUT_LIMIT: ['上限', '回复上限过小'],
   URL_INVALID: ['地址', '接口地址无效'],
   GROK_AUTH_ERROR: ['认证', 'Grok 认证失败'], GROK_TIMEOUT: ['超时', 'Grok 响应超时'],
   GROK_PARSE_ERROR: ['响应', 'Grok 响应无法解析'], GROK_PROVIDER_ERROR: ['接口', 'Grok 接口调用失败'],
@@ -1231,6 +1232,7 @@ function failureHelp(code) {
   if (value === 'GROK_AUTH_ERROR') return '检查 Grok Key 或原有登录凭据；上游未提供具体 HTTP 状态码。';
   if (['GROK_CONTENT_EMPTY', 'GROK_SOURCES_EMPTY', 'GROK_PARSE_ERROR'].includes(value)) return '核对模型与搜索能力；有 Key 不等于能返回可核验来源。';
   if (value === 'GROK_VERSION_UNVERIFIED') return '此版本尚未通过插件验证；不会擅自升级或覆盖已有安装。';
+  if (value === 'OUTPUT_LIMIT') return '调大「回复字符上限」以容纳搜索链接；此结果不表示 Key 失效。';
   if (value.startsWith('GROK_DOWNLOAD_') || value.startsWith('GROK_ARCHIVE_')) return '检查网络或程序缓存，在 Grok Search RS 设置中重新检测。';
   if (value.startsWith('GROK_PROGRAM_') || value.startsWith('GROK_PROCESS_')) return '检查程序状态，在 Grok Search RS 设置中重新检测；不会修改全局安装。';
   if (value.startsWith('GROK_')) return '核对 Grok 程序、Base URL 和模型；该错误不单独证明 Key 失效。';
@@ -1802,8 +1804,9 @@ function fieldReadOnly(k) {
   const key = CARD_FIELDS[D.id]?.[k.startsWith('keys.') ? 'keys' : k];
   if (!key) return k === 'ghApi';
   const secret = ['key', 'gwKey', 'token', 'keys'].includes(k.split('.')[0]);
+  const destination = ['url', 'gwUrl', 'searchUrl', 'fetchUrl'].includes(k);
   return D.fields?.[key]?.readOnly === true || D.id === 'grok' && D.base.authReadOnly
-    || secret && !S.capabilities?.secretsAllowed;
+    || (secret || destination) && !S.capabilities?.secretsAllowed;
 }
 function keyIn(k, v, ph, o = {}) {
   const shown = !!D.show[k];

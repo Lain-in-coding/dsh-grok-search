@@ -1,5 +1,38 @@
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+// Keep the browser socket alive until the owned Desktop has actually exited.
+// Browser.close may close the socket without a reply; socket-close alone is
+// not proof of process exit, and closing it immediately after send can discard
+// a queued command on a busy host.
+export async function requestDesktopShutdown(port, whenClosed, {
+  timeoutMs = 20_000, fetchImpl = fetch, WebSocketImpl = WebSocket,
+} = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof whenClosed?.then !== 'function') {
+    throw new TypeError('Desktop shutdown needs a bounded timeout and an owned-process exit promise.');
+  }
+  const response = await fetchImpl(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok) throw new Error('Desktop debugger is unavailable for shutdown.');
+  const info = await response.json();
+  const socket = new WebSocketImpl(info.webSocketDebuggerUrl);
+  let openTimer, exitTimer;
+  try {
+    await new Promise((resolve, reject) => {
+      openTimer = setTimeout(() => reject(new Error('Desktop shutdown socket did not open.')), timeoutMs);
+      socket.addEventListener('open', resolve, { once: true });
+      socket.addEventListener('error', () => reject(new Error('Desktop shutdown socket failed.')), { once: true });
+    });
+    clearTimeout(openTimer);
+    socket.send(JSON.stringify({ id: 1, method: 'Browser.close' }));
+    await Promise.race([
+      whenClosed,
+      new Promise((_, reject) => { exitTimer = setTimeout(() => reject(new Error('Official Browser.close did not finish within deadline.')), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(openTimer); clearTimeout(exitTimer);
+    socket.close();
+  }
+}
+
 async function pageTarget(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let last;

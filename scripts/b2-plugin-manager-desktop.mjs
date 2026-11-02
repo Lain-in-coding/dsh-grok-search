@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
-import { connectRenderer, waitForRenderer } from './lib/renderer-cdp.mjs';
+import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
 import {
   cleanEnvironment, commandResult, configSecrets, freshRun, project, receipt, redact, sha256, writeJson,
 } from './lib/internal-candidate-utils.mjs';
@@ -157,6 +157,10 @@ async function settingsRpcSecurityFlow(host) {
         const restrictedSnapshot = await call('snapshot', undefined, { 'X-Forwarded-Proto': 'https' });
         const deniedSave = await call('save', { expectedRevision: saved.result.value.config.revision,
           updates: { grok_api_key: 'must-not-be-written' } }, { 'X-Forwarded-Proto': 'https' });
+        const deniedDestination = await call('save', { expectedRevision: saved.result.value.config.revision,
+          updates: { grok_api_url: 'https://example.invalid/must-not-receive-credentials' } },
+          { 'X-Forwarded-Proto': 'https' });
+        const afterDestination = await call('snapshot');
         const unauthenticated = await call('reveal', { key: 'grok_api_key' }, {}, 'omit');
         return { snapshotOk: true, saveOk: true, capabilities: before.capabilities,
           redacted: redacted.result?.ok === true && !JSON.stringify(redacted.result.value).includes(sentinel),
@@ -167,6 +171,9 @@ async function settingsRpcSecurityFlow(host) {
             && restrictedSnapshot.result.value.capabilities.secretsAllowed === false,
           deniedSave: deniedSave.result?.ok !== true,
           deniedSaveCode: deniedSave.result?.error?.code ?? null,
+          deniedDestination: deniedDestination.result?.ok !== true
+            && afterDestination.result?.value?.config?.revision === saved.result.value.config.revision,
+          deniedDestinationCode: deniedDestination.result?.error?.code ?? null,
           rendererCookieOmissionDenied: unauthenticated.result?.ok !== true
             && !JSON.stringify(unauthenticated).includes(sentinel),
         };
@@ -192,12 +199,13 @@ async function settingsRpcSecurityFlow(host) {
     await unauthenticated.body?.cancel();
     writeJson(join(directory, currentVersion + '-settings-rpc-security.json'), safe(evidence));
     for (const key of ['snapshotOk', 'saveOk', 'redacted', 'revealMatches', 'forwardedDenied',
-      'restrictedSnapshotOk', 'deniedSave', 'unauthenticatedDenied']) {
+      'restrictedSnapshotOk', 'deniedSave', 'deniedDestination', 'unauthenticatedDenied']) {
       assert.equal(evidence[key], true, `Settings RPC security check ${key}: ${JSON.stringify(evidence)}`);
     }
     assert.equal(evidence.capabilities.transport, 'loopback');
     assert.equal(evidence.forwardedCode, 'SETTINGS_SECURE_CONNECTION_REQUIRED');
     assert.equal(evidence.deniedSaveCode, 'SETTINGS_SECURE_CONNECTION_REQUIRED');
+    assert.equal(evidence.deniedDestinationCode, 'SETTINGS_SECURE_CONNECTION_REQUIRED');
     return evidence;
   } finally { renderer.close(); }
 }
@@ -642,17 +650,7 @@ async function start(runtime, folder, phase) {
 async function close(state) {
   if (!state.exited) {
     try {
-      const response = await fetch('http://127.0.0.1:' + state.debuggerPort + '/json/version', { signal: AbortSignal.timeout(5000) });
-      const info = await response.json();
-      const socket = new WebSocket(info.webSocketDebuggerUrl);
-      await new Promise((done, reject) => {
-        socket.addEventListener('open', done, { once: true });
-        socket.addEventListener('error', reject, { once: true });
-      });
-      socket.send(JSON.stringify({ id: 1, method: 'Browser.close' }));
-      socket.close();
-      const ended = await Promise.race([state.closed.then(() => true), sleep(20000).then(() => false)]);
-      if (!ended) throw new Error('Official Browser.close did not finish within deadline.');
+      await requestDesktopShutdown(state.debuggerPort, state.closed, { timeoutMs: 20000 });
     } catch (error) {
       state.closeError = error.message;
       if (!state.exited) { state.forced = true; state.child.kill('SIGKILL'); await state.closed; }
@@ -949,7 +947,9 @@ async function firstUseStub() {
       }
       if (provider !== 'grok') {
         const source = { url: state.mode === 'invalid-first-source' && provider === 'exa'
-          ? 'https://[invalid-source' : 'https://example.invalid/integrated/' + provider,
+          ? 'https://[invalid-source' : state.mode === 'long-first-source' && provider === 'exa'
+            ? 'https://example.invalid/' + 'long-path-'.repeat(200)
+            : 'https://example.invalid/integrated/' + provider,
           title: 'Integrated ' + provider + ' result', content: 'loopback source',
           summary: 'loopback source', description: 'loopback source', snippet: 'loopback source', score: 1 };
         response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -1177,6 +1177,26 @@ async function productionDiagnosticsFlow(host, stub) {
       && !recoveredRequests.some(row => ['grok', 'tinyfish', 'firecrawl'].includes(row.provider)));
     check('invalid-source-URL-recovery-does-not-call-official',
       (await host.probe('snapshot')).calls.original === originalBefore);
+    stub.state.mode = 'long-first-source';
+    const beforeBudget = await call('snapshot');
+    await call('save', { expectedRevision: beforeBudget.config.revision, updates: { response_max_chars: 5000 } });
+    // Import a legal lower value through the isolated shared file. The UI's
+    // write range intentionally starts at 5000; production accepts >=100.
+    const budgetPath = beforeBudget.config.path;
+    const originalBudgetText = readFileSync(budgetPath, 'utf8');
+    assert.match(originalBudgetText, /^response_max_chars\s*=\s*5000/m);
+    writeFileSync(budgetPath, originalBudgetText.replace(/^response_max_chars\s*=\s*5000/m, 'response_max_chars = 100'));
+    try {
+      const budgetStart = stub.requests.length;
+      const bounded = await host.probe('product-query-result');
+      const budgetRequests = stub.requests.slice(budgetStart);
+      check('output-budget-zero-links-continues-to-next-source',
+        bounded.sources?.[0]?.url === 'https://example.invalid/integrated/tavily'
+        && JSON.stringify(bounded).length <= 100
+        && budgetRequests[0]?.provider === 'exa' && budgetRequests.slice(1).some(row => row.provider === 'tavily'));
+      check('output-budget-failover-does-not-call-official',
+        (await host.probe('snapshot')).calls.original === originalBefore);
+    } finally { writeFileSync(budgetPath, originalBudgetText); }
     stub.state.mode = 'failed';
     const allFailedStart = stub.requests.length;
     await runTest();

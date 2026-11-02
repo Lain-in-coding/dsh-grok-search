@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { apply as applySettings, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
+import { createConnectionSecurity } from '../src/core/connection-security.mjs';
 
 test('settings gateway reads shared config, saves with CAS and keeps secrets out of snapshot', async () => {
   let Gateway;
@@ -79,7 +80,50 @@ test('configuration history restore requires both owner and secret-write authori
   assert.throws(() => codec.parse({ expectedRevision: 'missing', revision: 1 }), /Invalid settings payload/);
 });
 
-test('settings descriptors do not expose a user stop button contract', () => {
+test('remote HTTP cannot redirect stored credentials by changing a service URL', async () => {
+  let Gateway;
+  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-destination-'));
+  const path = join(directory, 'config.toml');
+  const original = 'tavily_api_key = "synthetic-destination-key"\n';
+  writeFileSync(path, original);
+  const security = createConnectionSecurity();
+  const services = new Map([
+    ['grokSearchConnectionSecurity', security],
+    ['grokSearchProgram', { snapshot: () => ({ configPath: path }) }],
+  ]);
+  const ctx = { profileContext: { dir: directory }, get: key => services.get(key), provide() {},
+    invocation: { peer: { principal: { kind: 'owner' } } } };
+  const gateway = new Gateway(ctx);
+  const remote = { socket: { remoteAddress: '192.0.2.1', localAddress: '192.0.2.2', encrypted: false }, headers: {} };
+  const local = { socket: { remoteAddress: '127.0.0.1', localAddress: '127.0.0.1', encrypted: false }, headers: {} };
+  try {
+    await security.run(remote, null, async () => {
+      const before = await gateway.snapshot();
+      assert.equal(before.capabilities.secretsAllowed, false);
+      for (const key of ['grok_api_url', 'openai_compatible_api_url', 'tavily_api_url', 'exa_api_url',
+        'tinyfish_search_api_url', 'tinyfish_fetch_api_url', 'firecrawl_api_url']) {
+        for (const value of ['https://example.invalid/changed', null]) {
+          await assert.rejects(gateway.save({
+            expectedRevision: before.config.revision, updates: { [key]: value },
+          }), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+          assert.equal(readFileSync(path, 'utf8'), original);
+        }
+      }
+      const allowed = await gateway.save({ expectedRevision: before.config.revision, updates: { timeout_seconds: 65 } });
+      assert.equal(allowed.config.fields.timeout_seconds.value, 65, 'non-destination settings remain editable');
+    });
+    await security.run(local, null, async () => {
+      const before = await gateway.snapshot();
+      const saved = await gateway.save({ expectedRevision: before.config.revision,
+        updates: { tavily_api_url: 'https://example.invalid/authorized' } });
+      assert.equal(saved.config.fields.tavily_api_url.value, 'https://example.invalid/authorized');
+      assert.equal(saved.config.fields.tavily_api_key.value, null);
+    });
+  } finally { security.dispose(); }
+});
+
+test('legacy stop RPC remains available without requiring a user-visible stop button', () => {
   assert.equal(SETTINGS_DESCRIPTORS.some(descriptor => descriptor.method === 'stop'), true);
 });
 

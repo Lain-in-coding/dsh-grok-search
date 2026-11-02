@@ -32,7 +32,7 @@ export function createConnectionSecurity() {
     const secure = current?.encrypted === true;
     const local = current?.loopback === true && current?.proxyHeaders === false;
     return { secretsAllowed: secure || local, transport: secure ? 'https' : local ? 'loopback' : 'restricted',
-      reason: secure || local ? null : '请通过本机直连或 HTTPS 查看和保存 Key；远程 HTTP 只显示脱敏状态。' };
+      reason: secure || local ? null : '请通过本机直连或 HTTPS 查看、保存 Key 或修改服务地址；远程 HTTP 保持脱敏。' };
   };
   return Object.freeze({
     run(request, _response, next) {
@@ -49,7 +49,7 @@ export function createConnectionSecurity() {
     capabilities, requireOwner,
     requireSecret(ctx) {
       if (!capabilities(ctx).secretsAllowed) {
-        deny('SETTINGS_SECURE_CONNECTION_REQUIRED', '请通过本机直连或 HTTPS 查看和保存 Key。');
+        deny('SETTINGS_SECURE_CONNECTION_REQUIRED', '请通过本机直连或 HTTPS 查看、保存 Key 或修改服务地址。');
       }
     },
     dispose() { disposed = true; storage.disable(); },

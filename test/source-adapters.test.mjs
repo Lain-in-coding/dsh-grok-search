@@ -210,6 +210,23 @@ test('fallback serializes within shared character budget without routing metadat
   assert.equal(bad.calls.length, 0);
 });
 
+test('sources removed by the output budget cannot stop fallback as an empty success', async () => {
+  const config = { ...baseConfig(), source_providers: ['tavily', 'exa'], response_max_chars: 100 };
+  const longUrl = 'https://example.test/' + 'a'.repeat(1000);
+  const { instance, calls } = router({ config, fetchImpl: async url =>
+    json({ results: [{ url: url.includes('tavily') ? longUrl : 'https://a.test' }] }) });
+  const result = await instance.search({ query: 'bounded links' });
+  assert.equal(result.search_provider, 'exa');
+  assert.deepEqual(result.sources, [{ url: 'https://a.test' }]);
+  assert.equal(result.diagnostic.failures[0].code, 'OUTPUT_LIMIT');
+  assert.equal(calls.length, 2);
+  assert.ok(JSON.stringify(result).length <= 100);
+  const allLong = router({ config, fetchImpl: async () => json({ results: [{ url: longUrl }] }) });
+  await assert.rejects(allLong.instance.search({ query: 'bounded links' }), error =>
+    error.code === 'SOURCE_ALL_FAILED' && error.details.failures.length === 2
+      && error.details.failures.every(row => row.code === 'OUTPUT_LIMIT'));
+});
+
 test('network, redirect, invalid URL and oversized responses fail closed with fixed messages', async () => {
   const onlyTavily = without(baseConfig(), 'exa', 'firecrawl');
   const network = router({ config: onlyTavily, fetchImpl: async () => {

@@ -2,7 +2,7 @@ import { dirname, join, resolve } from 'node:path';
 import { statSync, existsSync } from 'node:fs';
 import { readAsar } from './asar.mjs';
 
-export const CANDIDATE_VERSIONS = Object.freeze(['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3']);
+export const CANDIDATE_VERSIONS = Object.freeze(['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.5']);
 
 // 独立于历史 M0 解析入口，不扩大旧探针的支持声明。
 export function candidateRuntime(executablePath) {

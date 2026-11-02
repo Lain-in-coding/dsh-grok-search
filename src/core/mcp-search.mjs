@@ -304,7 +304,7 @@ export async function runMcpSearch({
     if (sdkFactory === defaultSdkFactory) sdkEntry = import.meta.resolve('@modelcontextprotocol/client');
     budget();
     if (typeof sdk.Client !== 'function' || typeof sdk.ReadBuffer !== 'function' || typeof sdk.serializeMessage !== 'function') throw failure('GROK_SDK_UNSUPPORTED', 'MCP SDK 缺少所需公开接口，请检查依赖版本。');
-    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.1.0' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
+    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.1.1' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
     connection.client = client;
     // 所有可能拒绝的 framing 参数先校验，再启动本次进程。
     const buffer = new sdk.ReadBuffer({ maxBufferSize: maxMessageBytes + 1 });

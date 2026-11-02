@@ -135,6 +135,7 @@ async page => {
     check('restricted connection disables reveal', await page.locator('[data-a=eye]').first().isDisabled());
     check('restricted connection disables copy', await page.locator('[data-a=copy]').first().isDisabled());
     check('restricted connection disables key additions', await page.locator('[data-a=add-key]').isDisabled());
+    check('restricted connection locks credential destination URL', await page.locator('input[data-k=url]').getAttribute('readonly') !== null);
     await close();
 
     await state('returning');
@@ -214,6 +215,9 @@ async page => {
     check('no duplicate full search spends quota', await read(() => window.harness.state.calls.filter(c => c.method === 'testSearch').length), 0);
     await page.screenshot({ path: run.directory + '/diagnostic-partial-light.png' });
     await page.evaluate(() => window.harness.theme('dark'));
+    await page.waitForFunction(() => getComputedStyle(
+      document.querySelector('[data-dsg-route]').shadowRoot.querySelector('#routeCard')
+    ).backgroundColor === 'rgb(22, 24, 28)');
     await page.screenshot({ path: run.directory + '/diagnostic-partial-dark.png' });
     check('dark theme reaches dialog layer', await read(() => document.querySelector('[data-dsg-layer]').shadowRoot.querySelector('.dsg-layer').dataset.theme), 'dark');
     await card('grok');
@@ -256,6 +260,11 @@ async page => {
     check('background all failed cannot imply another key works', await page.locator('#statusText').textContent(), '搜索失败');
     check('provider-level Tavily failure has exact badge', await page.locator('.row[data-id=tavily] .row-fault').textContent().then(text => text.includes('401')));
     check('provider-level failure leaves per-key check unverified', await page.locator('.s-node[data-id=tavily] .s-dot[data-tone=err]').count(), 0);
+    await page.evaluate(() => window.harness.configure({ route: { at: Date.now(), origin: 'search', outcome: 'failed',
+      served: null, grokCode: 'DISABLED', fallbackUsed: false, code: 'SOURCE_ALL_FAILED',
+      failures: [{ provider: 'tavily', code: 'OUTPUT_LIMIT' }] } }));
+    await refresh();
+    check('output cap error is distinct from invalid key', await page.locator('.row[data-id=tavily] .row-fault').textContent().then(text => text.includes('回复上限过小')));
     await page.evaluate(() => window.harness.configure({ route: { at: Date.now(), origin: 'search', outcome: 'ok',
       served: 'grok-sources', grokCode: 'grok_auth_error', fallbackUsed: true, failures: [] } }));
     await refresh();

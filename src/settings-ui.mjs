@@ -547,7 +547,10 @@ class GrokSearchSettingsGateway extends Service {
     if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
       throw new GrokSearchError('CONFIG_UPDATES_INVALID', '配置更新必须是对象。');
     }
-    const needsSecret = Object.keys(updates).some(key => CONFIG_FIELDS[key]?.type === 'secret');
+    // A URL edit can send an existing (including environment/OAuth) credential
+    // to a different service without changing the key field. Protect changing
+    // or clearing destinations by the same transport proof as secret writes.
+    const needsSecret = Object.keys(updates).some(key => ['secret', 'url'].includes(CONFIG_FIELDS[key]?.type));
     if (needsSecret) this.security.requireSecret(this.ctx);
     const config = this._store().save({
       expectedRevision: request.expectedRevision,

@@ -1,11 +1,11 @@
 {
   "name": "dsh-grok-search",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "用 Grok 接管 DSH 网页搜索；支持共享配置、补充来源静默回退和即时恢复官方搜索。",
   "engines": {
     "node": ">=22.0.0",
-    "dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4"
+    "dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5"
   },
   "scripts": {
     "check": "node scripts/check.mjs",
@@ -13,7 +13,7 @@
     "test:provider": "node --test test/provider-core.test.mjs test/commit-message.test.mjs",
     "test:control": "node --test test/control-intent-store.test.mjs test/startup-recovery.test.mjs test/control-intent-migration.test.mjs",
     "test:migration": "node --test test/control-intent-migration.test.mjs",
-    "test:release": "node --test test/release-transaction.test.mjs test/pack-release.test.mjs",
+    "test:release": "node --test test/release-transaction.test.mjs test/pack-release.test.mjs test/host-compatibility.test.mjs",
     "test:wiring": "node --test test/product-wiring.test.mjs",
     "test:client": "node --test test/client.test.mjs",
     "test:session": "node --test test/session-owner.test.mjs",
@@ -68,11 +68,11 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4",
-    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4",
-    "@deepseek-ai/dsh-web": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4",
+    "@deepseek-ai/dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5",
+    "@deepseek-ai/dsh-web": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5",
     "@deepseek-ai/cordis": "~4.0.5",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5",
     "@deepseek-ai/schemastery": "~3.18.5"
   },
   "dependencies": {

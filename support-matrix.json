@@ -1,8 +1,12 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.1.0",
-  "channel": "首个公开版本：npm latest（next 同版本入口）与 GitHub Release 使用同一个安装包",
-  "supportPolicy": "正式支持承诺只覆盖 targets 所列组合与其已披露的验证范围。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；版本号不表示表外环境、真实付费接口或所有故障组合已通过。",
+  "packageVersion": "0.1.1",
+  "channel": "兼容与安全修复候选：审核后 npm latest（next 同版本入口）与 GitHub Release 使用同一个安装包",
+  "supportPolicy": "targets 列出本候选的兼容支持组合，verificationLevel 单独说明验证依据。支持声明不要求逐个官方 Desktop 发行包实测：rc.4 Desktop 经关键源码一致性审查并结合已有宿主证据纳入支持，但不宣称原包实测通过。新候选仍须完成受影响验证并审核后发布。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
+  "verificationLevels": {
+    "host-tested": "有对应系统、架构、入口和版本的宿主自动化测试记录；具体场景见 verification。运行时未变时可按源码哈希复用原范围证据，不把旧包安装写成新包安装，也不表示真实付费接口通过。",
+    "source-reviewed": "基于明确的接口与源码审查及相邻版本/同版其他入口证据声明兼容；未单独实测该官方 Desktop 原包。此等级属于支持范围，不属于宿主实测通过。"
+  },
   "platforms": [
     { "platform": "win32", "arch": "x64", "host": "Desktop" },
     { "platform": "darwin", "arch": "arm64", "host": "Desktop" },
@@ -20,43 +24,85 @@
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.2",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.3",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.4",
+      "verificationLevel": "source-reviewed",
+      "verification": "兼容支持：rc.4 与已测 rc.3/rc.5 的 11 个关键宿主源码目录一致，并有同版 Linux CLI/Web 验证依据；未取得并单独实测官方 rc.4 Windows Desktop 原包，不将源码审查视为桌面安装、打包或签名验证"
+    },
+    {
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.5",
+      "verificationLevel": "host-tested",
+      "verification": "自动化测试通过：官方 Desktop 原始 ASAR 的隔离启动、安装与移除、设置页、插件即时启停、搜索与恢复、配置重载不回退官方、只用补充来源、首次使用与诊断；上游使用本机合成响应"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.2",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过（GitHub 托管的 macOS 15 Apple Silicon）：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.3",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过（GitHub 托管的 macOS 15 Apple Silicon）：安装与移除、设置页与共享配置、插件即时启停、搜索接管与恢复原搜索、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.4",
+      "verificationLevel": "source-reviewed",
+      "verification": "兼容支持：rc.4 与已测 rc.3/rc.5 的 11 个关键宿主源码目录一致，并有同版 Linux CLI/Web 验证依据；未取得并单独实测官方 rc.4 macOS Desktop 原包，不将源码审查视为桌面安装、打包或签名验证"
+    },
+    {
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.5",
+      "verificationLevel": "host-tested",
+      "verification": "自动化测试通过（GitHub 托管 macOS 15 Apple Silicon）：官方 Desktop 原始 ASAR 的隔离启动、安装与移除、设置页、插件即时启停、搜索与恢复、配置重载不回退官方、只用补充来源、首次使用与诊断；上游使用本机合成响应"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.2",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过（WSL Ubuntu 22.04）：安装与逐文件核对、Web 设置页与共享配置、搜索与网页抓取及聊天不受影响、插件即时启停、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.3",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过（WSL Ubuntu 22.04）：安装与逐文件核对、Web 设置页与共享配置、搜索与网页抓取及聊天不受影响、插件即时启停、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.4",
+      "verificationLevel": "host-tested",
       "verification": "自动化测试通过（WSL Ubuntu 22.04）：安装与逐文件核对、Web 设置页与共享配置、搜索与网页抓取及聊天不受影响、插件即时启停、配置重载时不回退官方搜索、只用补充来源、首次使用自动下载 grok-search-rs 程序；Grok 主搜索服务为模拟响应"
+    },
+    {
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "dsh": "0.2.1-rc.5",
+      "verificationLevel": "host-tested",
+      "verification": "自动化测试通过（WSL Ubuntu 22.04）：CLI/Web 安装与逐文件核对、设置页、搜索与网页抓取及聊天保持、即时启停、配置重载不回退官方、只用补充来源、首次使用自动下载 grok-search-rs 程序与诊断；上游使用本机合成响应"
     }
   ],
   "realKeyVerification": {
@@ -64,7 +110,7 @@
     "darwin-arm64": "尚未做真实付费接口验收",
     "linux-x64": "尚未做真实付费接口验收"
   },
-  "versionPolicy": "每个入口至少保留最新可用版本和前一个已验证版本，各入口的版本号不要求同步。DSH 发布新版本后，要等插件发布把它加入版本范围的新版本才能使用；已发布的插件版本不会改动，旧版插件仍可按版本号安装。package.json 中的 engines.dsh 是所有目标版本的并集，不区分系统和入口：能安装不等于已验证，只有 targets 列出的组合及其 verification 范围属于支持承诺。",
+  "versionPolicy": "每个入口至少保留最新可用版本和前一个已验证版本，各入口的版本号不要求同步。DSH 发布新版本后，要等插件发布把它加入版本范围的新版本才能使用；已发布的插件版本不会改动，旧版插件仍可按版本号安装。package.json 中的 engines.dsh 是所有目标版本的并集，不区分系统和入口：能安装不等于已验证。targets 决定支持范围，verificationLevel 和 verification 决定证据等级及场景，不因为同一包可安装就自动支持表外组合。",
   "unsupported": [
     "macOS Intel（darwin-x64）",
     "Windows ARM（win32-arm64）",
@@ -73,6 +119,7 @@
     "DSH 0.2.2-alpha.2（不在 engines.dsh 范围内，安装会被拒绝）"
   ],
   "notTested": [
+    "DSH 0.2.1-rc.4 Desktop 官方原包实测：已纳入兼容支持，但仅有关键源码审查与关联宿主证据，不把该版本 CLI/Web 测试写成 Desktop 实测",
     "原生 Linux（非 WSL）上用 npm 全局安装 DSH CLI 的完整路径",
     "macOS 和 Linux 上的真实付费接口",
     "开发时的任意源码热替换",

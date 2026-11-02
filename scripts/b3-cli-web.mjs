@@ -40,14 +40,16 @@ const VERSIONS = Object.freeze({
   rc2: '0.2.1-rc.2',
   rc3: '0.2.1-rc.3',
   rc4: '0.2.1-rc.4',
+  rc5: '0.2.1-rc.5',
 });
 const CASES = new Set(['smoke', 'stop', 'full']);
 
 function usage() {
   return [
     'Usage:',
-    '  node scripts/b3-cli-web.mjs --dsh-cli <bin.js> --dsh-version <rc2|rc3|rc4>',
+    '  node scripts/b3-cli-web.mjs --dsh-cli <bin.js> --dsh-version <rc2|rc3|rc4|rc5>',
     '    --product-package <tgz> --grok-linux-archive <tar.gz> --case <smoke|stop|full>',
+    '    --browser-executable <linux-browser-path>',
     '    --pnpm-entry <pnpm.cjs> --pnpm-store <path> --pnpm-cache <path>',
   ].join('\n');
 }
@@ -84,11 +86,11 @@ function parseArgs(argv) {
     || !options.pnpmEntry || !options.pnpmStore || !options.pnpmCache) {
     throw new Error(`--dsh-cli, --dsh-version, --product-package, --grok-linux-archive, --pnpm-entry, --pnpm-store and --pnpm-cache are required.\n${usage()}`);
   }
-  if (options.case === 'full' && !options.browserExecutable) {
-    throw new Error(`--browser-executable is required for the full case.\n${usage()}`);
+  if (!options.browserExecutable) {
+    throw new Error(`--browser-executable is required for every case (settings DOM is always checked).\n${usage()}`);
   }
   if (!Object.hasOwn(VERSIONS, options.dshVersion)) {
-    throw new Error(`Unsupported --dsh-version ${JSON.stringify(options.dshVersion)}; expected rc2, rc3 or rc4.`);
+    throw new Error(`Unsupported --dsh-version ${JSON.stringify(options.dshVersion)}; expected rc2, rc3, rc4 or rc5.`);
   }
   if (!CASES.has(options.case)) {
     throw new Error(`Unsupported --case ${JSON.stringify(options.case)}; expected smoke, stop or full.`);
@@ -599,6 +601,13 @@ async function runGrokProtocolProbe({ executable, configPath, home, tempDirector
 function safeName(value) {
   return value.replaceAll(/[^a-zA-Z0-9._-]+/g, '-');
 }
+
+export const CLI_WEB_LOG_ARTIFACTS = Object.freeze({
+  webStderr: safeName('logs/dsh-web.stderr.log'),
+  webStdout: safeName('logs/dsh-web.stdout.log'),
+  browserStderr: safeName('logs/linux-browser.stderr.log'),
+  browserStdout: safeName('logs/linux-browser.stdout.log'),
+});
 
 function runSync(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
@@ -2272,6 +2281,13 @@ async function linuxWorker(options) {
         check('linux-settings-forwarded-facts-not-trusted', forwarded.ok !== true
           && forwarded.error?.code === 'SETTINGS_SECURE_CONNECTION_REQUIRED'
           && !JSON.stringify(forwarded).includes(GROK_TEST_API_KEY));
+        const deniedDestination = await settingsCall('save', { expectedRevision: current.value.config.revision,
+          updates: { grok_api_url: 'https://example.invalid/must-not-receive-credentials' } },
+          { 'X-Forwarded-Proto': 'https' });
+        const afterDestination = await settingsCall('snapshot');
+        check('linux-settings-restricted-destination-write-denied', deniedDestination.ok !== true
+          && deniedDestination.error?.code === 'SETTINGS_SECURE_CONNECTION_REQUIRED'
+          && afterDestination.value.config.revision === current.value.config.revision);
         const unauthenticated = await settingsCall('reveal', { key: 'grok_api_key' }, {}, '');
         check('linux-settings-no-owner-denied', [401, 403].includes(unauthenticated.status));
         check('linux-settings-dialog-open', await click('.row[data-id=grok] .row-main'));
@@ -2605,6 +2621,7 @@ async function linuxWorker(options) {
       check('sources-only-preferences-read', originalPreferences.ok === true);
       const received = [];
       let invalidFirstSource = false;
+      let longFirstSource = false;
       const server = createServer((request, response) => {
         let body = '';
         request.on('data', chunk => { if (body.length < 65536) body += chunk; });
@@ -2616,6 +2633,7 @@ async function linuxWorker(options) {
           received.push({ method: request.method, path: request.url, valid });
           response.writeHead(valid ? 200 : 400, { 'Content-Type': 'application/json' });
           response.end(JSON.stringify({ results: [{ url: invalidFirstSource && !tavily ? 'https://[invalid-source'
+            : longFirstSource && !tavily ? 'https://example.invalid/' + 'long-path-'.repeat(200)
             : tavily ? 'https://example.invalid/linux-source-failover' : 'https://example.invalid/linux-sources-only',
             title: '隔离补充来源', summary: '测试摘要'.repeat(20000) }] }));
         });
@@ -2650,6 +2668,21 @@ async function linuxWorker(options) {
           && JSON.stringify(received.slice(failoverStart).map(row => row.path)) === '["/search","/tavily/search"]');
         check('invalid-source-URL-failover-keeps-original-unused',
           grokResponsesStub.requests.length === grokBefore && officialStub.requests.length === officialBefore);
+        invalidFirstSource = false;
+        longFirstSource = true;
+        const budgetText = readFileSync(grokConfigPath, 'utf8');
+        if (!/^response_max_chars\s*=\s*5000/m.test(budgetText)) throw new Error('Isolated output budget field is missing.');
+        writeFileSync(grokConfigPath, budgetText.replace(/^response_max_chars\s*=\s*5000/m, 'response_max_chars = 100'));
+        try {
+          const budgetStart = received.length;
+          const bounded = await probe('product-query-result');
+          check('sources-only-output-limit-continues-to-next-source',
+            bounded.sources[0]?.url === 'https://example.invalid/linux-source-failover'
+            && JSON.stringify(bounded).length <= 100
+            && JSON.stringify(received.slice(budgetStart).map(row => row.path)) === '["/search","/tavily/search"]');
+          check('sources-only-output-limit-keeps-original-unused',
+            grokResponsesStub.requests.length === grokBefore && officialStub.requests.length === officialBefore);
+        } finally { writeFileSync(grokConfigPath, budgetText); }
         const count = received.length;
         writeFileSync(grokConfigPath, 'exa_api_key = invalid-TOML\n');
         const broken = await runTurn('sources-only-broken-config', 'search', 'web_search', true);
@@ -3220,8 +3253,8 @@ async function linuxWorker(options) {
         ? 'grok-direct-mcp-protocol.json' : null,
       grokResponsesStub: existsSync(join(artifactDir, 'grok-responses-stub-final.json'))
         ? 'grok-responses-stub-final.json' : 'grok-responses-stub-start.json',
-      webStderr: 'logs/dsh-web.stderr.log',
-      webStdout: 'logs/dsh-web.stdout.log',
+      ...Object.fromEntries(Object.entries(CLI_WEB_LOG_ARTIFACTS)
+        .map(([key, filename]) => [key, existsSync(join(artifactDir, filename)) ? filename : null])),
       settingsUi: existsSync(join(artifactDir, 'linux-settings-grok-ui.json'))
         ? 'linux-settings-grok-ui.json' : null,
       settingsUiScreenshot: existsSync(join(artifactDir, 'linux-settings-grok-ui.png'))
@@ -3260,7 +3293,7 @@ async function main() {
   }
 }
 
-export { runGrokProtocolProbe };
+export { runGrokProtocolProbe, parseArgs as parseCliWebArguments };
 
 if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_PATH) {
   main().catch(error => {

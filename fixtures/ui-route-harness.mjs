@@ -65,7 +65,7 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
   if (method === 'save') {
     if (nextSaveError) { const error = nextSaveError; nextSaveError = null; return failure(error, '保存失败，草稿应保留。'); }
     if (request.expectedRevision !== currentRevision) return failure('CONFIG_CONFLICT', '配置已在别处修改。');
-    if (Object.keys(request.updates).some(key => secrets.includes(key)) && !capabilities.secretsAllowed) return failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。');
+    if (Object.keys(request.updates).some(key => secrets.includes(key) || mapping[key]?.[1] === 'url') && !capabilities.secretsAllowed) return failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。');
     if (Object.keys(request.updates).some(key => Object.hasOwn(environment, key))) return failure('CONFIG_ENV_OVERRIDE', '环境变量只读。');
     if (exists) history[currentRevision] = clone(content);
     for (const [key, value] of Object.entries(request.updates)) { if (value === null) delete content[key]; else content[key] = clone(value); }

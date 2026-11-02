@@ -9,6 +9,7 @@ import {
   resolveNewTemporaryRunRoot, inspectDesktopPreparation,
 } from '../scripts/deferred-release-desktop-prepare.mjs';
 import { captureDesktopSearch, captureDesktopSeam, waitForDesktopRecovery } from '../fixtures/deferred-release/desktop-fixture.mjs';
+import { requestDesktopShutdown } from '../scripts/lib/renderer-cdp.mjs';
 
 const fuseBinary = (wire = '101100011', version = 1, length = wire.length) => Buffer.concat([
   Buffer.from('fixture-prefix:dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
@@ -125,4 +126,28 @@ test('Desktop Web 服务缺席拒绝 seam 采样，不能伪报业务成功或�
   for (const web of [undefined, {}, { search: false }]) {
     await assert.rejects(captureDesktopSeam({ get: () => web }, {}), /未完成 direct seam 采样/);
   }
+});
+
+test('Desktop 退出命令必须等待实际退出，不能发送后立刻关掉 CDP socket', async () => {
+  let closed, socket;
+  const whenClosed = new Promise(resolve => { closed = resolve; });
+  class DeferredSocket extends EventTarget {
+    constructor() {
+      super(); socket = this; this.closed = false; this.dispatched = false;
+      queueMicrotask(() => this.dispatchEvent(new Event('open')));
+    }
+    send(text) {
+      assert.equal(JSON.parse(text).method, 'Browser.close');
+      queueMicrotask(() => {
+        if (!this.closed) { this.dispatched = true; closed(); }
+      });
+    }
+    close() { this.closed = true; }
+  }
+  await requestDesktopShutdown(12345, whenClosed, {
+    timeoutMs: 1000, WebSocketImpl: DeferredSocket,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:12345/browser/test' }) }),
+  });
+  assert.equal(socket.dispatched, true);
+  assert.equal(socket.closed, true, 'socket is released only after actual exit');
 });

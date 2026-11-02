@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { candidateRuntime } from './lib/candidate-runtime.mjs';
+import { candidateRuntime, CANDIDATE_VERSIONS } from './lib/candidate-runtime.mjs';
+
+export function fixtureDshEngines(version) {
+  if (!CANDIDATE_VERSIONS.includes(version)) throw new Error('Unsupported isolated fixture host version.');
+  return { dsh: version };
+}
 
 // 只检查官方程序的 fuse 字节，不修改二进制或放宽运行策略。
 export function readElectronFuseWire(binary) {
@@ -184,7 +189,7 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
     const path = join(profile, 'node_modules', name); mkdirSync(path);
     write(join(path, 'package.json'), { name, version: '0.0.0', private: true, type: 'module',
       exports: { './package.json': './package.json', './cordis.patch.yml': './cordis.patch.yml', ...exports },
-      engines: { dsh: '0.2.1-rc.2 || 0.2.1-rc.3' }, dsh: { bundle: { patch: './cordis.patch.yml' } } });
+      engines: fixtureDshEngines(desktop.app.version), dsh: { bundle: { patch: './cordis.patch.yml' } } });
     write(join(path, 'cordis.patch.yml'), patch); return path;
   };
   const fixture = createBundle('candidate-offline-fixture', { '.': './desktop-fixture.mjs' }, [{ insert: [

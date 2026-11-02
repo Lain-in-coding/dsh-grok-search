@@ -316,3 +316,45 @@ test('a stopping barrier rejects new searches before any engine runs', async () 
   assert.equal(calls.sources.length, 0);
   assert.equal(routed.routeSnapshot(), null);
 });
+
+test('an unreaped Grok process is never hidden by supplementary fallback', async () => {
+  let confirmExit;
+  const whenExited = new Promise(resolve => { confirmExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', '本次进程尚未确认退出。');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  const { routed, calls } = harness({ grok: async () => { throw failure; },
+    sources: { search: async () => sourceResult('exa') } });
+  try {
+    await assert.rejects(routed.search({ query: QUERY }), error => error === failure);
+    assert.equal(calls.sources.length, 0);
+    assert.equal(routed.snapshot().accepting, false);
+    await assert.rejects(routed.search({ query: 'later' }), { code: 'GROK_PROCESS_REAP_FAILED' });
+    assert.equal(calls.grok, 1, 'faulted slot must block dispatching another process');
+    assert.equal(routed.routeSnapshot().grokCode, 'GROK_PROCESS_REAP_FAILED');
+  } finally {
+    confirmExit();
+    await new Promise(resolve => setImmediate(resolve));
+    await routed.dispose();
+  }
+});
+
+test('caller cancellation cannot hide an unreaped process or release its faulted slot', async () => {
+  const controller = new AbortController();
+  const cancellation = new Error('调用方取消');
+  let confirmExit;
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', '取消后进程尚未确认退出。');
+  Object.defineProperty(failure, 'whenExited', { value: new Promise(resolve => { confirmExit = resolve; }) });
+  const { routed, calls } = harness({ grok: async () => {
+    controller.abort(cancellation); throw failure;
+  }, sources: { search: async () => sourceResult('exa') } });
+  try {
+    await assert.rejects(routed.search({ query: QUERY }, controller.signal), error => error === failure);
+    assert.equal(routed.snapshot().accepting, false);
+    assert.equal(routed.snapshot().faulted, 1);
+    assert.equal(calls.sources.length, 0);
+  } finally {
+    confirmExit();
+    await new Promise(resolve => setImmediate(resolve));
+    await routed.dispose();
+  }
+});

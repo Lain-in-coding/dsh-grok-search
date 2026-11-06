@@ -86,6 +86,14 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 按完整包名即可定位安装，无需从搜索结果中挑选。若提示已经安装，返回已安装列表打开详情。
 
+**安装指定版本：** 填写 `dsh-grok-search@0.2.0`。新版本刚发布时，DSH 的安全等待策略可能让裸包名安装到较早版本；下方录屏使用「包名@版本」，安装后请核对显示的版本号，无需关闭安全策略。
+
+<p align="center">
+  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-by-name-020-hd.mp4"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-by-name-020-hd.png" alt="0.2.0 按名称安装实录：进入 DSH 插件页，添加插件，输入 dsh-grok-search@0.2.0，点击安装，最后显示已安装和版本 0.2.0，不点击启用" width="960"></a>
+  <br><sub>Windows Desktop 0.2.2-rc.1 · 已发布插件 0.2.0 · 约 13 秒，下载等待标注 ×8，安装成功即结束。</sub>
+  <br><sub>点击动态图观看 1920 像素宽高清 MP4。</sub>
+</p>
+
 ### 方式二：下载 Release 压缩包后本地导入
 
 适合安装指定版本或安装源尚未同步的情况，**直接导入 `.tgz` 即可，无需解压**。

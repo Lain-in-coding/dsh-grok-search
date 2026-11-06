@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 const [archive, directory] = process.argv.slice(2);
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const runtimeRoot = join(archive, 'dsh');
+const modernTools = existsSync(join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-tool-executor-native/package.json'));
 const imp = (name, file = 'lib/index.js') => import(pathToFileURL(join(runtimeRoot, 'node_modules', '@deepseek-ai', name, file)).href);
 const config = await new Promise(done => process.once('message', done));
 const productWiring = config.productWiring === true;
@@ -132,7 +133,9 @@ try {
     row('timer', 'cordis-plugin-timer'), row('config-editor', 'dsh-config-editor'),
     row('llm', 'dsh-llm'), row('sessions', 'dsh-session'), row('agents', 'dsh-agent'),
     row('session-projections', 'dsh-session-projection'), row('system-prompt', 'dsh-system-prompt'),
-    row('tools', 'dsh-tools', { mode: 'native' }), row('agent-loop', 'dsh-agent-loop', { agents: [] }),
+    row('tools', 'dsh-tools', modernTools ? {} : { mode: 'native' }),
+    ...(modernTools ? [row('tool-executor-native', 'dsh-tool-executor-native')] : []),
+    row('agent-loop', 'dsh-agent-loop', { agents: [] }),
     row('default-model', 'dsh-agent-default-model', { provider: 'candidate-offline', model: 'fixture-native' }),
     row('fs', 'dsh-fs-local', { cwd: workspace }), row('attachments', 'dsh-attachment-local', { dshHome: process.env.DSH_HOME }),
     row('session-persistence', 'dsh-session-persistence-jsonl', { root: join(directory, 'sessions') }),
@@ -142,7 +145,7 @@ try {
     row('credentials', 'dsh-credentials-local', { dshHome: process.env.DSH_HOME, watch: false }),
     row('connection', 'dsh-client-connection'), row('commands', 'dsh-commands'), row('file-upload', 'dsh-client-file-upload'),
     row('typert', 'dsh-typert-registry'), row('typert-loader', 'dsh-typert-loader'),
-    ...(JSON.parse(readFileSync(join(runtimeRoot, 'package.json'), 'utf8')).version.startsWith('0.2.1-') ? [row('remote-access', 'dsh-api-remote-access')] : []),
+    ...(existsSync(join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-api-remote-access/package.json')) ? [row('remote-access', 'dsh-api-remote-access')] : []),
     row('gateway', 'dsh-api-gateway'),
     row('session-controller', 'dsh-api-session-controller', { nativeOpen: false }),
     row('webserver', 'dsh-host-webserver', { host: '127.0.0.1', port, compression: 'none' }),

@@ -74,7 +74,7 @@ const sourceSpec = Object.freeze({
     request: (base, key, query, limit) => ({
       url: `${base}/search`,
       init: { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-        body: JSON.stringify({ query, max_results: limit, include_answer: false }) },
+        body: JSON.stringify({ query, max_results: limit, include_answer: false, include_usage: true }) },
     }),
     read: body => (Array.isArray(body?.results) ? body.results : [])
       .filter(item => typeof item === 'string' || !(typeof item?.score === 'number' && item.score < TAVILY_MIN_SCORE))
@@ -218,8 +218,12 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       }
       const body = await readBoundedJson(response);
       const sources = source.spec.read(body, limit).filter(Boolean);
-      return sources.length ? { status: 'ok', sources, elapsedMs: elapsed() }
-        : { status: 'empty', code: 'EMPTY', message: '连接正常，但本次测试没有返回结果。', elapsedMs: elapsed() };
+      const amount = source.id === 'tavily' ? body?.usage?.credits : source.id === 'firecrawl' ? body?.creditsUsed
+        : source.id === 'exa' ? body?.costDollars?.total : null;
+      const charge = typeof amount === 'number' && Number.isFinite(amount) && amount >= 0 && amount <= 1e9
+        ? { amount, unit: source.id === 'exa' ? 'USD' : 'credits', basis: source.id === 'exa' ? 'estimated' : 'reported' } : null;
+      return sources.length ? { status: 'ok', sources, charge, elapsedMs: elapsed() }
+        : { status: 'empty', code: 'EMPTY', message: '连接正常，但本次测试没有返回结果。', charge, elapsedMs: elapsed() };
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
       return { status: 'failed', ...classify(controller.signal.aborted ? controller.signal.reason : error),
@@ -291,14 +295,21 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     }
   };
 
-  const searchSource = async (source, query, limit, { signal, deadline }) => {
+  const searchSource = async (source, query, limit, { signal, deadline, onCall }) => {
     const count = source.keys.length;
     const start = source.spec.multiKey && count > 1 ? tavilyCursor++ % count : 0;
     let last = null;
     for (let offset = 0; offset < count; offset++) {
       const remaining = deadline - performance.now();
       if (remaining <= 0) return { status: 'failed', code: 'TIMEOUT', message: '补充来源在本次搜索预算内没有返回。' };
-      last = await attempt(source, source.keys[(start + offset) % count], query, limit, { signal, timeoutMs: remaining });
+      const keyIndex = (start + offset) % count;
+      try { last = await attempt(source, source.keys[keyIndex], query, limit, { signal, timeoutMs: remaining }); }
+      catch (error) {
+        onCall?.({ provider: source.id, keyIndex, result: 'cancelled', code: 'CANCELLED' });
+        throw error;
+      }
+      onCall?.({ provider: source.id, keyIndex, operation: offset ? 'retry' : 'search',
+        result: last.status === 'ok' ? 'ok' : 'failed', code: last.code, charge: last.charge });
       if (last.status === 'failed' && last.keyScoped && offset + 1 < count) continue;
       return last;
     }
@@ -331,12 +342,18 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       if (!source) throw new GrokSearchError('SOURCE_UNKNOWN', '未知补充来源。');
       return diagnoseSource(source, signal);
     },
-    async search({ query, maxResults = 5, signal, reason = 'grok-unavailable' } = {}) {
+    async search({ query, maxResults = 5, signal, reason = 'grok-unavailable', onCall } = {}) {
       if (typeof query !== 'string' || !query.trim()) throw new GrokSearchError('SOURCE_QUERY_INVALID', '搜索查询不能为空。');
       const { config, sources } = current();
       if (config.response_max_chars !== undefined
         && (!Number.isSafeInteger(config.response_max_chars) || config.response_max_chars < 100)) {
         throw new GrokSearchError('GROK_CONFIG_INVALID', '回复字符上限至少需要 100 字符，请检查共享配置。');
+      }
+      // Same budget as grok-search-rs: an explicit 0 means no fallback results,
+      // so nothing is sent; only a missing or invalid value means the default 5.
+      if (config.fallback_sources === 0) {
+        throw new GrokSearchError('FALLBACK_SOURCES_ZERO',
+          '回退来源数（fallback_sources）为 0，未调用补充来源；如需回退，请在 Grok Search Rs 设置中调大该值。');
       }
       const available = sources.filter(source => source.state === 'available');
       if (!available.length) {
@@ -348,7 +365,7 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       const deadline = performance.now() + timeoutSeconds * 1000;
       const failures = [];
       for (const source of available) {
-        const outcome = await searchSource(source, query, limit, { signal, deadline });
+        const outcome = await searchSource(source, query, limit, { signal, deadline, onCall });
         if (outcome.status === 'ok') {
           const maxChars = config.response_max_chars === undefined ? 45_000 : Math.min(500_000, config.response_max_chars);
           const mapped = mapSearchResult({ content: '', sources: outcome.sources }, { maxResults: limit, maxChars });

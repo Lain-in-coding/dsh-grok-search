@@ -3,8 +3,9 @@
  * Self-contained so build-client can embed this factory without runtime imports.
  * root/layer belong to this mount, never the host document's selector namespace.
  */
-export function createRouteController({ root, layer, remote, logos, sourceChain, memory = {} }) {
+export function createRouteController({ root, layer, remote, logos, sourceChain, memory = {}, logMemory = null, createSearchLogView, createQuotaView, dark = false }) {
 let disposed = false;
+let logView = null, quotaView = null;
 const timers = new Set(), frames = new Set(), waits = new Set(), listeners = new Set();
 const setTimeout = (fn, ms) => {
   if (disposed) return 0;
@@ -39,7 +40,8 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const RM = window.matchMedia('(prefers-reduced-motion: reduce)');
 const reduced = () => RM.matches;
-let darkTheme = false;
+let darkTheme = dark === true || dark === 'dark';
+root.dataset.theme = layer.dataset.theme = darkTheme ? 'dark' : 'light';
 const HIDDEN = '\u2063dsg-configured-secret:';
 const hidden = value => typeof value === 'string' && value.startsWith(HIDDEN);
 const configFields = () => S.config?.fields || {};
@@ -65,6 +67,9 @@ function configLocation() {
 
 /* ---------- 图标（界面功能图标，非品牌） ---------- */
 const I = {
+  replay: '<path d="M3.2 5.2A5.1 5.1 0 1 1 2.9 10M3.2 2.1v3.5h3.5"/><path d="M8 5.4v3L10 9.7"/>',
+  stop: '<rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" stroke="none"/>',
+  returnLog: '<path d="M5 5l-3 3 3 3M2 8h7.5A3.5 3.5 0 0 0 13 4.5V3"/><path d="M8 12h5"/>',
   play: '<path d="M5 3.5v9l7.5-4.5z" fill="currentColor"/>',
   eye: '<path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>',
   eyeOff: '<path d="M2 2l12 12M6.6 3.7A6.7 6.7 0 0 1 8 3.5C12 3.5 14.5 8 14.5 8a12 12 0 0 1-1.9 2.5M10 11.9a6 6 0 0 1-2 .6C4 12.5 1.5 8 1.5 8a12 12 0 0 1 2.4-3"/><path d="M6.6 6.6a2 2 0 0 0 2.8 2.8"/>',
@@ -218,6 +223,9 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
   S.program = snapshot.program;
   S.pluginInfo = snapshot.plugin || {};
   S.capabilities = snapshot.capabilities;
+  // Capability revocation is synchronous UI state, not the next log poll.
+  // read() invalidates an outstanding private reply before awaiting anything.
+  if (S.capabilities && !S.capabilities.secretsAllowed) void logView?.read();
   S.rpcError = null;
   S.config = snapshot.config;
   S.prefs = preferences || S.prefs;
@@ -249,16 +257,24 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
   if (oldOrder !== S.order.join()) buildRows(false);
   ingestRoute(snapshot.route, first);
   syncAll(keepTrace);
+  syncOpenCardBaseline();
 }
-let readTask = null, pollTimer = 0;
-async function refresh({ first = false, force = false } = {}) {
+let readTask = null, pollTimer = 0, snapshotSignature = null;
+async function refresh({ first = false, force = false, readLog = true } = {}) {
   if (disposed) return;
   if (readTask) return readTask;
   if (!force && (S.busy || S.testing || drag)) return;
   readTask = (async () => {
     try {
       const [snapshot, prefs] = await Promise.all([remote.snapshot(), remote.preferences()]);
-      if (!disposed) acceptSnapshot(snapshot, prefs, { first });
+      if (!disposed) {
+        const signature = JSON.stringify([snapshot, prefs]);
+        if (first || force || S.rpcError || signature !== snapshotSignature) {
+          acceptSnapshot(snapshot, prefs, { first });
+          snapshotSignature = signature;
+        }
+        if (readLog) void logView?.read();
+      }
     } catch (error) {
       if (disposed) return;
       S.loading = false;
@@ -271,7 +287,7 @@ async function refresh({ first = false, force = false } = {}) {
 function schedulePoll() {
   clearTimeout(pollTimer);
   pollTimer = setTimeout(async () => {
-    if (document.visibilityState !== 'hidden') await refresh();
+    if (document.visibilityState !== 'hidden') await refresh({ readLog: false });
     if (!disposed) schedulePoll();
   }, 3000);
 }
@@ -308,6 +324,14 @@ function operationError(error, dialog = false) {
     shake(dlg);
   } else toast(`${code} · ${message}`, { tone: 'err', ms: 5200 });
 }
+// An external write leaves an open card's baseline behind. When that blocks its
+// quota panel, offer the existing explicit reload; never rebase the draft silently.
+function syncOpenCardBaseline() {
+  if (D?.kind === 'card' && !dialogBusy() && D.operationError?.code !== 'CONFIG_CONFLICT' && quotaView?.stale()) {
+    D.operationError = { code: 'CONFIG_CONFLICT', message: '配置已在别处修改，请先读取最新配置。' };
+    refreshDialog();
+  } else quotaView?.render();
+}
 async function reloadDialogDraft() {
   if (!D || dialogBusy() || S.busy || disposed) return;
   const mine = D, previous = clone(mine.base), draft = clone(mine.draft);
@@ -333,7 +357,7 @@ async function reloadDialogDraft() {
       message: '已读取最新配置并保留你的修改。请核对后再保存；本次没有写入。' };
     mine.show = {};
     mine.saving = false;
-    if (mine.kind === 'card') renderCard(); else renderHub();
+    if (mine.kind === 'card') { renderCard(); void quotaView?.open(); } else renderHub();
   } catch (error) { if (D === mine) operationError(error, true); }
   finally { S.busy = false; if (D === mine) mine.saving = false; }
 }
@@ -342,8 +366,12 @@ async function reloadDialogDraft() {
 async function saveConfig(build, baseline = null) {
   if (!S.config || S.config.error) throw Object.assign(new Error('请先修正配置文件。'), { code: 'CONFIG_PARSE_FAILED' });
   const starting = clone(S.config);
+  // A destination change can forward an unchanged-looking (redacted) key to
+  // another service. Treat it like a secret edit: require explicit review of
+  // a newer revision instead of silently pairing the draft URL with its key.
   const fieldChanged = (old, current, updates) => old.path !== current.path || Object.keys(updates).some(key =>
-    key.endsWith('_key') || key === 'github_token' || JSON.stringify(old.fields[key]) !== JSON.stringify(current.fields[key]));
+    key.endsWith('_key') || key.endsWith('_url') || key === 'github_token'
+    || JSON.stringify(old.fields[key]) !== JSON.stringify(current.fields[key]));
   for (let attempt = 0; attempt < 2; attempt++) {
     const updates = typeof build === 'function' ? build(S.config.fields) : build;
     const revision = S.config.revision;
@@ -428,7 +456,7 @@ function ingestRoute(route, first = false) {
   if (route.grokCode !== 'DISABLED' && grokOn()) {
     rememberCheck('grok', 0, route.grokCode ? normalizeCode(route.grokCode) : '', 'search', route.at);
   }
-  if (SUPP.includes(route.served)) {
+  if (SUPP.includes(route.served) && route.provenance !== 'source-label') {
     delete S.providerBad[route.served];
     if (route.served === 'tavily') {
       // MCP/source search does not identify the successful Key. Do not turn
@@ -447,7 +475,8 @@ function ingestRoute(route, first = false) {
     reroute: route.fallbackUsed === true, outcome: route.outcome,
     done: { tone: route.outcome === 'ok' ? 'ok' : 'err',
       text: route.outcome !== 'ok' ? '全部不可用'
-        : route.served === 'grok-sources' ? '已回退 · Grok 内置补充链'
+        : route.resultProviders?.length && route.fallbackUsed ? `已回退 · ${route.resultProviders.filter(id => META[id]).map(id => META[id].name).join(' / ')}${route.resultProvidersComplete ? '' : ' / 来源未报告'}`
+          : route.served === 'grok-sources' ? '已回退 · 来源未报告'
           : route.fallbackUsed ? `已回退 · ${META[route.served]?.name || '补充来源'}` : 'Grok 搜索完成' } };
   clearTimeout(S.traceTimer);
   S.traceTimer = setTimeout(() => { S.trace = null; renderSummary(); pumpWires(200); }, 6500);
@@ -483,10 +512,14 @@ const isPart = (id) => faultOf(S.bad, id) === 'some';
 const grokOn = () => isOn('grok');
 const usable = (id) => isOn(id) && !isBad(id);
 const requestFailed = id => S.lastRoute?.failures?.some(failure => failure.provider === id) === true;
-const unknownFallback = () => S.lastRoute?.served === 'grok-sources' && S.lastRoute.outcome === 'ok';
+const observedSupp = () => (S.lastRoute?.resultProviders || [S.lastRoute?.served]).filter(id => SUPP.includes(id));
+const unknownFallback = () => S.lastRoute?.served === 'grok-sources' && S.lastRoute.outcome === 'ok' && !observedSupp().length;
 const servingSupp = () => unknownFallback() || S.lastRoute?.outcome === 'failed' ? null
-  : SUPP.includes(S.lastRoute?.served) && isOn(S.lastRoute.served) && !requestFailed(S.lastRoute.served)
-    ? S.lastRoute.served : enabledSupp().find(id => !isBad(id) && !requestFailed(id)) || null;
+  : S.lastRoute?.resultProviders ? observedSupp().find(id => isOn(id) && !requestFailed(id)) || null
+    : SUPP.includes(S.lastRoute?.served) && isOn(S.lastRoute.served) && !requestFailed(S.lastRoute.served)
+      ? S.lastRoute.served : enabledSupp().find(id => !isBad(id) && !requestFailed(id)) || null;
+const servingSupps = () => S.lastRoute?.resultProviders && S.lastRoute.outcome === 'ok'
+  ? observedSupp().filter(id => isOn(id) && !requestFailed(id)) : [servingSupp()].filter(Boolean);
 /* checked 只记录完成时间和来源；成败统一由 bad 与完成记录共同确定。
    pending 属于本轮 trace，不能覆盖上一次已经完成的验证结果。 */
 function savedCheck(id, slot = 0) {
@@ -495,7 +528,7 @@ function savedCheck(id, slot = 0) {
   return { tone: code ? 'err' : record ? 'ok' : 'idle', code: code || '', record };
 }
 function rememberCheck(id, slot, code, source, at = Date.now()) {
-  (S.checked[id] ||= {})[slot] = { at, source };
+  (S.checked[id] ||= {})[slot] = { at, source, status: code ? 'failed' : 'ok' };
   if (id === 'tavily') {
     const bad = { ...(S.bad.tavily || {}) };
     if (code) bad[slot] = code; else delete bad[slot];
@@ -537,6 +570,7 @@ function routeStatus() {
   if (!['required'].includes(S.control?.phase)) return 'connecting';
   if (S.lastRoute?.outcome === 'failed') return 'err';
   const sv = servingSupp();
+  if (S.lastRoute?.outcome === 'ok' && S.lastRoute.fallbackUsed && S.lastRoute.resultProviders) return 'fallback';
   if (unknownFallback()) return 'fallback';
   if (S.prov.grok.enabled !== false && ['idle', 'discovering', 'checking-version', 'downloading', 'verifying'].includes(S.program?.phase)) {
     return sv ? 'backup' : 'prep';
@@ -569,7 +603,7 @@ function rowState(id) {
   if (S.prov[id].enabled === false) return 'off';
   if (st === 'off' || id === 'github') return 'on';
   if (isBad(id) || requestFailed(id)) return st === 'err' ? 'err' : 'bad';
-  if ((st === 'fallback' || st === 'backup') && servingSupp() === id) return 'live';
+  if ((st === 'fallback' || st === 'backup') && servingSupps().includes(id)) return 'live';
   return 'on';
 }
 
@@ -579,7 +613,7 @@ const RANK = { hidden: 0, unset: 1, rest: 2, broken: 3, aux: 4, standby: 5, warn
 function wireDefs() {
   const st = routeStatus();
   const off = st === 'off';
-  const sv = servingSupp();
+  const serving = servingSupps();
   const covering = st === 'fallback' || st === 'backup';
   const defs = [];
   const top = { off: 'rest', load: 'hidden', down: 'rest', cfgerr: 'broken', ctlerr: 'broken',
@@ -597,20 +631,14 @@ function wireDefs() {
     else if (id === 'github') ws = isOn('github') ? 'aux' : 'unset';
     else if (isBad(id) || requestFailed(id) || id === 'grok' && S.program?.phase === 'error') ws = 'broken';
     else if (id === 'grok') ws = S.program?.phase === 'ready' ? 'live' : 'warn';
-    else ws = covering && id === sv ? 'live' : 'standby';
+    else ws = covering && serving.includes(id) ? 'live' : 'standby';
     defs.push({ id: 'hub-' + id, a: 'hub-out', b: 'row-' + id, ws, kind: 'branch', at: 'end' });
   });
   return defs;
 }
 function portEl(name) {
-  if (name.startsWith('row-')) return $(`.row[data-id="${name.slice(4)}"] > .port`);
+  if (name.startsWith('row-')) return $(`#colList .row[data-id="${name.slice(4)}"] > .port`);
   return $(`.port[data-port="${name}"]`);
-}
-function portXY(name, sr) {
-  const el = portEl(name);
-  if (!el) return null;
-  const r = el.getBoundingClientRect();
-  return { x: r.left + r.width / 2 - sr.left, y: r.top + r.height / 2 - sr.top };
 }
 function pathFor(d, A, B) {
   if (d.kind === 'alt') return `M${A.x},${A.y} L${B.x},${B.y}`;
@@ -687,25 +715,41 @@ function syncBreak(g, prev, at) {
 function drawWires() {
   const stage = $('#stage');
   const sr = stage.getBoundingClientRect();
+  const computed = getComputedStyle(stage);
+  const scaleX = sr.width / (parseFloat(computed.width) || sr.width || 1) || 1;
+  const scaleY = sr.height / (parseFloat(computed.height) || sr.height || 1) || 1;
   const defs = wireDefs();
+  // Measure every port before changing any SVG/port style. Measuring the next
+  // branch after writing the previous one forced a layout per branch per frame.
+  const ports = new Map();
+  for (const d of defs) for (const name of [d.a, d.b]) if (!ports.has(name)) {
+    const el = portEl(name), r = el?.getBoundingClientRect();
+    ports.set(name, { el, point: r ? {
+      x: (r.left + r.width / 2 - sr.left) / scaleX,
+      y: (r.top + r.height / 2 - sr.top) / scaleY,
+    } : null });
+  }
   const portRank = {};
   const live = new Set();
+  const breaks = [];
   let breaking = 0;
   defs.forEach((d) => {
     live.add(d.id);
     const fresh = !wireNodes.has(d.id);
     const g = ensureWire(d.id);
     const prev = g.dataset.ws;
-    g.dataset.ws = d.ws;
+    if (prev !== d.ws) g.dataset.ws = d.ws;
     const requesting = S.testing && !S.trace?.done && (d.id === 'dsh-hub'
       || S.trace?.items.some((it) => it.tone === 'run' && d.id === 'hub-' + it.id));
-    g.dataset.requesting = String(!!requesting);
-    const A = portXY(d.a, sr), B = portXY(d.b, sr);
+    if (g.dataset.requesting !== String(!!requesting)) g.dataset.requesting = String(!!requesting);
+    const A = ports.get(d.a).point, B = ports.get(d.b).point;
     if (A && B) {
       const dd = pathFor(d, A, B);
-      g.children[0].setAttribute('d', dd);
-      g.children[1].setAttribute('d', dd);
-      breaking = Math.max(breaking, syncBreak(g, prev, d.at));
+      if (g.children[1].getAttribute('d') !== dd) {
+        g.children[0].setAttribute('d', dd);
+        g.children[1].setAttribute('d', dd);
+      }
+      breaks.push({ g, prev, at: d.at });
     }
     if (!fresh && prev !== d.ws) {
       if (!S.testing && performance.now() > quietUntil) onWireChange(d, g, prev);
@@ -713,6 +757,7 @@ function drawWires() {
     }
     [d.a, d.b].forEach((pn) => { if ((portRank[pn] ?? -1) < RANK[d.ws]) portRank[pn] = RANK[d.ws]; });
   });
+  for (const { g, prev, at } of breaks) breaking = Math.max(breaking, syncBreak(g, prev, at));
   for (const [id, g] of wireNodes) if (!live.has(id)) { g.remove(); wireNodes.delete(id); }
   const rk = (g) => (g.classList.contains('lit') ? 99 : RANK[g.dataset.ws]);
   const sorted = defs.map((d) => wireNodes.get(d.id)).sort((x, y) => rk(x) - rk(y));
@@ -721,7 +766,10 @@ function drawWires() {
   if (!packetLayer) { packetLayer = document.createElementNS(SVGNS, 'g'); packetLayer.setAttribute('class', 'packets'); }
   if (wiresEl.lastChild !== packetLayer) wiresEl.appendChild(packetLayer);
   const names = Object.keys(RANK);
-  Object.entries(portRank).forEach(([pn, rk]) => { const el = portEl(pn); if (el) el.dataset.ps = names.find((n) => RANK[n] === rk); });
+  Object.entries(portRank).forEach(([pn, rk]) => {
+    const el = ports.get(pn).el, state = names.find(n => RANK[n] === rk);
+    if (el && el.dataset.ps !== state) el.dataset.ps = state;
+  });
   if (breaking) pumpWires(breaking);
 }
 let pumpUntil = 0, pumpRaf = 0;
@@ -760,7 +808,7 @@ function markFor(id) {
 }
 function syncMarks() {
   let changed = false;
-  $$('.row').forEach((r) => {
+  $$('#colList .row').forEach((r) => {
     const p = r.querySelector('.port');
     const m = markFor(r.dataset.id);
     if ((p.dataset.mark || '') === m) return;
@@ -780,6 +828,11 @@ const card = $('#routeCard');
 // 仅重新定位连线，不因窗口大小切换路由布局。
 const resizeObserver = new ResizeObserver(() => requestAnimationFrame(() => pumpWires(80)));
 resizeObserver.observe(card);
+const historyActionsObserver = new ResizeObserver(([entry]) => {
+  const width = entry.contentRect.width + 'px';
+  if (card.style.getPropertyValue('--history-actions-width') !== width) card.style.setProperty('--history-actions-width', width);
+});
+historyActionsObserver.observe($('.rc-actions', card));
 
 /* ---------- 供应商行：图标 + 名称 + 开关 ---------- */
 function rowEl(id) {
@@ -832,14 +885,22 @@ function syncRow(el) {
   }
   main.setAttribute('aria-label', aria);
 }
-function syncRows() { $$('.row').forEach(syncRow); syncMarks(); }
+function syncRows() { $$('#colList .row').forEach(syncRow); syncMarks(); }
 function buildRows(animate) {
-  $('#rowsPrimary').replaceChildren(rowEl('grok'));
-  $('#rowsSupp').replaceChildren(...S.order.map(rowEl));
-  $('#rowsExtract').replaceChildren(rowEl('github'));
+  for (const [target, ids] of [['#rowsPrimary', ['grok']], ['#rowsSupp', S.order], ['#rowsExtract', ['github']]]) {
+    const parent = $(target);
+    const nodes = new Map([...parent.children].map(node => [node.dataset.id, node]));
+    ids.forEach((id, index) => {
+      const node = nodes.get(id) || rowEl(id);
+      if (parent.children[index] !== node) parent.insertBefore(node, parent.children[index] || null);
+    });
+  }
   syncRows();
+  animateRows(animate);
+}
+function animateRows(animate) {
   if (animate && !reduced()) {
-    $$('.row').forEach((r, i) => {
+    $$('#colList .row').forEach((r, i) => {
       r.style.setProperty('--i', i);
       r.classList.add('enter');
       r.addEventListener('animationend', (e) => { if (e.animationName === 'row-in') r.classList.remove('enter'); });
@@ -891,15 +952,23 @@ let stripTipTarget = null, stripTipTimer = 0;
 let stripSect = '';
 function hideStripTip() {
   clearTimeout(stripTipTimer);
+  stripTipTarget?.removeAttribute('aria-describedby');
   stripTipTarget = null;
   routeTooltip.hidden = true;
+  routeTooltip.textContent = '';
+  delete routeTooltip.dataset.kind;
 }
 function showStripTip(node) {
-  if (!node?.isConnected || !stripSlot.classList.contains('has')) { hideStripTip(); return; }
+  const quotaTip = node?.matches('[data-quota-tip]');
+  if (!node?.isConnected || (quotaTip ? node.closest('[inert]') || !dlg.contains(node) || overlay.hidden
+    : !stripSlot.classList.contains('has'))) { hideStripTip(); return; }
   clearTimeout(stripTipTimer);
+  if (stripTipTarget !== node) stripTipTarget?.removeAttribute('aria-describedby');
   stripTipTarget = node;
-  routeTooltip.textContent = node._tip;
+  routeTooltip.textContent = quotaTip ? node.dataset.quotaTip : node._tip;
+  routeTooltip.dataset.kind = quotaTip ? 'quota' : 'route';
   routeTooltip.hidden = false;
+  node.setAttribute('aria-describedby', 'routeTooltip');
   const r = node.getBoundingClientRect();
   const t = routeTooltip.getBoundingClientRect();
   routeTooltip.style.left = Math.max(12, Math.min(innerWidth - t.width - 12, r.left + r.width / 2 - t.width / 2)) + 'px';
@@ -921,9 +990,25 @@ routeTooltip.addEventListener('pointerenter', () => clearTimeout(stripTipTimer))
 routeTooltip.addEventListener('pointerleave', () => {
   if (stripTipTarget !== active()) hideStripTip();
 });
-listen(document, 'keydown', e => { if (e.key === 'Escape') hideStripTip(); });
+listen(document, 'keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (stripTipTarget?.matches('[data-quota-tip]')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+  hideStripTip();
+});
 listen(window, 'resize', hideStripTip);
-listen(window, 'scroll', hideStripTip, true);
+listen(window, 'scroll', event => {
+  if (routeTooltip.contains(targetOf(event))) return;
+  const node = stripTipTarget;
+  if (node?.matches('[data-quota-tip]') && node.isConnected && active() === node) {
+    const bounds = node.getBoundingClientRect(), body = node.closest('.dlg-body').getBoundingClientRect();
+    if (bounds.bottom > Math.max(0, body.top) && bounds.top < Math.min(innerHeight, body.bottom)
+      && bounds.right > 0 && bounds.left < innerWidth) { showStripTip(node); return; }
+  }
+  hideStripTip();
+}, true);
 function stripNode(m) {
   let n = stripNodes.get(m.id);
   if (!n) {
@@ -1102,7 +1187,7 @@ const NETWORK_ERRORS = {
   URL_INVALID: ['地址', '接口地址无效'],
   GROK_AUTH_ERROR: ['认证', 'Grok 认证失败'], GROK_TIMEOUT: ['超时', 'Grok 响应超时'],
   GROK_PARSE_ERROR: ['响应', 'Grok 响应无法解析'], GROK_PROVIDER_ERROR: ['接口', 'Grok 接口调用失败'],
-  GROK_CONTENT_EMPTY: ['回答', '没有可核验回答'], GROK_SOURCES_EMPTY: ['来源', '没有可核验来源'],
+  GROK_CONTENT_EMPTY: ['回答', '未返回回答内容'], GROK_SOURCES_EMPTY: ['来源', '未返回引用链接'],
   GROK_PROGRAM_MISSING: ['程序', 'Grok 尚未就绪'], GROK_PROGRAM_PREPARING: ['程序', 'Grok 正在准备'],
   GROK_CONFIG_INVALID: ['配置', 'Grok 配置无效'], GROK_TOOL_ERROR: ['搜索', 'Grok 搜索报告错误'],
   GROK_MCP_ERROR: ['MCP', 'Grok 初始化或搜索失败'], GROK_CHILD_EXIT: ['进程', 'Grok 意外退出'],
@@ -1114,6 +1199,7 @@ const NETWORK_ERRORS = {
   GROK_PLATFORM_UNSUPPORTED: ['平台', '系统或架构不支持'], GROK_INSTALL_BUSY: ['安装', '程序正在安装'],
   GROK_PROGRAM_REAP_FAILED: ['回收', '程序回收未完成'], GROK_PROCESS_REAP_FAILED: ['回收', '进程回收未完成'],
   SETTINGS_UNAVAILABLE: ['连接', '设置服务不可用'], SOURCE_UNAVAILABLE: ['来源', '来源服务不可用'],
+  FALLBACK_SOURCES_ZERO: ['配置', '回退来源数为 0'],
 };
 function failureInfo(code) {
   const value = normalizeCode(code).toUpperCase();
@@ -1140,11 +1226,14 @@ function failureHelp(code) {
   if (value === 'CERT_HAS_EXPIRED' || value === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') return '核对 HTTPS 证书与代理设置，不要关闭证书校验。';
   if (['408', '504', 'TIMEOUT', 'ETIMEDOUT'].includes(value)) return '核对网络与超时设置，稍后重试。';
   if (value === 'GROK_AUTH_ERROR') return '检查 Grok Key 或原有登录凭据；上游未提供具体 HTTP 状态码。';
-  if (['GROK_CONTENT_EMPTY', 'GROK_SOURCES_EMPTY', 'GROK_PARSE_ERROR'].includes(value)) return '核对模型与搜索能力；有 Key 不等于能返回可核验来源。';
+  if (value === 'GROK_SOURCES_EMPTY') return '本次回答未提供可识别的来源链接，请检查模型联网能力与引用格式。';
+  if (value === 'GROK_CONTENT_EMPTY') return '本次未返回回答内容，请检查模型与接口响应。';
+  if (value === 'GROK_PARSE_ERROR') return '接口响应无法解析，请核对所选协议与服务商返回格式。';
+  if (value === 'GROK_PROVIDER_ERROR') return '核对 Base URL、接口协议与模型；该错误不单独表示 API Key 失效。';
   if (value === 'GROK_VERSION_UNVERIFIED') return '此版本尚未通过插件验证；不会擅自升级或覆盖已有安装。';
   if (value === 'OUTPUT_LIMIT') return '调大「回复字符上限」以容纳搜索链接；此结果不表示 Key 失效。';
-  if (value.startsWith('GROK_DOWNLOAD_') || value.startsWith('GROK_ARCHIVE_')) return '检查网络或程序缓存，在 Grok Search RS 设置中重新检测。';
-  if (value.startsWith('GROK_PROGRAM_') || value.startsWith('GROK_PROCESS_')) return '检查程序状态，在 Grok Search RS 设置中重新检测；不会修改全局安装。';
+  if (value.startsWith('GROK_DOWNLOAD_') || value.startsWith('GROK_ARCHIVE_')) return '检查网络或程序缓存，在 Grok Search Rs 设置中重新检测。';
+  if (value.startsWith('GROK_PROGRAM_') || value.startsWith('GROK_PROCESS_')) return '检查程序状态，在 Grok Search Rs 设置中重新检测；不会修改全局安装。';
   if (value.startsWith('GROK_')) return '核对 Grok 程序、Base URL 和模型；该错误不单独证明 Key 失效。';
   if (NETWORK_ERRORS[value]) return '核对 BaseURL、网络或代理设置。';
   if (Number(value) >= 500) return '上游服务异常，可稍后重试。';
@@ -1217,12 +1306,15 @@ function renderBanner() {
   } else if (st === 'off') {
     html = B('info', 'info', '已恢复原搜索设置，无需重启', '配置已保留。请在插件页使用 dsh-grok-search 的原生开关重新启用。');
   } else if (st === 'fallback') {
-    const observed = unknownFallback() ? 'Grok 内置补充链' : META[sv]?.name || '补充来源';
+    const observed = S.lastRoute?.resultProviders?.length
+      ? S.lastRoute.resultProviders.filter(id => META[id]).map(id => META[id].name).join(' / ')
+        + (S.lastRoute.resultProvidersComplete ? '' : ' / 来源未报告')
+      : unknownFallback() ? '来源未报告' : META[sv]?.name || '补充来源';
     const grokCode = codeOf('grok') || S.program?.error?.code;
     const rotates = sv && codeOf(sv).split('/').every((code) => TAVILY_ROTATE.has(code));
     const part = sv && isPart(sv) ? `；${META[sv].name} 有 Key 返回 ${codeOf(sv)}${rotates ? '，可换用其他 Key' : '，各 Key 的验证结果单独保留'}` : '';
     html = B('fallback', 'reroute', `Grok ${failureInfo(grokCode).status} · ${errText(grokCode)}，已静默回退到 ${observed}`,
-      `搜索照常可用，结果来自补充来源${part}。修好 Grok 后自动切回，不会回退官方搜索。`,
+      `搜索照常可用，${S.lastRoute?.provenance === 'source-label' ? '来源按返回结果确认' : '结果来自补充来源'}${part}。修好 Grok 后自动切回，不会回退官方搜索。`,
       btn('open:grok', '检查 Grok 配置') + btn('grok-off', '关闭 Grok'));
   } else if (st === 'err') {
     const fails = failList();
@@ -1308,12 +1400,25 @@ function dismissToast(el) {
   el.classList.add('is-out');
   setTimeout(() => el.remove(), 180);
 }
+const shakeCleanups = new WeakMap();
 function shake(el) {
   if (!el) return;
+  shakeCleanups.get(el)?.();
   el.classList.remove('shake');
   void el.offsetWidth;
   el.classList.add('shake');
-  el.addEventListener('animationend', function h(e) { if (e.animationName === 'shake') { el.classList.remove('shake'); el.removeEventListener('animationend', h); } });
+  let timer, offEnd, offCancel;
+  const clean = () => {
+    clearTimeout(timer);
+    el.classList.remove('shake');
+    offEnd?.(); offCancel?.();
+    shakeCleanups.delete(el);
+  };
+  const end = event => { if (event.target === el && event.animationName === 'shake') clean(); };
+  shakeCleanups.set(el, clean);
+  offEnd = listen(el, 'animationend', end);
+  offCancel = listen(el, 'animationcancel', end);
+  timer = setTimeout(clean, reduced() ? 0 : 450);
 }
 function bump(el) {
   if (!el) return;
@@ -1322,10 +1427,11 @@ function bump(el) {
   el.classList.add('tick');
   setTimeout(() => el.classList.remove('tick'), 720);
 }
-const rowOf = (id) => $(`.row[data-id="${id}"]`);
+const rowOf = (id) => $(`#colList .row[data-id="${id}"]`);
 
 /* ---------- 插件总开关：热重载语义，当场生效 ---------- */
 function cancelTest() {
+  logView?.cancel();
   const running = S.testing;
   gen++;
   const operationId = S.diagnosticOperation;
@@ -1465,6 +1571,10 @@ function startDrag() {
   const d = drag;
   const wrap = $('#rowsSupp');
   d.rows = $$('.row', wrap);
+  // A drag owns transforms from this point on; an entry animation must not
+  // keep replacing the drag's geometry or transform.
+  d.rows.forEach(row => row.classList.remove('enter'));
+  void wrap.offsetWidth;
   d.n = d.rows.length;
   d.from = d.rows.indexOf(d.row);
   d.to = d.from;
@@ -1598,6 +1708,7 @@ const dlg = $('#dialog');
 const testPop = $('#testPop');
 let D = null;
 let closeTimer = 0;
+let overlayEntranceTimer = 0;
 let gen = 0;
 const dialogBusy = () => !!D && (D.saving || D.clearing);
 function resetClearConfirmation() {
@@ -1616,18 +1727,24 @@ function lockDialog() {
 }
 function showOverlay() {
   hideStripTip();
+  logView?.hideTip();
   clearTimeout(closeTimer);
   overlay.classList.remove('is-closing');
   if (overlay.hidden) {
     clearToasts();
     overlay.hidden = false;
     dlg.classList.remove('is-in');
-    const done = () => dlg.classList.add('is-in');
-    dlg.addEventListener('animationend', function h(e) { if (e.target === dlg && e.animationName === 'dlg-in') { done(); dlg.removeEventListener('animationend', h); } });
-    setTimeout(done, 300);
+    clearTimeout(overlayEntranceTimer);
+    overlayEntranceTimer = setTimeout(() => {
+      overlayEntranceTimer = 0;
+      if (!overlay.hidden && D) dlg.classList.add('is-in');
+    }, reduced() ? 0 : 300);
   }
 }
 function hideOverlay(cb) {
+  hideStripTip();
+  clearTimeout(overlayEntranceTimer);
+  shakeCleanups.get(dlg)?.();
   overlay.classList.add('is-closing');
   closeTimer = setTimeout(() => {
     overlay.hidden = true;
@@ -1646,6 +1763,7 @@ function closeDialog(force) {
     if (fn) fn.innerHTML = '<b>有未保存的修改</b> · 再按一次 Esc 或点空白处放弃修改';
     return;
   }
+  quotaView?.cancel();
   const back = D.returnFocus;
   const id = D.id;
   clearTimeout(D.clearTimer);
@@ -1658,6 +1776,16 @@ function closeDialog(force) {
 overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) closeDialog(false); });
 listen(document, 'keydown', (e) => {
   if (!overlay.hidden && D) {
+    const mode = targetOf(e).closest?.('[data-a=mode]');
+    if (mode && !mode.disabled && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
+      e.preventDefault();
+      const modes = $$('[data-a=mode]', dlg).filter(button => !button.disabled);
+      const step = e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1;
+      const next = e.key === 'Home' ? modes[0] : e.key === 'End' ? modes.at(-1)
+        : modes[(modes.indexOf(mode) + step + modes.length) % modes.length];
+      if (next) { setMode(next); $('[data-a=mode][aria-checked=true]', dlg)?.focus({ preventScroll: true }); }
+      return;
+    }
     if (e.key === 'Escape') { e.preventDefault(); closeDialog(false); return; }
     if (e.key === 'Tab') { trapTab(e); return; }
     if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
@@ -1669,7 +1797,7 @@ listen(document, 'keydown', (e) => {
   if (e.key === 'Escape' && !testPop.hidden) closePop(true);
 });
 function focusables() {
-  return $$('button, [href], input, [tabindex]:not([tabindex="-1"])', dlg).filter((el) => !el.disabled && !el.closest('[inert]') && el.getClientRects().length);
+  return $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', dlg).filter((el) => !el.disabled && !el.closest('[inert]') && el.getClientRects().length);
 }
 function trapTab(e) {
   const f = focusables();
@@ -1682,6 +1810,9 @@ function trapTab(e) {
 }
 function initialFocus() {
   if (!D) return;
+  // An opening RAF must not steal focus after the user has already selected
+  // an input (or a quota selector) and started typing.
+  if (dlg.contains(active()) && active()?.matches('input,select,textarea,button,a')) return;
   let el = null;
   if (D.kind === 'card') {
     const kk = { grok: D.draft.mode === 'compat' ? 'gwKey' : 'key', tavily: 'keys.0', github: 'token' }[D.id] || 'key';
@@ -1697,7 +1828,10 @@ const fid = (k) => 'f-' + k.replace(/\./g, '-');
 function field({ label, hint, k, msg, ctl, help }) {
   const tag = k ? 'label' : 'span';
   const slot = msg || k;
-  const lab = `<${tag} class="f-label"${k ? ` for="${fid(k)}"` : ''}>${label}${k && fieldReadOnly(k) ? `<small>${svg('lock', 'ic ic-sm')}只读</small>` : hint ? `<small>${hint}</small>` : ''}</${tag}>`;
+  const sourceKey = D?.kind === 'card' ? CARD_FIELDS[D.id]?.[k?.startsWith('keys.') ? 'keys' : k] : HUB_FIELDS[k];
+  const environment = D?.fields?.[sourceKey]?.source === 'environment';
+  const locked = k && fieldReadOnly(k) ? `<small${environment ? ' title="此项由启动环境变量提供；请在启动环境中修改或移除覆盖，再使用共享配置。"' : ''}>${svg('lock', 'ic ic-sm')}${environment ? '环境变量 · 只读' : '只读'}</small>` : '';
+  const lab = `<${tag} class="f-label"${k ? ` for="${fid(k)}"` : ''}>${label}${locked || (hint ? `<small>${hint}</small>` : '')}</${tag}>`;
   const msgEl = slot ? `<p class="f-msg" id="${fid(slot)}-message" data-msg="${slot}" aria-live="polite" hidden></p>` : '';
   const helpEl = help ? `<p class="f-help"${slot ? ` id="${fid(slot)}-help"` : ''}>${help}</p>` : '';
   return `<div class="field">${lab}<div class="f-ctl">${ctl}${msgEl}${helpEl}</div></div>`;
@@ -1726,7 +1860,7 @@ function keyIn(k, v, ph, o = {}) {
   const cp = `<button type="button" class="icon-btn" data-a="copy" data-k="${k}" aria-label="复制密钥"${unavailable ? ' disabled' : ''}>${svg('copy')}</button>`;
   const del = o.del ? `<button type="button" class="icon-btn" data-a="del-key" data-i="${o.i}" aria-label="删除这个 Key"${ro ? ' disabled' : ''}>${svg('trash')}</button>` : '';
   const aria = o.aria ? ` aria-label="${o.aria}"` : '';
-  return `<div class="input${ro ? ' is-readonly' : ''}"><input id="${fid(k)}" type="${shown ? 'text' : 'password'}" class="mono" data-k="${k}" value="${isHidden ? '' : esc(v)}" placeholder="${isHidden ? '已配置 · 点击查看或编辑' : esc(ph || '')}" spellcheck="false" autocomplete="off"${aria}${isHidden ? ' data-hidden="true" readonly' : ro ? ' readonly' : ''}><span class="in-act">${eye}${cp}${del}</span></div>`;
+  return `<div class="input${ro ? ' is-readonly' : ''}"><input id="${fid(k)}" type="${shown ? 'text' : 'password'}" class="mono" data-k="${k}" value="${isHidden ? '' : esc(v)}" placeholder="${isHidden ? ro ? '已配置 · 点击查看' : '已配置 · 点击查看或编辑' : esc(ph || '')}" spellcheck="false" autocomplete="off"${aria}${isHidden ? ' data-hidden="true" readonly' : ro ? ' readonly' : ''}><span class="in-act">${eye}${cp}${del}</span></div>`;
 }
 function chip(k, v, label, cur) {
   return `<button type="button" class="chip" data-a="pick" data-k="${k}" data-v="${esc(v)}" aria-pressed="${(cur || '').trim() === v}"${fieldReadOnly(k) ? ' disabled' : ''}>${esc(label)}</button>`;
@@ -1742,7 +1876,10 @@ const KEEP_URL = '留空使用官方地址。';
 const GROK_NOTE = note('关闭右上角开关后，搜索直接由补充来源返回；Grok 失效时也会静默回退到补充来源，全部不可用才报错，不会回退官方搜索。这个开关只对 DSH 生效，不写入 config.toml。');
 const credKey = (id, p = S.prov[id]) => (id === 'grok' ? (p.mode === 'compat' ? 'gwKey' : 'key') : id === 'github' ? 'token' : 'key');
 const CRED = { grok: ['mode', 'url', 'key', 'model', 'gwUrl', 'gwKey', 'gwModel', 'web', 'x'], tavily: ['url', 'keys'], exa: ['url', 'key'], tinyfish: ['searchUrl', 'fetchUrl', 'key'], firecrawl: ['url', 'key'], github: ['token'] };
-/* 弹窗里的“最近一次结果”提示：跟随 Key 的值，改动该 Key 后自动消失 */
+/* Only explicit authentication failures belong beside a credential.
+   Other failures describe the search attempt, not the Key's format or validity. */
+const credentialFailure = code => String(code || '').split('/').every(value =>
+  ['401', 'GROK_AUTH_ERROR'].includes(normalizeCode(value).toUpperCase()));
 function healthOf(id) {
   const v = S.bad[id];
   if (!v) return [];
@@ -1751,9 +1888,10 @@ function healthOf(id) {
   const k = credKey(id, base);
   return [{ k, val: (base[k] || '').trim(), code: v }];
 }
-function healthMsg(id, code) {
-  const base = `最近一次检查：${failureInfo(code).status} · ${errText(code)}。${failureHelp(code)}`;
-  if (id === 'grok') return base + (grokOn() && servingSupp() ? '；搜索已静默回退到补充来源' : '');
+function healthMsg(id, code, summary = false) {
+  const base = `${summary ? '' : '最近一次检查：'}${failureInfo(code).status} · ${errText(code)}。${failureHelp(code)}`;
+  if (id === 'grok') return base + (summary && grokOn() && S.lastRoute?.outcome === 'ok' && S.lastRoute.fallbackUsed === true
+    ? '\n搜索已静默回退到补充来源' : '');
   if (id === 'tavily') return base + (!TAVILY_ROTATE.has(code) ? '；正常搜索遇到此错误不会换 Key，逐项测试仍独立检查其他 Key' : isBad('tavily') ? '' : '；已自动换用下一个 Key');
   return base + '；已自动跳过';
 }
@@ -1762,20 +1900,20 @@ const FIELDS = {
   grok(p) {
     const compat = p.mode === 'compat';
     const protocolLocked = D.base.authReadOnly || D.fields.grok_api_key?.readOnly || !S.capabilities?.secretsAllowed;
-    const seg = `<div class="seg" role="radiogroup" aria-label="接口协议"><button type="button" role="radio" data-a="mode" data-v="responses" aria-checked="${!compat}"${protocolLocked ? ' disabled' : ''}>xAI Responses</button><button type="button" role="radio" data-a="mode" data-v="compat" aria-checked="${compat}"${protocolLocked ? ' disabled' : ''}>OpenAI 兼容网关</button></div>`;
+    const seg = `<div class="seg" role="radiogroup" aria-label="接口协议"><button type="button" role="radio" data-a="mode" data-v="responses" title="Responses 接口；支持兼容此协议的自定义服务" aria-checked="${!compat}" tabindex="${compat ? -1 : 0}"${protocolLocked ? ' disabled' : ''}>xAI Responses</button><button type="button" role="radio" data-a="mode" data-v="compat" title="Chat Completions 接口" aria-checked="${compat}" tabindex="${compat ? 0 : -1}"${protocolLocked ? ' disabled' : ''}>OpenAI 兼容网关</button></div>`;
     const segHelp = compat
-      ? '通过兼容 Chat Completions 的网关调用 Grok。切换时原 xAI Key 会从配置删除并备份到配置历史；切回需重新填入或恢复历史。此模式不支持 X 搜索。'
+      ? '切换时原 Responses API Key 会从共享配置删除并备份到配置历史；切回需重新填入或恢复历史。此模式不支持 X 搜索。'
       : p.authReadOnly ? '正在复用原有登录认证，认证配置在此只读。'
-        : '直连 xAI 官方接口，支持网页搜索与 X 搜索。';
+        : D.fields.grok_api_key?.source === 'environment' ? 'API Key 由启动环境变量提供；移除该覆盖后，可在共享配置中修改 Key 和切换接口。' : '';
     let h = field({ label: '接口协议', ctl: seg, help: segHelp });
     if (compat) {
-      h += field({ label: '网关地址', k: 'gwUrl', ctl: txt('gwUrl', p.gwUrl, 'https://your-gateway/v1', { im: 'url' }) });
-      h += field({ label: '网关 Key', k: 'gwKey', ctl: keyIn('gwKey', p.gwKey, 'sk-...') });
+      h += field({ label: 'Base URL', k: 'gwUrl', ctl: txt('gwUrl', p.gwUrl, 'https://your-service/v1', { im: 'url' }) });
+      h += field({ label: 'API Key', k: 'gwKey', ctl: keyIn('gwKey', p.gwKey, 'sk-...') });
       h += field({ label: '模型', hint: '可选', k: 'gwModel', ctl: txt('gwModel', p.gwModel, '例如 grok-4.3-fast') });
       return h + GROK_NOTE;
     }
     h += field({ label: 'Base URL', k: 'url', ctl: txt('url', p.url, DEF.grokUrl, { im: 'url' }), help: '可填根地址、/v1 或完整端点，会自动规范到 /v1。' + KEEP_URL });
-    h += field({ label: 'API Key', k: 'key', ctl: keyIn('key', p.key, 'xai-...') });
+    h += field({ label: 'API Key', k: 'key', ctl: keyIn('key', p.key, 'xai-.../sk-...') });
     const chips = `<div class="chips">${chip('model', '', '默认', p.model)}${chip('model', 'grok-4.3', 'grok-4.3', p.model)}</div>`;
     h += field({ label: '模型', k: 'model', ctl: txt('model', p.model, `默认 ${DEF.grokModel}`) + chips });
     const checks = `<div class="checks">${chk('web', p.web, '网页搜索', '让 Grok 联网检索网页并给出来源')}${chk('x', p.x, 'X 搜索', '同时检索 X（Twitter）上的帖子')}</div>`;
@@ -1787,7 +1925,7 @@ const FIELDS = {
     const rows = keys.map((v, i) => `<div class="key-row">${keyIn('keys.' + i, v, 'tvly-...', { del: keys.length > 1, i, aria: `Tavily Key ${i + 1}` })}</div>`).join('');
     const add = `<button type="button" class="add-key" data-a="add-key"${fieldReadOnly('keys') ? ' disabled' : ''}>${svg('plus', 'ic ic-sm')}添加另一个 Key</button>`;
     return field({ label: 'Base URL', k: 'url', ctl: txt('url', p.url, DEF.tavilyUrl, { im: 'url' }), help: KEEP_URL })
-      + field({ label: 'API Key', hint: '可填多个', msg: 'keys', ctl: `<div class="keylist">${rows}</div>${add}`, help: '多个 Key 按请求轮换；遇到 401、403、429、432、433 会自动换下一个。' });
+      + field({ label: 'API Key', k: 'keys.0', hint: '可填多个', msg: 'keys', ctl: `<div class="keylist">${rows}</div>${add}`, help: '多个 Key 按请求轮换；遇到 401、403、429、432、433 会自动换下一个。' });
   },
   exa(p) {
     return field({ label: 'Base URL', k: 'url', ctl: txt('url', p.url, DEF.exaUrl, { im: 'url' }), help: KEEP_URL })
@@ -1841,8 +1979,8 @@ function vCard(id, p) {
     if (p.mode === 'compat') {
       url('gwUrl', p.gwUrl);
       const half = on && !!p.gwUrl.trim() !== !!p.gwKey.trim();
-      if ((need || half) && !p.gwUrl.trim()) err.gwUrl = '兼容模式需要网关地址';
-      key('gwKey', p.gwKey, need || half ? '兼容模式需要网关 Key' : '');
+      if ((need || half) && !p.gwUrl.trim()) err.gwUrl = 'Chat Completions 接口需要 Base URL';
+      key('gwKey', p.gwKey, need || half ? 'Chat Completions 接口需要 API Key' : '');
     } else {
       url('url', p.url);
       let host = '';
@@ -1907,11 +2045,29 @@ function refreshDialog() {
   if (D.kind === 'card') syncHeadSwitch();
   const shown = (k) => D.submitted || D.touched.has(k) || D.touched.has(k.split('.')[0]);
   const health = {};
-  if (D.kind === 'card') {
+  const resultFailures = [];
+  // A previous result only applies to the same endpoint, protocol, model and
+  // search settings. Secret reveal updates both base and draft, so it preserves
+  // the result without comparing a masked value with an exposed credential.
+  if (D.kind === 'card' && CRED[D.id].filter(k => !['key', 'gwKey', 'token', 'keys'].includes(k))
+    .every(k => JSON.stringify(D.draft[k]) === JSON.stringify(D.base[k]))) {
     healthOf(D.id).forEach((h) => {
-      if (D.id === 'tavily') D.draft.keys.forEach((v, i) => { if (v.trim() === h.val) health['keys.' + i] = h.code; });
-      else if ((D.draft[h.k] || '').trim() === h.val) health[h.k] = h.code;
+      const slots = D.id === 'tavily'
+        ? D.draft.keys.flatMap((v, i) => v.trim() === h.val ? ['keys.' + i] : [])
+        : (D.draft[h.k] || '').trim() === h.val ? [h.k] : [];
+      for (const slot of slots) {
+        if (credentialFailure(h.code) && !(D.id === 'grok' && D.base.authReadOnly)) health[slot] = h.code;
+        else resultFailures.push({ slot, code: h.code });
+      }
     });
+  }
+  const resultBox = $('.search-result', dlg);
+  if (resultBox) {
+    resultBox.hidden = !resultFailures.length;
+    const details = resultFailures.map(({ slot, code }) =>
+      `${D.id === 'tavily' ? `Key ${+slot.split('.')[1] + 1}：` : ''}${healthMsg(D.id, code, true).replaceAll('；', '，')}`).join('\n');
+    const content = details ? `${svg('info', 'ic ic-sm')}<span><strong>最近检查结果</strong>${esc(details)}</span>` : '';
+    if (resultBox.innerHTML !== content) resultBox.innerHTML = content;
   }
   $$('.f-msg[data-msg]', dlg).forEach((m) => {
     const slot = m.dataset.msg;
@@ -1966,8 +2122,11 @@ function refreshDialog() {
     }
     const retry = ['CONFIG_CONFLICT', 'CONFIG_COMMIT_UNCERTAIN', 'PREFERENCES_CONFLICT', 'PREFERENCES_COMMIT_UNCERTAIN'].includes(D.operationError.code)
       ? '<button type="button" class="btn btn-sm" data-a="reload-draft">读取最新配置</button>' : '';
-    error.innerHTML = `${svg('info', 'ic ic-sm')}<span>${esc(D.operationError.code)} · ${esc(D.operationError.message)}</span>${retry}`;
+    const html = `${svg('info', 'ic ic-sm')}<span>${esc(D.operationError.code)} · ${esc(D.operationError.message)}</span>${retry}`;
+    // Keystrokes re-run refreshDialog; an unchanged alert is not rewritten and re-announced.
+    if (error._html !== html) { error.innerHTML = html; error._html = html; }
   }
+  quotaView?.render();
 }
 
 /* ---------- 弹窗事件 ---------- */
@@ -2292,7 +2451,7 @@ function headState() {
 }
 function headSwitch() {
   const h = headState();
-  return `<label class="head-switch" data-pending="${h.pending}"><span class="hs-text">${h.text}</span><button type="button" class="switch" role="switch" aria-checked="${h.on}"${h.pending ? ' aria-disabled="true" title="在下方填写后自动打开"' : ''} data-a="enabled"><i></i></button></label>`;
+  return `<label class="head-switch" data-pending="${h.pending}"><span class="hs-text">${h.text}</span><button type="button" class="switch" role="switch" aria-label="${esc(META[D.id]?.name || D.id)} ${h.text}" aria-checked="${h.on}"${h.pending ? ' aria-disabled="true" title="在下方填写后自动打开"' : ''} data-a="enabled"><i></i></button></label>`;
 }
 function syncHeadSwitch() {
   const hs = $('.head-switch', dlg);
@@ -2313,7 +2472,7 @@ function renderCard() {
   const head = `<header class="dlg-head">${tile(id, 40)}<div class="dlg-titles"><h2 id="dlgTitle">${m.name}</h2><p class="dlg-sub"><span>${subText(id)}</span><a class="dlg-link" href="${m.link}" target="_blank" rel="noopener noreferrer">${EXT(m.linkText)}</a></p></div>${ctl}<button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg('x')}</button></header>`;
   // 用 form 包住字段，密码管理器才会把它当作一个凭据表单；保存仍由底部按钮控制。
   const locked = !S.capabilities?.secretsAllowed ? note('当前连接仅支持脱敏查看。请使用已认证的本机直连或 HTTPS 连接查看和保存 Key。') : '';
-  const body = `<div class="dlg-body">${locked}<form class="dlg-form" novalidate>${FIELDS[id](p)}</form></div>`;
+  const body = `<div class="dlg-body">${locked}<form class="dlg-form" novalidate>${FIELDS[id](p)}<div id="quotaSlot"></div></form><div class="note search-result" role="status" aria-live="polite" aria-atomic="true" hidden></div></div>`;
   const clearable = Object.values(CARD_FIELDS[id]).some(key => D.fields[key]?.source === 'file' && !D.fields[key]?.readOnly);
   const clearBtn = clearable ? `<button type="button" class="btn btn-ghost btn-sm btn-danger" data-a="clear"${S.capabilities?.secretsAllowed ? '' : ' disabled'}>清除配置</button>` : '';
   const foot = `<footer class="dlg-foot">${clearBtn}<span class="foot-note"></span><button type="button" class="btn btn-sm grow" data-a="cancel">取消</button><button type="button" class="btn btn-primary btn-sm grow" data-a="save">保存</button></footer>`;
@@ -2324,6 +2483,7 @@ function renderCard() {
 }
 function openCard(id, opt = {}) {
   if (S.loading || S.busy || !META[id]) return;
+  quotaView?.cancel();
   closePop();
   // 未配置来源的 enabled 只是默认值：草稿按“填好凭据后启用”处理，打开弹窗本身不算修改。
   const base = clone(S.prov[id]);
@@ -2338,10 +2498,11 @@ function openCard(id, opt = {}) {
   };
   showOverlay();
   renderCard();
+  void quotaView?.open();
   requestAnimationFrame(initialFocus);
 }
 
-/* ---------- 中继弹窗：Grok Search RS ---------- */
+/* ---------- 中继弹窗：Grok Search Rs ---------- */
 const NUM = {
   extra: { min: 0, max: 10, step: 1, unit: '条' },
   fallback: { min: 1, max: 10, step: 1, unit: '条' },
@@ -2447,7 +2608,7 @@ function hubBody(h) {
 }
 function renderHub() {
   const version = S.program?.program?.version ? 'v' + S.program.program.version : programPhase();
-  const head = `<header class="dlg-head"><span class="tile tile-glyph" style="--s:40px">${svg('hub')}</span><div class="dlg-titles"><h2 id="dlgTitle">Grok Search RS</h2><p class="dlg-sub"><span>${esc(version)} · MIT · 把 Grok 与各搜索来源串成一条路由</span><a class="dlg-link" href="https://github.com/Episkey-G/GrokSearch-rs" target="_blank" rel="noopener noreferrer">${EXT('GitHub 仓库')}</a></p></div><button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg('x')}</button></header>`;
+  const head = `<header class="dlg-head"><span class="tile tile-glyph" style="--s:40px">${svg('hub')}</span><div class="dlg-titles"><h2 id="dlgTitle">Grok Search Rs</h2><p class="dlg-sub"><span>${esc(version)} · MIT · 把 Grok 与各搜索来源串成一条路由</span><a class="dlg-link" href="https://github.com/Episkey-G/GrokSearch-rs" target="_blank" rel="noopener noreferrer">${EXT('GitHub 仓库')}</a></p></div><button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg('x')}</button></header>`;
   const foot = '<footer class="dlg-foot"><span class="foot-note"></span><button type="button" class="btn btn-sm grow" data-a="cancel">取消</button><button type="button" class="btn btn-primary btn-sm grow" data-a="save">保存</button></footer>';
   dlg.innerHTML = head + `<div class="dlg-body">${hubBody(D.draft)}</div>` + foot;
   refreshDialog();
@@ -2494,6 +2655,7 @@ async function commitHub(draft = D.draft) {
   toast('已写入 Grok 共享配置 · 下次搜索生效', { undo: configUndo(receipt) });
 }
 function openHub(opt = {}) {
+  quotaView?.cancel();
   if (S.loading || S.busy) return;
   closePop();
   D = {
@@ -2530,7 +2692,8 @@ testPop.addEventListener('click', (e) => {
 listen(document, 'pointerdown', e => { if (!testPop.hidden && !targetOf(e).closest?.('.rc-actions')) closePop(); });
 function travel(wid, o = {}) {
   return new Promise((resolve) => {
-    const g = wireNodes.get(wid);
+    const view = o.view;
+    const g = view ? view.paths.get(wid)?.group : wireNodes.get(wid);
     if (!g) { resolve(); return; }
     const path = g.children[1];
     // 数据包始终只用 agent 蓝；成败由端口形状和断口表达，不再把整条线染绿或染红。
@@ -2539,27 +2702,33 @@ function travel(wid, o = {}) {
     path.style.strokeDasharray = '';
     path.style.strokeLinecap = '';
     g.children[2].style.opacity = g.children[3].style.opacity = '0';
-    wiresEl.insertBefore(g, packetLayer);
+    const canvas = view ? view.svg : wiresEl;
+    const packets = view ? view.packetLayer : packetLayer;
+    canvas.insertBefore(g, packets);
     const pk = document.createElementNS(SVGNS, 'g');
     pk.setAttribute('class', 'packet');
     pk.innerHTML = '<circle class="p-halo" r="7"></circle><circle class="p-core" r="3.2"></circle>';
-    packetLayer.appendChild(pk);
+    pk.dataset.return = String(!!o.back);
+    pk.dataset.wire = wid;
+    packets.appendChild(pk);
     const dur = o.dur || T.hop;
     const t0 = performance.now();
     const myGen = gen;
-    const finish = () => { waits.delete(finish); pk.remove(); resolve(); };
+    let raf;
+    const finish = () => { cancelAnimationFrame(raf); waits.delete(finish); view?.cancelers.delete(finish); pk.remove(); resolve(); };
     waits.add(finish);
+    view?.cancelers.add(finish);
     const frame = (now) => {
-      if (myGen !== gen || disposed) { finish(); return; }
+      if ((view ? view.cancelled : myGen !== gen) || disposed) { finish(); return; }
       const t = Math.min(1, (now - t0) / dur);
       const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
       const len = path.getTotalLength();
       const pt = path.getPointAtLength((o.back ? 1 - e : e) * len);
       pk.setAttribute('transform', `translate(${pt.x},${pt.y})`);
-      if (t < 1) requestAnimationFrame(frame);
+      if (t < 1) raf = requestAnimationFrame(frame);
       else finish();
     };
-    requestAnimationFrame(frame);
+    raf = requestAnimationFrame(frame);
   });
 }
 /* 测试时先合上旧断口，让数据包走完整条线；失败时轻颤，再换一个位置张开断口。 */
@@ -2584,7 +2753,7 @@ function pulseFault(el) {
   }, 1100);
   faultPulses.set(el, timer);
 }
-function jolt(el, soft = false) {
+function jolt(el, soft = false, pump = pumpWires) {
   if (!el || reduced()) return Promise.resolve();
   jolts.get(el)?.();
   return new Promise((resolve) => {
@@ -2611,7 +2780,7 @@ function jolt(el, soft = false) {
     // 颤动尾部接上断线；取消场景时 clean() 同时解除等待和所有清理任务。
     leadTimer = setTimeout(resolve, soft ? 220 : 300);
     cleanupTimer = setTimeout(clean, soft ? 380 : 500);
-    pumpWires(soft ? 360 : 480);
+    pump(soft ? 360 : 480);
   });
 }
 function clearLit() {
@@ -2628,7 +2797,7 @@ function clearLit() {
 /* 测试节奏（毫秒） */
 const T = { hop: 380, grok: 720, supp: 560, fail: 420, hold: 900, trace: 6500 };
 function flashRow(id) {
-  const r = rowOf(id);
+  const r = typeof id === 'string' ? rowOf(id) : id;
   if (!r || reduced()) return;
   r.classList.remove('is-searching', 'flash-ok');
   void r.offsetWidth;
@@ -2648,6 +2817,7 @@ function flashNode(el) {
 async function runTest() {
   const st0 = routeStatus();
   if (S.testing || S.busy || ['off', 'wait', 'none', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'prep'].includes(st0)) return;
+  logView?.cancel();
   const my = ++gen;
   const started = performance.now();
   clearToasts();
@@ -2767,9 +2937,13 @@ async function runTest() {
 /* ---------- Mount-local theme, path actions and lifecycle ---------- */
 function setTheme(dark) {
   if (disposed) return;
-  darkTheme = dark === true || dark === 'dark';
+  const next = dark === true || dark === 'dark';
+  if (darkTheme === next) return;
+  darkTheme = next;
   root.dataset.theme = layer.dataset.theme = darkTheme ? 'dark' : 'light';
   refreshLogos();
+  logView?.theme();
+  quotaView?.render();
   bannerHtml = null;
   renderBanner();
 }
@@ -2802,6 +2976,37 @@ $('#bannerSlot').addEventListener('click', (e) => {
 $('#nodeHub').addEventListener('click', (e) => openHub({ from: e.currentTarget }));
 
 function init() {
+  logView = createSearchLogView({ $, $$, active, S, card, layer, listen, remote, uuid, clone, esc, svg, tile,
+    logoSrc, isDark, reduced, META, SUPP, setTimeout, clearTimeout, requestAnimationFrame, cancelAnimationFrame,
+    T, jolts, faultPulses, syncBreak, travel, jolt, pulseFault, flashRow, flashNode, pumpWires, closePop,
+    hideStripTip, toast, errText, rowOf, SVGNS, logMemory });
+  quotaView = createQuotaView({ $, S, getDialog: () => D, dlg, active, DEF, SUPP, svg, EXT, esc,
+    reduced, dialogBusy, remote, uuid,
+    hideTip: () => { if (stripTipTarget?.matches('[data-quota-tip]')) hideStripTip(); } });
+  listen(dlg, 'pointerover', event => {
+    const tip = event.target.closest('[data-quota-tip]');
+    if (tip && tip !== stripTipTarget) showStripTip(tip);
+  });
+  listen(dlg, 'pointerout', event => {
+    if (!event.target.closest('[data-quota-tip]')) return;
+    if (event.relatedTarget && (stripTipTarget?.contains(event.relatedTarget) || routeTooltip.contains(event.relatedTarget))) return;
+    clearTimeout(stripTipTimer);
+    stripTipTimer = setTimeout(() => { if (stripTipTarget !== active()) hideStripTip(); }, 100);
+  });
+  listen(dlg, 'focusin', event => { if (event.target.matches('[data-quota-tip]')) showStripTip(event.target); });
+  listen(dlg, 'focusout', event => {
+    if (event.target.matches('[data-quota-tip]') && !routeTooltip.contains(event.relatedTarget)) hideStripTip();
+  });
+  listen(dlg, 'click', event => {
+    const tip = event.target.closest('[data-quota-tip]');
+    if (tip) showStripTip(tip);
+    else if (stripTipTarget?.matches('[data-quota-tip]')) hideStripTip();
+    const action = event.target.closest('[data-a]')?.dataset.a;
+    if (action === 'quota-refresh') void quotaView.refresh();
+  });
+  listen(dlg, 'change', event => {
+    if (event.target.matches('[data-quota-key]')) quotaView.key(Number(event.target.value));
+  });
   $('#hubGlyph').innerHTML = svg('hub');
   $('[data-open=file]').insertAdjacentHTML('afterbegin', svg('file', 'ic ic-sm'));
   $('[data-open=folder]').insertAdjacentHTML('afterbegin', svg('folder', 'ic ic-sm'));
@@ -2815,8 +3020,7 @@ function init() {
   syncAll(true);
   void refresh({ first: true }).then(() => {
     if (disposed) return;
-    buildRows(!memory.mounted);
-    syncAll(true);
+    animateRows(!memory.mounted);
     if (!memory.mounted) wiresEl.classList.add('draw');
     pumpWires(720);
   });
@@ -2825,18 +3029,23 @@ function init() {
 listen(document, 'visibilitychange', () => {
   if (document.visibilityState !== 'hidden') { void refresh(); pumpWires(180); }
 });
-listen(RM, 'change', () => { quiet(1000); clearLit(); pumpWires(80); });
+listen(RM, 'change', () => { logView?.cancel(); quotaView?.stopAnimations(); quiet(1000); clearLit(); pumpWires(80); });
 init();
 return Object.freeze({
   setTheme,
   refresh: () => refresh({ force: true }),
   dispose() {
     if (disposed) return;
+    logView?.dispose();
+    quotaView?.dispose();
     cancelDrag();
     cancelOwnedDiagnosis();
     gen++;
+    clearTimeout(overlayEntranceTimer);
+    shakeCleanups.get(dlg)?.();
     clearLit();
     resizeObserver.disconnect();
+    historyActionsObserver.disconnect();
     Object.assign(memory, {
       mounted: true, checked: clone(S.checked), bad: clone(S.bad), providerBad: clone(S.providerBad), identity: clone(S.identity),
       readDismissed: S.readDismissed, auxDismissed: S.auxDismissed, lastRouteAt: S.lastRouteAt,

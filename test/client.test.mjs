@@ -3,7 +3,11 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSearchLogView } from '../src/ui/search-log-view.mjs';
+import { createQuotaView } from '../src/ui/quota-view.mjs';
 import { createSourceChain } from '../src/core/source-chain.mjs';
+import { createRouteController } from '../src/ui/route-controller.mjs';
+import { createToolRouteView } from '../src/ui/tool-route-view.mjs';
 
 function loadClient() {
   let factory;
@@ -25,7 +29,7 @@ function loadClient() {
     useMemo: value => value(),
     useRef: () => ({ current: null }),
   };
-  const jsx = () => ({});
+  const jsx = (type, props) => ({ type, props });
   return factory(name => name === 'react' ? react : { jsx, jsxs: jsx, Fragment: Symbol('Fragment') });
 }
 
@@ -41,6 +45,134 @@ test('client declares the owners of its remote and keyed detail slot', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-api-remotes'));
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-plugin-manager'));
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-tool'));
+});
+
+test('GitHub project badge uses the public title slot and is limited to this bundle', async () => {
+  const client = loadClient(), entries = [], disposers = [];
+  const ctx = {
+    locale: { register: () => () => {} }, effect: fn => fn(),
+    remote: { $mount: async () => () => {} },
+    inject(names, fn) {
+      const result = names.includes('theme') ? undefined : fn(ctx);
+      return Object.assign(Promise.resolve(result), { dispose: async () => {} });
+    },
+    slots: {
+      inject(name, fn) { if (name !== 'tool.call.toolview') disposers.push(fn()); },
+      register(options, component) {
+        const entry = { options, component };
+        entries.push(entry);
+        return () => entries.splice(entries.indexOf(entry), 1);
+      },
+    },
+  };
+  const dispose = await client.apply(ctx);
+  const badge = entries.find(entry => entry.options.name === 'plugins.detail.badge');
+  assert.equal(badge.options.id, 'dsh-grok-search-project');
+  for (const subject of [undefined, { kind: 'item', id: 'dsh-grok-search' },
+    { kind: 'row', pkg: { name: 'dsh-grok-search' } },
+    { kind: 'bundle', pkg: { name: 'another-plugin' } }]) {
+    assert.equal(badge.component({ subject }), null);
+  }
+  const own = badge.component({ subject: { kind: 'bundle', pkg: { name: 'dsh-grok-search' } },
+    ...badge.options.inject() });
+  assert.equal(typeof own.type, 'function');
+  assert.ok(own.props.theme.listeners instanceof Set || typeof own.props.theme.listeners.add === 'function');
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  assert.match(source, /href="https:\/\/github\.com\/Lain-in-coding\/dsh-grok-search" target="_blank" rel="noopener noreferrer"/);
+  assert.match(source, /role="tooltip">用着还行？给个star/);
+  for (const cleanup of disposers.reverse()) cleanup?.();
+  assert.equal(entries.length, 0);
+  await dispose();
+});
+
+// Mirrors the host SlotCore: rows keep identity, sort by ascending priority, the
+// first row of a key wins, and subscribers are flushed in one microtask batch.
+function fakeToolSlots() {
+  const rows = [], listeners = new Set();
+  let scheduled = false;
+  const dirty = () => {
+    if (scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => { scheduled = false; for (const listener of [...listeners]) listener(); });
+  };
+  const register = (options, component, extra = {}) => {
+    if (options.name !== 'tool.call.toolview') return () => {};
+    const row = { options, component, locale: options.locale, ...extra };
+    rows.push(row);
+    rows.sort((a, b) => (a.options.priority ?? 0) - (b.options.priority ?? 0));
+    dirty();
+    return () => { const index = rows.indexOf(row); if (index >= 0) { rows.splice(index, 1); dirty(); } };
+  };
+  return { rows, listeners, register,
+    entries: name => name === 'tool.call.toolview' ? rows : [],
+    subscribe(name, listener) {
+      if (name !== 'tool.call.toolview') return () => {};
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    } };
+}
+
+test('chat source ribbon wraps only a plain host web_search row and follows slot changes', async () => {
+  const client = loadClient(), slots = fakeToolSlots(), cleanups = [];
+  const ctx = {
+    locale: { register: () => () => {} }, effect: fn => fn(),
+    remote: { $mount: async () => () => {} },
+    inject(names, fn) {
+      const result = names.includes('theme') ? undefined : fn(ctx);
+      return Object.assign(Promise.resolve(result), { dispose: async () => {} });
+    },
+    slots: {
+      inject(name, fn) { const cleanup = fn(); if (name === 'tool.call.toolview') cleanups.push(cleanup); },
+      register: slots.register, entries: slots.entries, subscribe: slots.subscribe,
+    },
+  };
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const webRows = () => slots.rows.filter(row => row.options.key === 'web_search');
+  function HostWebRow() {}
+  let removeHost = slots.register({ name: 'tool.call.toolview', key: 'web_search', locale: 'host' }, HostWebRow);
+  const dispose = await client.apply(ctx);
+  await settle();
+  const [wrapper, host] = webRows();
+  assert.equal(webRows().length, 2);
+  assert.equal(host.component, HostWebRow);
+  assert.equal(wrapper.options.priority, -1);
+  assert.equal(wrapper.locale, 'host');
+  const tree = wrapper.component({ sessionId: 's', callId: 'c', phase: 'result', block: {} });
+  assert.equal(tree.props.children.find(child => child.type === HostWebRow)?.props.callId, 'c');
+
+  // Its own registration and other tools' changes never wrap or re-register it.
+  const removeOther = slots.register({ name: 'tool.call.toolview', key: 'fetch' }, function Fetch() {});
+  await settle();
+  assert.equal(webRows()[0], wrapper);
+  assert.equal(webRows().length, 2);
+  removeOther();
+
+  // A replaced host row is wrapped again just ahead of its own precedence.
+  function NewHostWebRow() {}
+  removeHost();
+  removeHost = slots.register({ name: 'tool.call.toolview', key: 'web_search', locale: 'host', priority: 4 }, NewHostWebRow);
+  await settle();
+  assert.deepEqual(webRows().map(row => [row.options.priority, row.component === NewHostWebRow]), [[3, false], [4, true]]);
+
+  // A winning third-party view keeps its injected props; the ribbon steps aside.
+  const removeComplex = slots.register({ name: 'tool.call.toolview', key: 'web_search', priority: 2 },
+    function ThirdPartyRow() {}, { inject: () => ({}) });
+  await settle();
+  assert.deepEqual(webRows().map(row => [row.options.priority, Boolean(row.inject)]), [[2, true], [4, false]]);
+  removeComplex();
+  await settle();
+  assert.deepEqual(webRows().map(row => [row.options.priority, row.component === NewHostWebRow]), [[3, false], [4, true]]);
+
+  // Disabling removes the wrapper and stops following later host changes.
+  for (const cleanup of cleanups) cleanup();
+  assert.deepEqual(webRows().map(row => row.component), [NewHostWebRow]);
+  assert.equal(slots.listeners.size, 0);
+  removeHost();
+  slots.register({ name: 'tool.call.toolview', key: 'web_search' }, HostWebRow);
+  await settle();
+  assert.deepEqual(webRows().map(row => row.component), [HostWebRow]);
+  await dispose();
 });
 
 test('production view embeds v74 inputs without mock actions or global presentation changes', () => {
@@ -53,6 +185,41 @@ test('production view embeds v74 inputs without mock actions or global presentat
   assert.doesNotMatch(code, /document\.body\.(?:style|dataset|classList)|document\.documentElement\.dataset/);
 });
 
+test('production embeds exact approved log/quota factories, not scene controls or synthesized balances', () => {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes(createSearchLogView.toString()));
+  assert.ok(source.includes(createQuotaView.toString()));
+  for (const id of ['logCard', 'historyStage', 'historyRoute', 'logPrivacy']) assert.ok(source.includes(id));
+  assert.doesNotMatch(source, /quotaFixture|LOG_SCENES|LOG_DEMO_QUERIES|mockbar|演示数据/);
+  assert.match(source, /scope: JSON\.stringify\(\[id, base, S\.config\?\.quotaRevision/);
+});
+
+test('approved compact quota removes detail panels without discarding query safeguards', () => {
+  const quota = createQuotaView.toString();
+  const css = readFileSync(new URL('../src/ui/search-log.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(quota, /quota-details|quotaDetailsOpen|qp-key-hint|qp-disclosure|qp-details/);
+  assert.match(quota, /data-quota-kind/);
+  assert.match(quota, /当前 Key 最多还可用/);
+  assert.match(quota, /<header class="qp-head"><div class="qp-heading">.*?\$\{tools\}<\/header>/);
+  assert.match(quota, /自定义服务的账户余额请以该服务提供方为准/);
+  assert.match(quota, /cancelAnimations\(\);\s*hideTip\?\.\(\)/);
+  assert.match(quota, /animation\.finished\.then/);
+  assert.match(quota, /parseFloat\(getComputedStyle\(slot\)\.height\)/);
+  assert.match(css, /\.qp-empty\{min-height:36px;/);
+  assert.match(css, /\.qp-head h3\{font-size:13px;font-weight:600;/);
+  assert.match(css, /\.qp-console\{font-size:11px;font-weight:550;/);
+});
+
+test('capability revocation invalidates pending log reads before polling can defer it', () => {
+  const controller = createRouteController.toString();
+  const log = createSearchLogView.toString();
+  assert.match(controller, /S\.capabilities = snapshot\.capabilities;[\s\S]*?if \(S\.capabilities && !S\.capabilities\.secretsAllowed\) void logView\?\.read\(\);/);
+  const read = log.slice(log.indexOf('async function read()'), log.indexOf('async function clearRemoteLog()'));
+  assert.ok(read.indexOf('if (!S.capabilities?.secretsAllowed)') < read.indexOf('if (readTask) return;'));
+  assert.match(read, /if \(!logRestricted\) \{\s*generation\+\+;/);
+  assert.match(read, /mine !== generation \|\| !S\.capabilities\?\.secretsAllowed/);
+});
+
 test('client embeds the exact host source-chain rules', () => {
   const client = loadClient();
   const fields = { source_providers: { value: ['exa', 'tavily'], readOnly: false }, exa_enabled: { value: false, readOnly: false } };
@@ -60,4 +227,253 @@ test('client embeds the exact host source-chain rules', () => {
   assert.equal(JSON.stringify(client.__test.sourceChain.view(fields)), JSON.stringify(host.view(fields)));
   const change = { kind: 'order', order: ['tavily', 'exa', 'firecrawl', 'tinyfish'] };
   assert.equal(JSON.stringify(client.__test.sourceChain.plan(fields, change)), JSON.stringify(host.plan(fields, change)));
+});
+
+test('Grok form names protocols and credentials without implying a provider or key-prefix restriction', () => {
+  const code = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  assert.match(code, />xAI Responses<\/button>/);
+  assert.match(code, />OpenAI 兼容网关<\/button>/);
+  assert.match(code, /title="Responses 接口；支持兼容此协议的自定义服务"/);
+  assert.match(code, /title="Chat Completions 接口"/);
+  assert.match(code, /label: 'Base URL', k: 'gwUrl'/);
+  assert.match(code, /label: 'API Key', k: 'gwKey'/);
+  assert.match(code, /keyIn\('key', p\.key, 'xai-\.\.\.\/sk-\.\.\.'\)/);
+  assert.doesNotMatch(code, /直连 xAI 官方接口/);
+});
+
+test('quota auto-load deduplicates, expires per account and keeps refresh independent from key reveal', async () => {
+  let now = 0, dialog = null, sequence = 0;
+  const calls = [], cancellations = [];
+  const S = { config: { quotaRevision: 'account-a' }, configRevision: 'file-a', capabilities: { secretsAllowed: true } };
+  const makeDialog = (id = 'tavily') => {
+    const base = { url: '', searchUrl: '', key: 'synthetic', keys: ['synthetic-a', 'synthetic-b'] };
+    return { id, kind: 'card', base, draft: structuredClone(base),
+      configBaseline: { revision: S.configRevision, quotaRevision: S.config.quotaRevision } };
+  };
+  const factory = vm.runInNewContext('(' + createQuotaView.toString() + ')', {
+    URL, Date: class extends Date { static now() { return now; } },
+  });
+  let failNext = false;
+  const view = factory({
+    $: () => null, S, getDialog: () => dialog, dlg: {}, active: () => null,
+    DEF: { tavilyUrl: 'https://quota.example.test', exaUrl: 'https://exa.example.test' },
+    SUPP: ['tavily', 'exa', 'tinyfish', 'firecrawl'], dialogBusy: () => false,
+    uuid: () => String(++sequence), remote: {
+      accountQuota(request) {
+        calls.push(request);
+        if (failNext) { failNext = false; return Promise.reject(new Error('synthetic failure')); }
+        return Promise.resolve({ value: { kind: 'credits', remaining: 100 } });
+      },
+      cancelDiagnosis(request) { cancellations.push(request); return Promise.resolve({ cancelled: true }); },
+    },
+  });
+  dialog = makeDialog();
+  await Promise.all([view.open(), view.open(), view.refresh()]);
+  assert.equal(calls.length, 1, 'in-flight opens and manual refresh coalesce');
+  view.cancel(); dialog = makeDialog();
+  await view.open();
+  assert.equal(calls.length, 1, 'reopening the same account reuses its fresh snapshot');
+  await view.key(1);
+  assert.equal(calls.length, 2, 'each saved Tavily key has a distinct automatic lookup');
+  await view.key(0);
+  assert.equal(calls.length, 2, 'switching back reuses the correct key cache');
+  now = 30_001; view.cancel(); dialog = makeDialog();
+  await view.open();
+  assert.equal(calls.length, 3, 'expired cache refreshes on reopen');
+  failNext = true; await view.refresh();
+  assert.equal(calls.length, 4, 'manual refresh bypasses cache freshness');
+  view.render(); view.cancel(); dialog = makeDialog();
+  await view.open();
+  assert.equal(calls.length, 4, 'failed query also has a short retry cooldown');
+  now += 30_001; view.cancel(); dialog = makeDialog();
+  await view.open();
+  assert.equal(calls.length, 5, 'later reopen retries a previously failed account');
+  S.config.quotaRevision = 'account-b'; dialog = makeDialog();
+  await view.open();
+  assert.equal(calls.length, 6, 'effective configuration identity invalidates old balances');
+  dialog.draft.url = 'https://unsaved.example.test'; view.render();
+  await view.open();
+  assert.equal(calls.length, 6, 'unsaved destinations never issue quota requests');
+  dialog = makeDialog('exa'); await view.open();
+  assert.equal(calls.length, 6, 'no invented Exa endpoint');
+  S.capabilities.secretsAllowed = false; dialog = makeDialog(); await view.open();
+  assert.equal(calls.length, 6, 'unsafe connections never automatically query');
+  assert.equal(calls.every(call => Object.keys(call).sort().join(',') ===
+    'expectedRevision,keyIndex,operationId,provider,quotaRevision'), true, 'RPC never sends key or arbitrary URL from the UI');
+  view.dispose();
+});
+
+test('quota draft changes, closed dialogs and disposal reject late replies even if text is restored', async () => {
+  let dialog, sequence = 0;
+  const pending = [], cancelled = [];
+  const S = { config: { quotaRevision: 'account' }, configRevision: 'file', capabilities: { secretsAllowed: true } };
+  const makeDialog = () => {
+    const base = { url: '', key: 'synthetic' };
+    return { id: 'firecrawl', kind: 'card', base, draft: { ...base },
+      configBaseline: { revision: 'file', quotaRevision: 'account' } };
+  };
+  const view = createQuotaView({
+    $: () => null, S, getDialog: () => dialog, dlg: {}, active: () => null,
+    DEF: { fcUrl: 'https://quota.example.test' }, SUPP: ['firecrawl'], dialogBusy: () => false,
+    uuid: () => String(++sequence), remote: {
+      accountQuota(request) { return new Promise(resolve => pending.push({ request, resolve })); },
+      cancelDiagnosis(request) { cancelled.push(request.operationId); return Promise.resolve({ cancelled: true }); },
+    },
+  });
+  dialog = makeDialog();
+  const first = view.open();
+  dialog.draft.url = 'https://changed.example.test'; view.render();
+  assert.deepEqual(cancelled, ['1']);
+  dialog.draft.url = ''; view.render();
+  pending[0].resolve({ value: { kind: 'credits', remaining: 100 } }); await first;
+  const second = view.open();
+  assert.equal(pending.length, 2, 'cancelled reply was not cached after restoring the original text');
+  view.cancel(); dialog = null; view.render();
+  pending[1].resolve({ value: { kind: 'credits', remaining: 200 } }); await second;
+  dialog = makeDialog();
+  const third = view.open();
+  assert.equal(pending.length, 3, 'closed-dialog reply was not cached');
+  view.dispose();
+  pending[2].resolve({ value: { kind: 'credits', remaining: 300 } }); await third;
+  assert.deepEqual(cancelled, ['1', '2', '3']);
+  await view.open();
+  assert.equal(pending.length, 3, 'disposed UI starts no new query');
+});
+
+test('generated client carries the current route controller and separates search errors from credential feedback', () => {
+  const code = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  assert.ok(code.includes(createRouteController.toString()), 'rebuild client after changing the route controller');
+  assert.match(code, /class="note search-result"/);
+  assert.match(code, /GROK_SOURCES_EMPTY: \['来源', '未返回引用链接'\]/);
+  assert.doesNotMatch(code, /没有可核验来源|没有可核验回答/);
+});
+
+test('chat route presentation preserves the host view and never infers unknown history', () => {
+  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes(createToolRouteView.toString()));
+  assert.match(source, /key: 'web_search', locale: entry\.locale/);
+  assert.match(source, /Original: entry\.component/);
+  assert.doesNotMatch(source, /toolName\s*=\s*['"]dsh-grok-search|lastRoute.*toolCallRoute/);
+  const view = createToolRouteView({ React: {}, jsx() {}, remote: {}, Original() {} });
+  const unknown = view.describe({ known: false, routes: [] }, 'result', false);
+  assert.equal(unknown.text, '本次来源未记录');
+  assert.equal(unknown.known, false);
+  const success = view.describe({ known: true, state: 'done', routes: [
+    { served: 'tavily', outcome: 'ok', fallbackUsed: false },
+  ] }, 'result', false);
+  assert.equal(success.text, '由 dsh-grok-search 执行 · Tavily');
+  assert.equal(success.tone, 'ok');
+  const fallback = view.describe({ known: true, state: 'done', routes: [
+    { served: 'grok-sources', outcome: 'ok', fallbackUsed: true },
+  ] }, 'result', false);
+  assert.match(fallback.text, /来源未报告 · 已回退$/);
+  const attributed = view.describe({ known: true, state: 'done', routes: [
+    { served: 'exa', resultProviders: ['grok', 'exa'], resultProvidersComplete: true, fallbackUsed: true },
+  ] }, 'result', false);
+  assert.equal(attributed.text, '由 dsh-grok-search 执行 · Grok / Exa · 已回退');
+  const partial = view.describe({ known: true, state: 'done', routes: [
+    { served: 'exa', resultProviders: ['exa'], resultProvidersComplete: false, fallbackUsed: true },
+  ] }, 'result', false);
+  assert.equal(partial.text, '由 dsh-grok-search 执行 · Exa / 来源未报告 · 已回退');
+  const batch = view.describe({ known: true, state: 'done', routes: [
+    { served: 'tavily', outcome: 'ok' }, { served: 'exa', outcome: 'ok' },
+  ] }, 'result', false);
+  assert.match(batch.text, /Tavily \/ Exa$/);
+  assert.equal(view.describe({ known: true, state: 'failed', routes: [
+    { served: null, outcome: 'failed', code: 'SOURCE_ALL_FAILED' },
+  ] }, 'result', true).tone, 'error');
+});
+
+test('chat route presentation marks capped calls as incomplete instead of presenting partial sources as all sources', () => {
+  const view = createToolRouteView({ React: {}, jsx() {}, remote: {}, Original() {} });
+  const routes = [{ served: 'tavily', outcome: 'ok', fallbackUsed: false }];
+  const done = view.describe({ known: true, state: 'done', routesComplete: false, routes }, 'result', false);
+  assert.equal(done.text, '由 dsh-grok-search 执行 · Tavily · 其余来源未记录');
+  assert.equal(done.tone, 'ok');
+  const failed = view.describe({ known: true, state: 'failed', routesComplete: false, routes }, 'result', false);
+  assert.equal(failed.text, '由 dsh-grok-search 执行 · Tavily · 其余来源未记录 · 搜索失败');
+  assert.equal(failed.tone, 'error');
+  assert.equal(view.describe({ known: true, state: 'done', routes }, 'result', false).text, '由 dsh-grok-search 执行 · Tavily');
+});
+
+// A one-component React stand-in: state survives renders and the effect reruns
+// only when its dependencies change, which is enough to drive the route poll.
+function routeHarness() {
+  let answer = null, dependencies, pendingEffect, cleanup;
+  const requests = [];
+  const view = createToolRouteView({
+    React: {
+      useState: () => [answer, value => { answer = value; }],
+      useEffect(effect, next) {
+        if (!dependencies || next.some((value, index) => value !== dependencies[index])) {
+          cleanup?.(); dependencies = next; pendingEffect = effect;
+        }
+      },
+    },
+    jsx: (type, props) => ({ type, props }), Original() {},
+    remote: { toolCallRoute: request => new Promise((resolve, reject) => requests.push({ request, resolve, reject })) },
+  });
+  const render = (phase, callId = 'same-call', sessionId = 'session') => {
+    const tree = view.Component({ sessionId, callId, phase });
+    if (pendingEffect) { const effect = pendingEffect; pendingEffect = null; cleanup = effect(); }
+    return tree.props.children.find(child => child.type === 'span').props;
+  };
+  const reply = async result => { requests.shift().resolve(result); await Promise.resolve(); };
+  return { view, requests, render, reply, unmount: () => cleanup?.() };
+}
+
+test('tool route mount and phase changes stay neutral while reading, until the final unknown reply', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { view, requests, render, reply, unmount } = routeHarness();
+  const reading = props => {
+    assert.equal(props.children, '正在读取本次来源…');
+    assert.equal(props['data-tone'], 'unknown');
+  };
+  try {
+    reading(render('result'));
+    await reply({ known: false, state: 'unknown', routes: [] });
+    reading(render('result'));
+    t.mock.timers.tick(750);
+    await reply({ known: false, state: 'unknown', routes: [] });
+    reading(render('result'));
+    t.mock.timers.tick(750);
+    await reply({ known: false, state: 'unknown', routes: [] });
+    assert.equal(render('result').children, '本次来源未记录');
+    const result = { known: true, state: 'running', routes: [{ served: 'tavily', outcome: 'ok' }] };
+    reading(render('start'));
+    await reply(result);
+    assert.match(render('start').children, /Tavily · 正在搜索$/);
+    reading(render('result'));
+    await reply({ ...result, state: 'done' });
+    assert.equal(render('result').children, '由 dsh-grok-search 执行 · Tavily');
+    assert.equal(view.describe({ known: false, routes: [] }, 'result', false).text, '本次来源未记录');
+    reading(render('result', 'unreadable'));
+    requests.shift().reject(new Error('synthetic RPC unavailable'));
+    await Promise.resolve();
+    assert.equal(render('result', 'unreadable').children, '本次来源暂不可读');
+  } finally { unmount(); t.mock.timers.reset(); }
+});
+
+test('tool route reading state needs a polled identity and leaves start wording to the reply', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { requests, render, reply, unmount } = routeHarness();
+  try {
+    assert.equal(render('result', 'no-session', null).children, '本次来源未记录');
+    assert.equal(render('start', null).children, '正在确认搜索通道…');
+    assert.equal(render('preparing').children, '等待搜索调用');
+    assert.equal(requests.length, 0, 'a card that is never polled must not wait in the reading state');
+    assert.equal(render('start').children, '正在读取本次来源…');
+    await reply({ known: false, state: 'unknown', routes: [] });
+    assert.equal(render('start').children, '正在确认搜索通道…');
+    t.mock.timers.tick(750);
+    assert.equal(requests.length, 1, 'start keeps polling until the route is published');
+  } finally { unmount(); t.mock.timers.reset(); }
+});
+
+test('cancelled tool routes stay cancelled even when the host marks the result as an error', () => {
+  const view = createToolRouteView({ React: {}, jsx() {}, remote: {}, Original() {} });
+  const label = view.describe({ known: true, state: 'cancelled',
+    routes: [{ served: 'tavily', outcome: 'cancelled' }] }, 'result', true);
+  assert.equal(label.text, '由 dsh-grok-search 执行 · Tavily · 已取消');
+  assert.equal(label.tone, 'cancelled');
 });

@@ -6,13 +6,13 @@ import * as desktopPreparation from '../scripts/deferred-release-desktop-prepare
 import * as cliWeb from '../scripts/b3-cli-web.mjs';
 
 const readJson = name => JSON.parse(readFileSync(new URL('../' + name, import.meta.url), 'utf8'));
-const versions = ['0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5'];
+const versions = ['0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5', '0.2.2-rc.1'];
 
-test('rc.5 兼容补丁同步版本、宿主声明与锁文件，不放宽到未来版本', () => {
+test('0.2.2-rc.1 适配同步版本、宿主声明与锁文件，不放宽到未来版本', () => {
   const manifest = readJson('package.json');
   const lock = readJson('package-lock.json');
   const matrix = readJson('support-matrix.json');
-  assert.equal(manifest.version, '0.1.1');
+  assert.equal(manifest.version, '0.2.0');
   assert.equal(lock.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
   assert.equal(matrix.packageVersion, manifest.version);
@@ -23,9 +23,11 @@ test('rc.5 兼容补丁同步版本、宿主声明与锁文件，不放宽到未
     assert.equal(manifest.peerDependencies[name], manifest.engines.dsh);
   }
   assert.deepEqual(manifest.dependencies, { '@modelcontextprotocol/client': '2.4.0', 'smol-toml': '1.9.1' });
+  assert.equal(manifest.peerDependencies['@deepseek-ai/cordis'], '~4.0.5 || ~4.1.0');
+  assert.equal(manifest.peerDependencies['@deepseek-ai/schemastery'], '~3.18.5 || ~3.19.0');
 });
 
-test('支持矩阵覆盖 rc.2 至 rc.5 的十二个明确组合，不扩张 Windows/macOS 独立 Web', () => {
+test('支持矩阵覆盖旧四版和 0.2.2-rc.1 的十五个组合，不扩张 Windows/macOS 独立 Web', () => {
   const matrix = readJson('support-matrix.json');
   const targets = matrix.targets.map(row => `${row.platform}/${row.host}/${row.dsh}`).sort();
   const expected = [
@@ -45,11 +47,13 @@ test('rc.4 Desktop 属于源码审查支持，不得冒充官方 Desktop 原包�
   for (const row of matrix.targets) {
     assert(Object.hasOwn(matrix.verificationLevels, row.verificationLevel));
   }
-  const inferred = matrix.targets.filter(row => row.verificationLevel === 'source-reviewed');
+  const inferred = matrix.targets.filter(row => row.dsh === '0.2.1-rc.4' && row.host === 'Desktop');
   assert.deepEqual(inferred.map(row => `${row.platform}/${row.host}/${row.dsh}`).sort(), [
     'darwin-arm64/Desktop/0.2.1-rc.4', 'win32-x64/Desktop/0.2.1-rc.4',
   ]);
-  assert.equal(matrix.targets.filter(row => row.verificationLevel === 'host-tested').length, 10);
+  for (const row of inferred) assert.equal(row.verificationLevel, 'source-reviewed');
+  assert.equal(matrix.targets.filter(row => row.verificationLevel === 'host-tested' && row.dsh !== '0.2.2-rc.1').length, 10);
+  assert.equal(matrix.targets.filter(row => row.verificationLevel === 'host-tested' && row.dsh === '0.2.2-rc.1').length, 3);
   for (const row of inferred) {
     assert.match(row.verification, /源码/);
     assert.match(row.verification, /未.*实测/);
@@ -60,18 +64,24 @@ test('rc.4 Desktop 属于源码审查支持，不得冒充官方 Desktop 原包�
 test('README 的验证边界不把全部支持组合写成自动化实测', () => {
   const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const boundary = readme.split('<summary>还有哪些验证边界？</summary>')[1]?.split('</details>')[0];
+  const support = readme.split('## 支持范围')[1]?.split('\n## ')[0];
   assert(boundary);
-  assert.match(boundary, /rc\.4 Desktop/);
-  assert.match(boundary, /源码审查/);
-  assert.doesNotMatch(boundary, /支持表列出的组合已完成自动化验证/);
+  assert(support);
+  assert.match(boundary, /\[支持范围\]\(#支持范围\)/);
+  assert.match(support, /rc\.4 Desktop/);
+  assert.match(support, /源码审查/);
+  assert.match(support, /未单独实测官方 rc\.4 桌面发行包/);
+  assert.doesNotMatch(boundary + support, /支持表列出的组合已完成自动化验证/);
 });
 
-test('Desktop 候选工具接受 rc.5 但保留历史边界，不能以 alpha 或未来 rc 替代实测', () => {
+test('Desktop 候选工具接受 0.2.2-rc.1 但不自动接受 alpha 或未来 rc', () => {
+  assert(CANDIDATE_VERSIONS.includes('0.2.2-rc.1'));
   assert(CANDIDATE_VERSIONS.includes('0.2.1-rc.5'));
   assert(CANDIDATE_VERSIONS.includes('0.2.1-rc.2'));
   assert(CANDIDATE_VERSIONS.includes('0.2.1-rc.3'));
   assert(!CANDIDATE_VERSIONS.includes('0.2.2-alpha.2'));
   assert(!CANDIDATE_VERSIONS.includes('0.2.1-rc.6'));
+  assert(!CANDIDATE_VERSIONS.includes('0.2.2-rc.2'));
 });
 
 test('隔离测试 bundle 使用被核验的真实宿主版本，不能因旧版硬编码被 rc.5 跳过', () => {
@@ -93,6 +103,21 @@ test('所有 CLI/Web 用例都检查设置 DOM，缺少浏览器参数应在启�
     const options = cliWeb.parseCliWebArguments([...common, '--case', value, '--browser-executable', '/test/chromium']);
     assert.equal(options.browserExecutable, '/test/chromium');
   }
+});
+
+test('新版 CLI/Web 在准备环境前拒绝 Node 22，允许隔离指定 Node 24.9 及以上', () => {
+  for (const version of ['22.22.2', '24.8.1', 'invalid']) {
+    assert.equal(cliWeb.cliNodeVersionSupported(version, '022-rc1'), false);
+  }
+  for (const version of ['24.9.0', 'v24.14.1', '25.0.0']) {
+    assert.equal(cliWeb.cliNodeVersionSupported(version, '022-rc1'), true);
+  }
+  assert.equal(cliWeb.cliNodeVersionSupported('22.22.2', 'rc5'), true);
+  const common = ['--dsh-cli', 'cli/bin.js', '--dsh-version', '022-rc1', '--product-package', 'candidate.tgz',
+    '--grok-linux-archive', 'grok.tar.gz', '--pnpm-entry', 'pnpm.mjs', '--pnpm-store', 'store', '--pnpm-cache', 'cache',
+    '--browser-executable', '/test/chromium'];
+  assert.equal(cliWeb.parseCliWebArguments([...common, '--linux-node', '/tmp/node/bin/node']).linuxNode, '/tmp/node/bin/node');
+  assert.throws(() => cliWeb.parseCliWebArguments([...common, '--linux-node', 'node']), /absolute Linux/);
 });
 
 test('CLI/Web 日志索引与实际扁平文件名一致，不能指向不存在的 logs 目录', () => {

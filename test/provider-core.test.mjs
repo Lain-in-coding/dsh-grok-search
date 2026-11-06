@@ -65,6 +65,29 @@ test('结构化和单个 JSON 文本响应均可解码，错误不得伪装成�
   assert.throws(() => mapSearchResult({ sources: [{ title: '无 URL' }] }), error => error.code === 'GROK_INVALID_RESULT');
 });
 
+test('来源标签随保留下来的结果跨预算映射，但不进入模型输出', () => {
+  const input = { content: 'ok', sources: [
+    { url: 'https://example.invalid/a', provider: 'tavily_fallback' },
+    { url: 'https://example.invalid/a', provider: 'exa_fallback' },
+    { url: 'file:///not-a-result', provider: 'firecrawl_fallback' },
+    { url: 'https://user:secret@example.invalid/private', provider: 'tinyfish_fallback' },
+    { url: 'https://example.invalid/b', provider: 'exa_enrichment' },
+    { url: 'https://example.invalid/c', provider: 'grok_responses' },
+    { url: 'https://example.invalid/d', provider: 'tavily_fallback_extra' },
+    { url: 'https://example.invalid/e', provider: 'constructor' },
+    { url: 'https://example.invalid/f', provider: { key: 'private' } },
+  ] };
+  const first = mapSearchResult(input);
+  const second = mapSearchResult(first, { maxResults: 2 });
+  assert.deepEqual(second.sources.map(source => source.provider), ['tavily_fallback', 'exa_enrichment']);
+  assert.equal(first.sources[2].provider, 'grok_responses');
+  assert.ok(first.sources.slice(3).every(source => source.provider === undefined));
+  assert.deepEqual(Object.keys(second.sources[0]), ['url']);
+  assert.doesNotMatch(JSON.stringify(second), /provider|fallback|enrichment|secret|private/);
+  assert.equal(mapSearchResult({ sources: [{ url: 'https://example.test/compat', provider: 'openai_compatible' }] })
+    .sources[0].provider, 'openai_compatible');
+});
+
 test('默认一个运行、八个排队，超出容量明确失败', async () => {
   const gate = deferred(); let calls = 0, peak = 0, active = 0;
   const executor = createSearchExecutor({ snapshot: () => ({}), runQuery: async () => {

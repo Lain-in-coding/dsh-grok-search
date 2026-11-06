@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.1.1",
-  "channel": "兼容与安全修复候选：审核后 npm latest（next 同版本入口）与 GitHub Release 使用同一个安装包",
-  "supportPolicy": "targets 列出本候选的兼容支持组合，verificationLevel 单独说明验证依据。支持声明不要求逐个官方 Desktop 发行包实测：rc.4 Desktop 经关键源码一致性审查并结合已有宿主证据纳入支持，但不宣称原包实测通过。新候选仍须完成受影响验证并审核后发布。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
+  "packageVersion": "0.2.0",
+  "channel": "正式版本：npm latest（next 同版本入口）与 GitHub Release 使用同一个安装包",
+  "supportPolicy": "targets 列出本版本的兼容支持组合，verificationLevel 单独说明验证依据。支持声明不要求逐个官方 Desktop 发行包实测：rc.4 Desktop 经关键源码一致性审查并结合已有宿主证据纳入支持，但不宣称原包实测通过。后续版本仍须完成受影响验证并审核后发布。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
   "verificationLevels": {
     "host-tested": "有对应系统、架构、入口和版本的宿主自动化测试记录；具体场景见 verification。运行时未变时可按源码哈希复用原范围证据，不把旧包安装写成新包安装，也不表示真实付费接口通过。",
     "source-reviewed": "基于明确的接口与源码审查及相邻版本/同版其他入口证据声明兼容；未单独实测该官方 Desktop 原包。此等级属于支持范围，不属于宿主实测通过。"
@@ -103,10 +103,31 @@
       "dsh": "0.2.1-rc.5",
       "verificationLevel": "host-tested",
       "verification": "自动化测试通过（WSL Ubuntu 22.04）：CLI/Web 安装与逐文件核对、设置页、搜索与网页抓取及聊天保持、即时启停、配置重载不回退官方、只用补充来源、首次使用自动下载 grok-search-rs 程序与诊断；上游使用本机合成响应"
+    },
+    {
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.2-rc.1",
+      "verificationLevel": "host-tested",
+      "verification": "官方原始 ASAR 的隔离 Desktop：配置/日志/回放/额度142项、安装移除、首次下载与诊断、原生/PTC多会话、预算、启停恢复、旧会话重开、配置重载及两种官方搜索选择通过；合成上游，不是付费服务验收"
+    },
+    {
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "dsh": "0.2.2-rc.1",
+      "verificationLevel": "host-tested",
+      "verification": "GitHub macOS Apple Silicon 自动化通过：官方 Desktop 原始程序/ASAR 的隔离安装、配置/日志/回放/额度、原生/PTC多会话、热启停、两种官方搜索选择、首次下载与诊断；合成上游，不是付费接口验收"
+    },
+    {
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "dsh": "0.2.2-rc.1",
+      "verificationLevel": "host-tested",
+      "verification": "WSL Ubuntu 22.04、隔离 Node 24.14.1：完整182项和首次使用199项通过，包括安装、共享配置、安全RPC、日志/额度/回放、原生启停、配置重载后工具恢复、自动下载与缓存复用；合成上游"
     }
   ],
   "realKeyVerification": {
-    "win32-x64": "作者用真实 Key 实测 Grok 主搜索返回结果；自动化测试另用真实 Key 完成只用补充来源的搜索（由 Tavily 返回结果）",
+    "win32-x64": "Grok 主搜索的作者人工通过记录来自 0.1.x，不是 0.2.0 当前主搜验收。0.2.0 开发期间曾验证四个补充来源、三家账户额度及 GitHub 认证；2026-11-06 复核时部分既有 Key 返回 401，仅 Firecrawl 回退成功，此后的第三方 Grok 网关未返回可核验引用。历史成功、当前凭据状态和隔离合成测试分别记录，不把内部回退当作主搜通过。",
     "darwin-arm64": "尚未做真实付费接口验收",
     "linux-x64": "尚未做真实付费接口验收"
   },

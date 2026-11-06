@@ -46,8 +46,16 @@ export const CONFIG_FIELDS = Object.freeze({
 });
 const knownReadOnly = new Set(['fetch_max_chars', 'source_max_answers', 'source_max_comments',
   'enrich_concurrency', 'enrich_max_chars', 'max_inline_sources']);
-const envValue = (env, key, platform = process.platform) => Object.entries(env)
-  .find(([name]) => platform === 'win32' ? name.toUpperCase() === key : name === key)?.[1];
+function environmentValues(environment) {
+  // Enumerating process.env on Windows crosses the native environment boundary.
+  // Capture it once per read, not once for each field; never cache it across reads.
+  const values = new Map();
+  for (const [name, value] of Object.entries(environment)) {
+    const key = process.platform === 'win32' ? name.toUpperCase() : name;
+    if (!values.has(key)) values.set(key, value);
+  }
+  return values;
+}
 
 function parseDocument(text) {
   try { return parse(text.replace(/^\uFEFF/, ''), { integersAsBigInt: 'asNeeded', unsafeKeyBehaviour: 'throw' }); }
@@ -172,9 +180,9 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
     }
   };
   const effective = document => {
-    const environment = env();
+    const environment = environmentValues(env());
     return Object.fromEntries(Object.entries(CONFIG_FIELDS).map(([key, spec]) => {
-    const raw = envValue(environment, spec.env);
+    const raw = environment.get(spec.env);
     let value, source;
     if (typeof raw === 'string' && raw !== '') {
       source = 'environment';
@@ -189,16 +197,18 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
     return [key, { value, source, readOnly: spec.readOnly === true || source === 'environment' }];
   }));
   };
-  const snapshot = () => {
+  const readSnapshot = () => {
     const document = read();
-    const fields = effective(document);
+    const resolved = effective(document);
+    const fields = { ...resolved };
     for (const [key, item] of Object.entries(fields)) if (CONFIG_FIELDS[key].type === 'secret') {
       const count = item.value.split(',').filter(value => value.trim()).length;
       fields[key] = { value: null, configured: count > 0, keyCount: count, source: item.source, readOnly: item.readOnly };
     }
-    return { path, exists: document.exists, revision: document.revision, fields,
-      unknownFields: Object.keys(document.values).filter(key => !CONFIG_FIELDS[key] && !knownReadOnly.has(key)) };
+    return { effective: resolved, snapshot: { path, exists: document.exists, revision: document.revision, fields,
+      unknownFields: Object.keys(document.values).filter(key => !CONFIG_FIELDS[key] && !knownReadOnly.has(key)) } };
   };
+  const snapshot = () => readSnapshot().snapshot;
   const commit = (expectedRevision, transform) => {
     if (expectedRevision !== 'missing' && !/^[a-f0-9]{64}$/.test(expectedRevision ?? '')) fail('CONFIG_REVISION_REQUIRED', '保存前必须读取当前配置修订。');
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -243,6 +253,9 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
   };
   return Object.freeze({
     snapshot,
+    // Server-only paired read: a redacted snapshot and its exact effective
+    // identity come from the same file/environment observation.
+    readSnapshot,
     readEffective: () => effective(read()),
     reveal(key) {
       if (CONFIG_FIELDS[key]?.type !== 'secret') fail('CONFIG_FIELD_INVALID', '只能显式查看凭据字段。');

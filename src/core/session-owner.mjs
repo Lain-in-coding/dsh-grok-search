@@ -16,10 +16,22 @@ export function createSessionOwner({ open, idleMs = 300_000, onError = () => {} 
     if (closing) return closing;
     if (!current) return Promise.resolve();
     const retiring = current;
+    const retiredGeneration = generation;
     current = null;
     const pending = Promise.resolve().then(() => retiring.session.close());
     closing = pending;
-    pending.then(() => { if (closing === pending) closing = null; }, error => { fault = error; });
+    pending.then(() => { if (closing === pending) closing = null; }, error => {
+      fault = error;
+      // Same exit proof as the outer executor: an unreaped process carries the
+      // promise of its actual exit. Only that proof lifts this fault, so a
+      // replacement is never launched over an exit that was not observed.
+      if (error?.code !== 'GROK_PROCESS_REAP_FAILED' || typeof error.whenExited?.then !== 'function') return;
+      Promise.resolve(error.whenExited).then(() => {
+        if (generation !== retiredGeneration || fault !== error || closing !== pending) return;
+        fault = null;
+        closing = null;
+      }, () => {});
+    });
     return pending;
   };
   const armIdle = () => {

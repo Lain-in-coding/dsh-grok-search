@@ -1,7 +1,7 @@
 <section class="route-card" id="routeCard" data-layout="wide" aria-labelledby="routeTitle">
   <div class="rc-head">
     <div class="rc-title">
-      <h3 id="routeTitle">搜索路由</h3>
+      <h3 id="routeTitle" tabindex="-1">搜索路由</h3>
       <span class="pill" id="statusPill" data-s="load"><i class="pill-dot" aria-hidden="true"></i><span id="statusText">读取配置…</span></span>
     </div>
     <div class="rc-actions">
@@ -16,7 +16,20 @@
         </div>
       </div>
     </div>
+      <div class="history-bar" id="historyBar" hidden>
+        <span class="history-label" id="historyLabel"></span>
+        <span class="history-phase" id="historyPhase" aria-hidden="true"></span>
+        <div class="history-actions">
+          <button type="button" class="replay-control" id="historyStop">停止</button>
+          <button type="button" class="replay-control history-return" id="historyReturn">返回该条日志</button>
+          <button type="button" class="replay-control history-dismiss" id="historyDismiss" aria-label="关闭回放提示" hidden></button>
+        </div>
+      </div>
   </div>
+    <div class="history-context" id="historyContext" hidden>
+      <span class="history-query" id="historyQuery"></span>
+      <div class="lroute history-route" id="historyRoute" role="img" aria-label="这条历史记录的完整结果链路" title="最终结果路径，不表示上游网络请求的先后顺序。"></div>
+    </div>
   <div class="banner-slot" id="bannerSlot"></div>
   <div class="stage" id="stage" data-layout="wide" role="group" aria-label="搜索路由图">
     <svg class="wires" id="wires" aria-hidden="true"></svg>
@@ -38,12 +51,12 @@
       </div>
     </div>
     <div class="col-hub">
-      <button type="button" class="node node-hub" id="nodeHub" aria-label="Grok Search RS 设置">
+      <button type="button" class="node node-hub" id="nodeHub" aria-label="Grok Search Rs 设置">
         <span class="port" data-port="hub-in"></span>
         <span class="port" data-port="hub-out"></span>
         <span class="hub-glyph" id="hubGlyph" aria-hidden="true"></span>
         <span class="hub-text">
-          <span class="node-name">Grok Search RS</span>
+          <span class="node-name">Grok Search Rs</span>
           <span class="node-meta" id="hubMeta">准备中…</span>
         </span>
         <span class="hub-pill" id="hubPill"><span id="hubPillText">按顺序</span><span aria-hidden="true">›</span></span>
@@ -64,6 +77,9 @@
       </div>
     </div>
   </div>
+    <div class="history-stage" id="historyStage" role="group" aria-label="历史搜索结果链路" hidden></div>
+    <p class="history-note" id="historyNote" hidden>历史结果路径 · 动效不代表原始请求时序</p>
+
   <footer class="rc-foot">
     <span class="cf-label">配置文件</span>
     <code class="cf-path" id="cfgPath"></code>
@@ -73,3 +89,30 @@
     <button type="button" class="btn btn-ghost btn-sm" data-open="folder">打开文件夹</button>
   </footer>
 </section>
+
+  <section class="log-card" id="logCard" data-region="插件提供的界面" aria-labelledby="logTitle">
+    <div class="lc-head">
+      <div class="lc-title">
+        <h3 id="logTitle">最近搜索 <span class="lc-count" id="logCount">0</span></h3>
+        <p class="lc-sub">点击记录查看查询与消耗</p>
+      </div>
+      <div class="lc-actions">
+        <div class="lc-filters" role="radiogroup" aria-label="筛选搜索记录">
+          <span class="lc-filter-active" id="logFilterActive" aria-hidden="true"></span>
+          <button type="button" role="radio" data-logfilter="all" aria-checked="true" tabindex="0">全部</button>
+          <button type="button" role="radio" data-logfilter="ok" aria-checked="false" tabindex="-1">成功</button>
+          <button type="button" role="radio" data-logfilter="fallback" aria-checked="false" tabindex="-1">回退</button>
+          <button type="button" role="radio" data-logfilter="failed" aria-checked="false" tabindex="-1">失败</button>
+        </div>
+        <button type="button" class="lc-privacy" id="logPrivacy" aria-pressed="false" aria-label="隐藏搜索内容" title="隐藏搜索内容"></button>
+      </div>
+    </div>
+    <div class="log-list" id="logList" role="list" aria-label="最近搜索与路由事件"></div>
+    <footer class="lc-foot">
+      <span id="logNote">仅内存 · 最近 20 条 · 停用或退出 DSH 后清空</span>
+      <button type="button" class="btn btn-ghost btn-sm" id="logClear">清空记录</button>
+    </footer>
+    <div class="sr-only" id="logAnnouncer" role="status" aria-live="polite" aria-atomic="true"></div>
+  </section>
+
+<div class="route-tooltip" id="logTooltip" role="tooltip" hidden></div>

@@ -26,8 +26,10 @@ lines.on('line', line => {
   if (request.method === 'initialize') {
     if (mode === 'init-hang') return;
     if (mode === 'init-exit') { process.exit(23); return; }
-    if (mode === 'init-error') {
-      send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message: 'api_key=never-retain-this-secret' } });
+    if (mode === 'init-error' || mode === 'init-empty-spoof') {
+      send({ jsonrpc: '2.0', id: request.id, error: { code: mode === 'init-error' ? -32603 : -32001,
+        message: mode === 'init-error' ? 'api_key=never-retain-this-secret'
+          : 'provider error: web_search returned no sources: grok_sources_empty, and the source fallback produced nothing (never-retain-this-secret)' } });
       return;
     }
     result(request.id, {
@@ -60,6 +62,20 @@ lines.on('line', line => {
     send({ jsonrpc: '2.0', id: request.id, error: { code: -32001, message: 'Authorization: Bearer never-retain-this-secret' } });
     return;
   }
+  if (mode.startsWith('rpc-empty-')) {
+    const reason = mode === 'rpc-empty-auth' ? 'grok_auth_error'
+      : mode === 'rpc-empty-unknown' ? 'grok_unknown_reason' : 'grok_sources_empty';
+    const message = mode === 'rpc-empty-spoof'
+      ? `Authorization: Bearer never-retain-this-secret; ${reason}`
+      : `${mode === 'rpc-empty-no-prefix' ? '' : 'provider error: '}web_search returned no sources: ${reason}, and ${mode === 'rpc-empty-budget'
+        ? 'the fallback source budget is 0 (GROK_SEARCH_FALLBACK_SOURCES)'
+        : 'the source fallback produced nothing (never-retain-this-secret)'}.`;
+    send({ jsonrpc: '2.0', id: request.id, error: {
+      code: mode === 'rpc-empty-wrong-code' ? -32603 : -32001, message,
+      data: { secret: 'never-retain-this-secret' },
+    } });
+    return;
+  }
   if (mode === 'tool-error') {
     result(request.id, { isError: true, content: [{ type: 'text', text: 'GROK_API_KEY=never-retain-this-secret' }] });
     return;
@@ -78,6 +94,13 @@ lines.on('line', line => {
     fallback_used: mode === 'fallback',
     truncated: mode === 'fallback',
   };
+  if (mode.startsWith('attribution-')) {
+    const provider = mode.slice('attribution-'.length);
+    payload.search_provider = 'source_fallback';
+    payload.fallback_used = true;
+    payload.fallback_reason = 'grok_sources_empty';
+    payload.sources = [{ ...payload.sources[0], provider: `${provider}_fallback` }];
+  }
   if (mode === 'stderr') process.stderr.write('api_key=never-retain-this-secret\n'.repeat(10_000));
   if (mode === 'malformed-result') payload.sources = 'not-an-array';
   answered = true;

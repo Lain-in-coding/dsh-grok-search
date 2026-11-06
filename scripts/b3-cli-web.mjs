@@ -41,16 +41,25 @@ const VERSIONS = Object.freeze({
   rc3: '0.2.1-rc.3',
   rc4: '0.2.1-rc.4',
   rc5: '0.2.1-rc.5',
+  '022-rc1': '0.2.2-rc.1',
 });
 const CASES = new Set(['smoke', 'stop', 'full']);
+
+export function cliNodeVersionSupported(version, dshVersion) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!match) return false;
+  const major = Number(match[1]), minor = Number(match[2]);
+  return dshVersion === '022-rc1' ? major > 24 || major === 24 && minor >= 9 : major >= 22;
+}
 
 function usage() {
   return [
     'Usage:',
-    '  node scripts/b3-cli-web.mjs --dsh-cli <bin.js> --dsh-version <rc2|rc3|rc4|rc5>',
+    '  node scripts/b3-cli-web.mjs --dsh-cli <bin.js> --dsh-version <rc2|rc3|rc4|rc5|022-rc1>',
     '    --product-package <tgz> --grok-linux-archive <tar.gz> --case <smoke|stop|full>',
     '    --browser-executable <linux-browser-path>',
     '    --pnpm-entry <pnpm.cjs> --pnpm-store <path> --pnpm-cache <path>',
+    '    [--linux-node <absolute-linux-node-path>]',
   ].join('\n');
 }
 
@@ -71,6 +80,7 @@ function parseArgs(argv) {
     ['--pnpm-store', 'pnpmStore'],
     ['--pnpm-cache', 'pnpmCache'],
     ['--first-use', 'firstUse'],
+    ['--linux-node', 'linuxNode'],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -90,13 +100,16 @@ function parseArgs(argv) {
     throw new Error(`--browser-executable is required for every case (settings DOM is always checked).\n${usage()}`);
   }
   if (!Object.hasOwn(VERSIONS, options.dshVersion)) {
-    throw new Error(`Unsupported --dsh-version ${JSON.stringify(options.dshVersion)}; expected rc2, rc3, rc4 or rc5.`);
+    throw new Error(`Unsupported --dsh-version ${JSON.stringify(options.dshVersion)}; expected ${Object.keys(VERSIONS).join(', ')}.`);
   }
   if (!CASES.has(options.case)) {
     throw new Error(`Unsupported --case ${JSON.stringify(options.case)}; expected smoke, stop or full.`);
   }
   if (options.firstUse && options.firstUse !== 'download') throw new Error('Expected --first-use download.');
   if (options.firstUse && options.case !== 'full') throw new Error('First-use verification requires --case full.');
+  if (options.linuxNode && (!options.linuxNode.startsWith('/') || /[\r\n\0]/.test(options.linuxNode))) {
+    throw new Error('--linux-node must be an absolute Linux executable path.');
+  }
   options.dshCli = resolve(options.dshCli);
   options.productPackage = resolve(options.productPackage);
   options.grokLinuxArchive = resolve(options.grokLinuxArchive);
@@ -688,10 +701,18 @@ async function windowsBootstrap(options) {
     }
     const cliRoot = findInstallRoot(options.dshCli);
     stage = 'wsl-preflight';
+    const linuxNode = options.linuxNode ?? 'node';
     const preflight = await runSync('wsl.exe', [
       '-d', distro, '--exec', 'bash', '-lc',
       'printf "%s\\n" "$(uname -m)" "$(node --version)" "$(npm --version)"',
     ]);
+    if (options.linuxNode) {
+      const selected = await runSync('wsl.exe', ['-d', distro, '--exec', linuxNode, '--version']);
+      if (selected.code !== 0) throw new Error('The explicitly selected Linux Node executable cannot start.');
+      const lines = preflight.stdout.trim().split(/\r?\n/);
+      lines[1] = selected.stdout.trim();
+      preflight.stdout = lines.join('\n');
+    }
     commands.push({
       label: 'wsl-preflight',
       command: 'wsl.exe',
@@ -701,9 +722,8 @@ async function windowsBootstrap(options) {
     if (preflight.code !== 0) throw new Error(`WSL preflight failed: ${preflight.stderr.trim()}`);
     const environment = preflight.stdout.trim().split(/\r?\n/);
     if (environment[0] !== 'x86_64') throw new Error(`Expected WSL x86_64, got ${environment[0]}.`);
-    const nodeMajor = Number(environment[1]?.replace(/^v/, '').split('.')[0]);
-    if (!Number.isSafeInteger(nodeMajor) || nodeMajor < 22) {
-      throw new Error(`Expected WSL Node >= 22, got ${environment[1]}.`);
+    if (!cliNodeVersionSupported(environment[1], options.dshVersion)) {
+      throw new Error(`Expected WSL Node >= ${options.dshVersion === '022-rc1' ? '24.9' : '22'}, got ${environment[1]}.`);
     }
 
     stage = 'create-temporary-root';
@@ -760,7 +780,7 @@ async function windowsBootstrap(options) {
     stage = 'linux-worker';
     const worker = await new Promise((resolvePromise, reject) => {
       const child = spawn('wsl.exe', [
-        '-d', distro, '--exec', 'node', paths.script,
+        '-d', distro, '--exec', linuxNode, paths.script,
         '--worker',
         '--run-id', runId,
         '--dsh-cli', paths.dshCli,
@@ -1136,8 +1156,8 @@ async function linuxWorker(options) {
     if (platform() !== 'linux' || arch() !== 'x64') {
       throw new Error(`Linux x64 is required, got ${platform()} ${arch()}.`);
     }
-    const nodeMajor = Number(process.versions.node.split('.')[0]);
-    check('linux-node-22', nodeMajor >= 22, { node: process.versions.node });
+    check('linux-node-supported', cliNodeVersionSupported(process.versions.node, options.dshVersion),
+      { node: process.versions.node, minimum: options.dshVersion === '022-rc1' ? '24.9.0' : '22.0.0' });
     packageReceipt = JSON.parse(readFileSync(packageReceiptPath, 'utf8'));
     if (options.bootstrapFile && existsSync(options.bootstrapFile)) {
       bootstrap = JSON.parse(readFileSync(options.bootstrapFile, 'utf8'));
@@ -1232,7 +1252,7 @@ async function linuxWorker(options) {
     });
 
     const npmEnv = {
-      PATH: process.env.PATH,
+      PATH: `${dirname(process.execPath)}:${process.env.PATH}`,
       HOME: homedir(),
       LANG: process.env.LANG ?? 'C.UTF-8',
       LC_ALL: process.env.LC_ALL ?? '',
@@ -1357,7 +1377,7 @@ async function linuxWorker(options) {
     });
 
     const dshEnv = {
-      PATH: `${pnpmBinDir}:${firstUse ? '/usr/local/bin:/usr/bin:/bin' : process.env.PATH}`,
+      PATH: `${pnpmBinDir}:${dirname(process.execPath)}:${firstUse ? '/usr/local/bin:/usr/bin:/bin' : process.env.PATH}`,
       HOME: home,
       LANG: process.env.LANG ?? 'C.UTF-8',
       LC_ALL: process.env.LC_ALL ?? '',
@@ -2325,6 +2345,54 @@ async function linuxWorker(options) {
         check('linux-settings-TinyFish-unconfigured-switch', await renderer.evaluate(`${q('.head-switch .switch')}
           ?.getAttribute('aria-checked') === 'false'`));
         await click('[data-a=cancel]');
+        await waitForRenderer(renderer, current => current.evaluate(`${q('#overlay')}?.hidden === true`));
+        // New log surface uses the real host RPC and a real managed MCP request;
+        // only the HTTP model response is supplied by the existing loopback stub.
+        await waitForRenderer(renderer, current => current.evaluate(`Boolean(${q('#logCard')})`));
+        await delay(2800);
+        // History is plugin-owned for the enabled lifetime: earlier searches stay
+        // visible to a new view, so the new record is identified by its id.
+        const logLease = crypto.randomUUID();
+        const logRead = await settingsCall('readSearchLog', { sessionId: logLease });
+        check('linux-search-log-authenticated-history', logRead.ok === true && Array.isArray(logRead.value.records)
+          && logRead.value.records.every(record => record.kind !== 'running'));
+        const previousLogId = logRead.ok ? logRead.value.records[0]?.id ?? null : null;
+        const loggedAnswer = await probe('product-query-result');
+        check('linux-search-log-real-provider-result', loggedAnswer.sources.length > 0);
+        const loggedRecord = await waitFor(async () => {
+          const state = await settingsCall('readSearchLog', { sessionId: logLease });
+          const latest = state.ok ? state.value.records[0] : null;
+          return latest && latest.id !== previousLogId && latest.kind === 'ok' ? latest : null;
+        }, 15000, 'new search log record');
+        await waitForRenderer(renderer, current => current.evaluate(`${q('.log-entry')}?.dataset.parentId === ${JSON.stringify(loggedRecord.id)}
+          && ${q('.log-entry')}?.dataset.kind === 'ok'`));
+        check('linux-search-log-production-dom', await renderer.evaluate(
+          `${q('.log-entry .lroute')}.innerText.includes('Grok') && !${q('.lofficial')}`));
+        check('linux-search-log-details-click', await click('.log-entry .le-head'));
+        check('linux-search-log-unknown-cost-honest', await renderer.evaluate(`Boolean(${q('.log-entry .lu-unknown')})`));
+        const networkBeforeReplay = grokResponsesStub.requests.length;
+        check('linux-search-log-replay-click', await click('.log-entry [data-log-replay]'));
+        await waitForRenderer(renderer, current => current.evaluate(`!${q('#historyStage')}.hidden`));
+        check('linux-search-log-full-history-route', await renderer.evaluate(
+          `JSON.stringify([...${q('#historyRoute')}.querySelectorAll('.lnode')].map(e=>e.dataset.node)) === '["dsh","hub","grok"]'`));
+        await waitForRenderer(renderer, current => current.evaluate(`Boolean(${q('.hr-wires .packet')})`));
+        check('linux-search-log-packet-glow', await renderer.evaluate(`(() => {
+          const packet=${q('.hr-wires .packet')};
+          return packet.querySelector('.p-halo').getAttribute('r')==='7'
+            && packet.querySelector('.p-core').getAttribute('r')==='3.2';})()`));
+        await click('#historyStop');
+        await waitForRenderer(renderer, current => current.evaluate(`${q('#historyStage')}.hidden`));
+        check('linux-search-log-replay-no-request', grokResponsesStub.requests.length === networkBeforeReplay);
+        await click('#logPrivacy');
+        check('linux-search-log-privacy', await renderer.evaluate(`${q('.le-query')}?.textContent === '搜索内容已隐藏'`));
+        await click('#logPrivacy');
+        await click('#logClear');
+        await waitForRenderer(renderer, current => current.evaluate(`${q('#logList')}.querySelectorAll('.log-entry').length===0`));
+        const clearedLease = await settingsCall('clearSearchLog', { sessionId: logLease });
+        check('linux-search-log-clear-rpc', clearedLease.ok === true && clearedLease.value.records.length === 0);
+        const closedLease = await settingsCall('closeSearchLog', { sessionId: logLease });
+        check('linux-search-log-close-rpc', closedLease.ok === true && closedLease.value.closed === true);
+        check('linux-search-log-no-renderer-exception', renderer.exceptions.length === 0);
         step('browser-settings-dom', {
           browser: '<BROWSER_EXECUTABLE>',
           href: detail.href,
@@ -2587,10 +2655,18 @@ async function linuxWorker(options) {
           reloadProbe: reloadState.reloadProbe,
         });
       if (reloadState.reloadProbe?.toolResult?.isError) {
-        check('config-reload-error-explicit', /CONTROL_|WEB_PROVIDER_|GROK_/i
+        const revokedAdmission = options.dshVersion === '022-rc1'
+          && reloadState.reloadProbe.toolErrorCode === 'UNKNOWN_TOOL'
+          && /unknown tool.*web_search/i.test(JSON.stringify(reloadState.reloadProbe.toolResult));
+        check('config-reload-error-explicit', revokedAdmission || /CONTROL_|WEB_PROVIDER_|GROK_/i
           .test(JSON.stringify(reloadState.reloadProbe.toolResult)), {
             toolResult: reloadState.reloadProbe.toolResult,
           });
+        if (revokedAdmission) {
+          const recovered = await runTurn('post-reload-admission-recovery', 'search', 'web_search');
+          check('post-reload-admission-restored', recovered.snapshot.runtimeWeb.searchProviderId === 'grok-search'
+            && recovered.snapshot.calls.original === 0 && officialStub.requests.length === officialRequestsBeforeReload);
+        }
       }
       grokRequestsAfterTakeover = grokResponsesStub.requests.length;
     }
@@ -2614,6 +2690,9 @@ async function linuxWorker(options) {
     });
 
     await browserSettingsDom();
+    // The new browser log check issued one extra search after the prior
+    // conversation baseline; subsequent stop assertions use this observed end.
+    grokRequestsAfterTakeover = grokResponsesStub.requests.length;
 
     if (options.case === 'full') {
       const originalText = readFileSync(grokConfigPath, 'utf8');

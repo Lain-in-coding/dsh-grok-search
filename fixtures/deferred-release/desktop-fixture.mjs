@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { createControlIntentStore } from '../../src/core/control-intent-store.mjs';
+import { effectiveConfig } from '../../src/core/product-control.mjs';
 
 export const name = 'candidate-desktop-fixture';
 export const inject = ['loader', 'profileContext'];
@@ -106,7 +107,7 @@ export async function apply(ctx) {
       runtimeWeb: web ? { searchProviderId: web.searchProviderId ?? raw(web.config).searchProvider,
         fetchProviderId: web.fetchProviderId ?? raw(web.config).fetchProvider,
         searchProviders: [...web.searchProviders.keys()] } : null,
-      webConfig: raw(webEntry.fiber.config), webInject: structuredClone(webEntry.options.inject),
+      webConfig: raw(effectiveConfig(webEntry.fiber)), webInject: structuredClone(webEntry.options.inject),
       authorConfig: structuredClone(webEntry.options.config),
       existingDependencyPresent: Boolean(ctx.get('candidateExistingDependency')),
       entries: [...ctx.loader.entries()].map(row => ({ id: row.options.id, state: row.fiber?.state ?? null,
@@ -140,7 +141,10 @@ export async function apply(ctx) {
           if (op === 'product-query-result') {
             const web = ctx.get('web');
             if (!web) throw new Error('Public WebRuntime is not available.');
-            return web.search({ query: 'offline per-query budget probe', maxResults: 1 }, AbortSignal.timeout(5000));
+            const query = typeof args.query === 'string' && args.query.length <= 1000
+              ? args.query : 'offline per-query budget probe';
+            const timeoutMs = args.timeoutMs === 30000 ? 30000 : 5000;
+            return web.search({ query, maxResults: 1 }, AbortSignal.timeout(timeoutMs));
           }
           if (op === 'model-auth') return { url: probeCtx.connection.authenticatedUrl('http://127.0.0.1:' + probeCtx.webServer.port + '/') };
           if (op === 'tool-definition') {
@@ -155,7 +159,7 @@ export async function apply(ctx) {
             const rows = [...ctx.loader.entries()];
             const core = rows.some(row => row.options.id === 'grok-search-core')
               ? entry('grok-search-core') : entry('grok-search');
-            const coreConfig = raw(core.fiber.config);
+            const coreConfig = raw(effectiveConfig(core.fiber));
             return { sessionId: args.sessionId, definitions, coreBudgetMs: coreConfig.budgetMs ?? null };
           }
           if (op === 'websocket') {
@@ -252,6 +256,7 @@ export async function apply(ctx) {
               promptAcceptedAt: Date.now(), toolCallAt: toolCall.time,
               toolResultAt: toolResult.time, overlappedReload: toolCall.time <= reloadSettledAt,
               toolResult: toolResult.data?.message ?? null,
+              toolErrorCode: toolResult.data?.error?.code ?? null,
               originalSearchCounter: ctx.get('grokSearchOriginalSearchCounter')?.snapshot?.() ?? null } };
           }
           if (op === 'wait-recovery') { await waitForDesktopRecovery(ctx); return snapshot(); }

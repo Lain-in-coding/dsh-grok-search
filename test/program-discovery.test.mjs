@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discoverGrokCandidates, findExistingGrok, grokPlatformPackage, inspectGrokProgram } from '../src/core/program-discovery.mjs';
+import { resolveGrokProgram } from '../src/core/program-install.mjs';
 const setup = () => mkdtempSync(join(tmpdir(), 'dsh-discovery-test-'));
 const makeFile = path => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'offline-fixture'); return path; };
 const nativeBinary = process.platform === 'win32' ? 'grok-search-rs.exe' : 'grok-search-rs';
@@ -32,6 +33,40 @@ test('npm global layout is resolved to the native binary, never to its launcher'
   assert.equal(rows.length, 1);
   assert.equal(rows[0].path, binary);
   assert.equal(rows[0].source, 'npm');
+});
+test('an orphan npm shim or incomplete package is never executed and falls back to the private program', async () => {
+  for (const artifact of ['grok-search-rs.cmd', 'grok-search-rs.ps1', 'grok-search-rs.bat',
+    'node_modules/grok-search-rs/package.json',
+    'node_modules/@epsiekygrr_zedxx/grok-search-rs-win32-x64/package.json']) {
+    for (const cached of [{ path: 'private-cache', found: true }, null]) {
+      const root = setup();
+      makeFile(join(root, artifact));
+      let inspections = 0, actives = 0, installs = 0;
+      const result = await resolveGrokProgram({
+        env: { PATH: root, USERPROFILE: root }, platform: 'win32', arch: 'x64',
+        inspect: async () => { inspections++; throw new Error('must not execute a shim'); },
+        installer: {
+          active: async () => { actives++; return cached; },
+          install: async () => { installs++; return { path: 'prepared', found: true }; },
+        },
+      });
+      assert.equal(inspections, 0, artifact);
+      assert.equal(actives, 1, artifact);
+      // A completed private install is reused; only a missing one is prepared.
+      assert.equal(installs, cached ? 0 : 1, artifact);
+      assert.equal(result.path, cached ? 'private-cache' : 'prepared', artifact);
+    }
+  }
+});
+test('a healthy native installation is reusable despite an orphan shim elsewhere on PATH', async () => {
+  const root = setup(), stale = join(root, 'stale'), healthy = join(root, 'healthy');
+  makeFile(join(stale, 'grok-search-rs.cmd'));
+  const binary = makeFile(join(healthy, 'grok-search-rs.exe'));
+  const result = await findExistingGrok({
+    env: { PATH: `${stale};${healthy}`, USERPROFILE: root }, platform: 'win32', arch: 'x64',
+    inspect: async path => ({ path, version: '0.1.26' }),
+  });
+  assert.equal(result.path, binary);
 });
 test('PATH and cargo discovery de-duplicate the same native program', () => {
   const root = setup();

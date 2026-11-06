@@ -194,6 +194,10 @@ try {
     calls: liveCounter.snapshot().calls, completionAbsent: true, injectedEventOnly: true,
   });
 } catch (error) {
+  observations.push({ label: 'failed-lifecycle-state',
+    entries: loader ? [...loader.entries()].map(entry => ({ id: entry.options.id,
+      state: entry.fiber?.state, error: entry.fiber?.error?.message ?? null })) : [],
+    logs: ctx.logger.buffer });
   failures.push({ message: error.message, stack: error.stack });
   process.exitCode = 1;
 } finally {

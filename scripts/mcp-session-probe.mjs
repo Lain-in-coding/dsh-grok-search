@@ -7,6 +7,9 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createManagedMcpSearch, runMcpSearch } from '../src/core/mcp-search.mjs';
 import { createGrokProvider } from '../src/provider.mjs';
+import { createRoutedSearch } from '../src/core/routed-search.mjs';
+import { createReleaseBarrier } from '../src/core/release-transaction.mjs';
+import { randomUUID } from 'node:crypto';
 import { freshRun, project, sha256, writeJson, cleanEnvironment } from './lib/internal-candidate-utils.mjs';
 
 const args = process.argv.slice(2);
@@ -179,7 +182,7 @@ try {
     await assert.rejects(provider.provider.search({ query: 'after-dispose' }), error => error.code === 'GROK_SEARCH_STOPPING');
   });
   if (grokExecutable) await check('real-grok-binary-reuses-one-process-with-local-upstream', async () => {
-    let requests = 0;
+    let requests = 0, omitSources = false;
     const server = createServer((request, response) => {
       request.resume();
       request.on('end', () => {
@@ -191,7 +194,7 @@ try {
         response.end(JSON.stringify({ id: 'offline-' + requests, object: 'response', status: 'completed',
           output_text: 'Real Grok local probe.',
           output: [
-            { type: 'web_search_call', action: { sources: [{ url: 'https://example.invalid/offline', title: 'Offline source' }] } },
+            { type: 'web_search_call', action: { sources: omitSources ? [] : [{ url: 'https://example.invalid/offline', title: 'Offline source' }] } },
             { type: 'message', content: [{ type: 'output_text', text: 'Real Grok local probe.' }] },
           ] }));
       });
@@ -218,16 +221,97 @@ try {
       assert.equal(new Set(pids).size, 1);
       assert.equal(requests, 4);
       assert.equal(version, '0.1.26');
+      omitSources = true;
+      await assert.rejects(session.run({ ...base, executable: grokExecutable, executableArgs: [],
+        configPath: binaryConfig, request: { query: 'Offline missing citations unique query' }, remainingMs: () => 10_000 }),
+      error => error.code === 'grok_sources_empty' && error.message === 'Grok 未返回引用链接。'
+        && error.diagnostic.exited === true);
+      assert.equal(alive(pids[0]), false, 'failed empty-source MCP session is reaped');
+      omitSources = false;
+      const recovered = await session.run({ ...base, executable: grokExecutable, executableArgs: [],
+        configPath: binaryConfig, request: { query: 'Offline recovered citations unique query' }, remainingMs: () => 10_000 });
+      assert.equal(recovered.sources[0].url, 'https://example.invalid/offline');
+      assert.notEqual(recovered.diagnostic.childPid, pids[0]);
+      pids.push(recovered.diagnostic.childPid);
+      assert.equal(requests, 6);
     } finally {
       await session.dispose();
       server.closeAllConnections();
       await new Promise(resolveClose => server.close(resolveClose));
     }
     assert.equal(alive(pids[0]), false);
-    return { version, upstreamRequests: requests, uniqueProcesses: new Set(pids).size, binarySha256: sha256(grokExecutable) };
+    return { version, upstreamRequests: requests, uniqueProcesses: new Set(pids).size,
+      emptySourceReasonValidated: true, reconnectedAfterError: true, binarySha256: sha256(grokExecutable) };
+  });
+  if (grokExecutable) await check('real-grok-internal-fallback-identifies-each-serving-provider', async () => {
+    const cases = [], received = [];
+    const server = createServer(async (request, response) => {
+      for await (const _ of request) { /* Discard query and synthetic headers. */ }
+      const path = new URL(request.url, 'http://127.0.0.1').pathname;
+      received.push(path);
+      response.setHeader('content-type', 'application/json');
+      if (path === '/v1/responses') {
+        response.end(JSON.stringify({ id: 'source-attribution-probe', object: 'response', status: 'completed',
+          output_text: 'No verifiable citations in this synthetic primary response.',
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'No citations.' }] }] }));
+        return;
+      }
+      const source = { url: 'https://example.test/provider-proof', title: 'Local source evidence', content: 'Local result',
+        summary: 'Local result', snippet: 'Local result', description: 'Local result', score: .99 };
+      response.end(JSON.stringify(path.startsWith('/firecrawl/')
+        ? { success: true, data: { web: [source] } } : { results: [source] }));
+    });
+    await new Promise(done => server.listen(0, '127.0.0.1', done));
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    try {
+      for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
+        const localConfig = join(root, 'attribution-' + provider + '.toml');
+        writeFileSync(localConfig, [
+          `grok_api_url = "${origin}/v1"`, 'grok_api_key = "offline-synthetic-key"', 'grok_auth_mode = "api_key"',
+          'grok_model = "offline-attribution"', 'web_search_enabled = true', 'x_search_enabled = false',
+          'source_providers = ["tavily","exa","tinyfish","firecrawl"]',
+          'default_extra_sources = 3', 'fallback_sources = 5', 'response_max_chars = 45000',
+          `tavily_api_url = "${origin}/tavily"`, 'tavily_api_key = "offline-synthetic-key"',
+          `exa_api_url = "${origin}/exa"`, 'exa_api_key = "offline-synthetic-key"',
+          `tinyfish_search_api_url = "${origin}/tinyfish"`, 'tinyfish_api_key = "offline-synthetic-key"',
+          `firecrawl_api_url = "${origin}/firecrawl"`, 'firecrawl_api_key = "offline-synthetic-key"',
+          ...['tavily', 'exa', 'tinyfish', 'firecrawl'].map(id => `${id}_enabled = ${id === provider}`),
+        ].join('\n') + '\n', { flag: 'wx' });
+        const session = createManagedMcpSearch();
+        let internal;
+        const routed = createRoutedSearch({ grok: { search: async () => {
+          internal = await session.run({ ...base, executable: grokExecutable, executableArgs: [],
+            configPath: localConfig, request: { query: 'Local source identity ' + provider }, remainingMs: () => 10_000 });
+          return internal;
+        } }, sourceRouter: { snapshot: () => ({ available: false }) }, releaseBarrier: createReleaseBarrier() });
+        const before = received.length;
+        try {
+          await routed.search({ query: 'Local source identity ' + provider });
+          assert.equal(internal.diagnostic.serverVersion, '0.1.26');
+          assert.equal(internal.diagnostic.fallbackUsed, true);
+          assert.equal(internal.diagnostic.fallbackReason, 'grok_sources_empty');
+          assert.ok(internal.sources.length > 0);
+          assert.ok(internal.sources.every(source => source.provider === `${provider}_fallback`));
+          assert.equal(routed.routeSnapshot().served, provider);
+          const row = routed.searchLog.snapshot(randomUUID()).records[0];
+          assert.deepEqual(row.resultProviders, [provider]);
+          assert.equal(row.resultProvidersComplete, true);
+          assert.equal(row.calls.at(-1).evidence, 'source-label');
+          assert.equal(row.calls.at(-1).keyIndex, null);
+          assert.equal(row.calls.at(-1).charge.basis, 'unknown');
+          cases.push({ provider, label: `${provider}_fallback`, served: row.served, sources: internal.sources.length,
+            requestPaths: received.slice(before), passed: true });
+        } finally { await routed.dispose(); await session.dispose(); }
+      }
+    } finally {
+      server.closeAllConnections();
+      await new Promise(done => server.close(done));
+    }
+    return { cases, binarySha256: sha256(grokExecutable), configScope: 'isolated-synthetic-only', paidRequests: 0 };
   });
 } catch (error) { fatal = { code: error.code ?? null, message: error.message }; }
 const sources = ['src/core/session-owner.mjs', 'src/core/mcp-search.mjs', 'src/core/search-executor.mjs',
+  'src/core/result-map.mjs', 'src/core/routed-search.mjs', 'src/core/search-log.mjs',
   'src/provider.mjs', 'fixtures/mcp/grok-server.mjs', 'scripts/mcp-session-probe.mjs'];
 const summary = { runId, status: fatal ? 'fail' : 'pass', checks, fatal: fatal ?? null,
   scope: 'real-owned-node-process-and-fixed-MCP-SDK-with-offline-peer',

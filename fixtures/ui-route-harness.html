@@ -7,8 +7,12 @@
 <link rel="icon" href="data:,">
 <style>
 body { margin:0; padding:32px; background:#eef0f3; color:#14161a; font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif; }
-main { width:1016px; max-width:100%; margin:0 auto; }
-h1 { margin:0 0 24px; font-size:19px; font-weight:650; }
+/* Match the supported Desktop's plugin-detail slot, not the wider mockup. */
+main { width:960px; max-width:100%; margin:0 auto; }
+h1 { margin:0; font-size:19px; font-weight:650; }
+.detail-title-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:24px; }
+.version-tag { font-size:12px; font-weight:500; color:#68707d; }
+#project-badge { display:inline-flex; }
 button { font:inherit; }
 body[data-theme=dark] { background:#0c0d10; color:#ecedf0; }
 #outside { margin-bottom:24px; }
@@ -17,7 +21,7 @@ body[data-theme=dark] { background:#0c0d10; color:#ecedf0; }
 </head>
 <body>
 <main>
-  <h1>dsh-grok-search</h1>
+  <div class="detail-title-row"><h1>dsh-grok-search</h1><span class="version-tag">0.2.0</span><span id="project-badge"></span></div>
   <button id="outside">宿主外部按钮（焦点隔离测试）</button>
   <div id="preview"></div>
 </main>

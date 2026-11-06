@@ -9,10 +9,10 @@
   color-scheme:light;
   --page:#eef0f3; --surface:#ffffff; --surface-2:#f7f8fa; --stage:#f4f5f8; --dot:#dde0e6;
   --line:#e5e7eb; --line-2:#d5d8de; --hair:rgba(15,23,42,.06);
-  --text:#14161a; --text-2:#545a66; --text-3:#878d98; --text-4:#b3b7bf;
+  --text:#14161a; --text-2:#545a66; --text-3:#626a77; --text-4:#767e8b;
   --field:#f1f2f5; --field-hover:#eaecf0; --field-focus:#ffffff;
-  --agent:#4d6bfe; --agent-soft:rgba(77,107,254,.10); --agent-ring:rgba(77,107,254,.30);
-  --btn-primary:#4d6bfe; --btn-primary-hover:#3d59e8;
+  --agent:#4d6bfe; --agent-soft:rgba(77,107,254,.10); --agent-ring:rgba(77,107,254,.30); --agent-text:#3559d8;
+  --btn-primary:#4561ed; --btn-primary-hover:#3d59e8;
   --ok:#12a150; --ok-soft:rgba(18,161,80,.10); --ok-text:#0a7a3b;
   --warn:#b86e00; --warn-soft:rgba(214,138,0,.11); --warn-line:#e0a23a; --warn-text:#8c5a00;
   --err:#e5484d; --err-soft:rgba(229,72,77,.10); --err-text:#b32429; --err-solid:#a92a30;
@@ -30,10 +30,10 @@
   color-scheme:dark;
   --page:#0c0d10; --surface:#16181c; --surface-2:#1b1d22; --stage:#111316; --dot:#24272d;
   --line:#272a31; --line-2:#353941; --hair:rgba(255,255,255,.06);
-  --text:#ecedf0; --text-2:#a6abb5; --text-3:#7a808b; --text-4:#50555e;
+  --text:#ecedf0; --text-2:#a6abb5; --text-3:#9aa1ac; --text-4:#929aa7;
   --field:#1f2227; --field-hover:#252930; --field-focus:#121417;
-  --agent:#7b93ff; --agent-soft:rgba(123,147,255,.14); --agent-ring:rgba(123,147,255,.34);
-  --btn-primary:#4d6bfe; --btn-primary-hover:#6680ff;
+  --agent:#7b93ff; --agent-soft:rgba(123,147,255,.14); --agent-ring:rgba(123,147,255,.34); --agent-text:#9eb0ff;
+  --btn-primary:#4561ed; --btn-primary-hover:#3d59e8;
   --ok:#3ccb7f; --ok-soft:rgba(60,203,127,.12); --ok-text:#3ccb7f;
   --warn:#f0b04a; --warn-soft:rgba(240,176,74,.12); --warn-line:#c98b2a; --warn-text:#f0b04a;
   --err:#ff6b70; --err-soft:rgba(255,107,112,.13); --err-text:#ff7b80; --err-solid:#b23b41;
@@ -52,8 +52,10 @@
 [hidden]{display:none !important}
 :host{all:initial;display:block;min-width:0}
 .dsg-surface{font:13px/1.5 var(--font);color:var(--text);-webkit-font-smoothing:antialiased;text-align:left}
-.dsg-root{width:100%;min-width:0}
-.route-scroll{min-width:0;overflow-x:auto;padding:20px 12px;margin:-20px -12px;scrollbar-gutter:stable}
+.dsg-root{width:100%;min-width:0;container-type:inline-size}
+/* The host detail is normally 960px, not the standalone mockup's 1016px.
+   Keep one fluid canvas; shadows remain visible without a nested scrollport. */
+.route-scroll{display:flow-root;width:100%;min-width:0}
 .dsg-layer{width:0;height:0;pointer-events:none}
 .dsg-layer .overlay,.dsg-layer .route-tooltip{pointer-events:auto}
 button,input,select,textarea{font:inherit;color:inherit}
@@ -66,14 +68,14 @@ a{color:inherit}
 .ic-sm{width:13px;height:13px}
 
 /* ---------- 路由卡 ---------- */
-.route-card{position:relative;min-width:820px;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-md);padding:18px 20px 0;transition:background-color .25s,border-color .25s}
-.rc-head{display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:8px 12px}
+.route-card{position:relative;width:100%;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-md);padding:18px 20px 0;transition:background-color .25s,border-color .25s}
+.rc-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:8px 12px}
 .rc-title{display:flex;align-items:center;align-content:center;flex-wrap:wrap;gap:4px 10px;min-width:0;min-height:32px}
 .rc-title h3{margin:0;font-size:15px;font-weight:650;letter-spacing:-.005em;white-space:nowrap}
-.rc-actions{position:relative;display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap;flex:none;min-width:0;max-width:100%}
+.rc-actions{position:relative;display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap;flex:0 1 auto;min-width:0;max-width:100%;margin-left:auto}
 
 /* 顺序 = 补充链优先级；logo = 启用状态；圆点 = 最近验证结果，三者不互相冒充。 */
-.strip-slot{flex:none;display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .3s var(--ease),opacity .25s var(--ease)}
+.strip-slot{flex:0 1 auto;min-width:0;max-width:100%;display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .3s var(--ease),opacity .25s var(--ease)}
 .strip-slot.has{grid-template-rows:1fr;opacity:1}
 .strip-slot:not(.has){display:none}
 .strip-slot > div{overflow:hidden;min-height:0}
@@ -110,7 +112,7 @@ a{color:inherit}
 .route-tooltip[hidden]{display:none}
 .banner-slot{display:grid;grid-template-rows:0fr;margin-top:0;transition:grid-template-rows .32s var(--ease),margin-top .32s var(--ease)}
 .banner-slot.has{grid-template-rows:1fr;margin-top:12px}
-.banner-slot > div{overflow:hidden;min-height:0}
+.banner-slot > div{overflow:hidden;min-width:0;min-height:0}
 
 /* 状态胶囊 */
 .pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px 0 8px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--surface-2);color:var(--text-2);border:1px solid var(--line);white-space:nowrap;transition:background-color .25s,color .25s,border-color .25s}
@@ -167,7 +169,7 @@ a{color:inherit}
 .banner .b-body{flex:1;min-width:0}
 .banner .b-title{display:block;color:var(--text);font-weight:600}
 .banner .b-text{display:block;margin-top:1px}
-.banner .b-text code{white-space:nowrap}
+.banner .b-text code{white-space:normal;overflow-wrap:anywhere}
 .banner .b-actions{display:flex;gap:4px;align-items:center;flex:none;align-self:center}
 .banner[data-tone=info] .b-ic{color:var(--agent)}
 .banner[data-tone=warn]{background:var(--warn-soft);border-color:transparent}
@@ -186,10 +188,10 @@ a{color:inherit}
 .mini-chip .tile{--s:14px}
 
 /* ---------- 路由舞台 ---------- */
-.stage{position:relative;margin:14px -20px 0;padding:28px 28px;display:grid;align-items:center;justify-content:center;min-height:300px;background-color:var(--stage);background-image:radial-gradient(var(--dot) 1px,transparent 1.3px);background-size:16px 16px;background-position:8px 8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);transition:column-gap .35s var(--ease),padding .3s var(--ease),background-color .25s}
+.stage{position:relative;margin:14px -20px 0;padding:28px clamp(12px,3cqi,28px);display:grid;align-items:center;justify-content:center;min-height:300px;background-color:var(--stage);background-image:radial-gradient(var(--dot) 1px,transparent 1.3px);background-size:16px 16px;background-position:8px 8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);transition:column-gap .35s var(--ease),padding .3s var(--ease),background-color .25s}
 /* 与 magpie 路由图一致：左侧两个节点单行并排，右侧供应商单列竖排 */
-.stage{grid-template-columns:148px 150px minmax(300px,460px);column-gap:56px}
-.col-agent,.col-hub,.col-list{position:relative;z-index:2}
+.stage{grid-template-columns:clamp(128px,16cqi,148px) clamp(132px,16cqi,150px) minmax(0,460px);column-gap:clamp(12px,calc((100cqi - 560px)/6),56px)}
+.col-agent,.col-hub,.col-list{position:relative;z-index:2;min-width:0}
 
 .wires{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:1;transition:opacity .3s var(--ease)}
 .wg .wt{fill:none;stroke:none;stroke-width:5;stroke-linecap:round}
@@ -247,7 +249,7 @@ a{color:inherit}
 .node-meta{font:500 11px/1.45 var(--mono);color:var(--text-3)}
 .node-meta .nw{white-space:nowrap}
 #hubMeta{display:flex;flex-wrap:wrap;justify-content:center;column-gap:4px}
-.node-dsh .node-name{white-space:nowrap}
+.node-dsh .node-name{white-space:normal}
 .node-logo{display:block;filter:drop-shadow(0 1px 1px rgba(15,23,42,.10));transition:filter .4s var(--ease),opacity .4s var(--ease)}
 
 /* DSH 节点（对应 magpie 的 Codex 卡）：位置始终不动 */
@@ -516,6 +518,10 @@ a{color:inherit}
 .sub-h{margin:12px 0 0;padding-top:12px;border-top:1px solid var(--line);font-size:11.5px;font-weight:650;color:var(--text-2);display:flex;align-items:center;gap:6px}
 .note{display:flex;gap:8px;align-items:flex-start;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:11.5px;color:var(--text-2);line-height:1.55;margin:8px 0}
 .note svg{flex:none;margin-top:1px;color:var(--text-3)}
+.search-result{border:1px solid var(--err-soft);background:var(--err-soft)}
+.search-result svg{color:var(--err-text)}
+.search-result span{min-width:0;white-space:pre-line;overflow-wrap:anywhere}
+.search-result strong{display:block;margin-bottom:2px;font-weight:600;color:var(--err-text)}
 
 /* ---------- 加载骨架 ---------- */
 .skel{display:inline-block;height:10px;border-radius:5px;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}

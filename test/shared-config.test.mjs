@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createSharedConfigStore, patchSharedToml, resolveSharedConfigPath } from '../src/core/shared-config.mjs';
+import { CONFIG_FIELDS, createSharedConfigStore, patchSharedToml, resolveSharedConfigPath } from '../src/core/shared-config.mjs';
 
 function setup(text, options = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-config-test-'));
@@ -44,6 +44,59 @@ test('environment overrides file and defaults, without exposing secret values', 
   assert.ok(!JSON.stringify(state).includes('file-key'));
   assert.throws(() => store.save({ expectedRevision: state.revision, updates: { grok_api_key: 'ignored-key' } }),
     code('CONFIG_ENV_OVERRIDE'));
+});
+
+test('all file-backed keys stay editable and persistent across independent store lifetimes', () => {
+  const { path, historyDirectory, store } = setup('# Existing shared file\nfuture_setting = "preserved"\n');
+  const keys = Object.entries(CONFIG_FIELDS).filter(([, spec]) => spec.type === 'secret').map(([key]) => key);
+  const updates = Object.fromEntries(keys.map(key => [key, 'synthetic-persisted-' + key]));
+  const saved = store.save({ expectedRevision: store.snapshot().revision, updates });
+  const reopen = () => createSharedConfigStore({ path, historyDirectory, env: () => ({}) });
+  for (const key of keys) {
+    const reopened = reopen();
+    assert.equal(reopened.snapshot().revision, saved.revision);
+    assert.equal(reopened.snapshot().fields[key].source, 'file');
+    assert.equal(reopened.snapshot().fields[key].readOnly, false);
+    assert.equal(reopened.reveal(key).value, updates[key]);
+  }
+  const reopened = reopen();
+  reopened.save({ expectedRevision: reopened.snapshot().revision, updates: { exa_api_key: 'synthetic-replaced-again' } });
+  assert.equal(reopen().reveal('exa_api_key').value, 'synthetic-replaced-again');
+  assert.equal(store.reveal('exa_api_key').value, 'synthetic-replaced-again', 'other readers of the same file see the update');
+  assert.match(readFileSync(path, 'utf8'), /# Existing shared file\nfuture_setting = "preserved"/);
+});
+
+test('paired settings snapshot enumerates environment once and returns matching redacted and private values', () => {
+  let enumerations = 0, reads = 0;
+  const environment = new Proxy({ GROK_SEARCH_API_KEY: 'synthetic-first', GROK_SEARCH_MODEL: 'first' }, {
+    ownKeys(target) { enumerations++; return Reflect.ownKeys(target); },
+  });
+  const { store, path } = setup('tavily_api_key = "synthetic-file"\n', {
+    env: () => { reads++; return environment; },
+  });
+  const first = store.readSnapshot();
+  assert.equal(reads, 1);
+  assert.equal(enumerations, 1, 'one native enumeration per observation, not one per configuration field');
+  assert.equal(first.snapshot.fields.grok_api_key.configured, true);
+  assert.equal(first.effective.grok_api_key.value, 'synthetic-first');
+  assert.ok(!JSON.stringify(first.snapshot).includes('synthetic-'));
+  assert.equal(first.snapshot.fields.grok_model.value, first.effective.grok_model.value);
+  environment.GROK_SEARCH_API_KEY = 'synthetic-next';
+  writeFileSync(path, 'tavily_api_key = "synthetic-changed"\n');
+  const second = store.readSnapshot();
+  assert.equal(reads, 2);
+  assert.equal(enumerations, 2);
+  assert.equal(second.effective.grok_api_key.value, 'synthetic-next');
+  assert.equal(second.effective.tavily_api_key.value, 'synthetic-changed');
+  assert.notEqual(first.snapshot.revision, second.snapshot.revision);
+  assert.ok(!JSON.stringify(second.snapshot).includes('synthetic-'));
+});
+
+test('single-pass environment capture retains platform case and first-match behavior', () => {
+  const { store } = setup('', { env: () => ({
+    grok_search_model: 'lower-case', GROK_SEARCH_MODEL: 'upper-case',
+  }) });
+  assert.equal(store.snapshot().fields.grok_model.value, process.platform === 'win32' ? 'lower-case' : 'upper-case');
 });
 
 test('default location follows upstream HOME / USERPROFILE and explicit precedence', () => {

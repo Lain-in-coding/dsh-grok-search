@@ -1,4 +1,5 @@
 import { composeEntries, readProfilePatches } from '@deepseek-ai/dsh-app-boot';
+import { resolveConfig } from '@deepseek-ai/cordis';
 import * as core from './index.mjs';
 import * as control from './control.mjs';
 import * as recovery from './recovery.mjs';
@@ -6,10 +7,12 @@ import * as routeVerifier from './route-verifier.mjs';
 import * as settings from './settings-ui.mjs';
 import * as program from './program.mjs';
 import { createOriginalSearchCounter } from './core/original-search-counter.mjs';
-import { createProductStore, normalizeCounterSnapshot, readSelection, PRODUCT_SEARCH_BUNDLE, PRODUCT_PROVIDER_ID }
+import { createProductStore, createSearchConfigHook, normalizeCounterSnapshot, readSelection, PRODUCT_SEARCH_BUNDLE }
   from './core/product-control.mjs';
 import { createConnectionSecurity } from './core/connection-security.mjs';
 import { createPrivatePreferences } from './core/private-preferences.mjs';
+import { createSearchLog } from './core/search-log.mjs';
+import { createToolRouteContext } from './core/tool-route-context.mjs';
 import { join } from 'node:path';
 
 export const name = 'dsh-grok-search';
@@ -21,6 +24,12 @@ export const ENTRY_ID = 'grok-search';
 // a WebRuntime rebuild and leaves a missing/unavailable Grok provider fail-closed.
 export async function apply(ctx, configuration) {
   const store = createProductStore(ctx);
+  // These lifetimes follow the selected bundle, not a settings page or rebuilt WebRuntime.
+  const searchLog = createSearchLog(), callRoutes = createToolRouteContext({ searchLog });
+  ctx.provide('grokSearchLog', searchLog);
+  ctx.provide('grokSearchCallRoutes', callRoutes);
+  ctx.on('tools/execute', (exec, next) => callRoutes.run(exec, next), { global: true, prepend: true });
+  ctx.effect(() => () => { searchLog.dispose(); callRoutes.dispose(); });
   const preferences = createPrivatePreferences({
     path: join(ctx.profileContext.dir, 'grok-search', 'preferences.json'),
   });
@@ -45,17 +54,15 @@ export async function apply(ctx, configuration) {
   const snapshotCounter = () => normalizeCounterSnapshot(
     typeof counter === 'function' ? counter() : counter.snapshot(), 'host-counter');
   const backgroundError = error => ctx.logger?.error?.(error);
-  ctx.on('internal/config', function(_raw, next) {
-    const value = next();
-    if (disabling || this.entry?.options.id !== 'web'
-      || this.entry.options.name !== '@deepseek-ai/dsh-web'
-      || this.parent?.fiber?.entry === this.entry) return value;
-    // Read failures cannot authorize an official fallback.
-    let required = true;
-    try { required = store.read()?.intent.policy !== 'released'; }
-    catch (error) { backgroundError(error); }
-    return required ? { ...value, searchProvider: PRODUCT_PROVIDER_ID } : value;
-  }, { global: true, prepend: true });
+  ctx.on('internal/config', createSearchConfigHook({
+    resolveConfig,
+    required() {
+      if (disabling) return false;
+      // Read failures cannot authorize an official fallback.
+      try { return store.read()?.intent.policy !== 'released'; }
+      catch (error) { backgroundError(error); return true; }
+    },
+  }), { global: true, prepend: true });
 
   const explicitDisableReason = () => {
     if (!readSelection(ctx).bundles.includes(PRODUCT_SEARCH_BUNDLE)) return 'native-bundle-disable';

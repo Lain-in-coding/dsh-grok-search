@@ -19,6 +19,7 @@ const runtimes = [candidateRuntime(options.get('--desktop-rc2')),candidateRuntim
   .filter(row => !process.env.DSH_B2_ONLY_VERSION || row.app.version === process.env.DSH_B2_ONLY_VERSION);
 const targetVersions = (process.env.DSH_B2_TARGET_VERSIONS ?? '0.2.1-rc.2,0.2.1-rc.3').split(',').map(value => value.trim()).filter(Boolean);
 assert.deepEqual(runtimes.map(row=>row.app.version),process.env.DSH_B2_ONLY_VERSION?[process.env.DSH_B2_ONLY_VERSION]:targetVersions);
+const testedVersions = runtimes.map(row => row.app.version);
 const verificationCase=options.get('--case')??'control';
 if(!['control','migration','product','m0-04','ux'].includes(verificationCase))throw new Error('Expected --case control, migration, product, m0-04 or ux.');
 if(verificationCase==='m0-04'&&!options.get('--grok-program'))throw new Error('M0-04 requires --grok-program with a grok-search-rs 0.1.26 executable; it is copied into each isolated run.');
@@ -591,6 +592,59 @@ try{
           restored, requestCount: stub.requests.length, exit };
       } finally { await stub.close(); }
     });
+    if (runtime.app.version === '0.2.2-rc.1') {
+      await scenario(runtime, 'deepseek-search-api-takeover-and-native-restore', async folder => {
+        let requests = 0;
+        const server = createServer((request, response) => {
+          request.resume();
+          request.on('end', () => {
+            assert.equal(request.url, '/v1/tools/search');
+            requests++;
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ results: [{ url: 'https://example.invalid/deepseek-api',
+              title: 'Official API fixture', snippet: 'Isolated search API result', date: null }] }));
+          });
+        });
+        await new Promise(done => server.listen(0, '127.0.0.1', done));
+        try {
+          await prepare(runtime, folder);
+          writeFileSync(join(folder, 'dsh-home/profiles/desktop/cordis.patch.yml'), JSON.stringify([
+            { id: 'web-deepseek-api', config: { apiKey: 'isolated-search-api-key',
+              baseURL: `http://127.0.0.1:${server.address().port}/v1/tools` } },
+            { id: 'web', config: { searchProvider: 'deepseek-search-api', fetchProvider: 'candidate-fetch' } },
+          ]) + '\n');
+          const host = await start(runtime, folder, 'ux-search-api', null, true, false);
+          await waitForProduct(host, { recovery: true, verifier: true });
+          const blocked = await modelTurn(host, 'search');
+          assert.equal(blocked.isError, true);
+          assert.equal(requests, 0);
+          await host.probe('rebuild-web-from-author');
+          await waitForProduct(host);
+          assert.equal((await host.probe('snapshot')).runtimeWeb.searchProviderId, 'grok-search');
+          const blockedAfterReload = await modelTurn(host, 'search');
+          assert.equal(blockedAfterReload.isError, true);
+          assert.equal(requests, 0);
+          const disabled = await host.probe('plugin-manager-set-bundle', { name: 'dsh-grok-search', enabled: false });
+          assert.equal(disabled.application, 'applied');
+          const restored = await preserved(host);
+          assert.equal(restored.runtimeWeb.searchProviderId, 'deepseek-search-api');
+          const original = await modelTurn(host, 'search');
+          assert.equal(original.isError, false);
+          assert.equal(requests, 1);
+          const enabled = await host.probe('plugin-manager-set-bundle', { name: 'dsh-grok-search', enabled: true });
+          assert.equal(enabled.application, 'applied');
+          await waitForProduct(host);
+          assert.equal((await modelTurn(host, 'search')).isError, true);
+          assert.equal(requests, 1);
+          assert.equal((await modelTurn(host, 'fetch')).isError, false);
+          const exit = await close(host);
+          assert.equal(exit.exitCode, 0);
+          assert.equal(exit.forced, false);
+          return { requests, originalSearchCounterScope: 'legacy-session-event-only',
+            directApiHttpCountVerified: true, blocked, blockedAfterReload, restored, original, exit };
+        } finally { await new Promise(done => server.close(done)); }
+      });
+    }
     continue;
   }
   if (verificationCase === 'product') {
@@ -622,7 +676,16 @@ try{
         assert.equal(state.reloadProbe.overlappedReload, true, 'Search tool call did not overlap the web reload.');
         assert.ok(state.reloadProbe.toolResult);
         if (state.reloadProbe.toolResult.isError) {
-          assert.match(JSON.stringify(state.reloadProbe.toolResult), /CONTROL_|WEB_PROVIDER_|Grok/i);
+          if (runtime.app.version === '0.2.2-rc.1' && state.reloadProbe.toolErrorCode === 'UNKNOWN_TOOL') {
+            // Per-step admission cannot retain the tool definition after its
+            // owning WebRuntime unloads. The new host refuses this in-flight
+            // call; it must not substitute the newly registered definition.
+            assert.match(JSON.stringify(state.reloadProbe.toolResult), /unknown tool.*web_search/i);
+            const next = await modelTurn(host, 'search');
+            assert.equal(next.afterCalls.original, 0);
+            assert.equal(next.toolResult?.isError, true);
+            assert.doesNotMatch(JSON.stringify(next.toolResult), /unknown tool/i);
+          } else assert.match(JSON.stringify(state.reloadProbe.toolResult), /CONTROL_|WEB_PROVIDER_|Grok/i);
         }
         const exit = await close(host);
         assert.equal(exit.exitCode, 0);
@@ -1187,16 +1250,17 @@ finally{
    // Only the explicit positive-control scenario establishes the canonical
    // counter; the native-toggle scenario uses the fixture's original provider.
    scope: 'actual-official-Desktop-aggregated-bundle-native-hmr-toggle-canonical-counter-and-reload-transition',
-   entryWiringValidated: !fatal && results.length === runtimes.length * 3,
-   routeVerifierValidated: !fatal && results.length === runtimes.length * 3,
+   entryWiringValidated: !fatal && testedVersions.every(version => results.filter(row => row.version === version && row.status === 'pass').length >= 3),
+   routeVerifierValidated: !fatal && testedVersions.every(version => results.filter(row => row.version === version && row.status === 'pass').length >= 3),
    releaseControllerWired: true,
-   releaseTransactionDesktopValidated: !fatal && results.length === runtimes.length * 3,
-   sourceOnlyDesktopValidated: !fatal && targetVersions.every(version => results.some(row => row.version === version
+   releaseTransactionDesktopValidated: !fatal && testedVersions.every(version => results.filter(row => row.version === version && row.status === 'pass').length >= 3),
+   sourceOnlyDesktopValidated: !fatal && testedVersions.every(version => results.some(row => row.version === version
      && row.scenario === 'sources-only-shared-budget-and-native-stop' && row.status === 'pass')),
-   nativeHmrToggleValidated: !fatal && targetVersions.every(version => results.some(row => row.version === version && row.scenario === 'native-hmr-toggle-and-reacquire' && row.status === 'pass')),
+   nativeHmrToggleValidated: !fatal && testedVersions.every(version => results.some(row => row.version === version && row.scenario === 'native-hmr-toggle-and-reacquire' && row.status === 'pass')),
    routeCounterAdapter: 'fixture-and-canonical-session-event',
-   realHostCounterAdapterValidated: !fatal && targetVersions.every(version => results.some(row => row.version === version && row.scenario === 'aggregated-canonical-counter-and-reload-transition' && row.status === 'pass')),
-   configReloadNoFallbackValidated: !fatal && targetVersions.every(version => results.some(row => row.version === version && row.scenario === 'aggregated-canonical-counter-and-reload-transition' && row.status === 'pass')),
+   realHostCounterAdapterValidated: !fatal && testedVersions.every(version => results.some(row => row.version === version && row.scenario === 'aggregated-canonical-counter-and-reload-transition' && row.status === 'pass')),
+   configReloadNoFallbackValidated: !fatal && testedVersions.every(version => results.some(row => row.version === version && row.scenario === 'aggregated-canonical-counter-and-reload-transition' && row.status === 'pass')),
+   deepSeekSearchApiRoutingValidated: !fatal && results.some(row => row.scenario === 'deepseek-search-api-takeover-and-native-restore' && row.status === 'pass'),
    pluginManagerUiDomValidated: false,
    packagedInstallValidated: false,
    realGrokQueryValidated: false,
@@ -1208,6 +1272,8 @@ finally{
    // The upstream is a loopback stub with a synthetic key; this is not a paid
    // xAI query and does not validate real upstream behaviour.
    realGrokUpstreamValidated: false,
+   m0_04BudgetMatrixValidated: !fatal && testedVersions.every(version => [60000, 90000, 120000].every(budget =>
+     results.some(row => row.version === version && row.scenario === 'budget-' + budget && row.status === 'pass'))),
    grokResponsesStub: grokStubEvidence && { requestCount: grokStubEvidence.requestCount,
      allResponsesPath: grokStubEvidence.allResponsesPath,
      allAuthorizedWithSyntheticKey: grokStubEvidence.allAuthorizedWithSyntheticKey,

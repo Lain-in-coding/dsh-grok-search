@@ -6,6 +6,29 @@ const optionalText = value => {
   if (typeof value !== 'string') throw invalid();
   return value;
 };
+// grok-search-rs v0.1.26 Source.provider is assigned by its adapters/service,
+// not by the model answer. Only these exact protocol labels are retained.
+const SOURCE_LABELS = new Map([
+  ['grok_responses', { provider: 'grok', role: 'primary' }],
+  ['openai_compatible', { provider: 'grok', role: 'primary' }],
+  ...['tavily', 'exa', 'tinyfish', 'firecrawl'].flatMap(provider => [
+    [provider, { provider, role: 'source' }],
+    [`${provider}_fallback`, { provider, role: 'fallback' }],
+    [`${provider}_enrichment`, { provider, role: 'enrichment' }],
+  ]),
+]);
+export function searchSourceProvenance(sources = []) {
+  const resultProviders = [], fallbackProviders = [], enrichmentProviders = [];
+  let complete = sources.length > 0;
+  for (const source of sources) {
+    const label = isRecord(source) && Object.hasOwn(source, 'provider') ? SOURCE_LABELS.get(source.provider) : null;
+    if (!label) { complete = false; continue; }
+    if (!resultProviders.includes(label.provider)) resultProviders.push(label.provider);
+    if (label.role === 'fallback' && !fallbackProviders.includes(label.provider)) fallbackProviders.push(label.provider);
+    if (label.role === 'enrichment' && !enrichmentProviders.includes(label.provider)) enrichmentProviders.push(label.provider);
+  }
+  return { resultProviders, resultProvidersComplete: complete, fallbackProviders, enrichmentProviders };
+}
 
 export function decodeGrokResult(result) {
   if (!isRecord(result)) throw invalid();
@@ -72,7 +95,14 @@ export function mapSearchResult(payload, { maxResults, maxChars = 45_000 } = {})
         delete item[field];
       }
     }
-    if (fits(candidate())) result.sources.push(item); else result.truncated = true;
+    if (fits(candidate())) {
+      // Keep provenance on the exact retained item through both budget passes,
+      // while preserving DSH's enumerable source contract and character budget.
+      if (Object.hasOwn(source, 'provider') && SOURCE_LABELS.has(source.provider)) {
+        Object.defineProperty(item, 'provider', { value: source.provider });
+      }
+      result.sources.push(item);
+    } else result.truncated = true;
   }
   const content = optionalText(payload.content) ?? '';
   // false 比 true 多一个序列化字符，先用实际标志判断完整内容。

@@ -302,6 +302,7 @@ export async function applyObserver(ctx) {
             promptAcceptedAt: Date.now(), toolCallAt: toolCall.time,
             toolResultAt: toolResult.time, overlappedReload: toolCall.time <= reloadSettledAt,
             toolResult: toolResult.data?.message ?? null,
+            toolErrorCode: toolResult.data?.error?.code ?? null,
             originalSearchCounter: ctx.get('grokSearchOriginalSearchCounter')?.snapshot?.() ?? null } };
         }
         if (input.op === 'plugin-manager-state') {

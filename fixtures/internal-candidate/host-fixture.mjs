@@ -29,7 +29,12 @@ export function applyModel(ctx) {
           text: manual ? (messages.length ? MANUAL_SEARCH_REPLY : MANUAL_CHAT_REPLY) : '内部候选轮次完成' };
         yield { type: 'finish', reason: { kind: 'stop' } }; return;
       }
-      const ptcTransport = process.env.DSH_TOOLS_MODE === 'ptc';
+      // The host's actual model-facing catalog is authoritative: 0.2.2 removed
+      // DSH_TOOLS_MODE and selects executors per agent scope.
+      const toolNames = Array.isArray(options.tools)
+        ? options.tools.map(tool => tool.name ?? tool.function?.name)
+        : Object.keys(options.tools ?? {});
+      const ptcTransport = toolNames.includes('run_code') && !toolNames.includes('web_search');
       const tool = (mode === 'ptc' || (ptcTransport && mode === 'search')) ? { name: 'run_code', args: {
         code: "return await tools.web_search({queries:['内部候选 PTC 离线查询']});",
         description: 'Run the controlled search through PTC',
@@ -40,7 +45,9 @@ export function applyModel(ctx) {
         } }
           : mode === 'fetch' ? { name: 'web_fetch', args: { url: 'https://example.invalid/fetch' } }
             : mode === 'echo' ? { name: 'candidate_echo', args: {} }
-              : { name: 'web_search', args: { queries: [state.searchQuery ?? question ?? '内部候选离线查询'] } };
+              : { name: 'web_search', args: { queries: !manual && command === 'search batch'
+                ? ['内部候选实时查询', '内部候选逐小时查询']
+                : [state.searchQuery ?? question ?? '内部候选离线查询'] } };
       yield { type: 'tool-call-delta', index: 0, id: randomUUID(), name: tool.name, argumentsDelta: JSON.stringify(tool.args) };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
     }

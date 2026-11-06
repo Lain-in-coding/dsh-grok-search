@@ -38,14 +38,16 @@ export function apply(ctx, config) {
     for (const result of results) if (result.status === 'rejected') throw result.reason;
   };
   const releaseBarrier = createReleaseBarrier();
+  const callRoutes = ctx.get('grokSearchCallRoutes');
   const routed = createRoutedSearch({ grok: core.provider, sourceRouter, preferences, releaseBarrier,
+    searchLog: ctx.get('grokSearchLog'),
     getConfig, budgetMs: config.budgetMs ?? 120_000 });
   const provider = {
     ...core.provider,
     available: () => releaseBarrier.snapshot().state === 'active'
       && routed.snapshot().accepting && (core.provider.available() || sourceRouter.snapshot().available),
     // The host passes only (request, signal); the origin is fixed here.
-    search: (request, signal) => routed.search(request, signal, 'search'),
+    search: (request, signal) => routed.search(request, signal, 'search', callRoutes?.capture() ?? null),
   };
   // 注册和回收均属于当前插件 fiber，没有借根上下文遗留效果。
   ctx.effect(() => dispose);
@@ -55,6 +57,7 @@ export function apply(ctx, config) {
     testSearch: (request, signal) => routed.search(request, signal, 'test'),
     testGrok: routed.testGrok,
     routeSnapshot: routed.routeSnapshot,
+    searchLog: routed.searchLog,
     budgetMs: config.budgetMs ?? 120_000,
     dispose,
     registerDiagnosticCancellation(cancel) {

@@ -45,7 +45,10 @@ export function discoverGrokCandidates({ override, configured, env = process.env
   for (const path of [...paths, join(cargo, 'bin')]) {
     add(join(path, filename), path === join(cargo, 'bin') ? 'cargo' : 'path');
     // Resolve only documented npm package layouts. Never execute .cmd/.bat,
-    // shell wrappers, a global npm command, or an arbitrary launcher.
+    // shell wrappers, a global npm command, or an arbitrary launcher. A
+    // launcher without its native program is not a usable installation: as
+    // released in 0.1.1, discovery reports nothing and the caller reuses a
+    // completed private install or prepares one.
     for (const modules of [join(path, 'node_modules'), join(dirname(path), 'lib/node_modules'),
       ...(path.endsWith('.bin') ? [dirname(path)] : [])]) {
       add(join(modules, 'grok-search-rs/node_modules', packageName, 'bin', filename), 'npm');

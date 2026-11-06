@@ -3,6 +3,8 @@ import test from 'node:test';
 import { createRoutedSearch } from '../src/core/routed-search.mjs';
 import { createReleaseBarrier } from '../src/core/release-transaction.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
+import { randomUUID } from 'node:crypto';
+import { createSourceRouter } from '../src/core/source-adapters.mjs';
 
 const QUERY = 'secret-query-text-7f3a';
 const sourceResult = (provider, failures = []) => ({ content: '', sources: [{ url: 'https://result.test/a' }],
@@ -22,7 +24,9 @@ function harness({ grok, sources = {}, prefs = { grokEnabled: true }, barrier = 
     preferences: { snapshot: () => ({ value: prefs }) },
     releaseBarrier: barrier,
     getConfig, budgetMs, cleanupMs,
-    now: () => clock++,
+    // Reading the clock is not the passage of time. History now samples both
+    // start and completion; these route-shape assertions hold time fixed.
+    now: () => clock,
   });
   return { routed, calls, barrier };
 }
@@ -155,6 +159,77 @@ test('grok-search-rs internal fallback is recorded as grok-sources with a stable
   assert.equal(free.routed.routeSnapshot().grokCode, 'grok_provider_error');
 });
 
+test('内部回退采用结果携带的实际供应商，不读取配置顺序或额外搜索', async () => {
+  for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
+    const { routed, calls } = harness({ grok: async () => ({
+      content: 'degraded answer', sources: [{ url: 'https://example.test/evidence', provider: `${provider}_fallback` }],
+      diagnostic: { fallbackUsed: true, fallbackReason: 'grok_sources_empty',
+        searchProvider: 'source_fallback', sourceProvenance: {} },
+    }) });
+    try {
+      await routed.search({ query: QUERY });
+      const route = routed.routeSnapshot();
+      assert.equal(route.served, provider);
+      assert.deepEqual(route.resultProviders, [provider]);
+      assert.equal(route.resultProvidersComplete, true);
+      const row = routed.searchLog.snapshot(randomUUID()).records[0];
+      assert.equal(row.served, provider);
+      assert.deepEqual(row.resultProviders, [provider]);
+      assert.deepEqual(row.calls.map(call => [call.provider, call.result]), [['grok', 'failed'], [provider, 'ok']]);
+      assert.equal(row.calls[1].evidence, 'source-label');
+      assert.equal(row.calls[1].keyIndex, null);
+      assert.equal(row.calls[1].charge.basis, 'unknown');
+      assert.equal(row.callsComplete, false);
+      assert.equal(calls.grok, 1);
+      assert.equal(calls.sources.length, 0);
+    } finally { await routed.dispose(); }
+  }
+});
+
+test('正常主搜的补充结果和混合回退均保留来源，不把补充结果当作主搜失败', async () => {
+  for (const fallbackUsed of [false, true]) {
+    const { routed } = harness({ grok: async () => ({
+      content: 'answer', sources: [
+        { url: 'https://example.test/primary', provider: 'grok_responses' },
+        { url: 'https://example.test/secondary', provider: fallbackUsed ? 'exa_fallback' : 'exa_enrichment' },
+      ], diagnostic: { fallbackUsed, fallbackReason: fallbackUsed ? 'grok_content_empty' : null, sourceProvenance: {} },
+    }) });
+    try {
+      await routed.search({ query: QUERY });
+      const route = routed.routeSnapshot();
+      assert.equal(route.served, fallbackUsed ? 'exa' : 'grok');
+      assert.deepEqual(route.resultProviders, ['grok', 'exa']);
+      assert.equal(route.fallbackUsed, fallbackUsed);
+      const row = routed.searchLog.snapshot(randomUUID()).records[0];
+      assert.equal(row.calls[0].result, fallbackUsed ? 'failed' : 'ok');
+      assert.equal(row.calls[1].provider, 'exa');
+      assert.equal(row.calls[1].operation, 'supplement');
+    } finally { await routed.dispose(); }
+  }
+});
+
+test('来源被裁掉或未知时不猜供应商；已知来源与未报告可同时保留', async () => {
+  for (const [sources, maxResults, expected, complete] of [
+    [[{ url: 'https://example.test/a', provider: 'tavily_fallback' },
+      { url: 'https://example.test/b', provider: 'exa_fallback' }], 1, ['tavily'], true],
+    [[{ url: 'https://example.test/a', provider: 'tavily_fallback' },
+      { url: 'https://example.test/b', provider: 'not-a-provider' }], 2, ['tavily'], false],
+    [[{ url: 'https://exa.ai/not-provider-proof', provider: 'constructor' }], 1, [], false],
+  ]) {
+    const { routed, calls } = harness({ grok: async () => ({ sources, diagnostic: {
+      fallbackUsed: true, fallbackReason: 'grok_sources_empty', sourceProvenance: {},
+    } }) });
+    try {
+      await routed.search({ query: QUERY, maxResults });
+      const route = routed.routeSnapshot();
+      assert.deepEqual(route.resultProviders, expected);
+      assert.equal(route.resultProvidersComplete, complete);
+      assert.equal(route.served, expected.length === 1 ? expected[0] : 'grok-sources');
+      assert.equal(calls.sources.length, 0);
+    } finally { await routed.dispose(); }
+  }
+});
+
 test('a failed Grok falls back to the shared source chain and records the primary code', async () => {
   const { routed, calls } = harness({
     grok: async () => { throw new GrokSearchError('GROK_TIMEOUT', '超时'); },
@@ -176,6 +251,90 @@ test('without an available source the primary failure is thrown and recorded', a
   assert.equal(calls.sources.length, 0);
   assert.deepEqual(routed.routeSnapshot(), { at: 1_000, origin: 'search', outcome: 'failed', served: null,
     grokCode: 'GROK_PROGRAM_PREPARING', fallbackUsed: false, failures: [], code: 'GROK_PROGRAM_PREPARING' });
+});
+
+// The real source adapter behind the routed search: the shared fallback budget
+// is enforced before any supplementary request, in both fallback modes.
+function liveSources(config, { prefs = { grokEnabled: true }, grok }) {
+  const requests = [];
+  let grokCalls = 0;
+  const sourceRouter = createSourceRouter({ getConfig: () => config,
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return new Response(JSON.stringify({ results: [{ url: 'https://result.test/live' }] }));
+    } });
+  const routed = createRoutedSearch({ grok: { search: async (...args) => { grokCalls++; return grok(...args); } },
+    sourceRouter, preferences: { snapshot: () => ({ value: prefs }) }, releaseBarrier: createReleaseBarrier(),
+    getConfig: () => config, now: () => 1_000 });
+  return { routed, requests, grokCalls: () => grokCalls };
+}
+const onlyTavily = extra => ({ source_providers: ['tavily'], tavily_api_key: 'synthetic-tavily-key', ...extra });
+
+test('an imported fallback_sources 0 sends no supplementary request and reports only the Grok failure', async () => {
+  const primary = new GrokSearchError('grok_auth_error', 'Grok 认证失败，请检查 API Key 或登录凭据。');
+  const { routed, requests } = liveSources(onlyTavily({ fallback_sources: 0 }), { grok: async () => { throw primary; } });
+  try {
+    await assert.rejects(routed.search({ query: QUERY, maxResults: 3 }), error => error === primary);
+    assert.equal(requests.length, 0);
+    assert.deepEqual(routed.routeSnapshot(), { at: 1_000, origin: 'search', outcome: 'failed', served: null,
+      grokCode: 'grok_auth_error', fallbackUsed: false, failures: [], code: 'grok_auth_error' });
+    const row = routed.searchLog.snapshot(randomUUID()).records[0];
+    assert.equal(row.kind, 'failed');
+    assert.equal(row.reason, 'grok_auth_error');
+    assert.deepEqual(row.calls.map(call => [call.provider, call.result]), [['grok', 'failed']]);
+  } finally { await routed.dispose(); }
+});
+
+test('sources-only mode with fallback_sources 0 sends no request and names the zero budget', async () => {
+  const { routed, requests, grokCalls } = liveSources(onlyTavily({ fallback_sources: 0 }), {
+    prefs: { grokEnabled: false }, grok: async () => { throw new Error('must not run'); } });
+  try {
+    await assert.rejects(routed.search({ query: QUERY }), error => {
+      assert.ok(error instanceof GrokSearchError);
+      assert.equal(error.code, 'FALLBACK_SOURCES_ZERO');
+      assert.match(error.message, /fallback_sources/);
+      return true;
+    });
+    assert.equal(requests.length, 0);
+    assert.equal(grokCalls(), 0);
+    assert.deepEqual(routed.routeSnapshot(), { at: 1_000, origin: 'search', outcome: 'failed', served: null,
+      grokCode: 'DISABLED', fallbackUsed: false, failures: [], code: 'FALLBACK_SOURCES_ZERO' });
+    const row = routed.searchLog.snapshot(randomUUID()).records[0];
+    assert.equal(row.kind, 'failed');
+    assert.equal(row.reason, 'FALLBACK_SOURCES_ZERO');
+    assert.deepEqual(row.calls, []);
+  } finally { await routed.dispose(); }
+});
+
+test('zero fallback budget keeps non-plugin primary errors secret-free', async () => {
+  const { routed, requests } = liveSources(onlyTavily({ fallback_sources: 0 }), {
+    grok: async () => { throw new Error('synthetic-private-upstream-text'); } });
+  try {
+    await assert.rejects(routed.search({ query: QUERY }), error => {
+      assert.ok(error instanceof GrokSearchError);
+      assert.equal(error.code, 'GROK_SEARCH_FAILED');
+      assert.equal(error.message, 'Grok 查询失败，请检查程序和配置。');
+      assert.equal(JSON.stringify(error).includes('synthetic-private'), false);
+      return true;
+    });
+    assert.equal(requests.length, 0);
+    assert.equal(routed.routeSnapshot().code, 'GROK_SEARCH_FAILED');
+  } finally { await routed.dispose(); }
+});
+
+test('a missing fallback_sources still requests five supplementary results in both fallback modes', async () => {
+  for (const prefs of [{ grokEnabled: true }, { grokEnabled: false }]) {
+    const { routed, requests } = liveSources(onlyTavily(), { prefs,
+      grok: async () => { throw new GrokSearchError('grok_timeout', 'Grok 响应超时。'); } });
+    try {
+      const result = await routed.search({ query: QUERY, maxResults: 10 });
+      assert.equal(result.sources[0].url, 'https://result.test/live');
+      assert.equal(requests.length, 1);
+      assert.equal(JSON.parse(requests[0].init.body).max_results, 5);
+      assert.equal(routed.routeSnapshot().served, 'tavily');
+      assert.equal(routed.routeSnapshot().fallbackUsed, true);
+    } finally { await routed.dispose(); }
+  }
 });
 
 test('when every source fails the error keeps grok first and the route lists only the sources', async () => {

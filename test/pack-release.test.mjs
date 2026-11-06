@@ -1,16 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { validatePackChannel } from '../scripts/pack-internal.mjs';
 
 const read = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
 const manifest = JSON.parse(read('package.json'));
 const matrix = JSON.parse(read('support-matrix.json'));
 
+test('完整离线门禁纳入全部单元与协议测试文件，不把遗漏套件当成全量通过', () => {
+  const expanded = manifest.scripts['test:all'].replace(/npm (?:run ([\w:-]+)|(test))\b/g,
+    (_command, name, fallback) => manifest.scripts[name || fallback] ?? '');
+  const files = readdirSync(new URL('../test/', import.meta.url)).filter(file => file.endsWith('.test.mjs'));
+  assert.deepEqual(files.filter(file => !expanded.includes(`test/${file}`)), []);
+  assert.doesNotMatch(read('test/provider-mcp.test.mjs'), /runtimeRoot \? test : test\.skip/);
+});
+
 test('正式候选版本、lockfile、支持矩阵与 MCP 客户端身份一致', () => {
   const lock = JSON.parse(read('package-lock.json'));
   assert.equal(validatePackChannel(manifest, matrix, { release: true }), 'release');
-  assert.equal(manifest.version, '0.1.1');
+  assert.equal(manifest.version, '0.2.0');
   assert.equal(lock.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
   const clientVersion = read('src/core/mcp-search.mjs')

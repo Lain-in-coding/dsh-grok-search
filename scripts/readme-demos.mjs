@@ -1,10 +1,10 @@
 // README 动态演示：生成的生产 client + 离线合成宿主（fixtures/ui-route-harness）。
 // 只用合成 Key，不点击查看/复制，不请求外部服务；不是 Desktop、真实宿主或付费上游证据。
 // 用法：node scripts/readme-demos.mjs --chrome <Chrome/Edge/Chromium 可执行文件>
-//        [--ffmpeg ffmpeg] [--formats apng,gif,webp] [--dpr 1.25] [--fps 24] [--speed 0.3] [--only test,fallback,first-use,order]
+//        [--ffmpeg ffmpeg] [--formats apng,gif,webp,mp4] [--dpr 1.25] [--fps 24] [--speed 0.3] [--only test,fallback,first-use,order] [--keep-frames true]
 // 截图本身较慢，录制时把页面时间（JS 计时器、rAF、CSS 动画时间线）放慢到 --speed，编码时按原速还原帧时长。
-// 输出：新的 artifacts/ui-route-browser/<runId>/demo-*.{png,gif,webp} 与 summary.json；挑选后复制到 docs/images/。
-// 临时帧和浏览器 profile 写入脚本自建的系统临时目录，成功后只删除该目录。
+// 输出：新的 artifacts/ui-route-browser/<runId>/demo-*.{png,gif,webp,mp4} 与 summary.json；挑选后复制到 docs/images/。
+// 临时帧和浏览器 profile 写入脚本自建的系统临时目录；--keep-frames true 保留无损源帧。
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -13,11 +13,11 @@ import { basename, join, resolve, sep } from 'node:path';
 import { connectRenderer, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { project } from './lib/internal-candidate-utils.mjs';
 
-const usage = 'Usage: node scripts/readme-demos.mjs --chrome <path> [--ffmpeg <path>] [--formats apng,gif,webp] [--dpr 1.25] [--fps 24] [--speed 0.3] [--only id,...]';
+const usage = 'Usage: node scripts/readme-demos.mjs --chrome <path> [--ffmpeg <path>] [--formats apng,gif,webp,mp4] [--dpr 1.25] [--fps 24] [--speed 0.3] [--only id,...] [--keep-frames true|false]';
 const options = new Map();
 for (let index = 2; index < process.argv.length; index += 2) {
   const key = process.argv[index], value = process.argv[index + 1];
-  if (!['--chrome', '--ffmpeg', '--formats', '--dpr', '--fps', '--speed', '--only'].includes(key) || value === undefined) throw new Error(usage);
+  if (!['--chrome', '--ffmpeg', '--formats', '--dpr', '--fps', '--speed', '--only', '--keep-frames'].includes(key) || value === undefined) throw new Error(usage);
   options.set(key, value);
 }
 const chrome = options.get('--chrome');
@@ -25,7 +25,9 @@ if (!chrome || !existsSync(chrome)) throw new Error('需要 --chrome 指向本�
 const ffmpeg = options.get('--ffmpeg') ?? 'ffmpeg';
 if (spawnSync(ffmpeg, ['-hide_banner', '-version'], { windowsHide: true }).status !== 0) throw new Error('找不到可用的 ffmpeg。');
 const formats = (options.get('--formats') ?? 'apng').split(',').map(value => value.trim()).filter(Boolean);
-for (const format of formats) if (!['apng', 'gif', 'webp'].includes(format)) throw new Error('Unknown format: ' + format);
+for (const format of formats) if (!['apng', 'gif', 'webp', 'mp4'].includes(format)) throw new Error('Unknown format: ' + format);
+const keepFrames = options.get('--keep-frames') ?? 'false';
+if (!['true', 'false'].includes(keepFrames)) throw new Error('--keep-frames must be true or false.');
 const dpr = Number(options.get('--dpr') ?? '1.25');
 if (!(dpr >= 1 && dpr <= 2)) throw new Error('--dpr must be between 1 and 2.');
 const minFrameMs = 1000 / Number(options.get('--fps') ?? '24');
@@ -43,6 +45,8 @@ const STAGE_CSS = `
   body { margin: 0 !important; padding: ${PAD}px ${PAD - 15}px 0 ${PAD}px !important; background: transparent !important; overflow: hidden; }
   main { width: auto !important; max-width: none !important; margin: 0 !important; }
   main > h1, #outside { display: none !important; }
+  .detail-title-row { margin-bottom: 18px !important; }
+  .detail-title-row::after { content: "离线交互演示 · 非真实搜索"; margin-left: auto; font-size: 12px; color: #68707d; }
   #demo-cursor { position: fixed; left: 0; top: 0; z-index: 2147483647; pointer-events: none; opacity: 0; transition: opacity .2s; will-change: transform; }
   #demo-cursor.on { opacity: 1; }
   #demo-cursor svg { position: absolute; left: -1px; top: -1px; transform-origin: 1px 1px; transition: transform .12s;
@@ -128,7 +132,9 @@ const browserExit = new Promise(done => browser.once('exit', done));
 
 let renderer, succeeded = false;
 const report = { runId: info.runId, scope: 'README animated demos: generated production client + offline synthetic host shim; synthetic keys, no reveal/copy; demo cursor injected in host page only; page time slowed during capture and restored at encode; not Desktop, real host or paid-provider evidence',
-  command: `node scripts/readme-demos.mjs --chrome <browser> --formats ${formats.join(',')} --dpr ${dpr} --speed ${speed}`, dpr, speed, width: WIDTH, scenarios: [] };
+  pluginVersion: JSON.parse(readFileSync(join(project, 'package.json'), 'utf8')).version,
+  command: `node scripts/readme-demos.mjs --chrome <browser> --formats ${formats.join(',')} --dpr ${dpr} --speed ${speed} --keep-frames ${keepFrames}`,
+  dpr, speed, width: WIDTH, scenarios: [] };
 try {
   const portFile = join(profile, 'DevToolsActivePort');
   const deadline = Date.now() + 20000;
@@ -296,7 +302,7 @@ try {
     await evaluate('window.__demo.resetMax()');
     await show(rest().x, rest().y);
     await scenario.steps();
-    const height = Math.ceil(PAD + await evaluate('window.__demo.maxCard') + PAD);
+    const height = Math.ceil(await evaluate(`window.__demo.box('#routeCard').y + window.__demo.maxCard`) + PAD);
 
     await load(scenario.state, height, speed);
     await scenario.setup();
@@ -363,6 +369,10 @@ try {
         run([...inputs, '-i', 'palette.png', '-filter_complex', merge + '[a];[a][2:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle:alpha_threshold=128',
           '-fps_mode', 'passthrough', '-loop', '0', file]);
       }
+      if (format === 'mp4') run(['-f', 'concat', '-safe', '0', '-i', 'frames.ffconcat',
+        '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p', '-r', '30',
+        '-c:v', 'libx264', '-crf', '16', '-preset', 'slow', '-movflags', '+faststart',
+        '-an', '-map_metadata', '-1', file]);
       outputs.push({ format, file: basename(file), bytes: statSync(file).size });
     }
     report.scenarios.push({ id: scenario.id, title: scenario.title, state: scenario.state, viewport: { width: WIDTH, height },
@@ -373,7 +383,9 @@ try {
   }
   report.pageErrors = renderer.exceptions.map(item => item.description ?? item.text);
   report.passed = report.scenarios.every(item => item.sensitiveCalls === 0 && item.expected) && report.pageErrors.length === 0;
-  const response = await fetch(info.origin + '/evidence', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report) });
+  writeFileSync(join(info.directory, 'recording-report.json'), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
+  const response = await fetch(info.origin + '/evidence', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: info.origin }, body: JSON.stringify(report) });
   if (!response.ok) throw new Error('Evidence write failed: ' + await response.text());
   succeeded = report.passed;
   console.log(JSON.stringify({ runId: info.runId, directory: info.directory, passed: report.passed, pageErrors: report.pageErrors.length }));
@@ -383,8 +395,8 @@ try {
   await Promise.race([browserExit, sleep(5000)]);
   preview.kill();
   const root = resolve(tmpdir()), target = resolve(scratch);
-  if (succeeded && target.startsWith(root + sep) && basename(target).startsWith('dsh-readme-demos-')) {
+  if (succeeded && keepFrames !== 'true' && target.startsWith(root + sep) && basename(target).startsWith('dsh-readme-demos-')) {
     rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-  } else if (!succeeded) console.error('临时帧保留在：' + target);
+  } else console.error('临时帧保留在：' + target);
 }
 if (!succeeded) process.exitCode = 1;

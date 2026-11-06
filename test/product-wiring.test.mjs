@@ -8,10 +8,11 @@ import test from 'node:test';
 import { apply as applyControl, projectPublicSnapshot } from '../src/control.mjs';
 import { apply as applyRecovery } from '../src/recovery.mjs';
 import { apply as applyRouteVerifier } from '../src/route-verifier.mjs';
-import { apply as applySettingsUi } from '../src/settings-ui.mjs';
+import { apply as applySettingsUi, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID, createAcquisition, createLease, createProductStore,
   createProductReleaseController, effectiveFetchProvider, effectiveSearchProvider, routeReceipt, takeOverAuthorRoute,
+  restoreAuthorRoute, effectiveConfig, createSearchConfigHook,
 } from '../src/core/product-control.mjs';
 import { commitExplicitRelease, createReleaseBarrier } from '../src/core/release-transaction.mjs';
 
@@ -20,6 +21,20 @@ const deferred = () => {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 };
+async function withIsolatedHome(work) {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-isolated-home-'));
+  const pattern = /^(HOME|USERPROFILE|GROK_SEARCH_.*|TAVILY_.*|EXA_.*|TINYFISH_.*|FIRECRAWL_.*|OPENAI_COMPATIBLE_.*|GITHUB_TOKEN)$/i;
+  const saved = Object.entries(process.env).filter(([name]) => pattern.test(name));
+  for (const [name] of saved) delete process.env[name];
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try { return await work(home); }
+  finally {
+    delete process.env.HOME;
+    delete process.env.USERPROFILE;
+    for (const [name, value] of saved) process.env[name] = value;
+  }
+}
 function writeProfile(ctx, bundles) {
   // D-28: search and recovery share one bundle, so profile selections are de-duplicated.
   const value = { name: 'product-wiring-profile', private: true, type: 'module',
@@ -72,6 +87,26 @@ function makeContext({ bundles, verifier, originalCalls } = {}) {
   if (verifier) services.set('grokSearchRouteVerifier', verifier);
   if (originalCalls !== undefined) services.set('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: originalCalls }) });
   return ctx;
+}
+
+function gateTakeover(ctx, mode = 'apply') {
+  const entry = ctx.loader.entries()[0], update = entry.update;
+  const started = deferred(), gate = deferred();
+  let blocked = false;
+  entry.update = async options => {
+    if (!blocked && options.config.searchProvider === 'grok-search') {
+      blocked = true;
+      started.resolve();
+      await gate.promise;
+      if (mode === 'reject') throw new Error('takeover rejected by host');
+      if (mode === 'ignore') return;
+      await update(options);
+      if (mode === 'apply-then-reject') throw new Error('host failed after applying takeover');
+      return;
+    }
+    return update(options);
+  };
+  return { started: started.promise, release: gate.resolve };
 }
 
 function createRequiredRecord(ctx, store, hostId) {
@@ -235,6 +270,9 @@ test('product control stop prelude failure is recorded and retryable', async () 
   await applyControl(ctx);
   const service = ctx.get('grokSearchControl');
   await service.retry();
+  const core = ctx.get('grokSearchCore');
+  let disposals = 0;
+  core.dispose = async () => { disposals += 1; };
 
   await assert.rejects(() => service.stop('missing-counter'),
     error => error.code === 'CONTROL_ROUTE_COUNTER_REQUIRED');
@@ -243,12 +281,23 @@ test('product control stop prelude failure is recorded and retryable', async () 
   assert.equal(failed.error.code, 'CONTROL_ROUTE_COUNTER_REQUIRED');
   assert.equal(failed.completionCommitted, false);
   assert.equal(failed.canStop, false);
+  assert.equal(core.releaseBarrier.snapshot().state, 'stopping');
+  assert.equal(disposals, 1);
+  assert.throws(() => core.releaseBarrier.begin({ operationId: randomUUID() }),
+    error => error.code === 'CONTROL_RELEASE_BARRIER_INACTIVE');
+  assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+  const beforeRetry = createProductStore(ctx).read();
+  assert.equal(beforeRetry.intent.policy, 'required');
+  await service.retry();
+  assert.deepEqual(createProductStore(ctx).read(), beforeRetry);
 
   ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 0 }) });
   const outcome = await service.stop('retry-with-counter');
   assert.equal(outcome.kind, 'released');
   assert.equal(service.publicSnapshot().completionCommitted, true);
   assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  assert.equal(disposals, 1);
+  assert.equal(createProductStore(ctx).read().intent.releaseCompletion.routeBefore, 'grok-search');
   ctx.dispose();
 });
 
@@ -274,6 +323,75 @@ test('product control refresh waits for an in-flight release instead of writing 
   assert.equal(service.publicSnapshot().phase, 'released');
   assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
   ctx.dispose();
+});
+
+test('explicit stop supersedes a pending takeover and restores the author after the late host update', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const takeover = gateTakeover(ctx);
+  const mounting = applyControl(ctx);
+  mounting.catch(() => {});
+  await takeover.started;
+  const service = ctx.get('grokSearchControl');
+  const release = service.stop('stop-during-takeover');
+  release.catch(() => {});
+  try {
+    assert.equal(service.retry(), release);
+    assert.equal(await Promise.race([
+      release.then(() => 'settled'),
+      new Promise(resolve => setTimeout(() => resolve('pending'), 50)),
+    ]), 'pending');
+    takeover.release();
+    assert.equal((await release).kind, 'released');
+    await mounting;
+    const record = createProductStore(ctx).read();
+    assert.equal(record.intent.policy, 'released');
+    assert.equal(record.intent.releaseCompletion.routeVerified, true);
+    assert.equal(record.intent.releaseCompletion.routeChanged, true);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+    assert.equal(effectiveSearchProvider(ctx.loader.entries()[0]), 'candidate-original');
+    assert.equal(service.publicSnapshot().phase, 'released');
+    await service.retry();
+    ctx.emit('loader/volatile-update', [['config', 'searchProvider']]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(createProductStore(ctx).read(), record);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  } finally {
+    takeover.release();
+    await Promise.allSettled([mounting, release]);
+    ctx.dispose();
+  }
+});
+
+test('a takeover that fails or rolls back after an explicit stop cannot overwrite the release', async t => {
+  for (const mode of ['reject', 'ignore', 'apply-then-reject']) {
+    await t.test(mode, async () => {
+      const ctx = makeContext({ originalCalls: 0 });
+      const takeover = gateTakeover(ctx, mode);
+      const mounting = applyControl(ctx);
+      mounting.catch(() => {});
+      await takeover.started;
+      const service = ctx.get('grokSearchControl');
+      const release = service.stop(`stop-before-${mode}`);
+      release.catch(() => {});
+      try {
+        assert.equal(service.retry(), release);
+        takeover.release();
+        assert.equal((await release).kind, 'released');
+        await mounting;
+        assert.equal(service.publicSnapshot().phase, 'released');
+        assert.equal(service.publicSnapshot().error, null);
+        assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+        assert.equal(effectiveSearchProvider(ctx.loader.entries()[0]), 'candidate-original');
+        const record = createProductStore(ctx).read();
+        await service.retry();
+        assert.deepEqual(createProductStore(ctx).read(), record);
+      } finally {
+        takeover.release();
+        await Promise.allSettled([mounting, release]);
+        ctx.dispose();
+      }
+    });
+  }
 });
 
 test('route takeover rejects when the host does not apply the product provider', async () => {
@@ -342,6 +460,78 @@ test('effective provider parsing is safe when the runtime service lookup throws 
     if (previous === undefined) delete process.env.DSH_WEB_FETCH_PROVIDER;
     else process.env.DSH_WEB_FETCH_PROVIDER = previous;
   }
+});
+
+test('Cordis 4.1 route receipts read effective config rather than pending raw input', () => {
+  const entry = {
+    options: { config: { searchProvider: 'author-search', fetchProvider: 'author-fetch' } },
+    fiber: {
+      config: { searchProvider: 'pending-search', fetchProvider: 'pending-fetch' },
+      effectiveConfig: { searchProvider: { get: () => 'grok-search' }, fetchProvider: { get: () => 'author-fetch' } },
+      ctx: { get: () => null },
+    },
+  };
+  assert.equal(effectiveSearchProvider(entry), 'grok-search');
+  assert.equal(effectiveFetchProvider(entry), 'author-fetch');
+});
+
+test('config hooks protect only the owning web entry in both Cordis contracts', () => {
+  const author = { searchProvider: 'author-search', fetchProvider: 'author-fetch' };
+  const entry = { options: { id: 'web', name: '@deepseek-ai/dsh-web' } };
+  const legacyFiber = { entry, parent: { fiber: {} } };
+  let required = true, resolves = 0;
+  const resolveConfig = (_runtime, value) => {
+    resolves++;
+    return Object.fromEntries(Object.entries(value).map(([name, selected]) => [name, { get: () => selected }]));
+  };
+  const hook = createSearchConfigHook({ required: () => required, resolveConfig });
+  const oldResult = hook.call(legacyFiber, author, () => author);
+  assert.deepEqual(oldResult, { ...author, searchProvider: 'grok-search' });
+  assert.deepEqual(author, { searchProvider: 'author-search', fetchProvider: 'author-fetch' });
+  assert.equal(resolves, 0);
+  const modernFiber = { ...legacyFiber, runtime: {}, resolveConfig() { throw new Error('must not recursively resolve hooks'); } };
+  const resolved = resolveConfig(null, author);
+  const modernResult = hook(modernFiber, () => resolved);
+  assert.equal(modernResult.searchProvider.get(), 'grok-search');
+  assert.equal(modernResult.fetchProvider.get(), 'author-fetch');
+  assert.equal(resolved.searchProvider.get(), 'author-search');
+  assert.equal(resolves, 2);
+  const child = { ...modernFiber, parent: { fiber: { entry } } };
+  assert.equal(hook(child, () => resolved), resolved);
+  assert.equal(hook({ ...modernFiber, entry: { options: { id: 'other' } } }, () => resolved), resolved);
+  required = false;
+  assert.equal(hook(modernFiber, () => resolved), resolved);
+  assert.equal(hook.call(legacyFiber, author, () => author), author);
+});
+
+test('modern unactivated fibers do not expose raw input as an effective config', () => {
+  assert.equal(effectiveConfig({ effectiveConfig: undefined, config: { searchProvider: 'not-applied' } }), undefined);
+  const legacy = { searchProvider: 'legacy-active' };
+  assert.equal(effectiveConfig({ config: legacy }), legacy);
+});
+
+test('Cordis 4.1 takeover and release preserve effective fetch and raw author configuration', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const entry = ctx.loader.entries()[0];
+  const author = structuredClone(entry.options.config);
+  entry.fiber.effectiveConfig = structuredClone(author);
+  entry.fiber.config = { searchProvider: 'uncommitted-search', fetchProvider: 'uncommitted-fetch' };
+  entry.update = async ({ config }) => {
+    entry.options.config = structuredClone(config);
+    entry.fiber.config = structuredClone(config);
+    entry.fiber.effectiveConfig = structuredClone(config);
+  };
+  const acquisition = createAcquisition(ctx), lease = createLease(ctx);
+  assert.equal(acquisition.authorSearchProvider, author.searchProvider);
+  assert.equal(acquisition.authorFetchProvider, author.fetchProvider);
+  await takeOverAuthorRoute(ctx, acquisition, lease);
+  assert.equal(effectiveSearchProvider(entry), 'grok-search');
+  assert.equal(effectiveFetchProvider(entry), author.fetchProvider);
+  assert.deepEqual(entry.options.config, author);
+  await restoreAuthorRoute(ctx, { acquisition, lease });
+  assert.equal(effectiveSearchProvider(entry), author.searchProvider);
+  assert.equal(effectiveFetchProvider(entry), author.fetchProvider);
+  ctx.dispose();
 });
 
 test('acquisition and route receipt use the same effective fetch environment value', () => {
@@ -423,6 +613,23 @@ test('release drain has its own timeout when the core never settles', async () =
   ctx.dispose();
 });
 
+test('release drain fails closed while a route takeover never settles', async () => {
+  const ctx = makeContext();
+  const controller = createProductReleaseController({
+    ctx,
+    priorIntent: { lease: createLease(ctx), acquisition: {
+      authorSearchProvider: 'candidate-original', authorFetchProvider: 'candidate-fetch',
+      authorInjectSha256: 'a'.repeat(64),
+    } },
+    core: { releaseBarrier: createReleaseBarrier(), dispose: async () => {} },
+    disposeTimeoutMs: 25,
+    pendingTakeovers: () => new Promise(() => {}),
+  });
+  controller.invalidate({ reason: 'test-takeover-timeout' });
+  await assert.rejects(() => controller.drain(), error => error.code === 'CONTROL_RELEASE_DRAIN_TIMEOUT');
+  ctx.dispose();
+});
+
 test('public snapshot keeps route verification separate from committed completion', () => {
   const projected = projectPublicSnapshot({
     phase: 'incomplete', record: { policy: 'released' }, revision: 3, releaseOperationId: 'operation',
@@ -434,14 +641,43 @@ test('public snapshot keeps route verification separate from committed completio
   assert.equal(projected.phase, 'incomplete');
 });
 
-test('settings gateway unavailable snapshot includes completionCommitted', async () => {
+test('settings gateway unavailable snapshot includes completionCommitted', async () => withIsolatedHome(async home => {
   let Gateway;
   applySettingsUi({ plugin(Plugin) { Gateway = Plugin; } });
   const gateway = new Gateway({ provide() {} });
   const snapshot = await gateway.snapshot();
   assert.equal(snapshot.available, false);
   assert.equal(snapshot.completionCommitted, false);
-});
+  assert.equal(snapshot.config.path, join(home, '.config/grok-search-rs/config.toml'));
+  assert.equal(snapshot.plugin.configSource, 'default');
+}));
+
+test('real control snapshot and stop results satisfy the strict settings RPC codecs', async () => withIsolatedHome(async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  ctx.provide('grokSearchProgram', { snapshot: () => ({
+    phase: 'ready', program: { version: '0.1.26', source: 'test' },
+    configPath: join(ctx.profileContext.dir, 'config.toml'), error: null,
+    configuration: { executable: false, configPath: true },
+  }) });
+  ctx.provide('grokSearchConnectionSecurity', {
+    requireOwner() {}, requireSecret() {},
+    capabilities: () => ({ secretsAllowed: true, transport: 'loopback', reason: null }),
+  });
+  let Gateway;
+  applySettingsUi({ plugin(Plugin) { Gateway = Plugin; } });
+  const gateway = new Gateway(ctx);
+  const snapshot = await gateway.snapshot();
+  const resultCodec = method => SETTINGS_DESCRIPTORS.find(row => row.method === method).result.create();
+  assert.equal(resultCodec('snapshot').safeParse(snapshot).success, true);
+  assert.equal(snapshot.control.available, true);
+  const stopped = await gateway.stop();
+  assert.equal(resultCodec('stop').safeParse(stopped).success, true);
+  assert.equal(stopped.outcome.kind, 'released');
+  assert.equal(stopped.snapshot.available, true);
+  ctx.dispose();
+  assert.equal(ctx.get('grokSearchControl').publicSnapshot().available, false);
+}));
 
 test('product recovery entry fails closed without a route receipt and preserves the required record', async () => {
   const ctx = makeContext();

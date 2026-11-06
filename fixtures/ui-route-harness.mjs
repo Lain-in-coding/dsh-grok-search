@@ -21,6 +21,7 @@ let prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true,
   sourceEnabled: Object.fromEntries(sourceNames.map(id => [id, true])) }, revision: 'missing' };
 let control, program, capabilities, route = null, configError = null, delay = 0, nextSaveError = null, nextPreferenceError = null;
 let diagnostics = {}, calls = [], themeListener = null, theme = 'light', fiberErrors = [];
+let logRecords = [], quotaReplies = {}, quotaError = false, quotaDelay = 0, quotaIgnoreCancellation = false;
 const cancelledOperations = new Set(), activeDiagnostics = new Map();
 let counters = { added: 0, removed: 0 };
 const failure = (code, message) => ({ ok: false, error: { code, message, details: {} } });
@@ -35,7 +36,7 @@ function configSnapshot() {
     return [key, { ...field, source, readOnly }];
   }));
   return { path: '/isolated/grok-search-rs/config.toml', displayPath: '~/.config/grok-search-rs/config.toml',
-    revision: currentRevision, exists, fields, error: configError, unknownFields: [] };
+    revision: currentRevision, quotaRevision: currentRevision, exists, fields, error: configError, unknownFields: [] };
 }
 function snapshot() {
   return { control: clone(control), program: clone(program), config: configSnapshot(), capabilities: clone(capabilities),
@@ -49,6 +50,22 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
     active?.();
     return { ok: true, value: { cancelled: Boolean(active) } };
   }
+  if (method === 'accountQuota') {
+    const operationId = request.operationId, ignoreCancellation = quotaIgnoreCancellation;
+    const reply = clone(quotaReplies[request.provider]);
+    const value = Array.isArray(reply) ? reply[request.keyIndex ?? 0] : reply;
+    const error = quotaError;
+    if (quotaDelay) await new Promise(done => {
+      const timer = setTimeout(() => { activeDiagnostics.delete(operationId); done(); }, quotaDelay);
+      if (!ignoreCancellation) activeDiagnostics.set(operationId, () => { clearTimeout(timer); done(); });
+    });
+    activeDiagnostics.delete(operationId);
+    if (!ignoreCancellation && cancelledOperations.has(operationId)) return failure('SETTINGS_DIAGNOSIS_CANCELLED', '查询已取消。');
+    if (!capabilities.secretsAllowed) return failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。');
+    if (request.expectedRevision !== currentRevision || request.quotaRevision !== currentRevision) return failure('CONFIG_CONFLICT', '配置已变更。');
+    return error ? failure('QUOTA_QUERY_FAILED', '查询失败。')
+      : { ok: true, value: { value: value ?? null, supported: request.provider !== 'exa' } };
+  }
   if (method === 'diagnoseProvider') {
     const operationId = request.operationId;
     if (cancelledOperations.has(operationId)) return failure('SETTINGS_DIAGNOSIS_CANCELLED', '测试已取消。');
@@ -61,6 +78,9 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
   }
   else if (delay) await new Promise(done => setTimeout(done, delay));
   if (method === 'snapshot') return { ok: true, value: snapshot() };
+  if (method === 'readSearchLog') return { ok: true, value: { records: clone(logRecords) } };
+  if (method === 'clearSearchLog') { logRecords = []; return { ok: true, value: { records: [] } }; }
+  if (method === 'closeSearchLog') return { ok: true, value: { closed: true } };
   if (method === 'preferences') return { ok: true, value: clone(prefs) };
   if (method === 'save') {
     if (nextSaveError) { const error = nextSaveError; nextSaveError = null; return failure(error, '保存失败，草稿应保留。'); }
@@ -117,12 +137,25 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
 } });
 
 // Minimal host hook/slot shim. Real React lifecycle is checked by Desktop gates.
-let client, component, hooks = [], effects = [], currentHook = 0, element = null, disposers = [];
+// Slot props come only from each registration's inject(), as in the host.
+let client, component, badge, routeOptions = null, badgeOptions = null;
+let hooks = [], effects = [], currentHook = 0, element = null, projectHost = null, disposers = [];
+let subject = { kind: 'bundle', pkg: { name: 'dsh-grok-search' } };
 const React = {
   useRef(initial) { return hooks[currentHook++] ||= { current: initial }; },
   useEffect(effect) { effects.push(effect); currentHook++; },
 };
 const jsx = (type, props) => {
+  if (typeof type === 'function') return type(props);
+  if (type === 'span' && props['data-dsg-project']) {
+    // One host per mount, like a React-owned DOM node.
+    if (!projectHost) {
+      projectHost = document.createElement('span');
+      projectHost.dataset.dsgProject = '1';
+      document.getElementById('project-badge').replaceChildren(projectHost);
+    }
+    props.ref.current = projectHost;
+  }
   if (type === 'div' && props.ref) {
     element ||= document.getElementById('preview');
     props.ref.current = element;
@@ -132,12 +165,24 @@ const jsx = (type, props) => {
 };
 function mount() {
   currentHook = 0; effects = [];
-  component({ remote: { grokSearchSettings: settings }, theme: { get current() { return theme === 'dark'; }, listeners: themeListeners } });
-  disposers = effects.map(effect => effect()).filter(Boolean);
+  component({ ...routeOptions?.inject?.() });
+  const routeEffects = effects.length;
+  badge?.({ subject, ...badgeOptions?.inject?.() });
+  const cleanups = effects.map(effect => effect());
+  // StrictMode replays the badge setup on the same host: cleanup, then setup again.
+  for (let index = routeEffects; index < effects.length; index++) {
+    cleanups[index]?.();
+    cleanups[index] = effects[index]();
+  }
+  disposers = cleanups.filter(Boolean);
   counters.added++;
 }
-const themeListeners = new Set();
-function unmount() { disposers.forEach(dispose => dispose()); disposers = []; counters.removed++; }
+function unmount() {
+  disposers.forEach(dispose => dispose()); disposers = [];
+  projectHost?.remove(); projectHost = null;
+  document.getElementById('project-badge').replaceChildren();
+  counters.removed++;
+}
 window.__ModuleLoader__ = { load(definition) { client = definition.factory(name => name === 'react' ? React : { jsx }); } };
 await import('/src/client.js');
 const ctx = {
@@ -151,7 +196,14 @@ const ctx = {
     promise.dispose = async () => { if (typeof value === 'function') await value(); };
     return promise;
   },
-  slots: { inject: (_, fn) => fn(), register: (_, view) => { component = view; return () => {}; } },
+  slots: {
+    inject: (name, fn) => ['plugins.bundle.config', 'plugins.detail.badge'].includes(name) ? fn() : () => {},
+    register: (options, view) => {
+      if (options.name === 'plugins.detail.badge') { badge = view; badgeOptions = options; }
+      else { component = view; routeOptions = options; }
+      return () => {};
+    },
+  },
 };
 await client.apply(ctx);
 function reset(state = 'returning') {
@@ -163,6 +215,7 @@ function reset(state = 'returning') {
   };
   environment = {}; history = {}; revisionNumber = 1; currentRevision = state === 'fresh' ? 'missing' : revision();
   exists = state !== 'fresh'; route = null; configError = null; diagnostics = {}; calls = []; delay = 0; nextSaveError = null; nextPreferenceError = null;
+  quotaDelay = 0; quotaIgnoreCancellation = false; quotaError = false; quotaReplies = {};
   prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true,
     sourceOrder: [...sourceNames], sourceEnabled: Object.fromEntries(sourceNames.map(id => [id, true])) }, revision: 'missing' };
   control = { available: true, phase: 'required', policy: 'required', routeVerified: true, completionCommitted: false };
@@ -182,11 +235,17 @@ mount();
 window.harness = {
   reset(state) { unmount(); hooks = []; reset(state); mount(); },
   remount() { unmount(); mount(); },
+  subject(value) { unmount(); subject = value; mount(); },
   unmount, mount,
-  theme(value) { theme = value; document.body.dataset.theme = value; themeListener?.({ active: { colorScheme: value } }); themeListeners.forEach(fn => fn()); },
+  theme(value) { theme = value; document.body.dataset.theme = value; themeListener?.({ active: { colorScheme: value } }); },
   inject(updates) { Object.assign(content, updates); currentRevision = revision(); },
   environment(updates) { environment = clone(updates); currentRevision = revision(); },
   configure(options) {
+    if (options.logs) logRecords = clone(options.logs);
+    if (options.quotas) quotaReplies = clone(options.quotas);
+    if (options.quotaError !== undefined) quotaError = options.quotaError;
+    if (options.quotaDelay !== undefined) quotaDelay = options.quotaDelay;
+    if (options.quotaIgnoreCancellation !== undefined) quotaIgnoreCancellation = options.quotaIgnoreCancellation;
     if (options.program) Object.assign(program, options.program);
     if (options.control) Object.assign(control, options.control);
     if (options.capabilities) Object.assign(capabilities, options.capabilities);

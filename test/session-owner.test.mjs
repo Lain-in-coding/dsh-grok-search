@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createSessionOwner } from '../src/core/session-owner.mjs';
+import { createSearchExecutor } from '../src/core/search-executor.mjs';
+import { GrokSearchError } from '../src/core/errors.mjs';
 
 const deferred = () => {
   let resolve, reject;
@@ -98,6 +100,61 @@ test('回收失败阻止新连接且优先于普通请求错误', async () => {
   await assert.rejects(owner.run(request()), error => error === fault);
   await assert.rejects(owner.dispose(), error => error === fault);
   assert.equal(opens, 1);
+});
+
+const reapFailure = whenExited => {
+  const error = new GrokSearchError('GROK_PROCESS_REAP_FAILED', '查询已停止，但本次 Grok 进程尚未回收；新查询已暂停。');
+  if (whenExited) Object.defineProperty(error, 'whenExited', { value: whenExited });
+  return error;
+};
+
+test('owner 与执行器共用回收证明：进程实际退出后可重建会话', async () => {
+  const exit = deferred();
+  let opens = 0;
+  const owner = createSessionOwner({ open: async () => {
+    const id = ++opens;
+    return { id, close: async () => { if (id === 1) throw reapFailure(exit.promise); } };
+  } });
+  const executor = createSearchExecutor({ snapshot: () => ({}), runQuery: ({ signal }) => owner.run({
+    identity: 'same', configuration: {}, signal,
+    operation: async session => {
+      if (session.id === 1) throw new Error('synthetic upstream failure');
+      return { sources: [], session: session.id };
+    },
+  }) });
+  await assert.rejects(executor.search({ query: 'first' }), { code: 'GROK_PROCESS_REAP_FAILED' });
+  await assert.rejects(executor.search({ query: 'paused' }), { code: 'GROK_PROCESS_REAP_FAILED' });
+  assert.equal(owner.snapshot().faulted, true);
+  exit.resolve();
+  await delay(0);
+  assert.equal(executor.snapshot().accepting, true);
+  assert.deepEqual(await executor.search({ query: 'after proven exit' }), { sources: [], session: 2 });
+  assert.equal(opens, 2);
+  assert.equal(owner.snapshot().faulted, false);
+  assert.equal(owner.snapshot().closing, false);
+  await executor.dispose();
+  await owner.dispose();
+});
+
+test('没有退出证明或已退出实例的迟到退出，不解除回收故障', async () => {
+  for (const fault of [new GrokSearchError('GROK_PROCESS_REAP_FAILED', '未回收'),
+    Object.assign(new Error('other close failure'), { whenExited: Promise.resolve() })]) {
+    let opens = 0;
+    const owner = createSessionOwner({ open: async () => ({ id: ++opens, close: async () => { throw fault; } }) });
+    await assert.rejects(owner.run(request('one', { operation: async () => { throw new Error('failure'); } })), error => error === fault);
+    await delay(0);
+    await assert.rejects(owner.run(request()), error => error === fault);
+    assert.equal(opens, 1);
+    await assert.rejects(owner.dispose(), error => error === fault);
+  }
+  const exit = deferred(), proven = reapFailure(exit.promise);
+  const owner = createSessionOwner({ open: async () => ({ close: async () => { throw proven; } }) });
+  await assert.rejects(owner.run(request('one', { operation: async () => { throw new Error('failure'); } })), error => error === proven);
+  await assert.rejects(owner.dispose(), error => error === proven);
+  exit.resolve();
+  await delay(0);
+  assert.equal(owner.snapshot().faulted, true);
+  await assert.rejects(owner.run(request()), { code: 'GROK_SEARCH_STOPPING' });
 });
 
 test('空闲退出只关闭本实例会话，后续请求重新打开', async () => {

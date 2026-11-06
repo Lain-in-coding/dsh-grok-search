@@ -93,8 +93,9 @@ window.__ModuleLoader__.load({
 
   return Object.freeze({ SOURCES: Object.freeze([...SOURCES]), view, plan });
 })();
-    const ROUTE_CONTROLLER = (function createRouteController({ root, layer, remote, logos, sourceChain, memory = {} }) {
+    const ROUTE_CONTROLLER = (function createRouteController({ root, layer, remote, logos, sourceChain, memory = {}, logMemory = null, createSearchLogView, createQuotaView, dark = false }) {
 let disposed = false;
+let logView = null, quotaView = null;
 const timers = new Set(), frames = new Set(), waits = new Set(), listeners = new Set();
 const setTimeout = (fn, ms) => {
   if (disposed) return 0;
@@ -129,7 +130,8 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const RM = window.matchMedia('(prefers-reduced-motion: reduce)');
 const reduced = () => RM.matches;
-let darkTheme = false;
+let darkTheme = dark === true || dark === 'dark';
+root.dataset.theme = layer.dataset.theme = darkTheme ? 'dark' : 'light';
 const HIDDEN = '\u2063dsg-configured-secret:';
 const hidden = value => typeof value === 'string' && value.startsWith(HIDDEN);
 const configFields = () => S.config?.fields || {};
@@ -155,6 +157,9 @@ function configLocation() {
 
 /* ---------- 图标（界面功能图标，非品牌） ---------- */
 const I = {
+  replay: '<path d="M3.2 5.2A5.1 5.1 0 1 1 2.9 10M3.2 2.1v3.5h3.5"/><path d="M8 5.4v3L10 9.7"/>',
+  stop: '<rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" stroke="none"/>',
+  returnLog: '<path d="M5 5l-3 3 3 3M2 8h7.5A3.5 3.5 0 0 0 13 4.5V3"/><path d="M8 12h5"/>',
   play: '<path d="M5 3.5v9l7.5-4.5z" fill="currentColor"/>',
   eye: '<path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>',
   eyeOff: '<path d="M2 2l12 12M6.6 3.7A6.7 6.7 0 0 1 8 3.5C12 3.5 14.5 8 14.5 8a12 12 0 0 1-1.9 2.5M10 11.9a6 6 0 0 1-2 .6C4 12.5 1.5 8 1.5 8a12 12 0 0 1 2.4-3"/><path d="M6.6 6.6a2 2 0 0 0 2.8 2.8"/>',
@@ -308,6 +313,9 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
   S.program = snapshot.program;
   S.pluginInfo = snapshot.plugin || {};
   S.capabilities = snapshot.capabilities;
+  // Capability revocation is synchronous UI state, not the next log poll.
+  // read() invalidates an outstanding private reply before awaiting anything.
+  if (S.capabilities && !S.capabilities.secretsAllowed) void logView?.read();
   S.rpcError = null;
   S.config = snapshot.config;
   S.prefs = preferences || S.prefs;
@@ -339,16 +347,24 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
   if (oldOrder !== S.order.join()) buildRows(false);
   ingestRoute(snapshot.route, first);
   syncAll(keepTrace);
+  syncOpenCardBaseline();
 }
-let readTask = null, pollTimer = 0;
-async function refresh({ first = false, force = false } = {}) {
+let readTask = null, pollTimer = 0, snapshotSignature = null;
+async function refresh({ first = false, force = false, readLog = true } = {}) {
   if (disposed) return;
   if (readTask) return readTask;
   if (!force && (S.busy || S.testing || drag)) return;
   readTask = (async () => {
     try {
       const [snapshot, prefs] = await Promise.all([remote.snapshot(), remote.preferences()]);
-      if (!disposed) acceptSnapshot(snapshot, prefs, { first });
+      if (!disposed) {
+        const signature = JSON.stringify([snapshot, prefs]);
+        if (first || force || S.rpcError || signature !== snapshotSignature) {
+          acceptSnapshot(snapshot, prefs, { first });
+          snapshotSignature = signature;
+        }
+        if (readLog) void logView?.read();
+      }
     } catch (error) {
       if (disposed) return;
       S.loading = false;
@@ -361,7 +377,7 @@ async function refresh({ first = false, force = false } = {}) {
 function schedulePoll() {
   clearTimeout(pollTimer);
   pollTimer = setTimeout(async () => {
-    if (document.visibilityState !== 'hidden') await refresh();
+    if (document.visibilityState !== 'hidden') await refresh({ readLog: false });
     if (!disposed) schedulePoll();
   }, 3000);
 }
@@ -398,6 +414,14 @@ function operationError(error, dialog = false) {
     shake(dlg);
   } else toast(`${code} · ${message}`, { tone: 'err', ms: 5200 });
 }
+// An external write leaves an open card's baseline behind. When that blocks its
+// quota panel, offer the existing explicit reload; never rebase the draft silently.
+function syncOpenCardBaseline() {
+  if (D?.kind === 'card' && !dialogBusy() && D.operationError?.code !== 'CONFIG_CONFLICT' && quotaView?.stale()) {
+    D.operationError = { code: 'CONFIG_CONFLICT', message: '配置已在别处修改，请先读取最新配置。' };
+    refreshDialog();
+  } else quotaView?.render();
+}
 async function reloadDialogDraft() {
   if (!D || dialogBusy() || S.busy || disposed) return;
   const mine = D, previous = clone(mine.base), draft = clone(mine.draft);
@@ -423,7 +447,7 @@ async function reloadDialogDraft() {
       message: '已读取最新配置并保留你的修改。请核对后再保存；本次没有写入。' };
     mine.show = {};
     mine.saving = false;
-    if (mine.kind === 'card') renderCard(); else renderHub();
+    if (mine.kind === 'card') { renderCard(); void quotaView?.open(); } else renderHub();
   } catch (error) { if (D === mine) operationError(error, true); }
   finally { S.busy = false; if (D === mine) mine.saving = false; }
 }
@@ -432,8 +456,12 @@ async function reloadDialogDraft() {
 async function saveConfig(build, baseline = null) {
   if (!S.config || S.config.error) throw Object.assign(new Error('请先修正配置文件。'), { code: 'CONFIG_PARSE_FAILED' });
   const starting = clone(S.config);
+  // A destination change can forward an unchanged-looking (redacted) key to
+  // another service. Treat it like a secret edit: require explicit review of
+  // a newer revision instead of silently pairing the draft URL with its key.
   const fieldChanged = (old, current, updates) => old.path !== current.path || Object.keys(updates).some(key =>
-    key.endsWith('_key') || key === 'github_token' || JSON.stringify(old.fields[key]) !== JSON.stringify(current.fields[key]));
+    key.endsWith('_key') || key.endsWith('_url') || key === 'github_token'
+    || JSON.stringify(old.fields[key]) !== JSON.stringify(current.fields[key]));
   for (let attempt = 0; attempt < 2; attempt++) {
     const updates = typeof build === 'function' ? build(S.config.fields) : build;
     const revision = S.config.revision;
@@ -518,7 +546,7 @@ function ingestRoute(route, first = false) {
   if (route.grokCode !== 'DISABLED' && grokOn()) {
     rememberCheck('grok', 0, route.grokCode ? normalizeCode(route.grokCode) : '', 'search', route.at);
   }
-  if (SUPP.includes(route.served)) {
+  if (SUPP.includes(route.served) && route.provenance !== 'source-label') {
     delete S.providerBad[route.served];
     if (route.served === 'tavily') {
       // MCP/source search does not identify the successful Key. Do not turn
@@ -537,7 +565,8 @@ function ingestRoute(route, first = false) {
     reroute: route.fallbackUsed === true, outcome: route.outcome,
     done: { tone: route.outcome === 'ok' ? 'ok' : 'err',
       text: route.outcome !== 'ok' ? '全部不可用'
-        : route.served === 'grok-sources' ? '已回退 · Grok 内置补充链'
+        : route.resultProviders?.length && route.fallbackUsed ? `已回退 · ${route.resultProviders.filter(id => META[id]).map(id => META[id].name).join(' / ')}${route.resultProvidersComplete ? '' : ' / 来源未报告'}`
+          : route.served === 'grok-sources' ? '已回退 · 来源未报告'
           : route.fallbackUsed ? `已回退 · ${META[route.served]?.name || '补充来源'}` : 'Grok 搜索完成' } };
   clearTimeout(S.traceTimer);
   S.traceTimer = setTimeout(() => { S.trace = null; renderSummary(); pumpWires(200); }, 6500);
@@ -573,10 +602,14 @@ const isPart = (id) => faultOf(S.bad, id) === 'some';
 const grokOn = () => isOn('grok');
 const usable = (id) => isOn(id) && !isBad(id);
 const requestFailed = id => S.lastRoute?.failures?.some(failure => failure.provider === id) === true;
-const unknownFallback = () => S.lastRoute?.served === 'grok-sources' && S.lastRoute.outcome === 'ok';
+const observedSupp = () => (S.lastRoute?.resultProviders || [S.lastRoute?.served]).filter(id => SUPP.includes(id));
+const unknownFallback = () => S.lastRoute?.served === 'grok-sources' && S.lastRoute.outcome === 'ok' && !observedSupp().length;
 const servingSupp = () => unknownFallback() || S.lastRoute?.outcome === 'failed' ? null
-  : SUPP.includes(S.lastRoute?.served) && isOn(S.lastRoute.served) && !requestFailed(S.lastRoute.served)
-    ? S.lastRoute.served : enabledSupp().find(id => !isBad(id) && !requestFailed(id)) || null;
+  : S.lastRoute?.resultProviders ? observedSupp().find(id => isOn(id) && !requestFailed(id)) || null
+    : SUPP.includes(S.lastRoute?.served) && isOn(S.lastRoute.served) && !requestFailed(S.lastRoute.served)
+      ? S.lastRoute.served : enabledSupp().find(id => !isBad(id) && !requestFailed(id)) || null;
+const servingSupps = () => S.lastRoute?.resultProviders && S.lastRoute.outcome === 'ok'
+  ? observedSupp().filter(id => isOn(id) && !requestFailed(id)) : [servingSupp()].filter(Boolean);
 /* checked 只记录完成时间和来源；成败统一由 bad 与完成记录共同确定。
    pending 属于本轮 trace，不能覆盖上一次已经完成的验证结果。 */
 function savedCheck(id, slot = 0) {
@@ -585,7 +618,7 @@ function savedCheck(id, slot = 0) {
   return { tone: code ? 'err' : record ? 'ok' : 'idle', code: code || '', record };
 }
 function rememberCheck(id, slot, code, source, at = Date.now()) {
-  (S.checked[id] ||= {})[slot] = { at, source };
+  (S.checked[id] ||= {})[slot] = { at, source, status: code ? 'failed' : 'ok' };
   if (id === 'tavily') {
     const bad = { ...(S.bad.tavily || {}) };
     if (code) bad[slot] = code; else delete bad[slot];
@@ -627,6 +660,7 @@ function routeStatus() {
   if (!['required'].includes(S.control?.phase)) return 'connecting';
   if (S.lastRoute?.outcome === 'failed') return 'err';
   const sv = servingSupp();
+  if (S.lastRoute?.outcome === 'ok' && S.lastRoute.fallbackUsed && S.lastRoute.resultProviders) return 'fallback';
   if (unknownFallback()) return 'fallback';
   if (S.prov.grok.enabled !== false && ['idle', 'discovering', 'checking-version', 'downloading', 'verifying'].includes(S.program?.phase)) {
     return sv ? 'backup' : 'prep';
@@ -659,7 +693,7 @@ function rowState(id) {
   if (S.prov[id].enabled === false) return 'off';
   if (st === 'off' || id === 'github') return 'on';
   if (isBad(id) || requestFailed(id)) return st === 'err' ? 'err' : 'bad';
-  if ((st === 'fallback' || st === 'backup') && servingSupp() === id) return 'live';
+  if ((st === 'fallback' || st === 'backup') && servingSupps().includes(id)) return 'live';
   return 'on';
 }
 
@@ -669,7 +703,7 @@ const RANK = { hidden: 0, unset: 1, rest: 2, broken: 3, aux: 4, standby: 5, warn
 function wireDefs() {
   const st = routeStatus();
   const off = st === 'off';
-  const sv = servingSupp();
+  const serving = servingSupps();
   const covering = st === 'fallback' || st === 'backup';
   const defs = [];
   const top = { off: 'rest', load: 'hidden', down: 'rest', cfgerr: 'broken', ctlerr: 'broken',
@@ -687,20 +721,14 @@ function wireDefs() {
     else if (id === 'github') ws = isOn('github') ? 'aux' : 'unset';
     else if (isBad(id) || requestFailed(id) || id === 'grok' && S.program?.phase === 'error') ws = 'broken';
     else if (id === 'grok') ws = S.program?.phase === 'ready' ? 'live' : 'warn';
-    else ws = covering && id === sv ? 'live' : 'standby';
+    else ws = covering && serving.includes(id) ? 'live' : 'standby';
     defs.push({ id: 'hub-' + id, a: 'hub-out', b: 'row-' + id, ws, kind: 'branch', at: 'end' });
   });
   return defs;
 }
 function portEl(name) {
-  if (name.startsWith('row-')) return $(`.row[data-id="${name.slice(4)}"] > .port`);
+  if (name.startsWith('row-')) return $(`#colList .row[data-id="${name.slice(4)}"] > .port`);
   return $(`.port[data-port="${name}"]`);
-}
-function portXY(name, sr) {
-  const el = portEl(name);
-  if (!el) return null;
-  const r = el.getBoundingClientRect();
-  return { x: r.left + r.width / 2 - sr.left, y: r.top + r.height / 2 - sr.top };
 }
 function pathFor(d, A, B) {
   if (d.kind === 'alt') return `M${A.x},${A.y} L${B.x},${B.y}`;
@@ -777,25 +805,41 @@ function syncBreak(g, prev, at) {
 function drawWires() {
   const stage = $('#stage');
   const sr = stage.getBoundingClientRect();
+  const computed = getComputedStyle(stage);
+  const scaleX = sr.width / (parseFloat(computed.width) || sr.width || 1) || 1;
+  const scaleY = sr.height / (parseFloat(computed.height) || sr.height || 1) || 1;
   const defs = wireDefs();
+  // Measure every port before changing any SVG/port style. Measuring the next
+  // branch after writing the previous one forced a layout per branch per frame.
+  const ports = new Map();
+  for (const d of defs) for (const name of [d.a, d.b]) if (!ports.has(name)) {
+    const el = portEl(name), r = el?.getBoundingClientRect();
+    ports.set(name, { el, point: r ? {
+      x: (r.left + r.width / 2 - sr.left) / scaleX,
+      y: (r.top + r.height / 2 - sr.top) / scaleY,
+    } : null });
+  }
   const portRank = {};
   const live = new Set();
+  const breaks = [];
   let breaking = 0;
   defs.forEach((d) => {
     live.add(d.id);
     const fresh = !wireNodes.has(d.id);
     const g = ensureWire(d.id);
     const prev = g.dataset.ws;
-    g.dataset.ws = d.ws;
+    if (prev !== d.ws) g.dataset.ws = d.ws;
     const requesting = S.testing && !S.trace?.done && (d.id === 'dsh-hub'
       || S.trace?.items.some((it) => it.tone === 'run' && d.id === 'hub-' + it.id));
-    g.dataset.requesting = String(!!requesting);
-    const A = portXY(d.a, sr), B = portXY(d.b, sr);
+    if (g.dataset.requesting !== String(!!requesting)) g.dataset.requesting = String(!!requesting);
+    const A = ports.get(d.a).point, B = ports.get(d.b).point;
     if (A && B) {
       const dd = pathFor(d, A, B);
-      g.children[0].setAttribute('d', dd);
-      g.children[1].setAttribute('d', dd);
-      breaking = Math.max(breaking, syncBreak(g, prev, d.at));
+      if (g.children[1].getAttribute('d') !== dd) {
+        g.children[0].setAttribute('d', dd);
+        g.children[1].setAttribute('d', dd);
+      }
+      breaks.push({ g, prev, at: d.at });
     }
     if (!fresh && prev !== d.ws) {
       if (!S.testing && performance.now() > quietUntil) onWireChange(d, g, prev);
@@ -803,6 +847,7 @@ function drawWires() {
     }
     [d.a, d.b].forEach((pn) => { if ((portRank[pn] ?? -1) < RANK[d.ws]) portRank[pn] = RANK[d.ws]; });
   });
+  for (const { g, prev, at } of breaks) breaking = Math.max(breaking, syncBreak(g, prev, at));
   for (const [id, g] of wireNodes) if (!live.has(id)) { g.remove(); wireNodes.delete(id); }
   const rk = (g) => (g.classList.contains('lit') ? 99 : RANK[g.dataset.ws]);
   const sorted = defs.map((d) => wireNodes.get(d.id)).sort((x, y) => rk(x) - rk(y));
@@ -811,7 +856,10 @@ function drawWires() {
   if (!packetLayer) { packetLayer = document.createElementNS(SVGNS, 'g'); packetLayer.setAttribute('class', 'packets'); }
   if (wiresEl.lastChild !== packetLayer) wiresEl.appendChild(packetLayer);
   const names = Object.keys(RANK);
-  Object.entries(portRank).forEach(([pn, rk]) => { const el = portEl(pn); if (el) el.dataset.ps = names.find((n) => RANK[n] === rk); });
+  Object.entries(portRank).forEach(([pn, rk]) => {
+    const el = ports.get(pn).el, state = names.find(n => RANK[n] === rk);
+    if (el && el.dataset.ps !== state) el.dataset.ps = state;
+  });
   if (breaking) pumpWires(breaking);
 }
 let pumpUntil = 0, pumpRaf = 0;
@@ -850,7 +898,7 @@ function markFor(id) {
 }
 function syncMarks() {
   let changed = false;
-  $$('.row').forEach((r) => {
+  $$('#colList .row').forEach((r) => {
     const p = r.querySelector('.port');
     const m = markFor(r.dataset.id);
     if ((p.dataset.mark || '') === m) return;
@@ -870,6 +918,11 @@ const card = $('#routeCard');
 // 仅重新定位连线，不因窗口大小切换路由布局。
 const resizeObserver = new ResizeObserver(() => requestAnimationFrame(() => pumpWires(80)));
 resizeObserver.observe(card);
+const historyActionsObserver = new ResizeObserver(([entry]) => {
+  const width = entry.contentRect.width + 'px';
+  if (card.style.getPropertyValue('--history-actions-width') !== width) card.style.setProperty('--history-actions-width', width);
+});
+historyActionsObserver.observe($('.rc-actions', card));
 
 /* ---------- 供应商行：图标 + 名称 + 开关 ---------- */
 function rowEl(id) {
@@ -922,14 +975,22 @@ function syncRow(el) {
   }
   main.setAttribute('aria-label', aria);
 }
-function syncRows() { $$('.row').forEach(syncRow); syncMarks(); }
+function syncRows() { $$('#colList .row').forEach(syncRow); syncMarks(); }
 function buildRows(animate) {
-  $('#rowsPrimary').replaceChildren(rowEl('grok'));
-  $('#rowsSupp').replaceChildren(...S.order.map(rowEl));
-  $('#rowsExtract').replaceChildren(rowEl('github'));
+  for (const [target, ids] of [['#rowsPrimary', ['grok']], ['#rowsSupp', S.order], ['#rowsExtract', ['github']]]) {
+    const parent = $(target);
+    const nodes = new Map([...parent.children].map(node => [node.dataset.id, node]));
+    ids.forEach((id, index) => {
+      const node = nodes.get(id) || rowEl(id);
+      if (parent.children[index] !== node) parent.insertBefore(node, parent.children[index] || null);
+    });
+  }
   syncRows();
+  animateRows(animate);
+}
+function animateRows(animate) {
   if (animate && !reduced()) {
-    $$('.row').forEach((r, i) => {
+    $$('#colList .row').forEach((r, i) => {
       r.style.setProperty('--i', i);
       r.classList.add('enter');
       r.addEventListener('animationend', (e) => { if (e.animationName === 'row-in') r.classList.remove('enter'); });
@@ -981,15 +1042,23 @@ let stripTipTarget = null, stripTipTimer = 0;
 let stripSect = '';
 function hideStripTip() {
   clearTimeout(stripTipTimer);
+  stripTipTarget?.removeAttribute('aria-describedby');
   stripTipTarget = null;
   routeTooltip.hidden = true;
+  routeTooltip.textContent = '';
+  delete routeTooltip.dataset.kind;
 }
 function showStripTip(node) {
-  if (!node?.isConnected || !stripSlot.classList.contains('has')) { hideStripTip(); return; }
+  const quotaTip = node?.matches('[data-quota-tip]');
+  if (!node?.isConnected || (quotaTip ? node.closest('[inert]') || !dlg.contains(node) || overlay.hidden
+    : !stripSlot.classList.contains('has'))) { hideStripTip(); return; }
   clearTimeout(stripTipTimer);
+  if (stripTipTarget !== node) stripTipTarget?.removeAttribute('aria-describedby');
   stripTipTarget = node;
-  routeTooltip.textContent = node._tip;
+  routeTooltip.textContent = quotaTip ? node.dataset.quotaTip : node._tip;
+  routeTooltip.dataset.kind = quotaTip ? 'quota' : 'route';
   routeTooltip.hidden = false;
+  node.setAttribute('aria-describedby', 'routeTooltip');
   const r = node.getBoundingClientRect();
   const t = routeTooltip.getBoundingClientRect();
   routeTooltip.style.left = Math.max(12, Math.min(innerWidth - t.width - 12, r.left + r.width / 2 - t.width / 2)) + 'px';
@@ -1011,9 +1080,25 @@ routeTooltip.addEventListener('pointerenter', () => clearTimeout(stripTipTimer))
 routeTooltip.addEventListener('pointerleave', () => {
   if (stripTipTarget !== active()) hideStripTip();
 });
-listen(document, 'keydown', e => { if (e.key === 'Escape') hideStripTip(); });
+listen(document, 'keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (stripTipTarget?.matches('[data-quota-tip]')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+  hideStripTip();
+});
 listen(window, 'resize', hideStripTip);
-listen(window, 'scroll', hideStripTip, true);
+listen(window, 'scroll', event => {
+  if (routeTooltip.contains(targetOf(event))) return;
+  const node = stripTipTarget;
+  if (node?.matches('[data-quota-tip]') && node.isConnected && active() === node) {
+    const bounds = node.getBoundingClientRect(), body = node.closest('.dlg-body').getBoundingClientRect();
+    if (bounds.bottom > Math.max(0, body.top) && bounds.top < Math.min(innerHeight, body.bottom)
+      && bounds.right > 0 && bounds.left < innerWidth) { showStripTip(node); return; }
+  }
+  hideStripTip();
+}, true);
 function stripNode(m) {
   let n = stripNodes.get(m.id);
   if (!n) {
@@ -1192,7 +1277,7 @@ const NETWORK_ERRORS = {
   URL_INVALID: ['地址', '接口地址无效'],
   GROK_AUTH_ERROR: ['认证', 'Grok 认证失败'], GROK_TIMEOUT: ['超时', 'Grok 响应超时'],
   GROK_PARSE_ERROR: ['响应', 'Grok 响应无法解析'], GROK_PROVIDER_ERROR: ['接口', 'Grok 接口调用失败'],
-  GROK_CONTENT_EMPTY: ['回答', '没有可核验回答'], GROK_SOURCES_EMPTY: ['来源', '没有可核验来源'],
+  GROK_CONTENT_EMPTY: ['回答', '未返回回答内容'], GROK_SOURCES_EMPTY: ['来源', '未返回引用链接'],
   GROK_PROGRAM_MISSING: ['程序', 'Grok 尚未就绪'], GROK_PROGRAM_PREPARING: ['程序', 'Grok 正在准备'],
   GROK_CONFIG_INVALID: ['配置', 'Grok 配置无效'], GROK_TOOL_ERROR: ['搜索', 'Grok 搜索报告错误'],
   GROK_MCP_ERROR: ['MCP', 'Grok 初始化或搜索失败'], GROK_CHILD_EXIT: ['进程', 'Grok 意外退出'],
@@ -1204,6 +1289,7 @@ const NETWORK_ERRORS = {
   GROK_PLATFORM_UNSUPPORTED: ['平台', '系统或架构不支持'], GROK_INSTALL_BUSY: ['安装', '程序正在安装'],
   GROK_PROGRAM_REAP_FAILED: ['回收', '程序回收未完成'], GROK_PROCESS_REAP_FAILED: ['回收', '进程回收未完成'],
   SETTINGS_UNAVAILABLE: ['连接', '设置服务不可用'], SOURCE_UNAVAILABLE: ['来源', '来源服务不可用'],
+  FALLBACK_SOURCES_ZERO: ['配置', '回退来源数为 0'],
 };
 function failureInfo(code) {
   const value = normalizeCode(code).toUpperCase();
@@ -1230,11 +1316,14 @@ function failureHelp(code) {
   if (value === 'CERT_HAS_EXPIRED' || value === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') return '核对 HTTPS 证书与代理设置，不要关闭证书校验。';
   if (['408', '504', 'TIMEOUT', 'ETIMEDOUT'].includes(value)) return '核对网络与超时设置，稍后重试。';
   if (value === 'GROK_AUTH_ERROR') return '检查 Grok Key 或原有登录凭据；上游未提供具体 HTTP 状态码。';
-  if (['GROK_CONTENT_EMPTY', 'GROK_SOURCES_EMPTY', 'GROK_PARSE_ERROR'].includes(value)) return '核对模型与搜索能力；有 Key 不等于能返回可核验来源。';
+  if (value === 'GROK_SOURCES_EMPTY') return '本次回答未提供可识别的来源链接，请检查模型联网能力与引用格式。';
+  if (value === 'GROK_CONTENT_EMPTY') return '本次未返回回答内容，请检查模型与接口响应。';
+  if (value === 'GROK_PARSE_ERROR') return '接口响应无法解析，请核对所选协议与服务商返回格式。';
+  if (value === 'GROK_PROVIDER_ERROR') return '核对 Base URL、接口协议与模型；该错误不单独表示 API Key 失效。';
   if (value === 'GROK_VERSION_UNVERIFIED') return '此版本尚未通过插件验证；不会擅自升级或覆盖已有安装。';
   if (value === 'OUTPUT_LIMIT') return '调大「回复字符上限」以容纳搜索链接；此结果不表示 Key 失效。';
-  if (value.startsWith('GROK_DOWNLOAD_') || value.startsWith('GROK_ARCHIVE_')) return '检查网络或程序缓存，在 Grok Search RS 设置中重新检测。';
-  if (value.startsWith('GROK_PROGRAM_') || value.startsWith('GROK_PROCESS_')) return '检查程序状态，在 Grok Search RS 设置中重新检测；不会修改全局安装。';
+  if (value.startsWith('GROK_DOWNLOAD_') || value.startsWith('GROK_ARCHIVE_')) return '检查网络或程序缓存，在 Grok Search Rs 设置中重新检测。';
+  if (value.startsWith('GROK_PROGRAM_') || value.startsWith('GROK_PROCESS_')) return '检查程序状态，在 Grok Search Rs 设置中重新检测；不会修改全局安装。';
   if (value.startsWith('GROK_')) return '核对 Grok 程序、Base URL 和模型；该错误不单独证明 Key 失效。';
   if (NETWORK_ERRORS[value]) return '核对 BaseURL、网络或代理设置。';
   if (Number(value) >= 500) return '上游服务异常，可稍后重试。';
@@ -1307,12 +1396,15 @@ function renderBanner() {
   } else if (st === 'off') {
     html = B('info', 'info', '已恢复原搜索设置，无需重启', '配置已保留。请在插件页使用 dsh-grok-search 的原生开关重新启用。');
   } else if (st === 'fallback') {
-    const observed = unknownFallback() ? 'Grok 内置补充链' : META[sv]?.name || '补充来源';
+    const observed = S.lastRoute?.resultProviders?.length
+      ? S.lastRoute.resultProviders.filter(id => META[id]).map(id => META[id].name).join(' / ')
+        + (S.lastRoute.resultProvidersComplete ? '' : ' / 来源未报告')
+      : unknownFallback() ? '来源未报告' : META[sv]?.name || '补充来源';
     const grokCode = codeOf('grok') || S.program?.error?.code;
     const rotates = sv && codeOf(sv).split('/').every((code) => TAVILY_ROTATE.has(code));
     const part = sv && isPart(sv) ? `；${META[sv].name} 有 Key 返回 ${codeOf(sv)}${rotates ? '，可换用其他 Key' : '，各 Key 的验证结果单独保留'}` : '';
     html = B('fallback', 'reroute', `Grok ${failureInfo(grokCode).status} · ${errText(grokCode)}，已静默回退到 ${observed}`,
-      `搜索照常可用，结果来自补充来源${part}。修好 Grok 后自动切回，不会回退官方搜索。`,
+      `搜索照常可用，${S.lastRoute?.provenance === 'source-label' ? '来源按返回结果确认' : '结果来自补充来源'}${part}。修好 Grok 后自动切回，不会回退官方搜索。`,
       btn('open:grok', '检查 Grok 配置') + btn('grok-off', '关闭 Grok'));
   } else if (st === 'err') {
     const fails = failList();
@@ -1398,12 +1490,25 @@ function dismissToast(el) {
   el.classList.add('is-out');
   setTimeout(() => el.remove(), 180);
 }
+const shakeCleanups = new WeakMap();
 function shake(el) {
   if (!el) return;
+  shakeCleanups.get(el)?.();
   el.classList.remove('shake');
   void el.offsetWidth;
   el.classList.add('shake');
-  el.addEventListener('animationend', function h(e) { if (e.animationName === 'shake') { el.classList.remove('shake'); el.removeEventListener('animationend', h); } });
+  let timer, offEnd, offCancel;
+  const clean = () => {
+    clearTimeout(timer);
+    el.classList.remove('shake');
+    offEnd?.(); offCancel?.();
+    shakeCleanups.delete(el);
+  };
+  const end = event => { if (event.target === el && event.animationName === 'shake') clean(); };
+  shakeCleanups.set(el, clean);
+  offEnd = listen(el, 'animationend', end);
+  offCancel = listen(el, 'animationcancel', end);
+  timer = setTimeout(clean, reduced() ? 0 : 450);
 }
 function bump(el) {
   if (!el) return;
@@ -1412,10 +1517,11 @@ function bump(el) {
   el.classList.add('tick');
   setTimeout(() => el.classList.remove('tick'), 720);
 }
-const rowOf = (id) => $(`.row[data-id="${id}"]`);
+const rowOf = (id) => $(`#colList .row[data-id="${id}"]`);
 
 /* ---------- 插件总开关：热重载语义，当场生效 ---------- */
 function cancelTest() {
+  logView?.cancel();
   const running = S.testing;
   gen++;
   const operationId = S.diagnosticOperation;
@@ -1555,6 +1661,10 @@ function startDrag() {
   const d = drag;
   const wrap = $('#rowsSupp');
   d.rows = $$('.row', wrap);
+  // A drag owns transforms from this point on; an entry animation must not
+  // keep replacing the drag's geometry or transform.
+  d.rows.forEach(row => row.classList.remove('enter'));
+  void wrap.offsetWidth;
   d.n = d.rows.length;
   d.from = d.rows.indexOf(d.row);
   d.to = d.from;
@@ -1688,6 +1798,7 @@ const dlg = $('#dialog');
 const testPop = $('#testPop');
 let D = null;
 let closeTimer = 0;
+let overlayEntranceTimer = 0;
 let gen = 0;
 const dialogBusy = () => !!D && (D.saving || D.clearing);
 function resetClearConfirmation() {
@@ -1706,18 +1817,24 @@ function lockDialog() {
 }
 function showOverlay() {
   hideStripTip();
+  logView?.hideTip();
   clearTimeout(closeTimer);
   overlay.classList.remove('is-closing');
   if (overlay.hidden) {
     clearToasts();
     overlay.hidden = false;
     dlg.classList.remove('is-in');
-    const done = () => dlg.classList.add('is-in');
-    dlg.addEventListener('animationend', function h(e) { if (e.target === dlg && e.animationName === 'dlg-in') { done(); dlg.removeEventListener('animationend', h); } });
-    setTimeout(done, 300);
+    clearTimeout(overlayEntranceTimer);
+    overlayEntranceTimer = setTimeout(() => {
+      overlayEntranceTimer = 0;
+      if (!overlay.hidden && D) dlg.classList.add('is-in');
+    }, reduced() ? 0 : 300);
   }
 }
 function hideOverlay(cb) {
+  hideStripTip();
+  clearTimeout(overlayEntranceTimer);
+  shakeCleanups.get(dlg)?.();
   overlay.classList.add('is-closing');
   closeTimer = setTimeout(() => {
     overlay.hidden = true;
@@ -1736,6 +1853,7 @@ function closeDialog(force) {
     if (fn) fn.innerHTML = '<b>有未保存的修改</b> · 再按一次 Esc 或点空白处放弃修改';
     return;
   }
+  quotaView?.cancel();
   const back = D.returnFocus;
   const id = D.id;
   clearTimeout(D.clearTimer);
@@ -1748,6 +1866,16 @@ function closeDialog(force) {
 overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) closeDialog(false); });
 listen(document, 'keydown', (e) => {
   if (!overlay.hidden && D) {
+    const mode = targetOf(e).closest?.('[data-a=mode]');
+    if (mode && !mode.disabled && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
+      e.preventDefault();
+      const modes = $$('[data-a=mode]', dlg).filter(button => !button.disabled);
+      const step = e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1;
+      const next = e.key === 'Home' ? modes[0] : e.key === 'End' ? modes.at(-1)
+        : modes[(modes.indexOf(mode) + step + modes.length) % modes.length];
+      if (next) { setMode(next); $('[data-a=mode][aria-checked=true]', dlg)?.focus({ preventScroll: true }); }
+      return;
+    }
     if (e.key === 'Escape') { e.preventDefault(); closeDialog(false); return; }
     if (e.key === 'Tab') { trapTab(e); return; }
     if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
@@ -1759,7 +1887,7 @@ listen(document, 'keydown', (e) => {
   if (e.key === 'Escape' && !testPop.hidden) closePop(true);
 });
 function focusables() {
-  return $$('button, [href], input, [tabindex]:not([tabindex="-1"])', dlg).filter((el) => !el.disabled && !el.closest('[inert]') && el.getClientRects().length);
+  return $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', dlg).filter((el) => !el.disabled && !el.closest('[inert]') && el.getClientRects().length);
 }
 function trapTab(e) {
   const f = focusables();
@@ -1772,6 +1900,9 @@ function trapTab(e) {
 }
 function initialFocus() {
   if (!D) return;
+  // An opening RAF must not steal focus after the user has already selected
+  // an input (or a quota selector) and started typing.
+  if (dlg.contains(active()) && active()?.matches('input,select,textarea,button,a')) return;
   let el = null;
   if (D.kind === 'card') {
     const kk = { grok: D.draft.mode === 'compat' ? 'gwKey' : 'key', tavily: 'keys.0', github: 'token' }[D.id] || 'key';
@@ -1787,7 +1918,10 @@ const fid = (k) => 'f-' + k.replace(/\./g, '-');
 function field({ label, hint, k, msg, ctl, help }) {
   const tag = k ? 'label' : 'span';
   const slot = msg || k;
-  const lab = `<${tag} class="f-label"${k ? ` for="${fid(k)}"` : ''}>${label}${k && fieldReadOnly(k) ? `<small>${svg('lock', 'ic ic-sm')}只读</small>` : hint ? `<small>${hint}</small>` : ''}</${tag}>`;
+  const sourceKey = D?.kind === 'card' ? CARD_FIELDS[D.id]?.[k?.startsWith('keys.') ? 'keys' : k] : HUB_FIELDS[k];
+  const environment = D?.fields?.[sourceKey]?.source === 'environment';
+  const locked = k && fieldReadOnly(k) ? `<small${environment ? ' title="此项由启动环境变量提供；请在启动环境中修改或移除覆盖，再使用共享配置。"' : ''}>${svg('lock', 'ic ic-sm')}${environment ? '环境变量 · 只读' : '只读'}</small>` : '';
+  const lab = `<${tag} class="f-label"${k ? ` for="${fid(k)}"` : ''}>${label}${locked || (hint ? `<small>${hint}</small>` : '')}</${tag}>`;
   const msgEl = slot ? `<p class="f-msg" id="${fid(slot)}-message" data-msg="${slot}" aria-live="polite" hidden></p>` : '';
   const helpEl = help ? `<p class="f-help"${slot ? ` id="${fid(slot)}-help"` : ''}>${help}</p>` : '';
   return `<div class="field">${lab}<div class="f-ctl">${ctl}${msgEl}${helpEl}</div></div>`;
@@ -1816,7 +1950,7 @@ function keyIn(k, v, ph, o = {}) {
   const cp = `<button type="button" class="icon-btn" data-a="copy" data-k="${k}" aria-label="复制密钥"${unavailable ? ' disabled' : ''}>${svg('copy')}</button>`;
   const del = o.del ? `<button type="button" class="icon-btn" data-a="del-key" data-i="${o.i}" aria-label="删除这个 Key"${ro ? ' disabled' : ''}>${svg('trash')}</button>` : '';
   const aria = o.aria ? ` aria-label="${o.aria}"` : '';
-  return `<div class="input${ro ? ' is-readonly' : ''}"><input id="${fid(k)}" type="${shown ? 'text' : 'password'}" class="mono" data-k="${k}" value="${isHidden ? '' : esc(v)}" placeholder="${isHidden ? '已配置 · 点击查看或编辑' : esc(ph || '')}" spellcheck="false" autocomplete="off"${aria}${isHidden ? ' data-hidden="true" readonly' : ro ? ' readonly' : ''}><span class="in-act">${eye}${cp}${del}</span></div>`;
+  return `<div class="input${ro ? ' is-readonly' : ''}"><input id="${fid(k)}" type="${shown ? 'text' : 'password'}" class="mono" data-k="${k}" value="${isHidden ? '' : esc(v)}" placeholder="${isHidden ? ro ? '已配置 · 点击查看' : '已配置 · 点击查看或编辑' : esc(ph || '')}" spellcheck="false" autocomplete="off"${aria}${isHidden ? ' data-hidden="true" readonly' : ro ? ' readonly' : ''}><span class="in-act">${eye}${cp}${del}</span></div>`;
 }
 function chip(k, v, label, cur) {
   return `<button type="button" class="chip" data-a="pick" data-k="${k}" data-v="${esc(v)}" aria-pressed="${(cur || '').trim() === v}"${fieldReadOnly(k) ? ' disabled' : ''}>${esc(label)}</button>`;
@@ -1832,7 +1966,10 @@ const KEEP_URL = '留空使用官方地址。';
 const GROK_NOTE = note('关闭右上角开关后，搜索直接由补充来源返回；Grok 失效时也会静默回退到补充来源，全部不可用才报错，不会回退官方搜索。这个开关只对 DSH 生效，不写入 config.toml。');
 const credKey = (id, p = S.prov[id]) => (id === 'grok' ? (p.mode === 'compat' ? 'gwKey' : 'key') : id === 'github' ? 'token' : 'key');
 const CRED = { grok: ['mode', 'url', 'key', 'model', 'gwUrl', 'gwKey', 'gwModel', 'web', 'x'], tavily: ['url', 'keys'], exa: ['url', 'key'], tinyfish: ['searchUrl', 'fetchUrl', 'key'], firecrawl: ['url', 'key'], github: ['token'] };
-/* 弹窗里的“最近一次结果”提示：跟随 Key 的值，改动该 Key 后自动消失 */
+/* Only explicit authentication failures belong beside a credential.
+   Other failures describe the search attempt, not the Key's format or validity. */
+const credentialFailure = code => String(code || '').split('/').every(value =>
+  ['401', 'GROK_AUTH_ERROR'].includes(normalizeCode(value).toUpperCase()));
 function healthOf(id) {
   const v = S.bad[id];
   if (!v) return [];
@@ -1841,9 +1978,10 @@ function healthOf(id) {
   const k = credKey(id, base);
   return [{ k, val: (base[k] || '').trim(), code: v }];
 }
-function healthMsg(id, code) {
-  const base = `最近一次检查：${failureInfo(code).status} · ${errText(code)}。${failureHelp(code)}`;
-  if (id === 'grok') return base + (grokOn() && servingSupp() ? '；搜索已静默回退到补充来源' : '');
+function healthMsg(id, code, summary = false) {
+  const base = `${summary ? '' : '最近一次检查：'}${failureInfo(code).status} · ${errText(code)}。${failureHelp(code)}`;
+  if (id === 'grok') return base + (summary && grokOn() && S.lastRoute?.outcome === 'ok' && S.lastRoute.fallbackUsed === true
+    ? '\n搜索已静默回退到补充来源' : '');
   if (id === 'tavily') return base + (!TAVILY_ROTATE.has(code) ? '；正常搜索遇到此错误不会换 Key，逐项测试仍独立检查其他 Key' : isBad('tavily') ? '' : '；已自动换用下一个 Key');
   return base + '；已自动跳过';
 }
@@ -1852,20 +1990,20 @@ const FIELDS = {
   grok(p) {
     const compat = p.mode === 'compat';
     const protocolLocked = D.base.authReadOnly || D.fields.grok_api_key?.readOnly || !S.capabilities?.secretsAllowed;
-    const seg = `<div class="seg" role="radiogroup" aria-label="接口协议"><button type="button" role="radio" data-a="mode" data-v="responses" aria-checked="${!compat}"${protocolLocked ? ' disabled' : ''}>xAI Responses</button><button type="button" role="radio" data-a="mode" data-v="compat" aria-checked="${compat}"${protocolLocked ? ' disabled' : ''}>OpenAI 兼容网关</button></div>`;
+    const seg = `<div class="seg" role="radiogroup" aria-label="接口协议"><button type="button" role="radio" data-a="mode" data-v="responses" title="Responses 接口；支持兼容此协议的自定义服务" aria-checked="${!compat}" tabindex="${compat ? -1 : 0}"${protocolLocked ? ' disabled' : ''}>xAI Responses</button><button type="button" role="radio" data-a="mode" data-v="compat" title="Chat Completions 接口" aria-checked="${compat}" tabindex="${compat ? 0 : -1}"${protocolLocked ? ' disabled' : ''}>OpenAI 兼容网关</button></div>`;
     const segHelp = compat
-      ? '通过兼容 Chat Completions 的网关调用 Grok。切换时原 xAI Key 会从配置删除并备份到配置历史；切回需重新填入或恢复历史。此模式不支持 X 搜索。'
+      ? '切换时原 Responses API Key 会从共享配置删除并备份到配置历史；切回需重新填入或恢复历史。此模式不支持 X 搜索。'
       : p.authReadOnly ? '正在复用原有登录认证，认证配置在此只读。'
-        : '直连 xAI 官方接口，支持网页搜索与 X 搜索。';
+        : D.fields.grok_api_key?.source === 'environment' ? 'API Key 由启动环境变量提供；移除该覆盖后，可在共享配置中修改 Key 和切换接口。' : '';
     let h = field({ label: '接口协议', ctl: seg, help: segHelp });
     if (compat) {
-      h += field({ label: '网关地址', k: 'gwUrl', ctl: txt('gwUrl', p.gwUrl, 'https://your-gateway/v1', { im: 'url' }) });
-      h += field({ label: '网关 Key', k: 'gwKey', ctl: keyIn('gwKey', p.gwKey, 'sk-...') });
+      h += field({ label: 'Base URL', k: 'gwUrl', ctl: txt('gwUrl', p.gwUrl, 'https://your-service/v1', { im: 'url' }) });
+      h += field({ label: 'API Key', k: 'gwKey', ctl: keyIn('gwKey', p.gwKey, 'sk-...') });
       h += field({ label: '模型', hint: '可选', k: 'gwModel', ctl: txt('gwModel', p.gwModel, '例如 grok-4.3-fast') });
       return h + GROK_NOTE;
     }
     h += field({ label: 'Base URL', k: 'url', ctl: txt('url', p.url, DEF.grokUrl, { im: 'url' }), help: '可填根地址、/v1 或完整端点，会自动规范到 /v1。' + KEEP_URL });
-    h += field({ label: 'API Key', k: 'key', ctl: keyIn('key', p.key, 'xai-...') });
+    h += field({ label: 'API Key', k: 'key', ctl: keyIn('key', p.key, 'xai-.../sk-...') });
     const chips = `<div class="chips">${chip('model', '', '默认', p.model)}${chip('model', 'grok-4.3', 'grok-4.3', p.model)}</div>`;
     h += field({ label: '模型', k: 'model', ctl: txt('model', p.model, `默认 ${DEF.grokModel}`) + chips });
     const checks = `<div class="checks">${chk('web', p.web, '网页搜索', '让 Grok 联网检索网页并给出来源')}${chk('x', p.x, 'X 搜索', '同时检索 X（Twitter）上的帖子')}</div>`;
@@ -1877,7 +2015,7 @@ const FIELDS = {
     const rows = keys.map((v, i) => `<div class="key-row">${keyIn('keys.' + i, v, 'tvly-...', { del: keys.length > 1, i, aria: `Tavily Key ${i + 1}` })}</div>`).join('');
     const add = `<button type="button" class="add-key" data-a="add-key"${fieldReadOnly('keys') ? ' disabled' : ''}>${svg('plus', 'ic ic-sm')}添加另一个 Key</button>`;
     return field({ label: 'Base URL', k: 'url', ctl: txt('url', p.url, DEF.tavilyUrl, { im: 'url' }), help: KEEP_URL })
-      + field({ label: 'API Key', hint: '可填多个', msg: 'keys', ctl: `<div class="keylist">${rows}</div>${add}`, help: '多个 Key 按请求轮换；遇到 401、403、429、432、433 会自动换下一个。' });
+      + field({ label: 'API Key', k: 'keys.0', hint: '可填多个', msg: 'keys', ctl: `<div class="keylist">${rows}</div>${add}`, help: '多个 Key 按请求轮换；遇到 401、403、429、432、433 会自动换下一个。' });
   },
   exa(p) {
     return field({ label: 'Base URL', k: 'url', ctl: txt('url', p.url, DEF.exaUrl, { im: 'url' }), help: KEEP_URL })
@@ -1931,8 +2069,8 @@ function vCard(id, p) {
     if (p.mode === 'compat') {
       url('gwUrl', p.gwUrl);
       const half = on && !!p.gwUrl.trim() !== !!p.gwKey.trim();
-      if ((need || half) && !p.gwUrl.trim()) err.gwUrl = '兼容模式需要网关地址';
-      key('gwKey', p.gwKey, need || half ? '兼容模式需要网关 Key' : '');
+      if ((need || half) && !p.gwUrl.trim()) err.gwUrl = 'Chat Completions 接口需要 Base URL';
+      key('gwKey', p.gwKey, need || half ? 'Chat Completions 接口需要 API Key' : '');
     } else {
       url('url', p.url);
       let host = '';
@@ -1997,11 +2135,29 @@ function refreshDialog() {
   if (D.kind === 'card') syncHeadSwitch();
   const shown = (k) => D.submitted || D.touched.has(k) || D.touched.has(k.split('.')[0]);
   const health = {};
-  if (D.kind === 'card') {
+  const resultFailures = [];
+  // A previous result only applies to the same endpoint, protocol, model and
+  // search settings. Secret reveal updates both base and draft, so it preserves
+  // the result without comparing a masked value with an exposed credential.
+  if (D.kind === 'card' && CRED[D.id].filter(k => !['key', 'gwKey', 'token', 'keys'].includes(k))
+    .every(k => JSON.stringify(D.draft[k]) === JSON.stringify(D.base[k]))) {
     healthOf(D.id).forEach((h) => {
-      if (D.id === 'tavily') D.draft.keys.forEach((v, i) => { if (v.trim() === h.val) health['keys.' + i] = h.code; });
-      else if ((D.draft[h.k] || '').trim() === h.val) health[h.k] = h.code;
+      const slots = D.id === 'tavily'
+        ? D.draft.keys.flatMap((v, i) => v.trim() === h.val ? ['keys.' + i] : [])
+        : (D.draft[h.k] || '').trim() === h.val ? [h.k] : [];
+      for (const slot of slots) {
+        if (credentialFailure(h.code) && !(D.id === 'grok' && D.base.authReadOnly)) health[slot] = h.code;
+        else resultFailures.push({ slot, code: h.code });
+      }
     });
+  }
+  const resultBox = $('.search-result', dlg);
+  if (resultBox) {
+    resultBox.hidden = !resultFailures.length;
+    const details = resultFailures.map(({ slot, code }) =>
+      `${D.id === 'tavily' ? `Key ${+slot.split('.')[1] + 1}：` : ''}${healthMsg(D.id, code, true).replaceAll('；', '，')}`).join('\n');
+    const content = details ? `${svg('info', 'ic ic-sm')}<span><strong>最近检查结果</strong>${esc(details)}</span>` : '';
+    if (resultBox.innerHTML !== content) resultBox.innerHTML = content;
   }
   $$('.f-msg[data-msg]', dlg).forEach((m) => {
     const slot = m.dataset.msg;
@@ -2056,8 +2212,11 @@ function refreshDialog() {
     }
     const retry = ['CONFIG_CONFLICT', 'CONFIG_COMMIT_UNCERTAIN', 'PREFERENCES_CONFLICT', 'PREFERENCES_COMMIT_UNCERTAIN'].includes(D.operationError.code)
       ? '<button type="button" class="btn btn-sm" data-a="reload-draft">读取最新配置</button>' : '';
-    error.innerHTML = `${svg('info', 'ic ic-sm')}<span>${esc(D.operationError.code)} · ${esc(D.operationError.message)}</span>${retry}`;
+    const html = `${svg('info', 'ic ic-sm')}<span>${esc(D.operationError.code)} · ${esc(D.operationError.message)}</span>${retry}`;
+    // Keystrokes re-run refreshDialog; an unchanged alert is not rewritten and re-announced.
+    if (error._html !== html) { error.innerHTML = html; error._html = html; }
   }
+  quotaView?.render();
 }
 
 /* ---------- 弹窗事件 ---------- */
@@ -2382,7 +2541,7 @@ function headState() {
 }
 function headSwitch() {
   const h = headState();
-  return `<label class="head-switch" data-pending="${h.pending}"><span class="hs-text">${h.text}</span><button type="button" class="switch" role="switch" aria-checked="${h.on}"${h.pending ? ' aria-disabled="true" title="在下方填写后自动打开"' : ''} data-a="enabled"><i></i></button></label>`;
+  return `<label class="head-switch" data-pending="${h.pending}"><span class="hs-text">${h.text}</span><button type="button" class="switch" role="switch" aria-label="${esc(META[D.id]?.name || D.id)} ${h.text}" aria-checked="${h.on}"${h.pending ? ' aria-disabled="true" title="在下方填写后自动打开"' : ''} data-a="enabled"><i></i></button></label>`;
 }
 function syncHeadSwitch() {
   const hs = $('.head-switch', dlg);
@@ -2403,7 +2562,7 @@ function renderCard() {
   const head = `<header class="dlg-head">${tile(id, 40)}<div class="dlg-titles"><h2 id="dlgTitle">${m.name}</h2><p class="dlg-sub"><span>${subText(id)}</span><a class="dlg-link" href="${m.link}" target="_blank" rel="noopener noreferrer">${EXT(m.linkText)}</a></p></div>${ctl}<button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg('x')}</button></header>`;
   // 用 form 包住字段，密码管理器才会把它当作一个凭据表单；保存仍由底部按钮控制。
   const locked = !S.capabilities?.secretsAllowed ? note('当前连接仅支持脱敏查看。请使用已认证的本机直连或 HTTPS 连接查看和保存 Key。') : '';
-  const body = `<div class="dlg-body">${locked}<form class="dlg-form" novalidate>${FIELDS[id](p)}</form></div>`;
+  const body = `<div class="dlg-body">${locked}<form class="dlg-form" novalidate>${FIELDS[id](p)}<div id="quotaSlot"></div></form><div class="note search-result" role="status" aria-live="polite" aria-atomic="true" hidden></div></div>`;
   const clearable = Object.values(CARD_FIELDS[id]).some(key => D.fields[key]?.source === 'file' && !D.fields[key]?.readOnly);
   const clearBtn = clearable ? `<button type="button" class="btn btn-ghost btn-sm btn-danger" data-a="clear"${S.capabilities?.secretsAllowed ? '' : ' disabled'}>清除配置</button>` : '';
   const foot = `<footer class="dlg-foot">${clearBtn}<span class="foot-note"></span><button type="button" class="btn btn-sm grow" data-a="cancel">取消</button><button type="button" class="btn btn-primary btn-sm grow" data-a="save">保存</button></footer>`;
@@ -2414,6 +2573,7 @@ function renderCard() {
 }
 function openCard(id, opt = {}) {
   if (S.loading || S.busy || !META[id]) return;
+  quotaView?.cancel();
   closePop();
   // 未配置来源的 enabled 只是默认值：草稿按“填好凭据后启用”处理，打开弹窗本身不算修改。
   const base = clone(S.prov[id]);
@@ -2428,10 +2588,11 @@ function openCard(id, opt = {}) {
   };
   showOverlay();
   renderCard();
+  void quotaView?.open();
   requestAnimationFrame(initialFocus);
 }
 
-/* ---------- 中继弹窗：Grok Search RS ---------- */
+/* ---------- 中继弹窗：Grok Search Rs ---------- */
 const NUM = {
   extra: { min: 0, max: 10, step: 1, unit: '条' },
   fallback: { min: 1, max: 10, step: 1, unit: '条' },
@@ -2537,7 +2698,7 @@ function hubBody(h) {
 }
 function renderHub() {
   const version = S.program?.program?.version ? 'v' + S.program.program.version : programPhase();
-  const head = `<header class="dlg-head"><span class="tile tile-glyph" style="--s:40px">${svg('hub')}</span><div class="dlg-titles"><h2 id="dlgTitle">Grok Search RS</h2><p class="dlg-sub"><span>${esc(version)} · MIT · 把 Grok 与各搜索来源串成一条路由</span><a class="dlg-link" href="https://github.com/Episkey-G/GrokSearch-rs" target="_blank" rel="noopener noreferrer">${EXT('GitHub 仓库')}</a></p></div><button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg('x')}</button></header>`;
+  const head = `<header class="dlg-head"><span class="tile tile-glyph" style="--s:40px">${svg('hub')}</span><div class="dlg-titles"><h2 id="dlgTitle">Grok Search Rs</h2><p class="dlg-sub"><span>${esc(version)} · MIT · 把 Grok 与各搜索来源串成一条路由</span><a class="dlg-link" href="https://github.com/Episkey-G/GrokSearch-rs" target="_blank" rel="noopener noreferrer">${EXT('GitHub 仓库')}</a></p></div><button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg('x')}</button></header>`;
   const foot = '<footer class="dlg-foot"><span class="foot-note"></span><button type="button" class="btn btn-sm grow" data-a="cancel">取消</button><button type="button" class="btn btn-primary btn-sm grow" data-a="save">保存</button></footer>';
   dlg.innerHTML = head + `<div class="dlg-body">${hubBody(D.draft)}</div>` + foot;
   refreshDialog();
@@ -2584,6 +2745,7 @@ async function commitHub(draft = D.draft) {
   toast('已写入 Grok 共享配置 · 下次搜索生效', { undo: configUndo(receipt) });
 }
 function openHub(opt = {}) {
+  quotaView?.cancel();
   if (S.loading || S.busy) return;
   closePop();
   D = {
@@ -2620,7 +2782,8 @@ testPop.addEventListener('click', (e) => {
 listen(document, 'pointerdown', e => { if (!testPop.hidden && !targetOf(e).closest?.('.rc-actions')) closePop(); });
 function travel(wid, o = {}) {
   return new Promise((resolve) => {
-    const g = wireNodes.get(wid);
+    const view = o.view;
+    const g = view ? view.paths.get(wid)?.group : wireNodes.get(wid);
     if (!g) { resolve(); return; }
     const path = g.children[1];
     // 数据包始终只用 agent 蓝；成败由端口形状和断口表达，不再把整条线染绿或染红。
@@ -2629,27 +2792,33 @@ function travel(wid, o = {}) {
     path.style.strokeDasharray = '';
     path.style.strokeLinecap = '';
     g.children[2].style.opacity = g.children[3].style.opacity = '0';
-    wiresEl.insertBefore(g, packetLayer);
+    const canvas = view ? view.svg : wiresEl;
+    const packets = view ? view.packetLayer : packetLayer;
+    canvas.insertBefore(g, packets);
     const pk = document.createElementNS(SVGNS, 'g');
     pk.setAttribute('class', 'packet');
     pk.innerHTML = '<circle class="p-halo" r="7"></circle><circle class="p-core" r="3.2"></circle>';
-    packetLayer.appendChild(pk);
+    pk.dataset.return = String(!!o.back);
+    pk.dataset.wire = wid;
+    packets.appendChild(pk);
     const dur = o.dur || T.hop;
     const t0 = performance.now();
     const myGen = gen;
-    const finish = () => { waits.delete(finish); pk.remove(); resolve(); };
+    let raf;
+    const finish = () => { cancelAnimationFrame(raf); waits.delete(finish); view?.cancelers.delete(finish); pk.remove(); resolve(); };
     waits.add(finish);
+    view?.cancelers.add(finish);
     const frame = (now) => {
-      if (myGen !== gen || disposed) { finish(); return; }
+      if ((view ? view.cancelled : myGen !== gen) || disposed) { finish(); return; }
       const t = Math.min(1, (now - t0) / dur);
       const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
       const len = path.getTotalLength();
       const pt = path.getPointAtLength((o.back ? 1 - e : e) * len);
       pk.setAttribute('transform', `translate(${pt.x},${pt.y})`);
-      if (t < 1) requestAnimationFrame(frame);
+      if (t < 1) raf = requestAnimationFrame(frame);
       else finish();
     };
-    requestAnimationFrame(frame);
+    raf = requestAnimationFrame(frame);
   });
 }
 /* 测试时先合上旧断口，让数据包走完整条线；失败时轻颤，再换一个位置张开断口。 */
@@ -2674,7 +2843,7 @@ function pulseFault(el) {
   }, 1100);
   faultPulses.set(el, timer);
 }
-function jolt(el, soft = false) {
+function jolt(el, soft = false, pump = pumpWires) {
   if (!el || reduced()) return Promise.resolve();
   jolts.get(el)?.();
   return new Promise((resolve) => {
@@ -2701,7 +2870,7 @@ function jolt(el, soft = false) {
     // 颤动尾部接上断线；取消场景时 clean() 同时解除等待和所有清理任务。
     leadTimer = setTimeout(resolve, soft ? 220 : 300);
     cleanupTimer = setTimeout(clean, soft ? 380 : 500);
-    pumpWires(soft ? 360 : 480);
+    pump(soft ? 360 : 480);
   });
 }
 function clearLit() {
@@ -2718,7 +2887,7 @@ function clearLit() {
 /* 测试节奏（毫秒） */
 const T = { hop: 380, grok: 720, supp: 560, fail: 420, hold: 900, trace: 6500 };
 function flashRow(id) {
-  const r = rowOf(id);
+  const r = typeof id === 'string' ? rowOf(id) : id;
   if (!r || reduced()) return;
   r.classList.remove('is-searching', 'flash-ok');
   void r.offsetWidth;
@@ -2738,6 +2907,7 @@ function flashNode(el) {
 async function runTest() {
   const st0 = routeStatus();
   if (S.testing || S.busy || ['off', 'wait', 'none', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'prep'].includes(st0)) return;
+  logView?.cancel();
   const my = ++gen;
   const started = performance.now();
   clearToasts();
@@ -2857,9 +3027,13 @@ async function runTest() {
 /* ---------- Mount-local theme, path actions and lifecycle ---------- */
 function setTheme(dark) {
   if (disposed) return;
-  darkTheme = dark === true || dark === 'dark';
+  const next = dark === true || dark === 'dark';
+  if (darkTheme === next) return;
+  darkTheme = next;
   root.dataset.theme = layer.dataset.theme = darkTheme ? 'dark' : 'light';
   refreshLogos();
+  logView?.theme();
+  quotaView?.render();
   bannerHtml = null;
   renderBanner();
 }
@@ -2892,6 +3066,37 @@ $('#bannerSlot').addEventListener('click', (e) => {
 $('#nodeHub').addEventListener('click', (e) => openHub({ from: e.currentTarget }));
 
 function init() {
+  logView = createSearchLogView({ $, $$, active, S, card, layer, listen, remote, uuid, clone, esc, svg, tile,
+    logoSrc, isDark, reduced, META, SUPP, setTimeout, clearTimeout, requestAnimationFrame, cancelAnimationFrame,
+    T, jolts, faultPulses, syncBreak, travel, jolt, pulseFault, flashRow, flashNode, pumpWires, closePop,
+    hideStripTip, toast, errText, rowOf, SVGNS, logMemory });
+  quotaView = createQuotaView({ $, S, getDialog: () => D, dlg, active, DEF, SUPP, svg, EXT, esc,
+    reduced, dialogBusy, remote, uuid,
+    hideTip: () => { if (stripTipTarget?.matches('[data-quota-tip]')) hideStripTip(); } });
+  listen(dlg, 'pointerover', event => {
+    const tip = event.target.closest('[data-quota-tip]');
+    if (tip && tip !== stripTipTarget) showStripTip(tip);
+  });
+  listen(dlg, 'pointerout', event => {
+    if (!event.target.closest('[data-quota-tip]')) return;
+    if (event.relatedTarget && (stripTipTarget?.contains(event.relatedTarget) || routeTooltip.contains(event.relatedTarget))) return;
+    clearTimeout(stripTipTimer);
+    stripTipTimer = setTimeout(() => { if (stripTipTarget !== active()) hideStripTip(); }, 100);
+  });
+  listen(dlg, 'focusin', event => { if (event.target.matches('[data-quota-tip]')) showStripTip(event.target); });
+  listen(dlg, 'focusout', event => {
+    if (event.target.matches('[data-quota-tip]') && !routeTooltip.contains(event.relatedTarget)) hideStripTip();
+  });
+  listen(dlg, 'click', event => {
+    const tip = event.target.closest('[data-quota-tip]');
+    if (tip) showStripTip(tip);
+    else if (stripTipTarget?.matches('[data-quota-tip]')) hideStripTip();
+    const action = event.target.closest('[data-a]')?.dataset.a;
+    if (action === 'quota-refresh') void quotaView.refresh();
+  });
+  listen(dlg, 'change', event => {
+    if (event.target.matches('[data-quota-key]')) quotaView.key(Number(event.target.value));
+  });
   $('#hubGlyph').innerHTML = svg('hub');
   $('[data-open=file]').insertAdjacentHTML('afterbegin', svg('file', 'ic ic-sm'));
   $('[data-open=folder]').insertAdjacentHTML('afterbegin', svg('folder', 'ic ic-sm'));
@@ -2905,8 +3110,7 @@ function init() {
   syncAll(true);
   void refresh({ first: true }).then(() => {
     if (disposed) return;
-    buildRows(!memory.mounted);
-    syncAll(true);
+    animateRows(!memory.mounted);
     if (!memory.mounted) wiresEl.classList.add('draw');
     pumpWires(720);
   });
@@ -2915,18 +3119,23 @@ function init() {
 listen(document, 'visibilitychange', () => {
   if (document.visibilityState !== 'hidden') { void refresh(); pumpWires(180); }
 });
-listen(RM, 'change', () => { quiet(1000); clearLit(); pumpWires(80); });
+listen(RM, 'change', () => { logView?.cancel(); quotaView?.stopAnimations(); quiet(1000); clearLit(); pumpWires(80); });
 init();
 return Object.freeze({
   setTheme,
   refresh: () => refresh({ force: true }),
   dispose() {
     if (disposed) return;
+    logView?.dispose();
+    quotaView?.dispose();
     cancelDrag();
     cancelOwnedDiagnosis();
     gen++;
+    clearTimeout(overlayEntranceTimer);
+    shakeCleanups.get(dlg)?.();
     clearLit();
     resizeObserver.disconnect();
+    historyActionsObserver.disconnect();
     Object.assign(memory, {
       mounted: true, checked: clone(S.checked), bad: clone(S.bad), providerBad: clone(S.providerBad), identity: clone(S.identity),
       readDismissed: S.readDismissed, auxDismissed: S.auxDismissed, lastRouteAt: S.lastRouteAt,
@@ -2948,8 +3157,1414 @@ return Object.freeze({
   },
 });
 });
-    const ROUTE_CSS = "/* dsh-grok-search · v74 route presentation\n   视觉方向：magpie 式单色中性底 + 一处 agent 蓝；节点/连线/数据包组成动态路由图。 */\n\n:host,.dsg-surface{\n  --font:\"Inter\",\"Segoe UI Variable Text\",\"Segoe UI\",-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"Microsoft YaHei UI\",\"Microsoft YaHei\",sans-serif;\n  --mono:\"JetBrains Mono\",\"Cascadia Mono\",Consolas,\"SFMono-Regular\",ui-monospace,monospace;\n  --ease:cubic-bezier(.2,.7,.2,1);\n  --spring:cubic-bezier(.34,1.45,.64,1);\n  color-scheme:light;\n  --page:#eef0f3; --surface:#ffffff; --surface-2:#f7f8fa; --stage:#f4f5f8; --dot:#dde0e6;\n  --line:#e5e7eb; --line-2:#d5d8de; --hair:rgba(15,23,42,.06);\n  --text:#14161a; --text-2:#545a66; --text-3:#878d98; --text-4:#b3b7bf;\n  --field:#f1f2f5; --field-hover:#eaecf0; --field-focus:#ffffff;\n  --agent:#4d6bfe; --agent-soft:rgba(77,107,254,.10); --agent-ring:rgba(77,107,254,.30);\n  --btn-primary:#4d6bfe; --btn-primary-hover:#3d59e8;\n  --ok:#12a150; --ok-soft:rgba(18,161,80,.10); --ok-text:#0a7a3b;\n  --warn:#b86e00; --warn-soft:rgba(214,138,0,.11); --warn-line:#e0a23a; --warn-text:#8c5a00;\n  --err:#e5484d; --err-soft:rgba(229,72,77,.10); --err-text:#b32429; --err-solid:#a92a30;\n  --wire-standby:#a6acb7; --wire-rest:#c0c5cd; --wire-unset:#cdd1d8; --wire-aux:#b4bac4;\n  --wire-broken:#a8595c; --wire-broken-soft:#c49a9c;\n  --tile:#f3f4f6; --tile-line:rgba(15,23,42,.08);\n  --shadow-sm:0 1px 2px rgba(15,23,42,.05);\n  --shadow-md:0 1px 2px rgba(15,23,42,.05),0 4px 14px rgba(15,23,42,.06);\n  --shadow-lg:0 2px 6px rgba(15,23,42,.06),0 22px 56px rgba(15,23,42,.16);\n  --shadow-drag:0 12px 32px rgba(15,23,42,.18),0 2px 6px rgba(15,23,42,.08);\n  --scrim:rgba(17,20,26,.34);\n  --toast-bg:#1b1d22; --toast-text:#f3f4f6; --toast-act:rgba(255,255,255,.12);\n}\n[data-theme=dark]{\n  color-scheme:dark;\n  --page:#0c0d10; --surface:#16181c; --surface-2:#1b1d22; --stage:#111316; --dot:#24272d;\n  --line:#272a31; --line-2:#353941; --hair:rgba(255,255,255,.06);\n  --text:#ecedf0; --text-2:#a6abb5; --text-3:#7a808b; --text-4:#50555e;\n  --field:#1f2227; --field-hover:#252930; --field-focus:#121417;\n  --agent:#7b93ff; --agent-soft:rgba(123,147,255,.14); --agent-ring:rgba(123,147,255,.34);\n  --btn-primary:#4d6bfe; --btn-primary-hover:#6680ff;\n  --ok:#3ccb7f; --ok-soft:rgba(60,203,127,.12); --ok-text:#3ccb7f;\n  --warn:#f0b04a; --warn-soft:rgba(240,176,74,.12); --warn-line:#c98b2a; --warn-text:#f0b04a;\n  --err:#ff6b70; --err-soft:rgba(255,107,112,.13); --err-text:#ff7b80; --err-solid:#b23b41;\n  --wire-standby:#5f6570; --wire-rest:#464b54; --wire-unset:#3c4048; --wire-aux:#525862;\n  --wire-broken:#b0696c; --wire-broken-soft:#6e4649;\n  --tile:#22252b; --tile-line:rgba(255,255,255,.08);\n  --shadow-sm:0 1px 2px rgba(0,0,0,.4);\n  --shadow-md:0 1px 2px rgba(0,0,0,.35),0 6px 18px rgba(0,0,0,.32);\n  --shadow-lg:0 2px 8px rgba(0,0,0,.4),0 26px 64px rgba(0,0,0,.55);\n  --shadow-drag:0 14px 36px rgba(0,0,0,.55),0 2px 6px rgba(0,0,0,.4);\n  --scrim:rgba(0,0,0,.56);\n  --toast-bg:#eceef2; --toast-text:#15171b; --toast-act:rgba(0,0,0,.08);\n}\n\n*,*::before,*::after{box-sizing:border-box}\n[hidden]{display:none !important}\n:host{all:initial;display:block;min-width:0}\n.dsg-surface{font:13px/1.5 var(--font);color:var(--text);-webkit-font-smoothing:antialiased;text-align:left}\n.dsg-root{width:100%;min-width:0}\n.route-scroll{min-width:0;overflow-x:auto;padding:20px 12px;margin:-20px -12px;scrollbar-gutter:stable}\n.dsg-layer{width:0;height:0;pointer-events:none}\n.dsg-layer .overlay,.dsg-layer .route-tooltip{pointer-events:auto}\nbutton,input,select,textarea{font:inherit;color:inherit}\nbutton{cursor:pointer}\nbutton:disabled{cursor:not-allowed}\na{color:inherit}\n:focus-visible{outline:2px solid var(--agent);outline-offset:2px}\n.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}\n.ic{width:16px;height:16px;flex:none;display:block}\n.ic-sm{width:13px;height:13px}\n\n/* ---------- 路由卡 ---------- */\n.route-card{position:relative;min-width:820px;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-md);padding:18px 20px 0;transition:background-color .25s,border-color .25s}\n.rc-head{display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:8px 12px}\n.rc-title{display:flex;align-items:center;align-content:center;flex-wrap:wrap;gap:4px 10px;min-width:0;min-height:32px}\n.rc-title h3{margin:0;font-size:15px;font-weight:650;letter-spacing:-.005em;white-space:nowrap}\n.rc-actions{position:relative;display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap;flex:none;min-width:0;max-width:100%}\n\n/* 顺序 = 补充链优先级；logo = 启用状态；圆点 = 最近验证结果，三者不互相冒充。 */\n.strip-slot{flex:none;display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .3s var(--ease),opacity .25s var(--ease)}\n.strip-slot.has{grid-template-rows:1fr;opacity:1}\n.strip-slot:not(.has){display:none}\n.strip-slot > div{overflow:hidden;min-height:0}\n.strip{display:flex;align-items:center;flex-wrap:nowrap;gap:6px;min-height:30px;padding:3px 8px 4px;border-radius:8px;background:color-mix(in srgb,var(--surface-2) 78%,transparent);box-shadow:inset 0 0 0 1px var(--hair);color:var(--text-3)}\n.strip .s-node{position:relative;display:inline-flex;flex:none;padding-bottom:5px;opacity:1;border-radius:3px;cursor:help;transition:opacity .32s var(--ease),filter .32s var(--ease)}\n.strip .s-node .tile{border-radius:4px}\n.strip .s-node[data-st=unset] .tile{filter:grayscale(1);opacity:.45}\n.strip .s-node[data-st=off] .tile{filter:grayscale(1);opacity:.28}\n.strip .s-node:focus-visible{outline:2px solid var(--agent);outline-offset:2px}\n.strip .s-dots{position:absolute;left:50%;bottom:0;display:flex;align-items:center;gap:2px;transform:translateX(-50%)}\n.strip .s-dot{width:4px;height:4px;border-radius:50%;border:1px solid var(--text-4);background:transparent;transition:border-color .3s,background-color .3s,opacity .3s}\n.strip .s-dot[data-tone=ok]{border-color:var(--agent);background:var(--agent)}\n.strip .s-dot[data-tone=err]{border-color:var(--wire-broken);background:transparent}\n.strip .s-dot[data-tone=run]{border-color:var(--agent);background:var(--agent);animation:s-pulse 1s var(--ease) infinite}\n.strip .s-dot[data-tone=idle]{border-color:var(--text-2);background:transparent}\n.strip .s-link{align-self:flex-start;flex:none;width:20px;height:8px;margin-top:5px;display:block;overflow:visible;color:var(--text-3);transition:color .3s var(--ease),opacity .3s var(--ease)}\n.strip .s-link .sl-line{fill:none;stroke:currentColor;stroke-width:1.25;stroke-linecap:round}\n.strip .s-link .sl-head{fill:none;stroke:currentColor;stroke-width:1.25;stroke-linecap:round;stroke-linejoin:round}\n.strip .s-link[data-tone=dash] .sl-line,.strip .s-link[data-tone=dash] .sl-head{stroke-dasharray:2 3;opacity:.55}\n.strip .s-link[data-tone=broken]{color:var(--wire-broken);overflow:visible}\n.strip .s-link[data-tone=detour]{color:var(--warn-line);overflow:visible}\n.strip .s-link[data-tone=detour] .sl-arc{fill:none;stroke:currentColor;stroke-width:1.25;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:1;stroke-dashoffset:0;animation:s-draw .55s var(--ease) both}\n.strip .s-link[data-tone=detour] .sl-head{stroke-dasharray:0}\n.strip .s-link.is-new{animation:s-fade-in .3s var(--ease)}\n.strip .s-end{margin-left:2px;padding-left:10px;border-left:1px solid var(--line-2);font-size:11.5px;line-height:1.5;color:var(--text-3);white-space:nowrap;font-variant-numeric:tabular-nums}\n.strip .s-end[data-tone=err]{color:var(--wire-broken)}\n.strip .s-end[data-tone=ok]{color:var(--text-2)}\n.strip .s-end.is-new{animation:s-fade-in .3s var(--ease)}\n.strip .s-skel{display:block;flex:none;height:16px;border-radius:4px;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}\n@keyframes s-pulse{0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.35);opacity:1}}\n@keyframes s-fade-in{from{opacity:0;transform:translateX(-3px)}}\n@keyframes s-draw{from{stroke-dashoffset:1}}\n.route-tooltip{position:fixed;z-index:65;max-width:min(310px,calc(100vw - 24px));padding:10px 12px;border:1px solid var(--line-2);border-radius:9px;background:var(--surface);box-shadow:var(--shadow-md);color:var(--text-2);font:12px/1.6 var(--font);white-space:pre-line;overflow-wrap:anywhere;pointer-events:auto}\n.route-tooltip[hidden]{display:none}\n.banner-slot{display:grid;grid-template-rows:0fr;margin-top:0;transition:grid-template-rows .32s var(--ease),margin-top .32s var(--ease)}\n.banner-slot.has{grid-template-rows:1fr;margin-top:12px}\n.banner-slot > div{overflow:hidden;min-height:0}\n\n/* 状态胶囊 */\n.pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px 0 8px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--surface-2);color:var(--text-2);border:1px solid var(--line);white-space:nowrap;transition:background-color .25s,color .25s,border-color .25s}\n.pill-dot{position:relative;width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}\n.pill[data-s=live]{color:var(--ok-text);background:var(--ok-soft);border-color:transparent}\n.pill[data-s=live] .pill-dot::after,.pill[data-s=fallback] .pill-dot::after,.pill[data-s=backup] .pill-dot::after{content:\"\";position:absolute;inset:-3px;border-radius:50%;border:1.5px solid currentColor;opacity:0;animation:ping 2.4s var(--ease) infinite}\n.pill[data-s=wait]{color:var(--warn-text);background:var(--warn-soft);border-color:transparent}\n.pill[data-s=none]{color:var(--warn-text);background:var(--warn-soft);border-color:transparent}\n.pill[data-s=fallback]{color:var(--warn-text);background:var(--warn-soft);border-color:transparent}\n.pill[data-s=backup]{color:var(--agent);background:var(--agent-soft);border-color:transparent}\n.pill[data-s=err]{color:var(--err-text);background:var(--err-soft);border-color:transparent}\n.pill[data-s=cfgerr],.pill[data-s=ctlerr],.pill[data-s=down]{color:var(--err-text);background:var(--err-soft);border-color:transparent}\n.pill[data-s=prep],.pill[data-s=connecting]{color:var(--text-3);background:var(--surface-2)}\n.pill[data-s=prep] .pill-dot,.pill[data-s=connecting] .pill-dot{animation:blink 1s steps(2,jump-none) infinite}\n.pill[data-s=off]{color:var(--text-2)}\n.pill[data-s=load]{color:var(--text-3)}\n.pill[data-s=load] .pill-dot{animation:blink 1s steps(2,jump-none) infinite}\n.pill.swap{animation:pill-swap .42s var(--spring)}\n@keyframes pill-swap{from{transform:scale(.86);opacity:.35}}\n@keyframes ping{0%{transform:scale(.6);opacity:.7}70%,100%{transform:scale(1.9);opacity:0}}\n@keyframes blink{50%{opacity:.2}}\n\n/* 按钮 */\n.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 12px;border-radius:9px;border:1px solid var(--line-2);background:var(--surface);color:var(--text);font-size:12.5px;font-weight:550;line-height:1;white-space:nowrap;box-shadow:var(--shadow-sm);transition:background-color .15s,border-color .15s,color .15s,box-shadow .15s,transform .1s,opacity .15s}\n.btn:hover:not(:disabled){background:var(--surface-2)}\n.btn:active:not(:disabled){transform:translateY(.5px)}\n.btn:disabled{opacity:.48}\n.btn-sm{height:28px;padding:0 10px;font-size:12px;border-radius:8px}\n.btn-ghost{background:transparent;border-color:transparent;box-shadow:none;color:var(--text-2)}\n.btn-ghost:hover:not(:disabled){background:var(--field);color:var(--text)}\n.btn-primary{background:var(--btn-primary);border-color:var(--btn-primary);color:#fff}\n.btn-primary:hover:not(:disabled){background:var(--btn-primary-hover);border-color:var(--btn-primary-hover)}\n.btn-danger{color:var(--err-text)}\n.btn-danger:hover:not(:disabled){background:var(--err-soft);color:var(--err-text)}\n.btn.is-confirm,.btn.is-confirm:hover:not(:disabled){background:var(--err-solid);border-color:var(--err-solid);color:#fff}\n.btn .spin,.spin{width:13px;height:13px;flex:none;border-radius:50%;border:1.7px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}\n@keyframes spin{to{transform:rotate(360deg)}}\n.icon-btn{width:28px;height:28px;flex:none;padding:0;display:inline-grid;place-items:center;border-radius:7px;border:0;background:transparent;color:var(--text-3);transition:background-color .15s,color .15s}\n.icon-btn:hover:not(:disabled){background:var(--field-hover);color:var(--text)}\n.icon-btn.is-on{color:var(--agent)}\n.icon-btn:disabled{opacity:.4}\n\n/* 测试确认弹层 */\n.popover{position:absolute;right:0;top:calc(100% + 9px);z-index:20;width:268px;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-lg);padding:12px 14px;transform-origin:top right;animation:pop-in .16s var(--ease)}\n.popover::before{content:\"\";position:absolute;top:-6px;right:30px;width:10px;height:10px;background:var(--surface);border-left:1px solid var(--line);border-top:1px solid var(--line);transform:rotate(45deg)}\n.pop-title{margin:0;font-weight:650;font-size:13px}\n.pop-text{margin:4px 0 12px;color:var(--text-2);font-size:12px;line-height:1.55}\n.pop-actions{display:flex;justify-content:flex-end;gap:6px}\n@keyframes pop-in{from{opacity:0;transform:translateY(-4px) scale(.97)}}\n\n/* 提示条 */\n.banner{display:flex;align-items:flex-start;gap:10px;padding:10px 10px 10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);font-size:12.5px;color:var(--text-2)}\n.banner .b-ic{flex:none;margin-top:1px;color:var(--text-3)}\n.banner .b-body{flex:1;min-width:0}\n.banner .b-title{display:block;color:var(--text);font-weight:600}\n.banner .b-text{display:block;margin-top:1px}\n.banner .b-text code{white-space:nowrap}\n.banner .b-actions{display:flex;gap:4px;align-items:center;flex:none;align-self:center}\n.banner[data-tone=info] .b-ic{color:var(--agent)}\n.banner[data-tone=warn]{background:var(--warn-soft);border-color:transparent}\n.banner[data-tone=warn] .b-ic{color:var(--warn)}\n.banner[data-tone=err]{background:var(--surface-2);border-color:var(--line-2)}\n.banner[data-tone=err] .b-ic{color:var(--err-text)}\n.banner[data-tone=err] .b-title{color:var(--err-text)}\n.banner[data-tone=err] .b-text{color:var(--text-2)}\n.banner[data-tone=fallback]{background:var(--warn-soft);border-color:transparent}\n.banner[data-tone=fallback] .b-ic{color:var(--warn)}\n.banner[data-tone=soft] .b-ic{color:var(--warn)}\n.b-swap{animation:b-swap .3s var(--ease)}\n@keyframes b-swap{from{opacity:0;transform:translateY(-3px)}}\n.chip-list{display:inline-flex;gap:4px;flex-wrap:wrap;vertical-align:middle;margin-left:2px}\n.mini-chip{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px 0 3px;border-radius:999px;background:var(--surface);border:1px solid var(--line);font-size:11.5px;color:var(--text);line-height:1}\n.mini-chip .tile{--s:14px}\n\n/* ---------- 路由舞台 ---------- */\n.stage{position:relative;margin:14px -20px 0;padding:28px 28px;display:grid;align-items:center;justify-content:center;min-height:300px;background-color:var(--stage);background-image:radial-gradient(var(--dot) 1px,transparent 1.3px);background-size:16px 16px;background-position:8px 8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);transition:column-gap .35s var(--ease),padding .3s var(--ease),background-color .25s}\n/* 与 magpie 路由图一致：左侧两个节点单行并排，右侧供应商单列竖排 */\n.stage{grid-template-columns:148px 150px minmax(300px,460px);column-gap:56px}\n.col-agent,.col-hub,.col-list{position:relative;z-index:2}\n\n.wires{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:1;transition:opacity .3s var(--ease)}\n.wg .wt{fill:none;stroke:none;stroke-width:5;stroke-linecap:round}\n.wg .w{fill:none;stroke-width:1.6;stroke-linecap:round;transition:stroke .3s var(--ease),opacity .3s var(--ease),stroke-width .2s}\n.wg[data-ws=live] .w{stroke:var(--agent);stroke-width:1.8;stroke-dasharray:none}\n.wg[data-ws=live] .wt{stroke:var(--agent);opacity:.12}\n.wg[data-ws=standby] .w{stroke:var(--wire-standby)}\n.wg[data-ws=rest] .w{stroke:var(--wire-rest);stroke-dasharray:2 6;opacity:.5}\n.wg[data-ws=unset] .w{stroke:var(--wire-unset);stroke-dasharray:1 5}\n.wg[data-ws=aux] .w{stroke:var(--wire-aux);stroke-dasharray:1 4}\n.wg[data-ws=warn] .w{stroke:var(--warn-line);stroke-dasharray:5 4}\n.wg[data-ws=broken] .w{stroke:var(--wire-broken);stroke-dasharray:none;opacity:.9}\n.wg[data-ws=broken] .wt{stroke:var(--wire-broken);opacity:.07}\n.wg .w-end{fill:var(--wire-broken);opacity:0;transition:opacity .3s var(--ease)}\n.wg.is-broken .w-end{opacity:1}\n.wg.is-broken.lit .w-end{opacity:0}\n.wg[data-ws=hidden]{opacity:0}\n.wg.hl .w{stroke-width:2.4}\n.wg.lit .w{stroke:var(--agent);stroke-width:2.2;opacity:1;stroke-dasharray:none}\n.wg.lit .wt{stroke:var(--agent);opacity:.16}\n.wg[data-requesting=true] .w{stroke:var(--agent);stroke-dasharray:3 5;animation:flow .7s linear infinite}\n/* 路由切换：新接管的支路涌光一次；失效由断路缓动承担，不再闪红 */\n.wg.surge .wt{stroke:var(--agent);animation:surge .95s var(--ease)}\n@keyframes surge{0%{opacity:.5;stroke-width:12}100%{opacity:0;stroke-width:5}}\n@keyframes flow{to{stroke-dashoffset:-8}}\n.packet .p-halo{fill:var(--agent);opacity:.2}\n.packet .p-core{fill:var(--agent)}\n.wires.draw{animation:wire-draw .65s var(--ease) both}\n@keyframes wire-draw{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}\n\n/* 端口 */\n.port{position:absolute;width:9px;height:9px;border-radius:50%;background:var(--surface);border:1.5px solid var(--wire-unset);transform:translate(-50%,-50%);z-index:3;pointer-events:none;transition:border-color .25s,background-color .25s,opacity .25s}\n.port[data-port=dsh-out],.port[data-port=hub-out]{left:100%;top:50%}\n.port[data-port=hub-in],.row > .port{left:0;top:50%}\n.port[data-port=dsh-alt]{left:50%;top:100%}\n.port[data-port=off-in]{left:50%;top:0}\n.port[data-ps=hidden]{opacity:0}\n.port[data-ps=live]{border-color:var(--agent);background:var(--agent)}\n.port[data-ps=standby]{border-color:var(--wire-standby)}\n.port[data-ps=rest],.port[data-ps=aux]{border-color:var(--wire-rest)}\n.port[data-ps=warn]{border-color:var(--warn-line)}\n.port[data-ps=broken]{border-color:var(--wire-broken);background:var(--stage)}\n/* 服务端口：空心 = 未验证或失效；半实心 = 部分 Key 通过；实心 = 全部 Key 最近验证通过。 */\n.row > .port{transition:width .22s var(--spring),height .22s var(--spring),border-color .25s,background-color .25s,opacity .25s,left .22s var(--ease)}\n.row > .port[data-ps=live]{background:var(--surface)}\n.row > .port[data-mark=ok]{background:var(--agent);border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft)}\n.row > .port[data-mark=part]{width:11px;height:11px;color:var(--wire-standby);background:linear-gradient(90deg,currentColor 50%,transparent 50%);border-color:currentColor}\n.row[data-st=live] > .port[data-mark=part]{color:var(--agent)}\n.row > .port.pop{animation:mark-pop .42s var(--spring)}\n@keyframes mark-pop{from{scale:.3}}\n\n/* 节点 */\n.node{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-sm);transition:opacity .35s var(--ease),filter .35s var(--ease),border-color .2s,box-shadow .2s,transform .2s var(--ease),background-color .25s}\n.node-name{font-weight:600;font-size:13px;color:var(--text);line-height:1.3}\n.node-meta{font:500 11px/1.45 var(--mono);color:var(--text-3)}\n.node-meta .nw{white-space:nowrap}\n#hubMeta{display:flex;flex-wrap:wrap;justify-content:center;column-gap:4px}\n.node-dsh .node-name{white-space:nowrap}\n.node-logo{display:block;filter:drop-shadow(0 1px 1px rgba(15,23,42,.10));transition:filter .4s var(--ease),opacity .4s var(--ease)}\n\n/* DSH 节点（对应 magpie 的 Codex 卡）：位置始终不动 */\n.col-agent{position:relative}\n.node-dsh{display:flex;flex-direction:column;align-items:center;text-align:center;padding:14px 8px 12px;gap:1px}\n.node-dsh .node-logo{width:34px;height:34px;margin-bottom:8px}\n.node-dsh .node-name::before{content:\"\";display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:var(--text-4);vertical-align:.12em;transition:background-color .25s}\n.route-card[data-s=live] .node-dsh .node-name::before{background:var(--agent)}\n.route-card[data-s=wait] .node-dsh .node-name::before{background:var(--warn-line)}\n.route-card[data-s=none] .node-dsh .node-name::before{background:var(--warn-line)}\n.route-card[data-s=fallback] .node-dsh .node-name::before{background:var(--warn-line)}\n.route-card[data-s=backup] .node-dsh .node-name::before{background:var(--agent)}\n.route-card[data-s=err] .node-dsh .node-name::before{background:transparent;box-shadow:inset 0 0 0 1.3px var(--wire-broken)}\n.route-card[data-s=off] .node-dsh .node-name::before{background:var(--ok)}\n.node-dsh.flash-ok{animation:node-ok 1.05s var(--ease)}\n@keyframes node-ok{0%{box-shadow:0 0 0 0 var(--agent),var(--shadow-sm);border-color:var(--agent)}30%{box-shadow:0 0 0 6px var(--agent-soft),var(--shadow-sm);border-color:var(--agent)}}\n/* 全部失败：整张图一起安静下来，红色只留给状态胶囊和提示条标题 */\n.route-card[data-s=err] .node-hub{border-color:color-mix(in srgb,var(--text) 42%,var(--line))}\n.route-card[data-s=err] .hub-glyph{color:var(--text-3)}\n.route-card[data-s=err] .hub-pill{background:var(--text-3);color:var(--surface)}\n.route-card[data-s=err] .node-dsh .node-logo{filter:grayscale(1);opacity:.55;transition:filter .4s var(--ease),opacity .4s var(--ease)}\n\n/* 官方搜索节点：只在插件关闭时浮现在 DSH 下方，绝对定位，不挤动主行 */\n.node-official{position:absolute;left:50%;top:calc(100% + 44px);width:136px;display:flex;flex-direction:column;align-items:center;text-align:center;padding:11px 8px 10px;gap:1px;opacity:0;visibility:hidden;translate:-50% -6px;scale:.98;transition:opacity .22s var(--ease),translate .35s var(--ease),scale .35s var(--ease),visibility 0s linear .35s,border-color .2s,background-color .25s,box-shadow .2s}\n.route-card[data-plugin=off] .node-official{opacity:1;visibility:visible;translate:-50% 0;scale:1;border-color:color-mix(in srgb,var(--agent) 55%,var(--line));box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm);transition:opacity .3s var(--ease) .1s,translate .4s var(--ease) .1s,scale .4s var(--ease) .1s,visibility 0s linear 0s,border-color .2s,background-color .25s,box-shadow .2s}\n.node-official .node-logo{width:26px;height:26px;margin-bottom:6px}\n.node-official .off-text{display:flex;flex-direction:column;align-items:center}\n.node-official .node-name{font-size:12px}\n.node-official .node-meta{font-family:var(--font);color:var(--ok-text);font-weight:600}\n\n/* 中继节点（对应 magpie 网关卡）：深色描边 + 黑色“按顺序”胶囊 */\n.col-hub{display:flex;justify-content:center;align-items:center;transition:opacity .35s var(--ease),filter .35s var(--ease)}\n.node-hub{display:flex;flex-direction:column;align-items:center;text-align:center;gap:1px;width:100%;padding:14px 8px 11px;color:inherit;font:inherit;cursor:pointer;border:1.5px solid color-mix(in srgb,var(--text) 82%,transparent)}\n.node-hub:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}\n.node-hub:active{transform:none}\n.node-hub.is-busy{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm)}\n.node-hub.is-falling{border-color:var(--warn-line);box-shadow:0 0 0 3px var(--warn-soft),var(--shadow-sm)}\n.node-hub.is-falling .hub-pill{background:var(--warn-line);color:#fff}\n.node-hub.is-falling .hub-glyph{color:var(--warn)}\n.hub-glyph{width:34px;height:34px;flex:none;border-radius:10px;display:grid;place-items:center;background:var(--tile);box-shadow:inset 0 0 0 1px var(--tile-line);color:var(--text-2);margin-bottom:8px;transition:color .3s var(--ease)}\n.hub-glyph svg{width:21px;height:21px}\n.route-card[data-s=live] .hub-glyph{color:var(--agent)}\n.route-card[data-s=backup] .hub-glyph{color:var(--agent)}\n.route-card[data-s=fallback] .hub-glyph{color:var(--warn)}\n.hub-text{display:flex;flex-direction:column;align-items:center}\n.hub-pill{margin-top:8px;display:inline-flex;align-items:center;gap:2px;height:19px;padding:0 8px;border-radius:999px;background:var(--text);color:var(--surface);font-size:10.5px;font-weight:600;transition:opacity .15s}\n.node-hub:hover .hub-pill{opacity:.85}\n.route-card[data-plugin=off] .col-hub,.route-card[data-plugin=off] .col-list{opacity:.5;filter:grayscale(1)}\n\n/* ---------- 供应商列表（每行：图标 + 名称 + 开关） ---------- */\n.col-list{display:flex;flex-direction:column;gap:14px;min-width:0;transition:opacity .35s var(--ease),filter .35s var(--ease)}\n.rg-label{font-size:11px;font-weight:600;color:var(--text-3);letter-spacing:.04em;margin:0 0 6px 2px;display:flex;align-items:center;gap:8px;white-space:nowrap}\n.rg-hint{font-weight:500;color:var(--text-4);letter-spacing:0;display:inline-flex;align-items:center;gap:3px}\n.rg-rows{position:relative;display:flex;flex-direction:column;gap:6px}\n\n.row{position:relative;display:flex;align-items:center;height:44px;padding:0 10px 0 0;border-radius:12px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow-sm);user-select:none;-webkit-user-select:none;transition:border-color .2s var(--ease),box-shadow .2s var(--ease),background-color .2s,opacity .2s}\n.row[data-drag=true]{touch-action:none}\n.row-main{flex:1;min-width:0;display:flex;align-items:center;gap:11px;height:100%;padding:0 6px 0 10px;border:0;background:transparent;border-radius:11px;cursor:pointer;text-align:left;color:inherit}\n.row[data-drag=true] .row-main{cursor:grab}\n.row-main:focus-visible{outline:none}\n.row:has(.row-main:focus-visible){outline:2px solid var(--agent);outline-offset:2px}\n.row.is-dragging{outline:none !important}\n.row-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .2s}\n.row .switch{margin-left:auto}\n.row:hover{border-color:var(--line-2);box-shadow:var(--shadow-md)}\n.row[data-st=unset]{border-style:dashed;border-color:var(--line-2);background:color-mix(in srgb,var(--surface) 55%,transparent);box-shadow:none}\n.row[data-st=unset] .row-name{color:var(--text-3)}\n.row[data-st=unset] .tile{filter:grayscale(1);opacity:.42}\n.row[data-st=off]{border-style:dashed;border-color:var(--line-2);box-shadow:none}\n.row[data-st=off] .row-name{color:var(--text-3)}\n.row[data-st=off] .tile{filter:grayscale(1);opacity:.42}\n.row[data-st=live]{border-color:var(--text);box-shadow:var(--shadow-sm)}\n.row[data-st=wait]{border-style:dashed;border-color:var(--warn-line);background:var(--warn-soft);box-shadow:none}\n.row[data-st=wait] .tile{filter:grayscale(1);opacity:.5}\n.row[data-st=bad],.row[data-st=err]{border-color:var(--line);background:color-mix(in srgb,var(--surface-2) 62%,var(--surface))}\n.row[data-st=bad] .tile,.row[data-st=err] .tile{opacity:.5;filter:saturate(.3)}\n.row[data-st=bad] .row-name,.row[data-st=err] .row-name{color:var(--text-3)}\n.row .tile{transition:filter .5s var(--ease),opacity .5s var(--ease)}\n/* 参考 Magpie 0.1.1978 的 .rt-accts .tag：右上悬浮，不挤占名称或开关。\n   动画只提示本次错误；最近失败的简短原因继续留在原供应商，直到重验或配置改变。 */\n.row-fault{position:absolute;right:10px;top:-14px;z-index:5;display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid transparent;border-radius:6px;background:var(--err-solid);color:#fff;font:600 12px/1.35 var(--font);font-variant-numeric:tabular-nums;max-width:calc(100% - 20px);white-space:nowrap;pointer-events:none;opacity:0;transform:translateY(4px) scale(.96);transform-origin:right bottom;transition:opacity .2s var(--ease),transform .25s var(--ease),background-color .2s,color .2s}\n.row.has-fault .row-fault{opacity:1;transform:none}\n.row-fault[data-tone=partial]{background:var(--surface);border-color:var(--warn-line);color:var(--warn-text)}\n.row-fault-code{font:600 11.5px/1.35 var(--mono);font-variant-numeric:tabular-nums}\n.row-fault-sep{opacity:.72}\n.row.is-fault-flash{border-color:var(--err);box-shadow:0 0 0 2px var(--err-soft)}\n.row.flash-ok{animation:row-ok .85s var(--ease)}\n@keyframes row-ok{0%{border-color:var(--agent);box-shadow:0 0 0 0 var(--agent-soft)}35%{border-color:var(--agent);box-shadow:0 0 0 5px var(--agent-soft)}}\n.row.is-hl{border-color:var(--line-2)}\n.row.is-searching{animation:searching 1s var(--ease) infinite}\n@keyframes searching{0%,100%{box-shadow:0 0 0 3px var(--agent-soft)}50%{box-shadow:0 0 0 6px var(--agent-soft)}}\n.row.tick{animation:tick .55s var(--spring)}\n.row.tick .tile{animation:lightup .7s var(--ease)}\n@keyframes tick{35%{transform:scale(1.025)}}\n@keyframes lightup{from{filter:grayscale(1);opacity:.42}}\n.row.enter{animation:row-in .42s var(--ease) both;animation-delay:calc(var(--i,0) * 45ms)}\n@keyframes row-in{from{opacity:0;transform:translateY(6px)}}\n.shake{animation:shake .38s var(--ease)}\n@keyframes shake{20%{transform:translateX(-4px)}40%{transform:translateX(4px)}60%{transform:translateX(-2px)}80%{transform:translateX(2px)}}\n/* 参考 Magpie 的 rthit：450ms 衰减轻颤；translate 不占用拖拽的 transform。 */\n.row.is-jolt,.node.is-jolt{animation:route-jolt .45s linear}\n.row.is-jolt-soft{animation:route-jolt-soft .3s linear}\n@keyframes route-jolt{0%,100%{translate:0 0}20%{translate:-5px 0}40%{translate:4px 0}60%{translate:-2px 0}80%{translate:1px 0}}\n@keyframes route-jolt-soft{0%,100%{translate:0 0}18%{translate:-1.5px 0}38%{translate:1.2px 0}60%{translate:-.7px 0}80%{translate:.3px 0}}\n\n/* 拖拽 */\n.rg-rows.is-sorting .row:not(.is-dragging){transition:transform .22s var(--ease),border-color .2s,box-shadow .2s}\n.row.is-dragging{z-index:6;border-color:var(--line-2);box-shadow:var(--shadow-drag)}\n.row.is-dragging .row-main{cursor:grabbing}\n.drop-ghost{position:absolute;left:0;right:0;z-index:0;border:1.5px dashed var(--agent-ring);border-radius:12px;background:var(--agent-soft);pointer-events:none;transition:transform .22s var(--ease)}\n.dsg-root.is-grabbing,.dsg-root.is-grabbing *{cursor:grabbing !important}\n\n/* logo 方块：官方原图不改，只做统一尺寸、底板与灰度滤镜 */\n.tile{--s:28px;position:relative;width:var(--s);height:var(--s);flex:none;border-radius:calc(var(--s) * .27);display:grid;place-items:center;overflow:hidden;transition:filter .3s var(--ease),opacity .3s var(--ease)}\n.tile img{display:block;width:100%;height:100%;object-fit:cover}\n.tile[data-fit=contain]{background:var(--tile);box-shadow:inset 0 0 0 1px var(--tile-line)}\n.tile[data-fit=contain] img{width:var(--k,62%);height:var(--k,62%);object-fit:contain}\n.tile[data-plate=light]{background:#f4f5f7}\n.tile[data-ring=true]::after{content:\"\";position:absolute;inset:0;border-radius:inherit;box-shadow:inset 0 0 0 1px rgba(255,255,255,.16);pointer-events:none}\n.tile-glyph{background:var(--tile);box-shadow:inset 0 0 0 1px var(--tile-line);color:var(--text-2)}\n.tile-glyph svg{width:62%;height:62%}\n\n/* 开关 */\n.switch{position:relative;width:34px;height:20px;flex:none;border-radius:999px;border:0;padding:0;background:var(--line-2);transition:background-color .2s var(--ease),opacity .2s}\n.switch i{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.22),0 0 0 .5px rgba(0,0,0,.04);display:grid;place-items:center;color:var(--btn-primary);transition:transform .26s var(--spring)}\n.switch[aria-checked=true]{background:var(--btn-primary)}\n.switch[aria-checked=true] i{transform:translateX(14px)}\n.switch:hover:not(:disabled){filter:brightness(1.04)}\n.switch-lg{width:42px;height:24px}\n.switch-lg i{width:20px;height:20px}\n.switch-lg[aria-checked=true] i{transform:translateX(18px)}\n[data-theme=dark] .switch{background:#3a3e46}\n[data-theme=dark] .switch[aria-checked=true]{background:#5873ff}\n\n/* 底部配置文件条 */\n.rc-foot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px 11px 20px;font-size:12px;color:var(--text-3)}\n.cf-label{white-space:nowrap}\n.cf-path{font:500 11.5px/1.5 var(--mono);color:var(--text-2);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:1px 7px;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.tag{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:999px;font-size:11px;font-weight:550;background:var(--surface-2);color:var(--text-3);border:1px solid var(--line);white-space:nowrap;line-height:1}\n.tag[data-tone=agent]{background:var(--agent-soft);color:var(--agent);border-color:transparent}\n.tag[data-tone=warn]{background:var(--warn-soft);color:var(--warn);border-color:transparent}\n.tag[data-tone=ok]{background:var(--ok-soft);color:var(--ok-text);border-color:transparent}\n.cf-spacer{flex:1}\n.rc-foot .btn svg{width:14px;height:14px}\n\n/* ---------- 弹窗 ---------- */\n.overlay{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:24px;background:var(--scrim);backdrop-filter:blur(2px);animation:fade-in .16s var(--ease)}\n.overlay[hidden]{display:none}\n.overlay.is-closing{animation:fade-out .15s var(--ease) forwards}\n.dialog{width:min(600px,100%);max-height:min(780px,calc(100vh - 48px));display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-lg);overflow:hidden;animation:dlg-in .22s var(--ease)}\n.overlay.is-closing .dialog{animation:dlg-out .15s var(--ease) forwards}\n.dialog.is-in{animation:none}\n.dialog.shake{animation:shake .38s var(--ease)}\n@keyframes fade-in{from{opacity:0}}\n@keyframes fade-out{to{opacity:0}}\n@keyframes dlg-in{from{opacity:0;transform:translateY(8px) scale(.98)}}\n@keyframes dlg-out{to{opacity:0;transform:translateY(4px) scale(.985)}}\n\n.dlg-head{display:flex;align-items:center;gap:12px;padding:16px 14px 14px 20px;border-bottom:1px solid var(--line)}\n.dlg-head > .tile{--s:40px}\n.dlg-titles{flex:1;min-width:0}\n.dlg-titles h2{margin:0;font-size:16px;font-weight:650;letter-spacing:-.005em;line-height:1.3}\n.dlg-sub{margin:2px 0 0;font-size:12px;color:var(--text-3);display:flex;align-items:center;gap:4px 8px;flex-wrap:wrap}\n.dlg-link{color:var(--agent);text-decoration:none;display:inline-flex;align-items:center;gap:2px;white-space:nowrap;font-weight:550}\n.dlg-link:hover{text-decoration:underline}\n.head-switch{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-2);white-space:nowrap;cursor:pointer}\n.head-switch[data-pending=true]{color:var(--text-3);cursor:default}\n.head-switch[data-pending=true] .switch{opacity:.48;cursor:default}\n.head-switch[data-pending=true] .switch:hover{filter:none}\n.dlg-head .icon-btn{margin-left:2px}\n\n.dlg-body{padding:4px 20px 8px;overflow:auto;overscroll-behavior:contain}\n.dlg-form{margin:0}\n.field{display:grid;grid-template-columns:112px minmax(0,1fr);column-gap:16px;align-items:start;padding:12px 0;border-bottom:1px solid var(--hair)}\n.field:last-child{border-bottom:0}\n.f-label{padding-top:8px;font-size:12.5px;font-weight:550;color:var(--text);display:flex;flex-direction:column;gap:1px}\n.f-label small{font-weight:400;color:var(--text-3);font-size:11px}\n.f-label small:has(.ic){display:inline-flex;align-items:center;gap:4px}\n.f-ctl{min-width:0;display:flex;flex-direction:column;gap:6px}\n.f-help{font-size:11.5px;color:var(--text-3);line-height:1.5;margin:0}\n.f-help code,.note code{font:500 11px var(--mono);color:var(--text-2);background:var(--field);border-radius:4px;padding:0 4px}\n.f-msg{font-size:11.5px;line-height:1.45;display:flex;gap:5px;align-items:flex-start;margin:0}\n.f-msg svg{flex:none;margin-top:2px}\n.f-msg[data-tone=err]{color:var(--err-text)}\n.f-msg[data-tone=warn]{color:var(--warn-text)}\n\n.input{position:relative;display:flex;align-items:center;height:34px;min-width:0;border-radius:9px;background:var(--field);border:1px solid transparent;transition:background-color .15s,border-color .15s,box-shadow .15s}\n.input:hover{background:var(--field-hover)}\n.input:focus-within{background:var(--field-focus);border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft)}\n.input[data-invalid=true]{border-color:var(--err);box-shadow:0 0 0 3px var(--err-soft)}\n.input[data-health=true]{border-color:color-mix(in srgb,var(--err) 55%,transparent)}\n.input input{flex:1;min-width:0;height:100%;border:0;background:transparent;outline:none;padding:0 10px;font-size:12.5px}\n.input input.mono{font-family:var(--mono);font-size:12px}\n.input input::placeholder{color:var(--text-4)}\n.input .in-act{display:flex;gap:1px;padding-right:3px}\n.input.is-readonly{background:transparent;border:1px dashed var(--line-2)}\n.input.is-readonly input{color:var(--text-3)}\n.save-error{color:var(--err-text);border:1px solid var(--err-soft)}\n\n.seg{display:inline-flex;align-self:flex-start;max-width:100%;padding:3px;gap:2px;border-radius:10px;background:var(--field)}\n.seg button{border:0;background:transparent;height:28px;padding:0 12px;border-radius:7px;font-size:12.5px;font-weight:550;color:var(--text-2);white-space:nowrap;transition:background-color .15s,color .15s,box-shadow .15s}\n.seg button:hover{color:var(--text)}\n.seg button[aria-checked=true]{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm),0 0 0 1px var(--line)}\n.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}\n.chips .f-help{margin-right:2px}\n.chip{height:24px;padding:0 9px;border-radius:999px;border:1px solid var(--line);background:var(--surface);font:500 11.5px var(--mono);color:var(--text-2);transition:border-color .15s,color .15s,background-color .15s}\n.chip:hover{border-color:var(--line-2);color:var(--text)}\n.chip[aria-pressed=true]{border-color:var(--agent);color:var(--agent);background:var(--agent-soft)}\n\n.checks{display:flex;flex-direction:column;gap:2px}\n.check{position:relative;display:flex;align-items:flex-start;gap:9px;padding:6px 8px;margin:0 -8px;border-radius:8px;cursor:pointer}\n.check:hover{background:var(--surface-2)}\n.check input{position:absolute;opacity:0;pointer-events:none}\n.check .box{flex:none;width:16px;height:16px;margin-top:1px;border-radius:5px;border:1.5px solid var(--line-2);background:var(--surface);display:grid;place-items:center;color:#fff;transition:background-color .15s,border-color .15s}\n.check .box svg{width:11px;height:11px;opacity:0;transform:scale(.6);transition:opacity .15s,transform .2s var(--spring)}\n.check input:checked + .box{background:var(--btn-primary);border-color:var(--btn-primary)}\n.check input:checked + .box svg{opacity:1;transform:none}\n.check input:focus-visible + .box{outline:2px solid var(--agent);outline-offset:2px}\n.check.is-disabled{cursor:not-allowed}\n.check.is-disabled .box,.check.is-disabled .c-text{opacity:.45}\n.check .c-text{display:flex;flex-direction:column;font-size:12.5px;font-weight:550}\n.check .c-text small{color:var(--text-3);font-size:11.5px;font-weight:400}\n\n.keylist{display:flex;flex-direction:column;gap:6px}\n.key-row{display:flex;gap:6px;align-items:center}\n.key-row .input{flex:1}\n.key-row.enter{animation:row-in .25s var(--ease)}\n.add-key{align-self:flex-start;display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 10px;border-radius:8px;border:1px dashed var(--line-2);background:transparent;color:var(--text-2);font-size:12px;transition:border-color .15s,color .15s,background-color .15s}\n.add-key:hover{border-color:var(--agent);color:var(--agent);background:var(--agent-soft)}\n\n.dlg-foot{display:flex;align-items:center;gap:8px;padding:12px 16px 12px 14px;border-top:1px solid var(--line);background:var(--surface-2)}\n.foot-note{flex:1;min-width:0;font-size:11.5px;color:var(--text-3);text-align:right;padding-right:4px}\n.foot-note b{color:var(--warn);font-weight:600}\n\n/* 中继弹窗 */\n.sec{padding:12px 0 4px;border-bottom:1px solid var(--line)}\n.sec:last-child{border-bottom:0}\n.sec-h{margin:4px 0 2px;font-size:11px;font-weight:650;letter-spacing:.06em;color:var(--text-3);display:flex;align-items:center;gap:8px}\n.prog{display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px;padding:10px 10px 10px 12px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line)}\n.prog-main{flex:1;min-width:190px;display:flex;flex-direction:column;gap:2px}\n.prog-title{font-weight:600;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}\n.prog-path{font:500 11.5px var(--mono);color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.order{margin:2px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px;counter-reset:o}\n.order li{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-3)}\n.order li::before{counter-increment:o;content:counter(o);width:17px;height:17px;flex:none;border-radius:50%;display:grid;place-items:center;font-size:10px;font-weight:650;background:var(--field);color:var(--text-3)}\n.order li.is-hit{color:var(--text)}\n.order li.is-hit::before{background:var(--btn-primary);color:#fff}\n.stepper{display:inline-flex;align-items:center;align-self:flex-start;height:34px;border-radius:9px;background:var(--field);border:1px solid transparent;transition:background-color .15s,border-color .15s,box-shadow .15s}\n.stepper:focus-within{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft);background:var(--field-focus)}\n.stepper button{width:30px;height:30px;margin:0 1px;border:0;background:transparent;border-radius:8px;color:var(--text-2);display:grid;place-items:center}\n.stepper button:hover:not(:disabled){background:var(--field-hover);color:var(--text)}\n.stepper button:disabled{opacity:.3}\n.stepper input{width:58px;height:100%;border:0;background:transparent;text-align:center;font:600 12.5px var(--mono);outline:none;-moz-appearance:textfield;appearance:textfield}\n.stepper input::-webkit-inner-spin-button,.stepper input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}\n.stepper .unit{font-size:11.5px;color:var(--text-3);margin:0 2px 0 -6px}\n.stepper.is-readonly{background:transparent;border:1px dashed var(--line-2);color:var(--text-3)}\n.static-val{display:inline-flex;align-items:center;gap:8px;min-height:34px;font-size:12.5px;color:var(--text);flex-wrap:wrap}\n.adv-toggle{display:flex;align-items:center;gap:6px;width:100%;padding:13px 0 11px;border:0;background:transparent;font-size:12.5px;font-weight:600;color:var(--text-2);text-align:left}\n.adv-toggle:hover{color:var(--text)}\n.adv-toggle .adv-hint{font-weight:400;color:var(--text-3);font-size:11.5px}\n.adv-toggle svg{transition:transform .25s var(--ease)}\n.adv-toggle[aria-expanded=true] svg{transform:rotate(90deg)}\n.adv{display:grid;grid-template-rows:0fr;transition:grid-template-rows .32s var(--ease)}\n.adv.is-open{grid-template-rows:1fr}\n.adv > div{overflow:hidden;min-height:0}\n.sub-h{margin:12px 0 0;padding-top:12px;border-top:1px solid var(--line);font-size:11.5px;font-weight:650;color:var(--text-2);display:flex;align-items:center;gap:6px}\n.note{display:flex;gap:8px;align-items:flex-start;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:11.5px;color:var(--text-2);line-height:1.55;margin:8px 0}\n.note svg{flex:none;margin-top:1px;color:var(--text-3)}\n\n/* ---------- 加载骨架 ---------- */\n.skel{display:inline-block;height:10px;border-radius:5px;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}\n.route-card.is-loading .row{border-style:solid;border-color:transparent;box-shadow:none;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}\n.route-card.is-loading .row > *{visibility:hidden}\n.route-card.is-loading .wires,.route-card.is-loading .port{opacity:0}\n.route-card.is-loading .rc-foot .cf-path,.route-card.is-loading .rc-foot .tag{opacity:.4}\n@keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}\n\n/* ---------- toast ---------- */\n.toasts{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:max-content;max-width:calc(100vw - 32px)}\n.toast{pointer-events:auto;display:flex;align-items:center;gap:9px;min-height:38px;max-width:100%;padding:7px 7px 7px 13px;border-radius:12px;background:var(--toast-bg);color:var(--toast-text);font-size:12.5px;box-shadow:0 10px 30px rgba(0,0,0,.25);animation:toast-in .28s var(--spring)}\n.toast.no-act{padding-right:15px}\n.toast.is-out{animation:toast-out .18s var(--ease) forwards}\n.toast .t-ic{flex:none;display:grid;place-items:center}\n.toast[data-tone=ok] .t-ic{color:#3ccb7f}\n.toast[data-tone=err] .t-ic{color:#ff6b70}\n.toast[data-tone=warn] .t-ic{color:#f0b04a}\n.toast[data-tone=info] .t-ic{color:#93a6ff}\n[data-theme=dark] .toast[data-tone=ok] .t-ic{color:#12a150}\n[data-theme=dark] .toast[data-tone=err] .t-ic{color:#e5484d}\n[data-theme=dark] .toast[data-tone=warn] .t-ic{color:#b86e00}\n[data-theme=dark] .toast[data-tone=info] .t-ic{color:#4d6bfe}\n.toast .t-text{min-width:0}\n.toast .t-act{flex:none;display:inline-flex;align-items:center;gap:4px;border:0;background:var(--toast-act);color:inherit;height:26px;padding:0 10px 0 8px;border-radius:7px;font-size:12px;font-weight:600;white-space:nowrap}\n.toast .t-act:hover{filter:brightness(1.15)}\n@keyframes toast-in{from{opacity:0;transform:translateY(10px) scale(.96)}}\n@keyframes toast-out{to{opacity:0;transform:translateY(6px) scale(.98)}}\n\n@media (prefers-reduced-motion:reduce){\n  *,*::before,*::after{animation-duration:.001ms !important;animation-delay:0s !important;animation-iteration-count:1 !important;transition-duration:.001ms !important;transition-delay:0s !important;scroll-behavior:auto !important}\n}\n";
-    const ROUTE_CARD = "<section class=\"route-card\" id=\"routeCard\" data-layout=\"wide\" aria-labelledby=\"routeTitle\">\n  <div class=\"rc-head\">\n    <div class=\"rc-title\">\n      <h3 id=\"routeTitle\">搜索路由</h3>\n      <span class=\"pill\" id=\"statusPill\" data-s=\"load\"><i class=\"pill-dot\" aria-hidden=\"true\"></i><span id=\"statusText\">读取配置…</span></span>\n    </div>\n    <div class=\"rc-actions\">\n      <div class=\"strip-slot\" id=\"stripSlot\"><div><div class=\"strip\" id=\"strip\" role=\"group\" aria-label=\"搜索顺序与最近验证状态\"></div></div></div>\n      <button type=\"button\" class=\"btn\" id=\"testBtn\"></button>\n      <div class=\"popover\" id=\"testPop\" role=\"dialog\" aria-modal=\"false\" aria-labelledby=\"testPopTitle\" hidden>\n        <p class=\"pop-title\" id=\"testPopTitle\">测试全部已开启的搜索来源？</p>\n        <p class=\"pop-text\">会逐一测试已开启的搜索来源及其 Key，各次测试会消耗相应额度。</p>\n        <div class=\"pop-actions\">\n          <button type=\"button\" class=\"btn btn-ghost btn-sm\" data-pop=\"cancel\">取消</button>\n          <button type=\"button\" class=\"btn btn-primary btn-sm\" data-pop=\"go\">开始测试</button>\n        </div>\n      </div>\n    </div>\n  </div>\n  <div class=\"banner-slot\" id=\"bannerSlot\"></div>\n  <div class=\"stage\" id=\"stage\" data-layout=\"wide\" role=\"group\" aria-label=\"搜索路由图\">\n    <svg class=\"wires\" id=\"wires\" aria-hidden=\"true\"></svg>\n    <div class=\"col-agent\" id=\"colAgent\">\n      <div class=\"node node-dsh\" id=\"nodeDsh\" title=\"宿主：DeepSeek Harness 的 web_search 工具\">\n        <span class=\"port\" data-port=\"dsh-out\"></span>\n        <span class=\"port\" data-port=\"dsh-alt\"></span>\n        <img class=\"node-logo\" data-logo=\"dsh\" alt=\"\">\n        <span class=\"node-name\">DeepSeek Harness</span>\n        <span class=\"node-meta\">web_search</span>\n      </div>\n      <div class=\"node node-official\" id=\"nodeOfficial\" aria-hidden=\"true\">\n        <span class=\"port\" data-port=\"off-in\"></span>\n        <img class=\"node-logo\" data-logo=\"deepseek\" alt=\"\">\n        <span class=\"off-text\">\n          <span class=\"node-name\">DeepSeek 官方搜索</span>\n          <span class=\"node-meta\">内置 · 已恢复</span>\n        </span>\n      </div>\n    </div>\n    <div class=\"col-hub\">\n      <button type=\"button\" class=\"node node-hub\" id=\"nodeHub\" aria-label=\"Grok Search RS 设置\">\n        <span class=\"port\" data-port=\"hub-in\"></span>\n        <span class=\"port\" data-port=\"hub-out\"></span>\n        <span class=\"hub-glyph\" id=\"hubGlyph\" aria-hidden=\"true\"></span>\n        <span class=\"hub-text\">\n          <span class=\"node-name\">Grok Search RS</span>\n          <span class=\"node-meta\" id=\"hubMeta\">准备中…</span>\n        </span>\n        <span class=\"hub-pill\" id=\"hubPill\"><span id=\"hubPillText\">按顺序</span><span aria-hidden=\"true\">›</span></span>\n      </button>\n    </div>\n    <div class=\"col-list\" id=\"colList\">\n      <div class=\"rgroup\" data-group=\"primary\">\n        <div class=\"rg-label\">主搜索</div>\n        <div class=\"rg-rows\" id=\"rowsPrimary\"></div>\n      </div>\n      <div class=\"rgroup\" data-group=\"supp\">\n        <div class=\"rg-label\">补充来源 <span class=\"rg-hint\">拖动排序</span></div>\n        <div class=\"rg-rows\" id=\"rowsSupp\"></div>\n      </div>\n      <div class=\"rgroup\" data-group=\"extract\">\n        <div class=\"rg-label\">专用抽取</div>\n        <div class=\"rg-rows\" id=\"rowsExtract\"></div>\n      </div>\n    </div>\n  </div>\n  <footer class=\"rc-foot\">\n    <span class=\"cf-label\">配置文件</span>\n    <code class=\"cf-path\" id=\"cfgPath\"></code>\n    <span class=\"tag\" id=\"cfgTag\"></span>\n    <span class=\"cf-spacer\"></span>\n    <button type=\"button\" class=\"btn btn-ghost btn-sm\" data-open=\"file\">打开文件</button>\n    <button type=\"button\" class=\"btn btn-ghost btn-sm\" data-open=\"folder\">打开文件夹</button>\n  </footer>\n</section>\n";
+    const SEARCH_LOG = (function createSearchLogView(host) {
+const { $, $$, active, S, card, layer, listen, remote, uuid, clone, esc, svg, tile,
+  logoSrc, isDark, reduced, META, SUPP, setTimeout, clearTimeout, requestAnimationFrame,
+  cancelAnimationFrame, T, jolts, faultPulses, syncBreak, travel, jolt, pulseFault,
+  flashRow, flashNode, pumpWires, closePop, hideStripTip: hideRouteTip, toast, errText, rowOf, SVGNS, logMemory } = host;
+const HUB_DISPLAY_NAME = 'Grok Search Rs';
+const sessionId = uuid();
+let disposed = false, readTask = null, generation = 0, clearing = false, pollTimer = 0;
+let readSignature = null;
+// The first readable snapshot of a mount is a baseline, not new activity.
+let logBaselined = false, logRestricted = false;
+
+
+
+
+const routeTooltip = $('#logTooltip');
+let stripTipTarget = null, stripTipTimer = 0;
+function hideStripTip() {
+  clearTimeout(stripTipTimer);
+  stripTipTarget?.removeAttribute('aria-describedby');
+  stripTipTarget = null;
+  routeTooltip.hidden = true;
+  routeTooltip.textContent = '';
+  delete routeTooltip.dataset.kind;
+}
+function showStripTip(node) {
+  hideRouteTip();
+  const logTip = true;
+  if (!node?.isConnected || node.closest('[inert]')) {
+    hideStripTip(); return;
+  }
+  clearTimeout(stripTipTimer);
+  if (stripTipTarget !== node) stripTipTarget?.removeAttribute('aria-describedby');
+  stripTipTarget = node;
+  routeTooltip.textContent = logTip ? node.dataset.logTip : node._tip;
+  routeTooltip.dataset.kind = logTip ? 'log' : 'route';
+  routeTooltip.hidden = false;
+  node.setAttribute('aria-describedby', 'logTooltip');
+  const r = node.getBoundingClientRect();
+  const t = routeTooltip.getBoundingClientRect();
+  routeTooltip.style.left = Math.max(12, Math.min(innerWidth - t.width - 12, r.left + r.width / 2 - t.width / 2)) + 'px';
+  routeTooltip.style.top = Math.max(12, r.bottom + t.height + 10 < innerHeight ? r.bottom + 8 : r.top - t.height - 8) + 'px';
+}
+function syncFocusedLogTip() {
+  const node = stripTipTarget;
+  if (node?.matches('[data-log-tip]') && node.isConnected && active() === node) {
+    const bounds = node.getBoundingClientRect(), list = $('#logList').getBoundingClientRect();
+    if (bounds.bottom > Math.max(0, list.top) && bounds.top < Math.min(innerHeight, list.bottom)
+      && bounds.right > 0 && bounds.left < innerWidth) {
+      showStripTip(node);
+      return;
+    }
+  }
+  hideStripTip();
+}
+
+listen(routeTooltip, 'pointerenter', () => clearTimeout(stripTipTimer));
+listen(routeTooltip, 'pointerleave', () => { if (stripTipTarget !== active()) hideStripTip(); });
+listen(document, 'keydown', event => { if (event.key === 'Escape') hideStripTip(); });
+listen(window, 'resize', hideStripTip);
+listen(window, 'scroll', event => { if (!routeTooltip.contains(event.target)) syncFocusedLogTip(); }, true);
+listen($('#logList'), 'scroll', syncFocusedLogTip);
+const LOG_CAP = 20;
+const LOG_KINDS = new Set(['ok', 'sources', 'fallback', 'failed', 'running', 'cancelled', 'unknown', 'released', 'enabled', 'official']);
+const LOG_CHANNELS = new Set(['grok', 'grok-sources', ...SUPP]);
+const LOG_CHIP = {
+  ok: ['ok', 'Grok 返回'], sources: ['ok', '补充来源'],
+  fallback: ['warn', '已回退'], failed: ['err', '搜索失败'],
+  running: ['run', '处理中'], cancelled: ['idle', '已取消'], released: ['idle', '官方已恢复'],
+  enabled: ['idle', '插件已启用'], official: ['idle', '官方搜索'], unknown: ['idle', '结果未完整记录'],
+};
+const USAGE_CHANNELS = new Set(['grok', 'grok-sources', ...SUPP, 'deepseek']);
+const USAGE_OPERATIONS = { search: '搜索', supplement: '补充搜索', fetch: '网页提取', retry: '重试' };
+const USAGE_RESULTS = { ok: '成功', failed: '失败', running: '处理中', cancelled: '已取消', unknown: '未报告' };
+function normalizeUsage(input) {
+  const rows = Array.isArray(input) ? input : [];
+  return rows.slice(0, 16).filter(item => item && USAGE_CHANNELS.has(item.provider)).map(item => {
+    const basis = ['reported', 'estimated'].includes(item.charge?.basis) ? item.charge.basis : 'unknown';
+    const amount = basis !== 'unknown' && Number.isFinite(item.charge?.amount)
+      && item.charge.amount >= 0 && item.charge.amount <= 1e9 ? item.charge.amount : null;
+    const expectedUnit = item.provider === 'tavily' || item.provider === 'firecrawl' ? 'credits' : 'USD';
+    const unit = item.charge?.unit === expectedUnit ? expectedUnit : null;
+    const keyIndex = item.provider === 'tavily' && Number.isSafeInteger(item.keyIndex) && item.keyIndex >= 0 && item.keyIndex < 100
+      ? item.keyIndex : null;
+    return {
+      provider: item.provider,
+      operation: Object.hasOwn(USAGE_OPERATIONS, item.operation) ? item.operation : 'search',
+      result: Object.hasOwn(USAGE_RESULTS, item.result) ? item.result : 'unknown',
+      ...(item.evidence === 'source-label' ? { evidence: 'source-label' } : {}),
+      code: /^[\w.-]{1,64}$/.test(item.code || '') ? item.code : '',
+      keyIndex,
+      charge: { basis: amount === null || !unit ? 'unknown' : item.provider === 'exa' ? 'estimated' : basis, amount, unit },
+    };
+  });
+}
+let logRows = [];
+let logFilter = 'all';
+
+let logSequence = 0;
+let logEpoch = 0;
+let logPrivate = logMemory?.private === true;
+
+let logRoutePlayback = null;
+let logReplayReturn = null;
+const logOpen = new Set();
+const logNodes = new Map();
+const logFingerprints = new WeakMap();
+const logEvent = rec => rec.kind === 'released' || rec.kind === 'enabled';
+const logReplayable = rec => ['ok', 'sources', 'fallback', 'failed', 'official'].includes(rec.kind);
+const logTime = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+function normalizeLog(input, child = false) {
+  if (!input || !LOG_KINDS.has(input.kind)) throw new TypeError('Unknown search log state.');
+  const calls = logEvent(input) ? [] : normalizeUsage(input.calls);
+  const record = {
+    id: /^search-log-[0-9]+$/.test(input.id) ? input.id : `search-log-${++logSequence}`,
+    t: String(input.t || (Number.isFinite(input.at) ? new Date(input.at).toLocaleTimeString('zh-CN', { hour12: false }) : logTime())).slice(0, 60),
+    q: String(input.q || '').slice(0, 5000),
+    kind: input.kind,
+    served: LOG_CHANNELS.has(input.served) ? input.served : null,
+    ms: !logEvent(input) && Number.isFinite(input.ms) && input.ms >= 0 && input.ms <= Number.MAX_SAFE_INTEGER ? input.ms : null,
+    official: !logEvent(input) && Number.isSafeInteger(input.official) && input.official >= 0 ? input.official : null,
+    reason: /^[\w.-]{1,64}$/.test(input.reason || '') ? input.reason : '',
+    detail: String(input.detail || '').slice(0, 3000),
+    calls,
+    callsComplete: !logEvent(input) && input.callsComplete === true
+      && Array.isArray(input.calls) && input.calls.length === calls.length,
+    epoch: logEpoch,
+  };
+  if (Array.isArray(input.resultProviders) && !logEvent(input)) {
+    record.resultProviders = [...new Set(input.resultProviders.filter(provider =>
+      LOG_CHANNELS.has(provider) && provider !== 'grok-sources'))].slice(0, 5);
+    record.resultProvidersComplete = input.resultProvidersComplete === true
+      && input.resultProviders.every(provider => record.resultProviders.includes(provider));
+  }
+  if (!child && !logEvent(input) && Array.isArray(input.queries)) {
+    record.queries = input.queries.slice(0, 16)
+      .filter(query => query && LOG_KINDS.has(query.kind) && !logEvent(query))
+      .map(query => normalizeLog({ ...query, t: query.t || (Number.isFinite(query.at) ? undefined : record.t),
+        kind: input.kind !== 'running' && query.kind === 'running' ? 'unknown' : query.kind }, true));
+    record.queryCount = Math.max(input.queries.length, record.queries.length,
+      Number.isSafeInteger(input.queryCount) && input.queryCount >= 0 ? Math.min(input.queryCount, 1000000) : input.queries.length);
+    record.queriesComplete = input.queriesComplete !== false
+      && record.queryCount === record.queries.length && input.queries.length === record.queries.length;
+    // The parent receipt describes the lifecycle of the whole tool invocation.
+    // Child results can disprove success, but cannot turn a live/failed/cancelled
+    // parent into success. Missing history is not a still-running request.
+    const kinds = record.queries.map(query => query.kind);
+    if (!['running', 'failed', 'cancelled', 'unknown'].includes(input.kind)) {
+      if (kinds.includes('failed')) record.kind = 'failed';
+      else if (kinds.includes('cancelled')) record.kind = 'cancelled';
+      else if (!record.queriesComplete || !kinds.length || kinds.includes('unknown')) record.kind = 'unknown';
+      else record.kind = input.kind === 'fallback' || kinds.includes('fallback') ? 'fallback'
+        : kinds.every(kind => kind === 'official') ? 'official' : kinds.every(kind => kind === 'sources') ? 'sources' : 'ok';
+    }
+  }
+  return record;
+}
+const logQueries = rec => logEvent(rec) ? [] : rec.queries || [rec];
+const logQueryCount = rec => logEvent(rec) ? 0 : rec.queryCount ?? 1;
+// Keep invocation receipts for late-write/cancellation protection, but render
+// each recorded query as its own row. A row's identity does not depend on the
+// child IDs regenerated by normalizeLog when a parent receipt is updated.
+const logEntryId = (record, index = 0) => record.queries?.length ? `${record.id}-query-${record.queries[index].id}` : record.id;
+function logEntries() {
+  const entries = [];
+  for (const record of logRows) {
+    if (record.queries?.length) {
+      record.queries.forEach((query, index) => entries.push({
+        ...query, id: logEntryId(record, index), parentId: record.id, queryIndex: index,
+        receipt: { kind: record.kind, reason: record.reason, detail: record.detail,
+          incomplete: record.queriesComplete === false },
+      }));
+    } else {
+      entries.push({ ...record, parentId: record.id, queryIndex: 0,
+        receiptOnly: Array.isArray(record.queries), queries: undefined });
+    }
+    if (entries.length >= LOG_CAP) break;
+  }
+  return entries.slice(0, LOG_CAP);
+}
+function logDuration(ms) {
+  if (ms === null) return '—';
+  if (ms >= 86400000) return (ms / 86400000).toLocaleString('zh-CN', { maximumFractionDigits: 1 }) + ' 天';
+  return (ms / 1000).toFixed(1) + ' 秒';
+}
+const logSucceeded = rec => ['ok', 'sources', 'fallback', 'official'].includes(rec.kind);
+function logStatus(rec) {
+  if (rec.kind === 'fallback') return ['warn', '已回退', 'reroute'];
+  if (logSucceeded(rec)) return ['ok', LOG_CHIP[rec.kind][1], 'ok'];
+  if (rec.kind === 'failed') return ['err', '搜索失败', 'warn'];
+  if (rec.kind === 'cancelled') return ['idle', '已取消', 'minus'];
+  if (rec.kind === 'running') return ['run', '处理中', 'refresh'];
+  return [LOG_CHIP[rec.kind][0], LOG_CHIP[rec.kind][1], 'info'];
+}
+function logStatusHtml(rec) {
+  const [tone, label] = logStatus(rec);
+  return `<span class="le-chip" data-t="${tone}"><span class="le-dot" aria-hidden="true"></span>${label}</span>`;
+}
+function logChannel(rec) {
+  if (rec.kind === 'released') return '官方路由已恢复';
+  if (rec.kind === 'enabled') return '尚未发起搜索';
+  if (rec.kind === 'official') return 'DeepSeek 官方搜索';
+  if (rec.kind === 'running') return '等待结果回执';
+  if (rec.kind === 'cancelled') return '请求未完成';
+  if (rec.kind === 'unknown') return '结果未完整记录';
+  if (rec.kind === 'failed') return '无可用通道';
+  if (rec.resultProviders?.length) return [...rec.resultProviders.map(provider => META[provider].name),
+    ...(rec.resultProvidersComplete ? [] : ['来源未报告'])].join(' / ');
+  if (rec.served === 'grok-sources') return '来源未报告';
+  return META[rec.served]?.name || '具体来源未报告';
+}
+function logVisibleQuery(rec) {
+  return logPrivate && !logEvent(rec) ? '搜索内容已隐藏' : rec.q;
+}
+function logNode(id, name, state, tone = '') {
+  const mark = id === 'hub' ? `<span class="lhub">${svg('hub')}</span>` : tile(id, 18);
+  return `<span class="lnode" title="${esc(name)}" data-node="${id}" data-s="${state}"${tone ? ` data-tone="${tone}"` : ''}>${mark}<span class="ln-name">${esc(name)}</span></span>`;
+}
+function logWire(state) {
+  return `<span class="lwire" data-s="${state}"></span>`;
+}
+function logRouteHtml(rec) {
+  let route = logNode('dsh', 'DSH', 'hit');
+  const final = rec.served === 'grok-sources' || !rec.served ? 'hub' : rec.served;
+  const providers = rec.resultProviders;
+  const results = providers
+    ? [...providers, ...(rec.resultProvidersComplete ? [] : ['hub'])]
+    : [final];
+  if (!results.length) results.push('hub');
+  const appendResults = fallback => results.map(provider => logWire(fallback ? 'back' : 'flow')
+    + logNode(provider, provider === 'hub' ? '来源未报告' : META[provider].name, 'hit', fallback ? 'warn' : '')).join('');
+  if (rec.kind === 'released' || rec.kind === 'official') {
+    route += logWire(rec.kind === 'released' ? 'idle' : 'flow') + logNode('deepseek', 'DeepSeek 官方搜索', 'hit');
+  } else if (rec.kind === 'enabled') {
+    route += logWire('idle') + logNode('hub', HUB_DISPLAY_NAME, 'off');
+  } else if (['running', 'cancelled', 'unknown'].includes(rec.kind)) {
+    route += logWire('idle') + logNode('hub', rec.kind === 'running' ? '等待结果回执' : rec.kind === 'cancelled' ? '请求已取消' : '结果未完整记录', 'off');
+  } else {
+    route += logWire('flow') + logNode('hub', HUB_DISPLAY_NAME, 'hit');
+    if (rec.kind === 'fallback') {
+      // A fallback may start with supplemental sources while Grok is disabled.
+      // Render recorded failures only; the outcome alone identifies no source.
+      const failed = [...new Set(rec.calls.filter(call =>
+        call.result === 'failed' && call.provider !== rec.served && !providers?.includes(call.provider) && LOG_CHANNELS.has(call.provider))
+        .map(call => call.provider))];
+      for (const provider of failed) {
+        route += logWire('dead') + logNode(provider === 'grok-sources' ? 'hub' : provider,
+          provider === 'grok-sources' ? '来源未报告' : META[provider].name, 'fail');
+      }
+      route += appendResults(true);
+    } else if (rec.kind === 'failed') {
+      route += logWire('dead') + logNode('hub', '无可用通道', 'fail');
+    } else {
+      route += appendResults(false);
+    }
+  }
+  return route;
+}
+function logBandHtml(rec, queryIndex = 0) {
+  const replayHint = logReplayable(rec) ? '仅回放这个查询的结果链路，不重新搜索或消耗额度；动画不代表原始请求时序。'
+    : rec.kind === 'running' ? '等待搜索完成后回放。'
+      : logEvent(rec) ? '这是启停路由事件，没有发起搜索。' : '没有完整的结果链路可供回放。';
+  return `<div class="lband"><div class="lroute-viewport" tabindex="0" role="group" aria-label="搜索链路，较长时可横向滚动"><div class="lroute" role="img" aria-label="${esc(`${LOG_CHIP[rec.kind][1]}；结果通道：${logChannel(rec)}。`)}" title="记录中的结果与失败来源，不表示供应商之间直接调用或实际网络时序。">${logRouteHtml(rec)}</div></div>
+    <button type="button" class="lr-replay" data-log-replay="${queryIndex}" aria-label="回放此条搜索的链路动画" aria-pressed="false" title="${replayHint}"${logReplayable(rec) && !rec.receiptOnly ? '' : ' disabled'}>${svg('replay', 'ic ic-sm')}<span>回放</span></button></div>`;
+}
+function logReason(rec) {
+  const codes = {
+    grok_auth_error: 'Grok 认证失败', grok_sources_empty: 'Grok 未返回引用链接',
+    grok_provider_error: 'Grok 接口调用失败', grok_timeout: 'Grok 响应超时',
+    grok_parse_error: 'Grok 响应无法解析', SOURCE_ALL_FAILED: '全部搜索来源不可用',
+    CONFIG_REQUIRED: '尚未配置搜索来源', CANCELLED: '此次搜索已取消',
+  };
+  return Object.hasOwn(codes, rec.reason) ? codes[rec.reason] : rec.reason ? errText(rec.reason) : '';
+}
+function logChargeAmount(charge) {
+  const amount = charge.amount > 0 && charge.amount < 0.000001 ? '<0.000001'
+    : charge.amount.toLocaleString('en-US', { maximumFractionDigits: 6 });
+  return charge.unit === 'USD' ? '$' + amount : amount + ' credits';
+}
+function logInfoTip(text, label) {
+  return `<button type="button" class="lu-info" data-log-tip="${esc(text)}" aria-label="${esc(label)}"><svg class="lu-info-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 5.8v5.1m0 3.2v.1"/></svg></button>`;
+}
+function logCharge(call) {
+  const charge = call.charge;
+  if (charge.basis === 'unknown' || charge.amount === null || !charge.unit) {
+    return `<span class="lu-unknown">未报告${logInfoTip('未报告不代表免费；失败、超时或取消也可能产生消耗。', '未报告消耗的说明')}</span>`;
+  }
+  const amount = logChargeAmount(charge);
+  return `<span class="lu-charge" data-basis="${charge.basis}">${esc(amount)}<small title="${charge.basis === 'estimated' ? '服务返回的估算费用，不是账单或实际扣费。' : '服务在本次响应中报告的消耗，不由余额差值计算。'}">${charge.basis === 'estimated' ? '估算' : '接口报告'}</small></span>`;
+}
+function logCallsHtml(rec) {
+  if (logEvent(rec)) return '<p class="lu-empty">无搜索调用</p>';
+  const calls = rec.calls;
+  const notes = [];
+  if (rec.reason) notes.push(`${logReason(rec)}（${rec.reason}）`);
+  if (rec.detail) notes.push(logPrivate ? '错误详情已隐藏。' : rec.detail);
+  const receipt = rec.receipt;
+  if (receipt) {
+    if (receipt.kind === 'failed') notes.push('所属调用报告失败；本条状态仅代表此查询。');
+    else if (receipt.kind === 'cancelled') notes.push('所属调用已取消，本条保留已记录的结果。');
+    if (receipt.kind === 'unknown' || receipt.incomplete) notes.push('所属调用的记录不完整。');
+    if (receipt.reason && receipt.reason !== rec.reason) notes.push(`${logReason(receipt)}（${receipt.reason}）`);
+    if (receipt.detail && receipt.detail !== rec.detail) notes.push(logPrivate ? '错误详情已隐藏。' : receipt.detail);
+  }
+  if (rec.receiptOnly || !rec.callsComplete) notes.push('调用明细未完整报告，不推测缺失来源。');
+  if (calls.some(call => call.evidence === 'source-label')) {
+    notes.push('结果来源由 Grok Search Rs 返回标签确认，不代表完整调用次数或具体 Key；未报告的消耗不推算。');
+  }
+  const resultInfo = notes.length ? logInfoTip(notes.join('\n'), '搜索结果补充说明') : '';
+  const rows = calls.map(call => {
+    const provider = call.provider === 'grok-sources' ? '来源未报告'
+      : call.provider === 'deepseek' ? 'DeepSeek 官方搜索' : META[call.provider].name;
+    const mark = call.provider === 'grok-sources' ? `<span class="lhub">${svg('hub')}</span>` : tile(call.provider, 18);
+    return `<div class="lu-row" role="row">
+      <div class="lu-provider" role="cell">${mark}<span>${provider}${call.keyIndex === null ? '' : `<small>Key ${call.keyIndex + 1}</small>`}</span></div>
+      <span class="lu-operation" role="cell">${call.evidence === 'source-label' ? '结果来源' : USAGE_OPERATIONS[call.operation]}</span>
+      <span class="lu-result" role="cell" data-result="${call.result}">${USAGE_RESULTS[call.result]}${call.code ? `<code>${esc(call.code)}</code>${logInfoTip(errText(call.code), `错误 ${call.code} 的说明`)}` : ''}</span>
+      <span class="lu-cost" role="cell">${logCharge(call)}</span></div>`;
+  }).join('');
+  return `<section class="log-usage" aria-label="此查询的调用与消耗明细">
+    <div class="lu-table" role="table" aria-label="本次服务调用">
+      <div class="lu-columns" role="row"><span role="columnheader">服务</span><span role="columnheader">调用</span><span role="columnheader">结果${resultInfo}</span><span role="columnheader">消耗</span></div>
+      ${rows || `<div class="lu-empty-row" role="row"><span role="cell" aria-colspan="4">${rec.kind === 'running' ? '等待调用明细' : '暂无调用明细'}</span></div>`}
+    </div></section>`;
+}
+function logDetailHtml(rec) {
+  return `<section class="lquery" aria-label="此条搜索的详情">${logCallsHtml(rec)}</section>`;
+}
+function logMatches(rec) {
+  return logFilter === 'all' || rec.kind === logFilter
+    || logFilter === 'ok' && (rec.kind === 'sources' || rec.kind === 'official');
+}
+function syncLogControls({ snap = false } = {}) {
+  const filters = $$('[data-logfilter]');
+  filters.forEach(b => {
+    const selected = b.dataset.logfilter === logFilter;
+    b.setAttribute('aria-checked', String(selected));
+    b.tabIndex = selected ? 0 : -1;
+  });
+  const target = filters.find(b => b.dataset.logfilter === logFilter);
+  const indicator = $('#logFilterActive');
+  if (snap) indicator.style.transition = 'none';
+  indicator.style.width = target.offsetWidth + 'px';
+  indicator.style.transform = `translateX(${target.offsetLeft - 3}px)`;
+  if (snap) requestAnimationFrame(() => indicator.style.removeProperty('transition'));
+  const privacy = $('#logPrivacy');
+  privacy.setAttribute('aria-pressed', String(logPrivate));
+  privacy.setAttribute('aria-label', logPrivate ? '显示搜索内容' : '隐藏搜索内容');
+  privacy.title = logPrivate ? '显示搜索内容' : '隐藏搜索内容';
+  const icon = svg(logPrivate ? 'eyeOff' : 'eye');
+  if (privacy.innerHTML !== icon) privacy.innerHTML = icon;
+  $('#logCount').textContent = String(logEntries().length);
+  $('#logClear').disabled = !logRows.length;
+  syncLogRuntime();
+}
+function syncLogRuntime() {}
+function updateLogEntry(article, rec) {
+  const open = logOpen.has(rec.id);
+  const fingerprint = JSON.stringify([rec, logPrivate, isDark()]);
+  if (stripTipTarget && article.contains(stripTipTarget) && !open) hideStripTip();
+  if (logFingerprints.get(article) !== fingerprint) {
+    const label = logStatus(rec)[1];
+    if (logRoutePlayback?.entryId === rec.id) stopLogRouteReplay();
+    const duration = logEvent(rec) ? '—' : logDuration(rec.ms);
+    const query = logVisibleQuery(rec) || (rec.receiptOnly ? '查询明细未报告' : '搜索内容未报告');
+    const summary = `${rec.t}，${query}，${label}，耗时 ${duration}；展开查看详情`;
+    if (!article.firstElementChild) article.innerHTML = `<button type="button" class="le-head">
+      <span class="le-top"><span class="le-time"></span><span class="le-query"></span>
+        <span class="le-state"></span>
+        <span class="le-dur" title="此条查询报告的耗时"></span>
+        <span class="le-chevron">${svg('chev')}</span></span></button>
+      <div class="le-band-slot"></div><div class="ldet">
+        <div class="ldet-inner"><div class="ldet-body"></div></div></div>`;
+    const header = $('.le-head', article), title = $('.le-query', article), time = $('.le-time', article);
+    header.setAttribute('aria-controls', `${rec.id}-detail`);
+    header.setAttribute('aria-describedby', `${rec.id}-summary`);
+    header.setAttribute('aria-label', summary);
+    if (time.textContent !== rec.t) time.textContent = rec.t;
+    time.title = rec.t;
+    if (title.textContent !== query) title.textContent = query;
+    title.title = query;
+    title.dataset.private = String(logPrivate && !logEvent(rec));
+    $('.le-dur', article).textContent = duration;
+    const state = $('.le-state', article), stateHtml = logStatusHtml(rec);
+    if (state._logHtml !== stateHtml) { state.innerHTML = stateHtml; state._logHtml = stateHtml; }
+    const band = $('.le-band-slot', article), bandHtml = logBandHtml(rec, rec.queryIndex);
+    if (band._logHtml !== bandHtml) {
+      const scrollLeft = $('.lroute-viewport', band)?.scrollLeft || 0;
+      band.innerHTML = bandHtml; band._logHtml = bandHtml;
+      $('.lroute-viewport', band).scrollLeft = scrollLeft;
+    }
+    $('.lband', article).id = `${rec.id}-summary`;
+    const detail = $('.ldet', article);
+    detail.id = `${rec.id}-detail`;
+    detail._logFingerprint = null;
+    if (!open && detail._logHtml) {
+      $('.ldet-body', detail).replaceChildren(); detail._logHtml = null;
+    }
+    logFingerprints.set(article, fingerprint);
+  }
+  article.dataset.kind = rec.kind;
+  article.dataset.id = rec.id;
+  article.dataset.parentId = rec.parentId;
+  article.dataset.queryIndex = String(rec.queryIndex);
+  article.classList.toggle('is-open', open);
+  $('.le-head', article).setAttribute('aria-expanded', String(open));
+  const detail = $('.ldet', article);
+  if (open && detail._logFingerprint !== fingerprint) {
+    const detailHtml = logDetailHtml(rec);
+    if (detail._logHtml !== detailHtml) {
+      if (stripTipTarget && detail.contains(stripTipTarget)) hideStripTip();
+      const scrollLeft = $('.lu-table', detail)?.scrollLeft || 0;
+      $('.ldet-body', detail).innerHTML = detailHtml;
+      const table = $('.lu-table', detail);
+      if (table) table.scrollLeft = scrollLeft;
+      detail._logHtml = detailHtml;
+    }
+    detail._logFingerprint = fingerprint;
+  }
+  detail.setAttribute('aria-hidden', String(!open));
+  detail.inert = !open;
+}
+function renderLog(opt = {}) {
+  const list = $('#logList');
+  if (!list) return;
+  const focusElement = active();
+  const focused = focusElement?.closest('.log-entry')?.dataset.id;
+  const replayFocused = active()?.getAttribute('data-log-replay');
+  const top = list.scrollTop;
+  const anchor = top > 24 ? Array.from(list.children).find(node =>
+    node.dataset.id && node.getBoundingClientRect().bottom > list.getBoundingClientRect().top) : null;
+  const anchorOffset = anchor ? anchor.getBoundingClientRect().top - list.getBoundingClientRect().top : null;
+  const entries = logEntries();
+  const rows = entries.filter(logMatches);
+  const allIds = new Set(entries.map(r => r.id));
+  for (const [id, node] of logNodes) if (!allIds.has(id)) {
+    node.remove(); logNodes.delete(id); logOpen.delete(id);
+  }
+  const visibleIds = new Set(rows.map(r => r.id));
+  if (logRoutePlayback && !visibleIds.has(logRoutePlayback.entryId)) stopLogRouteReplay();
+  if (logReplayReturn && !visibleIds.has(logReplayReturn.entryId)) clearHistoryReturn();
+  for (const node of Array.from(list.children)) {
+    if (!visibleIds.has(node.dataset.id)) node.remove();
+  }
+  if (!rows.length) {
+    const blank = logRows.length
+      ? ['没有符合条件的记录', '切换筛选查看其他记录']
+      : ['还没有搜索记录', S.plugin ? '下一次搜索完成后，可在这里查看通道' : '官方路由已恢复，当前没有搜索记录'];
+    const empty = document.createElement('div');
+    empty.className = 'lc-empty';
+    empty.innerHTML = `<p>${blank[0]}</p><small>${blank[1]}</small>`;
+    list.appendChild(empty);
+  } else {
+    rows.forEach((rec, index) => {
+      let node = logNodes.get(rec.id);
+      if (!node) {
+        node = document.createElement('article');
+        node.className = 'log-entry';
+        node.setAttribute('role', 'listitem');
+        logNodes.set(rec.id, node);
+      }
+      updateLogEntry(node, rec);
+      if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null);
+      if (opt.fresh === rec.parentId || opt.final === rec.parentId) {
+        node.classList.remove('is-new', 'is-final');
+        node.classList.add(opt.final ? 'is-final' : 'is-new');
+      }
+    });
+  }
+  if (focused && logNodes.get(focused)?.isConnected && !focusElement?.isConnected) {
+    const node = logNodes.get(focused);
+    const replay = replayFocused !== null ? $(`[data-log-replay="${replayFocused}"]`, node) : null;
+    const target = replay && !replay.disabled ? replay : $('.le-head', node);
+    if (target !== active()) target.focus({ preventScroll: true });
+  }
+  if (anchor?.isConnected && anchorOffset !== null) {
+    list.scrollTop += anchor.getBoundingClientRect().top - list.getBoundingClientRect().top - anchorOffset;
+  } else list.scrollTop = opt.fresh && top < 24 ? 0 : top;
+  if (focused && !logNodes.get(focused)?.isConnected && active() === document.body) {
+    const target = list.querySelector('.le-head') || $('[data-logfilter=all]');
+    target.focus({ preventScroll: true });
+  }
+  syncLogControls({ snap: opt.snap === true });
+  if (stripTipTarget?.matches('[data-log-tip]')) {
+    if (!stripTipTarget.isConnected || stripTipTarget.closest('[inert]')) hideStripTip();
+    else showStripTip(stripTipTarget);
+  }
+}
+function clearLocalLog({ announce = true } = {}) {
+  stopLogRouteReplay();
+  clearHistoryReturn();
+  logEpoch++;
+  logRows = [];
+  readSignature = null;
+  logOpen.clear();
+  logNodes.clear();
+  renderLog();
+  if (announce) $('#logAnnouncer').textContent = '已清空本次会话的搜索记录。';
+}
+function selectLogFilter(value, focus = false) {
+  if (!['all', 'ok', 'fallback', 'failed'].includes(value)) return;
+  logFilter = value;
+  renderLog();
+  if (focus) $(`[data-logfilter="${value}"]`).focus();
+}
+function syncLogRouteReplay(play, active) {
+  const buttons = $$(`[data-log-replay="${play.queryIndex}"]`, play.article || play.node);
+  buttons.forEach(button => {
+    button.setAttribute('aria-pressed', String(active));
+    button.setAttribute('aria-label', active ? '停止此条搜索的链路回放' : '回放此条搜索的链路动画');
+    button.innerHTML = `${svg(active ? 'stop' : 'replay', 'ic ic-sm')}<span>${active ? '停止' : '回放'}</span>`;
+  });
+}
+function clearHistoryReturn() {
+  logReplayReturn = null;
+  const bar = $('#historyBar');
+  const focused = bar.contains(active());
+  bar.hidden = true;
+  $('#historyQuery').textContent = '';
+  $('#historyContext').hidden = true;
+  $('#historyPhase').textContent = '';
+  $('#historyRoute').replaceChildren();
+  $('#historyRoute').classList.remove('is-replaying');
+  if (focused) $('#routeTitle').focus({ preventScroll: true });
+}
+function stopLogRouteReplay({ retain = false, completed = false } = {}) {
+  const play = logRoutePlayback;
+  if (!play) {
+    if (!retain) clearHistoryReturn();
+    return false;
+  }
+  logRoutePlayback = null;
+  play.cancelled = true;
+  play.cancelScroll?.();
+  play.cancelers.forEach(cancel => cancel());
+  cancelAnimationFrame(play.pumpRaf);
+  $$('.hr-node', play.stage).forEach(element => {
+    jolts.get(element)?.();
+    clearTimeout(faultPulses.get(element));
+    faultPulses.delete(element);
+  });
+  play.animations.forEach(animation => animation.cancel());
+  play.resize?.disconnect();
+  play.offResize?.();
+  play.node.classList.remove('is-replaying');
+  play.article?.classList.remove('is-replaying');
+  $$('.is-replay-seen', play.node).forEach(node => node.classList.remove('is-replay-seen'));
+  syncLogRouteReplay(play, false);
+  const focusInHistory = $('#historyBar').contains(active());
+  delete card.dataset.history;
+  for (const [element, inert] of play.locks) element.inert = inert;
+  $('#historyStage').hidden = true;
+  $('#historyStage').replaceChildren();
+  $('#historyNote').hidden = true;
+  $('#historyContext').hidden = true;
+  $('#historyRoute').replaceChildren();
+  $('#historyRoute').classList.remove('is-replaying');
+  if (retain && play.article?.isConnected) {
+    $('#historyBar').dataset.phase = 'done';
+    $('#historyLabel').textContent = '已恢复当前配置';
+    $('#historyLabel').title = `${completed ? '回放结束' : '回放已停止'} · ${play.rec.t}`;
+    $('#historyPhase').textContent = '';
+    $('#historyStop').hidden = true;
+    $('#historyDismiss').hidden = false;
+    if (focusInHistory) $('#historyReturn').focus({ preventScroll: true });
+  } else clearHistoryReturn();
+  // The live canvas never changed state; redraw coordinates after unhiding it.
+  pumpWires(120);
+  return true;
+}
+function historyNode(id, name, meta = '') {
+  const glyph = id === 'hub' ? `<span class="hub-glyph">${svg('hub')}</span>`
+    : `<img class="node-logo" src="${logoSrc(id)}" alt="">`;
+  return `<div class="node ${id === 'dsh' ? 'node-dsh' : id === 'hub' ? 'node-hub' : 'history-official'} hr-node" data-history-node="${id}" data-hs="idle">
+    ${id !== 'dsh' ? '<span class="port hr-port"></span>' : ''}${id !== 'deepseek' ? '<span class="port hr-port out"></span>' : ''}
+    ${glyph}<span class="node-name">${esc(name)}</span><span class="node-meta">${esc(meta)}</span>
+    ${id === 'hub' ? '<span class="hub-pill hr-hub-mode">历史路径</span>' : ''}</div>`;
+}
+function mountHistoryRoute(play) {
+  const rec = play.rec;
+  const stage = $('#historyStage');
+  const unknown = rec.kind === 'failed' || rec.kind !== 'official' && (rec.resultProviders
+    ? !rec.resultProviders.length || !rec.resultProvidersComplete : !rec.served || rec.served === 'grok-sources');
+  const provider = id => `<div class="row hr-provider hr-node" data-history-node="${id}" data-hs="idle" data-st="off">
+    ${id === 'unknown' ? `<span class="tile tile-glyph" style="--s:28px">${svg('hub')}</span>` : tile(id, 28)}
+    <span class="hr-provider-name">${id === 'unknown' ? rec.kind === 'failed' ? '无可用通道' : '来源未报告' : META[id].name}</span>
+    <span class="hr-result"></span><span class="row-fault hr-fault" hidden></span><span class="port hr-port"></span></div>`;
+  stage.innerHTML = `<svg class="wires hr-wires" aria-hidden="true"></svg>
+    ${historyNode('dsh', 'DeepSeek Harness', 'web_search')}${rec.kind === 'official' ? historyNode('deepseek', 'DeepSeek 官方搜索', '记录报告的通道') : ''}
+    ${historyNode('hub', HUB_DISPLAY_NAME, rec.kind === 'official' ? '未经过此通道' : '记录链路')}
+    ${['grok', ...SUPP, 'github', ...(unknown ? ['unknown'] : [])].map(provider).join('')}
+    ${['primary', 'supp', 'extract'].map((group, index) => `<span class="hr-label" data-history-group="${group}">${['主搜索', '补充来源', '专用抽取'][index]}</span>`).join('')}`;
+  play.stage = stage;
+  play.svg = $('.hr-wires', stage);
+  play.paths = new Map();
+  const edges = rec.kind === 'official' ? [['dsh-deepseek', 'dsh', 'deepseek']]
+    : [['dsh-hub', 'dsh', 'hub'], ...['grok', ...SUPP, 'github', ...(unknown ? ['unknown'] : [])].map(id => ['hub-' + id, 'hub', id])];
+  for (const [id, from, to] of edges) {
+    const group = document.createElementNS(SVGNS, 'g');
+    group.setAttribute('class', 'wg');
+    group.dataset.ws = 'rest';
+    group.innerHTML = '<path class="wt"/><path class="w"/><circle class="w-end" r="1.4"/><circle class="w-end" r="1.4"/>';
+    const path = group.children[1];
+    path.dataset.historyWire = id;
+    path.dataset.hs = 'idle';
+    play.svg.appendChild(group);
+    play.paths.set(id, { path, group, from, to });
+  }
+  play.packetLayer = document.createElementNS(SVGNS, 'g');
+  play.packetLayer.setAttribute('class', 'packets');
+  play.svg.appendChild(play.packetLayer);
+  if (rec.kind === 'official') {
+    $('[data-history-node=dsh] .hr-port', stage).className = 'port hr-port bottom';
+    $('[data-history-node=deepseek] .hr-port', stage).className = 'port hr-port top';
+    $('[data-history-node=hub] .hr-port.out', stage).hidden = true;
+  } else if (unknown) {
+    $('[data-history-node=unknown] .hr-port', stage).className = 'port hr-port top';
+    $('[data-history-node=hub]', stage).insertAdjacentHTML('beforeend', '<span class="port hr-port bottom"></span>');
+  }
+  const draw = () => {
+    if (logRoutePlayback !== play || play.cancelled || stage.hidden) return;
+    const liveStage = $('#stage'), root = liveStage.getBoundingClientRect();
+    const parent = card.getBoundingClientRect();
+    const computed = getComputedStyle(liveStage);
+    const sx = root.width / parseFloat(computed.width), sy = root.height / parseFloat(computed.height);
+    stage.style.left = (root.left - parent.left) / sx - card.clientLeft + 'px';
+    stage.style.top = (root.top - parent.top) / sy - card.clientTop + 'px';
+    stage.style.width = root.width / sx + 'px';
+    stage.style.height = root.height / sy + 'px';
+    const place = (target, bounds) => {
+      Object.assign(target.style, { left: (bounds.left - root.left) / sx + 'px',
+        top: (bounds.top - root.top) / sy - stage.clientTop + 'px', width: bounds.width / sx + 'px', height: bounds.height / sy + 'px' });
+    };
+    for (const element of $$('.hr-node', stage)) {
+      const id = element.dataset.historyNode;
+      const source = id === 'dsh' ? $('#nodeDsh') : id === 'hub' ? $('#nodeHub')
+        : id === 'deepseek' ? $('#nodeOfficial') : id === 'unknown' ? null : rowOf(id);
+      if (source) place(element, source.getBoundingClientRect());
+      else {
+        const hub = $('#nodeHub').getBoundingClientRect();
+        place(element, { left: hub.left - 15 * sx, top: hub.bottom + 26 * sy, width: hub.width + 30 * sx, height: 44 * sy });
+      }
+    }
+    for (const label of $$('.hr-label', stage)) {
+      place(label, $(`[data-group="${label.dataset.historyGroup}"] .rg-label`).getBoundingClientRect());
+    }
+    const banner = $('#bannerSlot').getBoundingClientRect(), context = $('#historyContext');
+    const compact = banner.height < 36 * sy;
+    context.dataset.compact = String(compact);
+    Object.assign(context.style, { left: '20px', right: '20px',
+      top: (compact ? root.top - parent.top + 4 * sy : banner.top - parent.top) / sy - card.clientTop + 'px',
+      height: (compact ? 22 : banner.height / sy) + 'px' });
+    const overlayRoot = stage.getBoundingClientRect();
+    for (const { path, group, from, to } of play.paths.values()) {
+      const a = $(`[data-history-node="${from}"]`, stage).getBoundingClientRect();
+      const b = $(`[data-history-node="${to}"]`, stage).getBoundingClientRect();
+      const vertical = to === 'deepseek' || to === 'unknown';
+      const x1 = ((vertical ? a.left + a.width / 2 : a.right) - overlayRoot.left) / sx;
+      const y1 = ((vertical ? a.bottom : a.top + a.height / 2) - overlayRoot.top) / sy - stage.clientTop;
+      const x2 = ((vertical ? b.left + b.width / 2 : b.left) - overlayRoot.left) / sx;
+      const y2 = ((vertical ? b.top : b.top + b.height / 2) - overlayRoot.top) / sy - stage.clientTop;
+      const mid = (x1 + x2) / 2;
+      path.setAttribute('d', vertical ? `M${x1},${y1} L${x2},${y2}` : `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`);
+      group.children[0].setAttribute('d', path.getAttribute('d'));
+      syncBreak(group, group.dataset.ws, from === 'dsh' ? 'start' : 'end');
+    }
+  };
+  play.layout = draw;
+  play.pump = (ms = 520) => {
+    play.pumpUntil = Math.max(play.pumpUntil || 0, performance.now() + ms);
+    if (play.pumpRaf) return;
+    const tick = () => {
+      if (play.cancelled || logRoutePlayback !== play) { play.pumpRaf = 0; return; }
+      draw();
+      play.pumpRaf = performance.now() < play.pumpUntil ? requestAnimationFrame(tick) : 0;
+    };
+    play.pumpRaf = requestAnimationFrame(tick);
+  };
+  stage.hidden = false;
+  draw();
+  play.resize = new ResizeObserver(draw);
+  play.resize.observe($('#stage'));
+  play.resize.observe(card);
+  play.offResize = listen(window, 'resize', draw);
+}
+function scrollToHistory(play) {
+  const scrollers = [];
+  for (let element = card.parentElement; element; element = element.parentElement || element.getRootNode()?.host) {
+    if (element.scrollHeight > element.clientHeight && /auto|scroll/.test(getComputedStyle(element).overflowY)) scrollers.push(element);
+  }
+  if (!scrollers.length) scrollers.push(document.scrollingElement);
+  const positions = scrollers.filter(Boolean).map(element => {
+    const viewport = element === document.scrollingElement ? { top: 0 } : element.getBoundingClientRect();
+    return { element, start: element.scrollTop, target: Math.max(0, Math.min(element.scrollHeight - element.clientHeight,
+      element.scrollTop + card.getBoundingClientRect().top - viewport.top - 16)) };
+  });
+  if (reduced()) { positions.forEach(({ element, target }) => { element.scrollTop = target; }); return Promise.resolve(); }
+  return new Promise(resolve => {
+    const start = performance.now();
+    let frame, offWheel, offTouch;
+    const done = () => { cancelAnimationFrame(frame); offWheel?.(); offTouch?.(); play.cancelScroll = null; resolve(); };
+    offWheel = listen(window, 'wheel', done, { once: true, passive: true });
+    offTouch = listen(window, 'touchstart', done, { once: true, passive: true });
+    play.cancelScroll = done;
+    const tick = time => {
+      if (play.cancelled) return done();
+      const progress = Math.min(1, (time - start) / 420);
+      positions.forEach(({ element, start, target }) => { element.scrollTop = start + (target - start) * (1 - (1 - progress) ** 3); });
+      if (progress === 1) done(); else frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+  });
+}
+async function replayLogRoute(id, queryIndex = 0) {
+  if (!Number.isSafeInteger(queryIndex) || queryIndex < 0 || queryIndex >= 16) return false;
+  const rec = logEntries().find(record => record.parentId === id && record.queryIndex === queryIndex);
+  const article = rec && logNodes.get(rec.id);
+  if (!rec || rec.receiptOnly || !article?.isConnected || !logReplayable(rec)) return false;
+  if (logRoutePlayback?.entryId === rec.id) {
+    stopLogRouteReplay({ retain: true });
+    $('#logAnnouncer').textContent = '已停止链路回放，没有重新搜索。';
+    return true;
+  }
+  if (S.testing || S.loading || false || logRows.some(record => record.kind === 'running')) {
+    $('#logAnnouncer').textContent = '正在处理搜索或加载，完成后可回放历史链路。';
+    toast('搜索或加载进行中，请完成后再回放', { tone: 'info' });
+    return false;
+  }
+  stopLogRouteReplay();
+  const node = article;
+  // A replay never calls runTest or any provider. It reads the rendered,
+  // recorded outcome path only; durations are visual pacing, not request timing.
+  const play = { id, entryId: rec.id, queryIndex, article, node, rec, epoch: logEpoch, animations: new Set(), cancelers: new Set(),
+    cancelled: false, static: reduced(),
+    locks: [$('#stage'), $('.rc-actions', card), $('#bannerSlot'), $('.rc-foot', card)].map(element => [element, element.inert]) };
+  logRoutePlayback = play;
+  logReplayReturn = { id, entryId: rec.id, queryIndex, epoch: logEpoch };
+  if (!play.static) {
+    node.classList.add('is-replaying');
+    article.classList.add('is-replaying');
+  }
+  syncLogRouteReplay(play, true);
+  closePop();
+  hideStripTip();
+  play.locks.forEach(([element]) => { element.inert = true; });
+  card.dataset.history = 'true';
+  $('#historyBar').hidden = false;
+  $('#historyBar').dataset.phase = 'playing';
+  $('#historyLabel').textContent = `${play.static ? '历史记录' : '历史回放'} · ${rec.t}`;
+  $('#historyLabel').removeAttribute('title');
+  $('#historyQuery').textContent = logVisibleQuery(rec);
+  $('#historyContext').hidden = false;
+  $('#historyPhase').textContent = play.static ? '历史终态' : '准备回放';
+  $('#historyStop').hidden = false;
+  $('#historyStop').innerHTML = `${svg(play.static ? 'replay' : 'stop')}<span>${play.static ? '返回当前配置' : '停止'}</span>`;
+  $('#historyReturn').innerHTML = `${svg('returnLog')}<span>返回该条日志</span>`;
+  $('#historyDismiss').innerHTML = svg('x');
+  $('#historyDismiss').hidden = true;
+  $('#historyNote').hidden = false;
+  let completed = false;
+  try {
+    mountHistoryRoute(play);
+    $('#historyStop').focus({ preventScroll: true });
+    $('#logAnnouncer').textContent = '正在回放记录链路，不会重新搜索或消耗额度。';
+    const alive = () => logRoutePlayback === play && !play.cancelled
+      && logEpoch === play.epoch && node.isConnected;
+    const animate = async (element, keyframes, duration, options = {}) => {
+      if (!alive() || play.static) return;
+      const index = elements.indexOf(element);
+      const targets = index < 0 ? [element] : [element, historyElements[index]];
+      await Promise.all(targets.map(async target => {
+        const animation = target.animate(keyframes, {
+          duration, easing: 'cubic-bezier(.2,.7,.2,1)', fill: 'forwards', ...options,
+        });
+        play.animations.add(animation);
+        await animation.finished.catch(() => {});
+        if (options.fill === 'none') { animation.cancel(); play.animations.delete(animation); }
+      }));
+    };
+    const elements = Array.from($('.lroute', node).children);
+    const historyRoute = $('#historyRoute');
+    // The header is the complete log chain, from the same renderer and CSS.
+    historyRoute.innerHTML = logRouteHtml(rec);
+    historyRoute.classList.toggle('is-replaying', !play.static);
+    historyRoute.setAttribute('aria-label', `历史结果链路：${Array.from(historyRoute.querySelectorAll('.ln-name'), el => el.textContent).join(' → ')}；${LOG_CHIP[rec.kind][1]}。不重新搜索，不代表原始请求时序。`);
+    const historyElements = Array.from(historyRoute.children);
+    const mainNode = element => $(`[data-history-node="${element.dataset.node === 'hub'
+      ? element === elements[2] ? 'hub' : 'unknown' : element.dataset.node}"]`, play.stage);
+    const hub = $('[data-history-node=hub]', play.stage);
+    const delay = ms => new Promise(resolve => {
+      if (!alive() || play.static) { resolve(); return; }
+      let timer;
+      const clean = () => { clearTimeout(timer); play.cancelers.delete(clean); resolve(); };
+      timer = setTimeout(clean, ms);
+      play.cancelers.add(clean);
+    });
+    const markNode = element => {
+      const target = mainNode(element);
+      if (!target) return null;
+      target.dataset.hs = element.dataset.s === 'fail' ? 'fail' : element.dataset.tone === 'warn' ? 'back' : 'hit';
+      if (target.classList.contains('row')) target.dataset.st = element.dataset.s === 'fail' ? 'bad' : 'live';
+      $$('.hr-port', target).forEach(port => {
+        port.dataset.ps = element.dataset.s === 'fail' ? 'broken' : 'live';
+        if (target.classList.contains('row') && element.dataset.s !== 'fail') port.dataset.mark = 'ok';
+      });
+      const result = $('.hr-result', target);
+      if (result) result.textContent = element.dataset.s === 'fail' ? target.dataset.historyNode === 'unknown' ? '搜索失败' : '来源不可用'
+        : rec.kind === 'failed' ? '搜索未完成' : '返回结果';
+      const badge = $('.hr-fault', target);
+      if (badge && element.dataset.s === 'fail') {
+        const code = rec.calls.find(call => call.provider === target.dataset.historyNode && call.result === 'failed')?.code;
+        badge.textContent = code ? `${code} · ${errText(code)}` : logReason(rec) || '来源不可用';
+        badge.hidden = false;
+        target.classList.add('has-fault');
+      }
+      return target;
+    };
+    const wireFor = index => {
+      const next = elements[index + 1]?.dataset.node;
+      return play.paths.get(next === 'deepseek' ? 'dsh-deepseek'
+        : index === 1 ? 'dsh-hub' : 'hub-' + (next === 'hub' ? 'unknown' : next));
+    };
+    const setWire = (edge, state) => {
+      if (!edge) return;
+      edge.path.dataset.hs = state;
+      edge.group.dataset.ws = state === 'fail' ? 'broken' : 'live';
+      if (state === 'fail') {
+        edge.group.classList.remove('lit');
+        edge.group._bt = performance.now();
+        delete edge.group._bf;
+      }
+      play.pump(480);
+    };
+    await scrollToHistory(play);
+    if (!alive()) return true;
+    if (play.static) {
+      elements.forEach((element, index) => {
+        if (element.classList.contains('lwire')) {
+          setWire(wireFor(index), element.dataset.s === 'dead' ? 'fail' : element.dataset.s === 'back' ? 'back' : 'hit');
+        } else markNode(element);
+      });
+      play.layout();
+      $('#historyPhase').textContent = logChannel(rec);
+      $('#logAnnouncer').textContent = '已在搜索路由图展示历史终态，没有重新搜索。可返回当前配置或该条日志。';
+      completed = true;
+      return true;
+    }
+    for (const [index, element] of elements.entries()) {
+      if (!alive()) return true;
+      element.classList.add('is-replay-seen');
+      historyElements[index].classList.add('is-replay-seen');
+      if (element.classList.contains('lwire')) {
+        const edge = wireFor(index);
+        const tone = element.dataset.s === 'back' ? 'back' : 'hit';
+        setWire(edge, 'active');
+        const nextTarget = mainNode(elements[index + 1]);
+        if (nextTarget?.classList.contains('row')) {
+          nextTarget.dataset.st = 'on';
+        }
+        if (tone === 'back') {
+          hub.classList.add('is-falling');
+          $('.hr-hub-mode', hub).textContent = '回退中';
+          await delay(260);
+          if (!alive()) return true;
+        }
+        if (edge) edge.group.dataset.requesting = 'true';
+        $('#historyPhase').textContent = index === 1 ? rec.kind === 'official' ? '官方结果路径' : '进入 Grok Search Rs'
+          : tone === 'back' ? '转向补充来源' : '请求路径';
+        await Promise.all([animate(element, [
+          { clipPath: 'inset(0 100% 0 0)', opacity: .35 },
+          { clipPath: 'inset(0)', opacity: 1 },
+        ], T.hop), edge && travel(edge.path.dataset.historyWire, { view: play })]);
+        if (!alive()) return true;
+        if (edge) edge.group.dataset.requesting = 'false';
+      } else {
+        const target = mainNode(element);
+        const failed = element.dataset.s === 'fail';
+        if (target?.classList.contains('row')) {
+          target.classList.add('is-searching');
+          await delay(failed ? T.fail : target.dataset.historyNode === 'grok' ? T.grok : T.supp);
+          if (!alive()) return true;
+          target.classList.remove('is-searching');
+        }
+        markNode(element);
+        if (failed) {
+          $('#historyPhase').textContent = rec.kind === 'failed' ? '没有可用结果' : `${element.querySelector('.ln-name').textContent} 不可用`;
+          pulseFault(target);
+          await jolt(target, false, play.pump);
+          if (!alive()) return true;
+          setWire(wireFor(index - 1), 'fail');
+          await delay(260);
+        } else {
+          if (target === hub) hub.classList.add('is-busy');
+          if (target?.classList.contains('row')) flashRow(target);
+          if (index > 0) setWire(wireFor(index - 1), element.dataset.tone === 'warn' ? 'back' : 'hit');
+          await animate(element, [{ opacity: .6 }, { opacity: 1 }], 180);
+        }
+      }
+    }
+    if (alive()) {
+      if (rec.kind !== 'failed') {
+        $('#historyPhase').textContent = '结果返回';
+        const lastEdge = wireFor(elements.length - 2);
+        if (lastEdge) await travel(lastEdge.path.dataset.historyWire, { view: play, back: true });
+        if (alive() && rec.kind !== 'official') {
+          hub.classList.remove('is-busy', 'is-falling');
+          $('.hr-hub-mode', hub).textContent = '历史路径';
+          await travel('dsh-hub', { view: play, back: true });
+        }
+        if (alive()) flashNode($('[data-history-node=dsh]', play.stage));
+      } else {
+        hub.classList.remove('is-busy', 'is-falling');
+        await jolt($('[data-history-node=dsh]', play.stage), false, play.pump);
+        if (alive()) setWire(play.paths.get('dsh-hub'), 'fail');
+      }
+      if (!alive()) return true;
+      $('#historyPhase').textContent = logChannel(rec);
+      await animate($('.le-chip', node), [{ opacity: .7 }, { opacity: 1 }, { opacity: 1 }], T.hold);
+      if (alive()) $('#logAnnouncer').textContent = '链路回放结束，已恢复当前配置。原记录与额度未改变。';
+    }
+    completed = alive();
+    return true;
+  } catch {
+    $('#logAnnouncer').textContent = '回放未能完成，已恢复当前配置；原记录未改变。';
+    return false;
+  } finally {
+    if (logRoutePlayback === play && (!play.static || !completed)) {
+      stopLogRouteReplay({ retain: completed, completed });
+    }
+  }
+}
+listen($('#historyStop'), 'click', () => stopLogRouteReplay({ retain: true }));
+listen($('#historyDismiss'), 'click', clearHistoryReturn);
+listen($('#historyReturn'), 'click', () => {
+  const target = logReplayReturn && logReplayReturn.epoch === logEpoch ? logNodes.get(logReplayReturn.entryId) : null;
+  const queryIndex = logReplayReturn?.queryIndex || 0;
+  stopLogRouteReplay({ retain: true });
+  if (!target?.isConnected) { clearHistoryReturn(); return; }
+  target.style.scrollMarginTop = '16px';
+  target.scrollIntoView({ behavior: reduced() ? 'instant' : 'smooth', block: 'center' });
+  ($(`[data-log-replay="${queryIndex}"]`, target) || $('.le-head', target)).focus({ preventScroll: true });
+});
+listen($('#logList'), 'pointerover', event => {
+  const tip = event.target.closest('[data-log-tip]');
+  if (tip && tip !== stripTipTarget) showStripTip(tip);
+});
+listen($('#logList'), 'pointerout', event => {
+  if (!event.target.closest('[data-log-tip]')) return;
+  if (event.relatedTarget && (stripTipTarget?.contains(event.relatedTarget) || routeTooltip.contains(event.relatedTarget))) return;
+  clearTimeout(stripTipTimer);
+  stripTipTimer = setTimeout(() => {
+    if (stripTipTarget !== active()) hideStripTip();
+  }, 100);
+});
+listen($('#logList'), 'focusin', event => {
+  if (event.target.matches('[data-log-tip]')) showStripTip(event.target);
+});
+listen($('#logList'), 'focusout', event => {
+  if (event.target.matches('[data-log-tip]') && !routeTooltip.contains(event.relatedTarget)) hideStripTip();
+});
+listen($('#logList'), 'click', event => {
+  const tip = event.target.closest('[data-log-tip]');
+  if (tip) { showStripTip(tip); return; }
+  const replay = event.target.closest('[data-log-replay]');
+  if (replay) {
+    if (!replay.disabled) void replayLogRoute(replay.closest('.log-entry').dataset.parentId, Number(replay.dataset.logReplay));
+    return;
+  }
+  const button = event.target.closest('.le-head');
+  if (!button) return;
+  const node = button.closest('.log-entry');
+  const id = node.dataset.id;
+  if (logOpen.has(id)) {
+    if (logRoutePlayback?.entryId === id) stopLogRouteReplay();
+    logOpen.delete(id);
+  } else logOpen.add(id);
+  updateLogEntry(node, logEntries().find(r => r.id === id));
+});
+listen($('#logList'), 'animationend', event => {
+  if (event.target.classList.contains('log-entry')) event.target.classList.remove('is-new', 'is-final');
+});
+$$('[data-logfilter]').forEach(b => listen(b, 'click', () => selectLogFilter(b.dataset.logfilter)));
+listen($('.lc-filters'), 'keydown', event => {
+  const buttons = $$('[data-logfilter]');
+  const current = buttons.indexOf(event.target);
+  if (current < 0 || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+    : (current + (event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length;
+  selectLogFilter(buttons[next].dataset.logfilter, true);
+});
+listen($('#logPrivacy'), 'click', () => {
+  stopLogRouteReplay();
+  logPrivate = !logPrivate;
+  if (logMemory) logMemory.private = logPrivate;
+  renderLog();
+  $('#logAnnouncer').textContent = logPrivate ? '搜索内容已隐藏，结果通道仍可查看。' : '搜索内容已显示。';
+});
+listen($('#logClear'), 'click', () => { void clearRemoteLog(); });
+async function read() {
+  if (disposed || clearing) return;
+  // No snapshot yet: the connection is unknown, not restricted.
+  if (!S.capabilities) return;
+  if (!S.capabilities?.secretsAllowed) {
+    // Hide the records once; this is not a user clear and must not repeat on every poll.
+    if (!logRestricted) {
+      generation++;
+      logRestricted = true;
+      logBaselined = false;
+      clearLocalLog({ announce: false });
+      $('#logNote').textContent = '请通过本机直连或 HTTPS 查看搜索日志';
+    }
+    return;
+  }
+  logRestricted = false;
+  if (readTask) return;
+  const mine = generation;
+  readTask = (async () => {
+    try {
+      const result = await remote.readSearchLog({ sessionId });
+      if (disposed || mine !== generation || !S.capabilities?.secretsAllowed) return;
+      const records = (result.records || []).slice(0, LOG_CAP);
+      const signature = JSON.stringify([records, S.plugin]);
+      $('#logNote').textContent = '仅内存 · 最近 20 条 · 停用或退出 DSH 后清空';
+      if (readSignature === signature) return;
+      const before = new Map(logRows.map(row => [row.id, row.kind]));
+      logRows = records.map(input => {
+        const row = normalizeLog({ ...input, t: new Date(input.at).toLocaleTimeString('zh-CN', { hour12: false }) });
+        return { ...row, id: /^search-log-[0-9]+$/.test(input.id) ? input.id : row.id };
+      });
+      if (logRows.some(row => row.kind === 'running')) stopLogRouteReplay();
+      const fresh = logBaselined ? logRows.find(row => !before.has(row.id)) : undefined;
+      const final = logBaselined ? logRows.find(row => before.get(row.id) === 'running' && row.kind !== 'running') : undefined;
+      renderLog({ fresh: fresh?.id, final: final?.id });
+      readSignature = signature;
+      logBaselined = true;
+      if (fresh || final) {
+        const row = final || fresh;
+        $('#logAnnouncer').textContent = `${logVisibleQuery(row)}，${LOG_CHIP[row.kind][1]}。`;
+      }
+    } catch {
+      if (disposed || mine !== generation || !S.capabilities?.secretsAllowed) return;
+      $('#logNote').textContent = '日志暂不可读，请通过安全连接重新打开设置页';
+    }
+  })().finally(() => { readTask = null; });
+  return readTask;
+}
+async function clearRemoteLog() {
+  if (clearing || disposed) return;
+  clearing = true;
+  generation++;
+  clearLocalLog();
+  try {
+    await remote.clearSearchLog({ sessionId });
+    if (!disposed) toast('已清空当前插件的搜索记录', { tone: 'info' });
+  } catch { if (!disposed) toast('清空未确认，请稍后重试', { tone: 'info' }); }
+  finally { generation++; clearing = false; }
+}
+renderLog({ snap: true });
+const poll = async () => {
+  if (disposed) return;
+  if (document.visibilityState !== 'hidden') await read();
+  if (!disposed) pollTimer = setTimeout(poll, 2500);
+};
+pollTimer = setTimeout(poll, 2500);
+return Object.freeze({
+  read,
+  hideTip: hideStripTip,
+  stop: () => { hideStripTip(); return stopLogRouteReplay(); },
+  cancel: () => { hideStripTip(); stopLogRouteReplay(); clearHistoryReturn(); },
+  theme: () => { hideStripTip(); stopLogRouteReplay(); renderLog(); },
+  dispose() {
+    if (disposed) return;
+    disposed = true; generation++;
+    clearTimeout(pollTimer);
+    hideStripTip();
+    stopLogRouteReplay(); clearHistoryReturn();
+    logRows = []; readSignature = null; logNodes.clear(); logOpen.clear();
+    void remote.closeSearchLog({ sessionId }).catch(() => {});
+  },
+});
+});
+    const QUOTA_VIEW = (function createQuotaView(host) {
+const { $, S, getDialog, dlg, active, DEF, SUPP, svg, EXT, esc, reduced, dialogBusy,
+  remote, uuid, hideTip } = host;
+let D = null, disposed = false;
+const QUOTA_PROVIDERS = new Set(SUPP);
+const QUOTA_CONSOLE = {
+  tavily: 'https://app.tavily.com', exa: 'https://dashboard.exa.ai',
+  firecrawl: 'https://www.firecrawl.dev/app', tinyfish: 'https://agent.tinyfish.ai/wallet',
+};
+const QUOTA_ERRORS = {
+  AUTH: '额度查询失败 · 无查询权限', RATE_LIMIT: '额度查询失败 · 请求限流',
+  NETWORK: '额度查询失败 · 网络异常', UNAVAILABLE: '额度查询失败', UNREPORTED: '额度查询失败',
+};
+const QUOTA_ERROR_HELP = {
+  AUTH: '额度接口拒绝了访问。请检查 Key 的查询权限；这不代表搜索一定不可用。',
+  RATE_LIMIT: '额度查询请求受到限流，请稍后重试。',
+  NETWORK: '未能完成额度查询，请检查网络或服务地址后重试。',
+  UNAVAILABLE: '暂时未能取得额度信息，请稍后重试。额度查询失败不等于搜索不可用。',
+  UNREPORTED: '接口未返回可识别的额度数据。未报告不代表余额为零。',
+};
+const quotaCache = new Map();
+const QUOTA_CACHE_MS = 30_000;
+const animations = new Set();
+let quotaEpoch = 0;
+function cancelAnimations() {
+  for (const animation of animations) animation.cancel();
+  animations.clear();
+}
+function animate(element, keyframes, options) {
+  if (!element?.animate || disposed || reduced()) return;
+  const animation = element.animate(keyframes, options);
+  animations.add(animation);
+  // Interrupted transitions reject finished; cancellation is normal cleanup.
+  animation.finished.then(() => animations.delete(animation), () => animations.delete(animation));
+}
+const quotaTime = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
+function quotaBase(id, p) {
+  const raw = id === 'tinyfish' ? p.searchUrl || DEF.tfSearch
+    : p.url || DEF[id === 'firecrawl' ? 'fcUrl' : id + 'Url'];
+  try {
+    const url = new URL(raw.trim());
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+    return url.href.replace(/\/+$/, '');
+  } catch { return null; }
+}
+function quotaContext(id, p, keyIndex = 0) {
+  const keys = id === 'tavily' ? p.keys : [p.key];
+  const index = Math.max(0, Math.min(Number.isSafeInteger(keyIndex) ? keyIndex : 0, keys.length - 1));
+  const key = (keys[index] || '').trim();
+  const base = quotaBase(id, p);
+  const official = id === 'tavily' ? base === DEF.tavilyUrl
+    : id === 'exa' ? base === DEF.exaUrl
+      : id === 'firecrawl' ? base === DEF.fcUrl || base === DEF.fcUrl + '/v2'
+        : base === DEF.tfSearch;
+  return { id, keyIndex: index, key, base, official,
+    scope: JSON.stringify([id, base, S.config?.quotaRevision || S.configRevision, index]) };
+}
+const quotaNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const quotaFormat = value => quotaNumber(value) ? value.toLocaleString('zh-CN', { maximumFractionDigits: 6 }) : '未报告';
+function quotaView() {
+  if (!D || D.kind !== 'card' || !QUOTA_PROVIDERS.has(D.id)) return null;
+  const context = quotaContext(D.id, D.draft, D.quotaKeyIndex);
+  const saved = D.base;
+  // A draft edit and an external write are different states: only the first is "changed".
+  const draftSame = JSON.stringify(D.id === 'tavily' ? D.draft.keys : D.draft.key) === JSON.stringify(D.id === 'tavily' ? saved.keys : saved.key) && quotaBase(D.id, saved) === context.base;
+  const baselineCurrent = D.configBaseline.revision === S.configRevision && D.configBaseline.quotaRevision === S.config?.quotaRevision;
+  const unchanged = draftSame && baselineCurrent;
+  const cached = quotaCache.get(context.scope);
+  const status = !S.capabilities?.secretsAllowed ? 'restricted'
+    : !context.key ? 'unconfigured' : !draftSame ? 'changed'
+    : D.id === 'exa' ? 'unsupported'
+      : !baselineCurrent ? 'stale'
+      : D.quotaRequest?.scope === context.scope ? 'loading'
+        : cached?.error ? 'error' : cached?.value ? 'ready' : 'unreported';
+  return { context, status, cached, unchanged,
+    canRefresh: context.key && unchanged && !!context.base && D.id !== 'exa' && status !== 'loading' && !dialogBusy() && S.capabilities?.secretsAllowed };
+}
+function quotaHtml() {
+  const view = quotaView();
+  if (!view) return '';
+  const { context, status, cached } = view;
+  const select = context.id === 'tavily' && D.draft.keys.length > 1
+    ? `<label class="qp-key"><select data-quota-key aria-label="查看哪个 Tavily Key 的额度">${D.draft.keys.map((_, index) =>
+      `<option value="${index}"${index === context.keyIndex ? ' selected' : ''}>Key ${index + 1}</option>`).join('')}</select></label>` : '';
+  const value = ['ready', 'loading', 'error'].includes(status) ? cached?.value : null;
+  const credits = value?.kind === 'credits';
+  const placeholder = {
+    unconfigured: '填写并保存 API Key 后查看', changed: '保存后查询额度',
+    stale: '配置已在别处修改，读取最新配置后刷新',
+    unsupported: '请到服务控制台查看', unreported: '尚未查询额度',
+    error: QUOTA_ERRORS[cached?.error] || '额度查询失败', loading: '正在查询额度…',
+    restricted: '请使用本机直连或 HTTPS 查看额度',
+  };
+  const info = (kind, label, text) => `<button type="button" class="qp-info" data-quota-kind="${kind}" data-quota-tip="${esc(text)}" aria-label="${esc(label)}">${svg('info', 'ic')}</button>`;
+  const stat = (label, amount, name, primary = false) => `<div class="qp-stat${primary ? ' is-primary' : ''}" data-stat="${name}">
+    <span class="qp-label">${label}</span><div class="qp-amount"><strong class="qp-value${quotaNumber(amount) ? '' : ' is-unknown'}">${quotaFormat(amount)}</strong>${quotaNumber(amount) ? '<span class="qp-unit">credits</span>' : ''}</div></div>`;
+  const metrics = credits ? `<div class="qp-stats">${stat('已用', value.used, 'used')}${stat('剩余', value.remaining, 'remaining', true)}</div>`
+    : value?.kind === 'wallet' ? `<div class="qp-wallet"><span class="qp-label">钱包余额</span><div class="qp-amount"><span class="qp-currency">$</span><strong class="qp-value">${esc(value.balance)}</strong><span class="qp-unit">USD</span></div></div>` : '';
+  const progress = credits && quotaNumber(value.used) && value.plan > 0
+    ? `<div class="qp-meter" role="meter" aria-label="账户已用额度" aria-valuemin="0" aria-valuemax="${value.plan}" aria-valuenow="${Math.min(value.plan, value.used)}" aria-valuetext="已用 ${quotaFormat(value.used)} credits，总额度 ${quotaFormat(value.plan)} credits"><i style="transform:scaleX(${Math.min(1, value.used / value.plan)})"></i></div>`
+    : credits ? '<div class="qp-meter is-unreported" aria-hidden="true"></div>' : '';
+  const hasKey = credits && context.id === 'tavily'
+    && ['keyUsed', 'keyLimit', 'keyRemaining'].some(field => quotaNumber(value[field]));
+  const restricted = hasKey && quotaNumber(value.remaining) && quotaNumber(value.keyRemaining)
+    && value.keyRemaining < value.remaining;
+  const keyNote = restricted ? `当前 Key 最多还可用 ${quotaFormat(value.keyRemaining)} credits。` : '';
+  const accountInfo = context.id === 'tavily'
+    ? keyNote ? info('key', '当前 Key 剩余额度', keyNote) : ''
+    : value ? info('account', '额度统计说明', value.note) : '';
+  const errorHelp = QUOTA_ERROR_HELP[cached?.error] || QUOTA_ERROR_HELP.UNAVAILABLE;
+  const stateText = status === 'loading' ? '正在刷新…' : status === 'error' && value ? '刷新失败 · 上次结果'
+    : value ? `更新于 ${cached.updatedAt}` : '';
+  const stateIcon = status === 'error' ? info('error', '额度查询失败原因', errorHelp)
+    : status === 'changed' ? info('changed', '配置修改说明', '保存后查询新账户，不沿用上一份 Key 或地址的余额。')
+      : svg('info', 'ic qp-state-icon');
+  const retry = status === 'error';
+  const refresh = context.id === 'exa' ? '' : `<button type="button" class="qp-refresh${retry ? ' is-retry' : ''}" data-a="quota-refresh" aria-label="${retry ? '重新查询账户额度' : '刷新账户额度'}" title="${retry ? '重新查询账户额度' : '刷新账户额度'}"${view.canRefresh ? '' : ' disabled'} aria-busy="${status === 'loading'}">${svg('refresh', 'ic')}${retry ? '<span>重试</span>' : ''}</button>`;
+  const tools = `<div class="qp-tools">${select}${refresh}</div>`;
+  const consoleHelp = context.official ? '打开官方服务控制台'
+    : '打开官方服务控制台；自定义服务的账户余额请以该服务提供方为准。';
+  const consoleLink = `<a class="dlg-link qp-console" href="${QUOTA_CONSOLE[context.id]}" target="_blank" rel="noopener noreferrer" data-quota-kind="console" data-quota-tip="${consoleHelp}" aria-label="服务控制台（官方）">${EXT('服务控制台')}</a>`;
+  const total = credits ? `<span class="qp-total">${quotaNumber(value.plan) ? `总额度 <b>${quotaFormat(value.plan)}</b> credits` : '总额度未报告'}</span>` : '';
+  const updated = value ? `<span class="qp-updated" data-state="${status}">${status === 'error' ? info('error', '额度查询失败原因', `${errorHelp}\n上次更新：${cached.updatedAt}`) : ''}<span>${stateText}</span></span>` : '';
+  return `<section class="quota-panel" id="quotaPanel" data-provider="${context.id}" data-state="${status}" data-kind="${value?.kind || ''}" aria-labelledby="quotaTitle" aria-busy="${status === 'loading'}">
+    <header class="qp-head"><div class="qp-heading"><h3 id="quotaTitle">账户额度</h3>${consoleLink}</div>${tools}</header>
+    <div class="qp-content"><div class="qp-main" aria-live="polite" aria-atomic="true">
+      ${value ? `${metrics}${progress}<div class="qp-summary"><span class="qp-account-meta">${total}${accountInfo}</span>${updated}</div>`
+        : `<div class="qp-empty"><div class="qp-placeholder" data-state="${status}">${stateIcon}<span>${placeholder[status] || '额度尚未查询'}</span></div></div>`}
+    </div></div></section>`;
+}
+function renderQuota() {
+  const slot = $('#quotaSlot', dlg);
+  if (!slot || !D || D.kind !== 'card') return;
+  const html = quotaHtml();
+  if (slot._html === html) return;
+  const focused = active()?.closest('#quotaSlot')?.querySelector(':focus');
+  const focusedTip = focused?.dataset.quotaKind;
+  const focusKind = focused?.hasAttribute('data-quota-key') ? 'select'
+    : focusedTip ? 'tip'
+    : focused?.dataset.a === 'quota-refresh' || focused?.id === 'quotaPanel' ? 'refresh' : null;
+  const previousMeter = $('.qp-meter i', slot);
+  const previousTransform = previousMeter && getComputedStyle(previousMeter).transform;
+  // CSS-pixel heights stay correct under browser/CSS zoom. Client rects scale.
+  const previousHeight = parseFloat(getComputedStyle(slot).height);
+  const previousState = $('#quotaPanel', slot)?.dataset.state;
+  cancelAnimations();
+  hideTip?.();
+  slot._html = html;
+  slot.innerHTML = html;
+  const nextHeight = parseFloat(getComputedStyle(slot).height);
+  if (previousHeight && Math.abs(nextHeight - previousHeight) > 1) {
+    animate(slot, [{ height: `${previousHeight}px` }, { height: `${nextHeight}px` }],
+      { duration: 200, easing: 'cubic-bezier(.2,.7,.2,1)' });
+  }
+  if (previousState && previousState !== $('#quotaPanel', slot)?.dataset.state) {
+    animate($('.qp-main', slot), [{ opacity: .65 }, { opacity: 1 }], { duration: 180, easing: 'ease-out' });
+  }
+  const meter = $('.qp-meter i', slot);
+  if (meter && previousTransform) animate(meter, [
+    { transform: previousTransform }, { transform: meter.style.transform },
+  ], { duration: 220, easing: 'cubic-bezier(.2,.7,.2,1)' });
+  if (focusKind) {
+    const target = focusKind === 'select' ? $('[data-quota-key]', slot)
+      : focusKind === 'tip' ? $(`[data-quota-kind="${focusedTip}"]`, slot) : $('[data-a=quota-refresh]', slot);
+    if (target && !target.disabled) target.focus({ preventScroll: true });
+    else {
+      const panel = $('#quotaPanel', slot);
+      panel.tabIndex = -1;
+      panel.focus({ preventScroll: true });
+    }
+  }
+}
+function cancel() {
+  cancelAnimations();
+  hideTip?.();
+  const request = D?.quotaRequest;
+  if (request) void remote.cancelDiagnosis({ operationId: request.operationId }).catch(() => {});
+  if (D) D.quotaRequest = null;
+  quotaEpoch++;
+}
+function syncDialog() {
+  const next = getDialog();
+  if (D !== next) cancel();
+  D = next;
+}
+function render() {
+  if (disposed) return;
+  syncDialog();
+  const view = quotaView();
+  // A draft edit is not part of the saved account identity. Cancel immediately,
+  // including when the user later restores the old text before the reply arrives.
+  if (D?.quotaRequest && (!view?.unchanged || !S.capabilities?.secretsAllowed
+    || D.quotaRequest.scope !== view.context.scope)) cancel();
+  renderQuota();
+}
+async function refresh({ automatic = false } = {}) {
+  syncDialog();
+  const view = quotaView();
+  if (disposed) return;
+  // A manual click on a panel drawn before the state changed still explains why.
+  if (!view?.canRefresh) { if (!automatic) renderQuota(); return; }
+  const age = Date.now() - (view.cached?.completedAt ?? -Infinity);
+  if (automatic && age >= 0 && age < QUOTA_CACHE_MS) return;
+  const mine = D, epoch = quotaEpoch;
+  const request = { scope: view.context.scope, operationId: uuid() };
+  mine.quotaRequest = request;
+  renderQuota();
+  const previous = quotaCache.get(request.scope);
+  try {
+    const result = await remote.accountQuota({ provider: view.context.id, keyIndex: view.context.keyIndex,
+      expectedRevision: mine.configBaseline.revision, quotaRevision: mine.configBaseline.quotaRevision, operationId: request.operationId });
+    if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
+    D = mine; mine.quotaRequest = null;
+    const current = quotaView();
+    if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
+    quotaCache.set(request.scope, { value: result.value, updatedAt: quotaTime(),
+      completedAt: Date.now(), error: result.value ? null : 'UNREPORTED' });
+  } catch {
+    if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
+    D = mine; mine.quotaRequest = null;
+    const current = quotaView();
+    if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
+    quotaCache.set(request.scope, { value: previous?.value ?? null, updatedAt: previous?.updatedAt,
+      completedAt: Date.now(), error: 'UNAVAILABLE' });
+  } finally {
+    while (quotaCache.size > 16) quotaCache.delete(quotaCache.keys().next().value);
+    if (!disposed && getDialog() === mine) { D = mine; renderQuota(); }
+  }
+}
+return Object.freeze({
+  render,
+  stale() { syncDialog(); return quotaView()?.status === 'stale'; },
+  open() { render(); return refresh({ automatic: true }); },
+  refresh, cancel,
+  stopAnimations: cancelAnimations,
+  key(index) {
+    if (disposed || dialogBusy()) return;
+    syncDialog();
+    if (D) {
+      cancel(); D.quotaKeyIndex = index; renderQuota();
+      return refresh({ automatic: true });
+    }
+  },
+  dispose() { cancel(); disposed = true; D = null; quotaCache.clear(); },
+});
+});
+    const TOOL_ROUTE_VIEW = (function createToolRouteView({ React, jsx, remote, Original }) {
+  const names = { grok: 'Grok', 'grok-sources': '来源未报告', tavily: 'Tavily', exa: 'Exa',
+    tinyfish: 'TinyFish', firecrawl: 'Firecrawl' };
+  const describe = (result, phase, isError) => {
+    if (!result?.known || !Array.isArray(result.routes) || result.routes.length === 0) {
+      return { known: false, tone: 'unknown',
+        text: phase === 'preparing' ? '等待搜索调用' : phase === 'start' ? '正在确认搜索通道…' : '本次来源未记录' };
+    }
+    const sources = [...new Set(result.routes.flatMap(route => Array.isArray(route.resultProviders)
+      ? [...route.resultProviders.filter(provider => Object.hasOwn(names, provider) && provider !== 'grok-sources').map(provider => names[provider]),
+        ...(route.resultProvidersComplete === true && route.resultProviders.length ? [] : ['来源未报告'])]
+      : Object.hasOwn(names, route.served) ? [names[route.served]] : []))];
+    const cancelled = result.state === 'cancelled';
+    const failed = !cancelled && (isError || result.state === 'failed');
+    const running = phase !== 'result' || result.state === 'running';
+    const fallback = result.routes.some(route => route.fallbackUsed === true);
+    const status = cancelled ? '已取消' : failed ? '搜索失败' : running ? '正在搜索'
+      : fallback ? '已回退' : '';
+    // A capped call lists only its recorded routes; never present them as every source.
+    const text = ['由 dsh-grok-search 执行', sources.join(' / ') || (running ? '等待来源返回' : '来源未报告'),
+      result.routesComplete === false ? '其余来源未记录' : '', status]
+      .filter(Boolean).join(' · ');
+    return { known: true, tone: failed ? 'error' : cancelled ? 'cancelled' : running ? 'running' : 'ok', text };
+  };
+  const styles = `
+    [data-dsg-search-card]{min-width:0;display:flex;flex-direction:column}
+    [data-dsg-search-card] .dsg-tool-attribution{display:flex;align-items:center;gap:6px;min-height:22px;
+      margin:1px 0 3px 20px;font-size:var(--dsh-content-font-size-secondary,13px);line-height:1.5;
+      color:var(--dsw-alias-label-secondary,#545a66);overflow-wrap:anywhere}
+    [data-dsg-search-card] .dsg-tool-attribution::before{content:"";width:5px;height:5px;border-radius:50%;
+      flex:none;background:var(--dsw-alias-label-caption,#878d98)}
+    [data-dsg-search-card] .dsg-tool-attribution[data-tone=ok]::before,
+    [data-dsg-search-card] .dsg-tool-attribution[data-tone=running]::before{background:var(--dsw-alias-brand-primary,#4d6bfe)}
+    [data-dsg-search-card] .dsg-tool-attribution[data-tone=error]{color:var(--dsw-alias-state-error-primary,#b32429)}
+    [data-dsg-search-card] .dsg-tool-attribution[data-tone=error]::before{background:currentColor}
+    [data-dsg-search-card] .dsg-tool-attribution[data-tone=cancelled]{color:var(--dsw-alias-state-warn-label,#8c5a00)}
+  `;
+  function SearchToolWithRoute(props) {
+    const { sessionId, callId, phase, block } = props;
+    const identity = JSON.stringify([sessionId, callId, phase, block?.isError === true]);
+    // Only an identity that is actually polled may wait in the reading state.
+    const readable = typeof sessionId === 'string' && typeof callId === 'string' && phase !== 'preparing';
+    const [answer, setAnswer] = React.useState(null);
+    React.useEffect(() => {
+      let active = true, timer = null, attempts = 0;
+      const poll = async () => {
+        try {
+          const result = await remote.toolCallRoute({ sessionId, callId });
+          if (!active) return;
+          // Only mounted running calls poll. Settled calls retry a brief publication race.
+          const retry = phase === 'start' || (!result.known && phase === 'result' && ++attempts < 3);
+          // A start-phase miss keeps its own wording; a settled miss waits for the last retry.
+          setAnswer({ identity, result, reading: !result.known && phase === 'result' && retry });
+          if (retry) timer = setTimeout(poll, 750);
+        } catch {
+          if (active) setAnswer({ identity, result: null, unreadable: true });
+        }
+      };
+      if (readable) void poll();
+      return () => { active = false; clearTimeout(timer); };
+    }, [remote, identity, sessionId, callId, phase]);
+    const matched = answer?.identity === identity;
+    const label = readable && (!matched || answer.reading)
+      ? { known: false, tone: 'unknown', text: '正在读取本次来源…' }
+      : matched && answer.unreadable
+        ? { known: false, tone: 'unknown', text: '本次来源暂不可读' }
+        : describe(matched ? answer.result : null, phase, block?.isError);
+    return jsx('div', { 'data-dsg-search-card': callId, children: [
+      jsx('style', { children: styles }, 'style'),
+      jsx(Original, props, 'original'),
+      jsx('span', { className: 'dsg-tool-attribution', 'data-tone': label.tone,
+        'data-known': String(label.known), role: phase === 'start' ? 'status' : undefined,
+        'aria-atomic': phase === 'start' ? 'true' : undefined, children: label.text }, 'attribution'),
+    ] });
+  }
+  return Object.freeze({ Component: SearchToolWithRoute, describe });
+});
+    const ROUTE_CSS = "/* dsh-grok-search · v74 route presentation\n   视觉方向：magpie 式单色中性底 + 一处 agent 蓝；节点/连线/数据包组成动态路由图。 */\n\n:host,.dsg-surface{\n  --font:\"Inter\",\"Segoe UI Variable Text\",\"Segoe UI\",-apple-system,BlinkMacSystemFont,\"PingFang SC\",\"Microsoft YaHei UI\",\"Microsoft YaHei\",sans-serif;\n  --mono:\"JetBrains Mono\",\"Cascadia Mono\",Consolas,\"SFMono-Regular\",ui-monospace,monospace;\n  --ease:cubic-bezier(.2,.7,.2,1);\n  --spring:cubic-bezier(.34,1.45,.64,1);\n  color-scheme:light;\n  --page:#eef0f3; --surface:#ffffff; --surface-2:#f7f8fa; --stage:#f4f5f8; --dot:#dde0e6;\n  --line:#e5e7eb; --line-2:#d5d8de; --hair:rgba(15,23,42,.06);\n  --text:#14161a; --text-2:#545a66; --text-3:#626a77; --text-4:#767e8b;\n  --field:#f1f2f5; --field-hover:#eaecf0; --field-focus:#ffffff;\n  --agent:#4d6bfe; --agent-soft:rgba(77,107,254,.10); --agent-ring:rgba(77,107,254,.30); --agent-text:#3559d8;\n  --btn-primary:#4561ed; --btn-primary-hover:#3d59e8;\n  --ok:#12a150; --ok-soft:rgba(18,161,80,.10); --ok-text:#0a7a3b;\n  --warn:#b86e00; --warn-soft:rgba(214,138,0,.11); --warn-line:#e0a23a; --warn-text:#8c5a00;\n  --err:#e5484d; --err-soft:rgba(229,72,77,.10); --err-text:#b32429; --err-solid:#a92a30;\n  --wire-standby:#a6acb7; --wire-rest:#c0c5cd; --wire-unset:#cdd1d8; --wire-aux:#b4bac4;\n  --wire-broken:#a8595c; --wire-broken-soft:#c49a9c;\n  --tile:#f3f4f6; --tile-line:rgba(15,23,42,.08);\n  --shadow-sm:0 1px 2px rgba(15,23,42,.05);\n  --shadow-md:0 1px 2px rgba(15,23,42,.05),0 4px 14px rgba(15,23,42,.06);\n  --shadow-lg:0 2px 6px rgba(15,23,42,.06),0 22px 56px rgba(15,23,42,.16);\n  --shadow-drag:0 12px 32px rgba(15,23,42,.18),0 2px 6px rgba(15,23,42,.08);\n  --scrim:rgba(17,20,26,.34);\n  --toast-bg:#1b1d22; --toast-text:#f3f4f6; --toast-act:rgba(255,255,255,.12);\n}\n[data-theme=dark]{\n  color-scheme:dark;\n  --page:#0c0d10; --surface:#16181c; --surface-2:#1b1d22; --stage:#111316; --dot:#24272d;\n  --line:#272a31; --line-2:#353941; --hair:rgba(255,255,255,.06);\n  --text:#ecedf0; --text-2:#a6abb5; --text-3:#9aa1ac; --text-4:#929aa7;\n  --field:#1f2227; --field-hover:#252930; --field-focus:#121417;\n  --agent:#7b93ff; --agent-soft:rgba(123,147,255,.14); --agent-ring:rgba(123,147,255,.34); --agent-text:#9eb0ff;\n  --btn-primary:#4561ed; --btn-primary-hover:#3d59e8;\n  --ok:#3ccb7f; --ok-soft:rgba(60,203,127,.12); --ok-text:#3ccb7f;\n  --warn:#f0b04a; --warn-soft:rgba(240,176,74,.12); --warn-line:#c98b2a; --warn-text:#f0b04a;\n  --err:#ff6b70; --err-soft:rgba(255,107,112,.13); --err-text:#ff7b80; --err-solid:#b23b41;\n  --wire-standby:#5f6570; --wire-rest:#464b54; --wire-unset:#3c4048; --wire-aux:#525862;\n  --wire-broken:#b0696c; --wire-broken-soft:#6e4649;\n  --tile:#22252b; --tile-line:rgba(255,255,255,.08);\n  --shadow-sm:0 1px 2px rgba(0,0,0,.4);\n  --shadow-md:0 1px 2px rgba(0,0,0,.35),0 6px 18px rgba(0,0,0,.32);\n  --shadow-lg:0 2px 8px rgba(0,0,0,.4),0 26px 64px rgba(0,0,0,.55);\n  --shadow-drag:0 14px 36px rgba(0,0,0,.55),0 2px 6px rgba(0,0,0,.4);\n  --scrim:rgba(0,0,0,.56);\n  --toast-bg:#eceef2; --toast-text:#15171b; --toast-act:rgba(0,0,0,.08);\n}\n\n*,*::before,*::after{box-sizing:border-box}\n[hidden]{display:none !important}\n:host{all:initial;display:block;min-width:0}\n.dsg-surface{font:13px/1.5 var(--font);color:var(--text);-webkit-font-smoothing:antialiased;text-align:left}\n.dsg-root{width:100%;min-width:0;container-type:inline-size}\n/* The host detail is normally 960px, not the standalone mockup's 1016px.\n   Keep one fluid canvas; shadows remain visible without a nested scrollport. */\n.route-scroll{display:flow-root;width:100%;min-width:0}\n.dsg-layer{width:0;height:0;pointer-events:none}\n.dsg-layer .overlay,.dsg-layer .route-tooltip{pointer-events:auto}\nbutton,input,select,textarea{font:inherit;color:inherit}\nbutton{cursor:pointer}\nbutton:disabled{cursor:not-allowed}\na{color:inherit}\n:focus-visible{outline:2px solid var(--agent);outline-offset:2px}\n.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}\n.ic{width:16px;height:16px;flex:none;display:block}\n.ic-sm{width:13px;height:13px}\n\n/* ---------- 路由卡 ---------- */\n.route-card{position:relative;width:100%;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-md);padding:18px 20px 0;transition:background-color .25s,border-color .25s}\n.rc-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:8px 12px}\n.rc-title{display:flex;align-items:center;align-content:center;flex-wrap:wrap;gap:4px 10px;min-width:0;min-height:32px}\n.rc-title h3{margin:0;font-size:15px;font-weight:650;letter-spacing:-.005em;white-space:nowrap}\n.rc-actions{position:relative;display:flex;align-items:center;justify-content:flex-end;gap:12px;flex-wrap:wrap;flex:0 1 auto;min-width:0;max-width:100%;margin-left:auto}\n\n/* 顺序 = 补充链优先级；logo = 启用状态；圆点 = 最近验证结果，三者不互相冒充。 */\n.strip-slot{flex:0 1 auto;min-width:0;max-width:100%;display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .3s var(--ease),opacity .25s var(--ease)}\n.strip-slot.has{grid-template-rows:1fr;opacity:1}\n.strip-slot:not(.has){display:none}\n.strip-slot > div{overflow:hidden;min-height:0}\n.strip{display:flex;align-items:center;flex-wrap:nowrap;gap:6px;min-height:30px;padding:3px 8px 4px;border-radius:8px;background:color-mix(in srgb,var(--surface-2) 78%,transparent);box-shadow:inset 0 0 0 1px var(--hair);color:var(--text-3)}\n.strip .s-node{position:relative;display:inline-flex;flex:none;padding-bottom:5px;opacity:1;border-radius:3px;cursor:help;transition:opacity .32s var(--ease),filter .32s var(--ease)}\n.strip .s-node .tile{border-radius:4px}\n.strip .s-node[data-st=unset] .tile{filter:grayscale(1);opacity:.45}\n.strip .s-node[data-st=off] .tile{filter:grayscale(1);opacity:.28}\n.strip .s-node:focus-visible{outline:2px solid var(--agent);outline-offset:2px}\n.strip .s-dots{position:absolute;left:50%;bottom:0;display:flex;align-items:center;gap:2px;transform:translateX(-50%)}\n.strip .s-dot{width:4px;height:4px;border-radius:50%;border:1px solid var(--text-4);background:transparent;transition:border-color .3s,background-color .3s,opacity .3s}\n.strip .s-dot[data-tone=ok]{border-color:var(--agent);background:var(--agent)}\n.strip .s-dot[data-tone=err]{border-color:var(--wire-broken);background:transparent}\n.strip .s-dot[data-tone=run]{border-color:var(--agent);background:var(--agent);animation:s-pulse 1s var(--ease) infinite}\n.strip .s-dot[data-tone=idle]{border-color:var(--text-2);background:transparent}\n.strip .s-link{align-self:flex-start;flex:none;width:20px;height:8px;margin-top:5px;display:block;overflow:visible;color:var(--text-3);transition:color .3s var(--ease),opacity .3s var(--ease)}\n.strip .s-link .sl-line{fill:none;stroke:currentColor;stroke-width:1.25;stroke-linecap:round}\n.strip .s-link .sl-head{fill:none;stroke:currentColor;stroke-width:1.25;stroke-linecap:round;stroke-linejoin:round}\n.strip .s-link[data-tone=dash] .sl-line,.strip .s-link[data-tone=dash] .sl-head{stroke-dasharray:2 3;opacity:.55}\n.strip .s-link[data-tone=broken]{color:var(--wire-broken);overflow:visible}\n.strip .s-link[data-tone=detour]{color:var(--warn-line);overflow:visible}\n.strip .s-link[data-tone=detour] .sl-arc{fill:none;stroke:currentColor;stroke-width:1.25;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:1;stroke-dashoffset:0;animation:s-draw .55s var(--ease) both}\n.strip .s-link[data-tone=detour] .sl-head{stroke-dasharray:0}\n.strip .s-link.is-new{animation:s-fade-in .3s var(--ease)}\n.strip .s-end{margin-left:2px;padding-left:10px;border-left:1px solid var(--line-2);font-size:11.5px;line-height:1.5;color:var(--text-3);white-space:nowrap;font-variant-numeric:tabular-nums}\n.strip .s-end[data-tone=err]{color:var(--wire-broken)}\n.strip .s-end[data-tone=ok]{color:var(--text-2)}\n.strip .s-end.is-new{animation:s-fade-in .3s var(--ease)}\n.strip .s-skel{display:block;flex:none;height:16px;border-radius:4px;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}\n@keyframes s-pulse{0%,100%{transform:scale(1);opacity:.5}50%{transform:scale(1.35);opacity:1}}\n@keyframes s-fade-in{from{opacity:0;transform:translateX(-3px)}}\n@keyframes s-draw{from{stroke-dashoffset:1}}\n.route-tooltip{position:fixed;z-index:65;max-width:min(310px,calc(100vw - 24px));padding:10px 12px;border:1px solid var(--line-2);border-radius:9px;background:var(--surface);box-shadow:var(--shadow-md);color:var(--text-2);font:12px/1.6 var(--font);white-space:pre-line;overflow-wrap:anywhere;pointer-events:auto}\n.route-tooltip[hidden]{display:none}\n.banner-slot{display:grid;grid-template-rows:0fr;margin-top:0;transition:grid-template-rows .32s var(--ease),margin-top .32s var(--ease)}\n.banner-slot.has{grid-template-rows:1fr;margin-top:12px}\n.banner-slot > div{overflow:hidden;min-width:0;min-height:0}\n\n/* 状态胶囊 */\n.pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px 0 8px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--surface-2);color:var(--text-2);border:1px solid var(--line);white-space:nowrap;transition:background-color .25s,color .25s,border-color .25s}\n.pill-dot{position:relative;width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}\n.pill[data-s=live]{color:var(--ok-text);background:var(--ok-soft);border-color:transparent}\n.pill[data-s=live] .pill-dot::after,.pill[data-s=fallback] .pill-dot::after,.pill[data-s=backup] .pill-dot::after{content:\"\";position:absolute;inset:-3px;border-radius:50%;border:1.5px solid currentColor;opacity:0;animation:ping 2.4s var(--ease) infinite}\n.pill[data-s=wait]{color:var(--warn-text);background:var(--warn-soft);border-color:transparent}\n.pill[data-s=none]{color:var(--warn-text);background:var(--warn-soft);border-color:transparent}\n.pill[data-s=fallback]{color:var(--warn-text);background:var(--warn-soft);border-color:transparent}\n.pill[data-s=backup]{color:var(--agent);background:var(--agent-soft);border-color:transparent}\n.pill[data-s=err]{color:var(--err-text);background:var(--err-soft);border-color:transparent}\n.pill[data-s=cfgerr],.pill[data-s=ctlerr],.pill[data-s=down]{color:var(--err-text);background:var(--err-soft);border-color:transparent}\n.pill[data-s=prep],.pill[data-s=connecting]{color:var(--text-3);background:var(--surface-2)}\n.pill[data-s=prep] .pill-dot,.pill[data-s=connecting] .pill-dot{animation:blink 1s steps(2,jump-none) infinite}\n.pill[data-s=off]{color:var(--text-2)}\n.pill[data-s=load]{color:var(--text-3)}\n.pill[data-s=load] .pill-dot{animation:blink 1s steps(2,jump-none) infinite}\n.pill.swap{animation:pill-swap .42s var(--spring)}\n@keyframes pill-swap{from{transform:scale(.86);opacity:.35}}\n@keyframes ping{0%{transform:scale(.6);opacity:.7}70%,100%{transform:scale(1.9);opacity:0}}\n@keyframes blink{50%{opacity:.2}}\n\n/* 按钮 */\n.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 12px;border-radius:9px;border:1px solid var(--line-2);background:var(--surface);color:var(--text);font-size:12.5px;font-weight:550;line-height:1;white-space:nowrap;box-shadow:var(--shadow-sm);transition:background-color .15s,border-color .15s,color .15s,box-shadow .15s,transform .1s,opacity .15s}\n.btn:hover:not(:disabled){background:var(--surface-2)}\n.btn:active:not(:disabled){transform:translateY(.5px)}\n.btn:disabled{opacity:.48}\n.btn-sm{height:28px;padding:0 10px;font-size:12px;border-radius:8px}\n.btn-ghost{background:transparent;border-color:transparent;box-shadow:none;color:var(--text-2)}\n.btn-ghost:hover:not(:disabled){background:var(--field);color:var(--text)}\n.btn-primary{background:var(--btn-primary);border-color:var(--btn-primary);color:#fff}\n.btn-primary:hover:not(:disabled){background:var(--btn-primary-hover);border-color:var(--btn-primary-hover)}\n.btn-danger{color:var(--err-text)}\n.btn-danger:hover:not(:disabled){background:var(--err-soft);color:var(--err-text)}\n.btn.is-confirm,.btn.is-confirm:hover:not(:disabled){background:var(--err-solid);border-color:var(--err-solid);color:#fff}\n.btn .spin,.spin{width:13px;height:13px;flex:none;border-radius:50%;border:1.7px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}\n@keyframes spin{to{transform:rotate(360deg)}}\n.icon-btn{width:28px;height:28px;flex:none;padding:0;display:inline-grid;place-items:center;border-radius:7px;border:0;background:transparent;color:var(--text-3);transition:background-color .15s,color .15s}\n.icon-btn:hover:not(:disabled){background:var(--field-hover);color:var(--text)}\n.icon-btn.is-on{color:var(--agent)}\n.icon-btn:disabled{opacity:.4}\n\n/* 测试确认弹层 */\n.popover{position:absolute;right:0;top:calc(100% + 9px);z-index:20;width:268px;background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-lg);padding:12px 14px;transform-origin:top right;animation:pop-in .16s var(--ease)}\n.popover::before{content:\"\";position:absolute;top:-6px;right:30px;width:10px;height:10px;background:var(--surface);border-left:1px solid var(--line);border-top:1px solid var(--line);transform:rotate(45deg)}\n.pop-title{margin:0;font-weight:650;font-size:13px}\n.pop-text{margin:4px 0 12px;color:var(--text-2);font-size:12px;line-height:1.55}\n.pop-actions{display:flex;justify-content:flex-end;gap:6px}\n@keyframes pop-in{from{opacity:0;transform:translateY(-4px) scale(.97)}}\n\n/* 提示条 */\n.banner{display:flex;align-items:flex-start;gap:10px;padding:10px 10px 10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);font-size:12.5px;color:var(--text-2)}\n.banner .b-ic{flex:none;margin-top:1px;color:var(--text-3)}\n.banner .b-body{flex:1;min-width:0}\n.banner .b-title{display:block;color:var(--text);font-weight:600}\n.banner .b-text{display:block;margin-top:1px}\n.banner .b-text code{white-space:normal;overflow-wrap:anywhere}\n.banner .b-actions{display:flex;gap:4px;align-items:center;flex:none;align-self:center}\n.banner[data-tone=info] .b-ic{color:var(--agent)}\n.banner[data-tone=warn]{background:var(--warn-soft);border-color:transparent}\n.banner[data-tone=warn] .b-ic{color:var(--warn)}\n.banner[data-tone=err]{background:var(--surface-2);border-color:var(--line-2)}\n.banner[data-tone=err] .b-ic{color:var(--err-text)}\n.banner[data-tone=err] .b-title{color:var(--err-text)}\n.banner[data-tone=err] .b-text{color:var(--text-2)}\n.banner[data-tone=fallback]{background:var(--warn-soft);border-color:transparent}\n.banner[data-tone=fallback] .b-ic{color:var(--warn)}\n.banner[data-tone=soft] .b-ic{color:var(--warn)}\n.b-swap{animation:b-swap .3s var(--ease)}\n@keyframes b-swap{from{opacity:0;transform:translateY(-3px)}}\n.chip-list{display:inline-flex;gap:4px;flex-wrap:wrap;vertical-align:middle;margin-left:2px}\n.mini-chip{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px 0 3px;border-radius:999px;background:var(--surface);border:1px solid var(--line);font-size:11.5px;color:var(--text);line-height:1}\n.mini-chip .tile{--s:14px}\n\n/* ---------- 路由舞台 ---------- */\n.stage{position:relative;margin:14px -20px 0;padding:28px clamp(12px,3cqi,28px);display:grid;align-items:center;justify-content:center;min-height:300px;background-color:var(--stage);background-image:radial-gradient(var(--dot) 1px,transparent 1.3px);background-size:16px 16px;background-position:8px 8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);transition:column-gap .35s var(--ease),padding .3s var(--ease),background-color .25s}\n/* 与 magpie 路由图一致：左侧两个节点单行并排，右侧供应商单列竖排 */\n.stage{grid-template-columns:clamp(128px,16cqi,148px) clamp(132px,16cqi,150px) minmax(0,460px);column-gap:clamp(12px,calc((100cqi - 560px)/6),56px)}\n.col-agent,.col-hub,.col-list{position:relative;z-index:2;min-width:0}\n\n.wires{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:1;transition:opacity .3s var(--ease)}\n.wg .wt{fill:none;stroke:none;stroke-width:5;stroke-linecap:round}\n.wg .w{fill:none;stroke-width:1.6;stroke-linecap:round;transition:stroke .3s var(--ease),opacity .3s var(--ease),stroke-width .2s}\n.wg[data-ws=live] .w{stroke:var(--agent);stroke-width:1.8;stroke-dasharray:none}\n.wg[data-ws=live] .wt{stroke:var(--agent);opacity:.12}\n.wg[data-ws=standby] .w{stroke:var(--wire-standby)}\n.wg[data-ws=rest] .w{stroke:var(--wire-rest);stroke-dasharray:2 6;opacity:.5}\n.wg[data-ws=unset] .w{stroke:var(--wire-unset);stroke-dasharray:1 5}\n.wg[data-ws=aux] .w{stroke:var(--wire-aux);stroke-dasharray:1 4}\n.wg[data-ws=warn] .w{stroke:var(--warn-line);stroke-dasharray:5 4}\n.wg[data-ws=broken] .w{stroke:var(--wire-broken);stroke-dasharray:none;opacity:.9}\n.wg[data-ws=broken] .wt{stroke:var(--wire-broken);opacity:.07}\n.wg .w-end{fill:var(--wire-broken);opacity:0;transition:opacity .3s var(--ease)}\n.wg.is-broken .w-end{opacity:1}\n.wg.is-broken.lit .w-end{opacity:0}\n.wg[data-ws=hidden]{opacity:0}\n.wg.hl .w{stroke-width:2.4}\n.wg.lit .w{stroke:var(--agent);stroke-width:2.2;opacity:1;stroke-dasharray:none}\n.wg.lit .wt{stroke:var(--agent);opacity:.16}\n.wg[data-requesting=true] .w{stroke:var(--agent);stroke-dasharray:3 5;animation:flow .7s linear infinite}\n/* 路由切换：新接管的支路涌光一次；失效由断路缓动承担，不再闪红 */\n.wg.surge .wt{stroke:var(--agent);animation:surge .95s var(--ease)}\n@keyframes surge{0%{opacity:.5;stroke-width:12}100%{opacity:0;stroke-width:5}}\n@keyframes flow{to{stroke-dashoffset:-8}}\n.packet .p-halo{fill:var(--agent);opacity:.2}\n.packet .p-core{fill:var(--agent)}\n.wires.draw{animation:wire-draw .65s var(--ease) both}\n@keyframes wire-draw{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0 0 0)}}\n\n/* 端口 */\n.port{position:absolute;width:9px;height:9px;border-radius:50%;background:var(--surface);border:1.5px solid var(--wire-unset);transform:translate(-50%,-50%);z-index:3;pointer-events:none;transition:border-color .25s,background-color .25s,opacity .25s}\n.port[data-port=dsh-out],.port[data-port=hub-out]{left:100%;top:50%}\n.port[data-port=hub-in],.row > .port{left:0;top:50%}\n.port[data-port=dsh-alt]{left:50%;top:100%}\n.port[data-port=off-in]{left:50%;top:0}\n.port[data-ps=hidden]{opacity:0}\n.port[data-ps=live]{border-color:var(--agent);background:var(--agent)}\n.port[data-ps=standby]{border-color:var(--wire-standby)}\n.port[data-ps=rest],.port[data-ps=aux]{border-color:var(--wire-rest)}\n.port[data-ps=warn]{border-color:var(--warn-line)}\n.port[data-ps=broken]{border-color:var(--wire-broken);background:var(--stage)}\n/* 服务端口：空心 = 未验证或失效；半实心 = 部分 Key 通过；实心 = 全部 Key 最近验证通过。 */\n.row > .port{transition:width .22s var(--spring),height .22s var(--spring),border-color .25s,background-color .25s,opacity .25s,left .22s var(--ease)}\n.row > .port[data-ps=live]{background:var(--surface)}\n.row > .port[data-mark=ok]{background:var(--agent);border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft)}\n.row > .port[data-mark=part]{width:11px;height:11px;color:var(--wire-standby);background:linear-gradient(90deg,currentColor 50%,transparent 50%);border-color:currentColor}\n.row[data-st=live] > .port[data-mark=part]{color:var(--agent)}\n.row > .port.pop{animation:mark-pop .42s var(--spring)}\n@keyframes mark-pop{from{scale:.3}}\n\n/* 节点 */\n.node{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-sm);transition:opacity .35s var(--ease),filter .35s var(--ease),border-color .2s,box-shadow .2s,transform .2s var(--ease),background-color .25s}\n.node-name{font-weight:600;font-size:13px;color:var(--text);line-height:1.3}\n.node-meta{font:500 11px/1.45 var(--mono);color:var(--text-3)}\n.node-meta .nw{white-space:nowrap}\n#hubMeta{display:flex;flex-wrap:wrap;justify-content:center;column-gap:4px}\n.node-dsh .node-name{white-space:normal}\n.node-logo{display:block;filter:drop-shadow(0 1px 1px rgba(15,23,42,.10));transition:filter .4s var(--ease),opacity .4s var(--ease)}\n\n/* DSH 节点（对应 magpie 的 Codex 卡）：位置始终不动 */\n.col-agent{position:relative}\n.node-dsh{display:flex;flex-direction:column;align-items:center;text-align:center;padding:14px 8px 12px;gap:1px}\n.node-dsh .node-logo{width:34px;height:34px;margin-bottom:8px}\n.node-dsh .node-name::before{content:\"\";display:inline-block;width:6px;height:6px;margin-right:5px;border-radius:50%;background:var(--text-4);vertical-align:.12em;transition:background-color .25s}\n.route-card[data-s=live] .node-dsh .node-name::before{background:var(--agent)}\n.route-card[data-s=wait] .node-dsh .node-name::before{background:var(--warn-line)}\n.route-card[data-s=none] .node-dsh .node-name::before{background:var(--warn-line)}\n.route-card[data-s=fallback] .node-dsh .node-name::before{background:var(--warn-line)}\n.route-card[data-s=backup] .node-dsh .node-name::before{background:var(--agent)}\n.route-card[data-s=err] .node-dsh .node-name::before{background:transparent;box-shadow:inset 0 0 0 1.3px var(--wire-broken)}\n.route-card[data-s=off] .node-dsh .node-name::before{background:var(--ok)}\n.node-dsh.flash-ok{animation:node-ok 1.05s var(--ease)}\n@keyframes node-ok{0%{box-shadow:0 0 0 0 var(--agent),var(--shadow-sm);border-color:var(--agent)}30%{box-shadow:0 0 0 6px var(--agent-soft),var(--shadow-sm);border-color:var(--agent)}}\n/* 全部失败：整张图一起安静下来，红色只留给状态胶囊和提示条标题 */\n.route-card[data-s=err] .node-hub{border-color:color-mix(in srgb,var(--text) 42%,var(--line))}\n.route-card[data-s=err] .hub-glyph{color:var(--text-3)}\n.route-card[data-s=err] .hub-pill{background:var(--text-3);color:var(--surface)}\n.route-card[data-s=err] .node-dsh .node-logo{filter:grayscale(1);opacity:.55;transition:filter .4s var(--ease),opacity .4s var(--ease)}\n\n/* 官方搜索节点：只在插件关闭时浮现在 DSH 下方，绝对定位，不挤动主行 */\n.node-official{position:absolute;left:50%;top:calc(100% + 44px);width:136px;display:flex;flex-direction:column;align-items:center;text-align:center;padding:11px 8px 10px;gap:1px;opacity:0;visibility:hidden;translate:-50% -6px;scale:.98;transition:opacity .22s var(--ease),translate .35s var(--ease),scale .35s var(--ease),visibility 0s linear .35s,border-color .2s,background-color .25s,box-shadow .2s}\n.route-card[data-plugin=off] .node-official{opacity:1;visibility:visible;translate:-50% 0;scale:1;border-color:color-mix(in srgb,var(--agent) 55%,var(--line));box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm);transition:opacity .3s var(--ease) .1s,translate .4s var(--ease) .1s,scale .4s var(--ease) .1s,visibility 0s linear 0s,border-color .2s,background-color .25s,box-shadow .2s}\n.node-official .node-logo{width:26px;height:26px;margin-bottom:6px}\n.node-official .off-text{display:flex;flex-direction:column;align-items:center}\n.node-official .node-name{font-size:12px}\n.node-official .node-meta{font-family:var(--font);color:var(--ok-text);font-weight:600}\n\n/* 中继节点（对应 magpie 网关卡）：深色描边 + 黑色“按顺序”胶囊 */\n.col-hub{display:flex;justify-content:center;align-items:center;transition:opacity .35s var(--ease),filter .35s var(--ease)}\n.node-hub{display:flex;flex-direction:column;align-items:center;text-align:center;gap:1px;width:100%;padding:14px 8px 11px;color:inherit;font:inherit;cursor:pointer;border:1.5px solid color-mix(in srgb,var(--text) 82%,transparent)}\n.node-hub:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}\n.node-hub:active{transform:none}\n.node-hub.is-busy{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm)}\n.node-hub.is-falling{border-color:var(--warn-line);box-shadow:0 0 0 3px var(--warn-soft),var(--shadow-sm)}\n.node-hub.is-falling .hub-pill{background:var(--warn-line);color:#fff}\n.node-hub.is-falling .hub-glyph{color:var(--warn)}\n.hub-glyph{width:34px;height:34px;flex:none;border-radius:10px;display:grid;place-items:center;background:var(--tile);box-shadow:inset 0 0 0 1px var(--tile-line);color:var(--text-2);margin-bottom:8px;transition:color .3s var(--ease)}\n.hub-glyph svg{width:21px;height:21px}\n.route-card[data-s=live] .hub-glyph{color:var(--agent)}\n.route-card[data-s=backup] .hub-glyph{color:var(--agent)}\n.route-card[data-s=fallback] .hub-glyph{color:var(--warn)}\n.hub-text{display:flex;flex-direction:column;align-items:center}\n.hub-pill{margin-top:8px;display:inline-flex;align-items:center;gap:2px;height:19px;padding:0 8px;border-radius:999px;background:var(--text);color:var(--surface);font-size:10.5px;font-weight:600;transition:opacity .15s}\n.node-hub:hover .hub-pill{opacity:.85}\n.route-card[data-plugin=off] .col-hub,.route-card[data-plugin=off] .col-list{opacity:.5;filter:grayscale(1)}\n\n/* ---------- 供应商列表（每行：图标 + 名称 + 开关） ---------- */\n.col-list{display:flex;flex-direction:column;gap:14px;min-width:0;transition:opacity .35s var(--ease),filter .35s var(--ease)}\n.rg-label{font-size:11px;font-weight:600;color:var(--text-3);letter-spacing:.04em;margin:0 0 6px 2px;display:flex;align-items:center;gap:8px;white-space:nowrap}\n.rg-hint{font-weight:500;color:var(--text-4);letter-spacing:0;display:inline-flex;align-items:center;gap:3px}\n.rg-rows{position:relative;display:flex;flex-direction:column;gap:6px}\n\n.row{position:relative;display:flex;align-items:center;height:44px;padding:0 10px 0 0;border-radius:12px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow-sm);user-select:none;-webkit-user-select:none;transition:border-color .2s var(--ease),box-shadow .2s var(--ease),background-color .2s,opacity .2s}\n.row[data-drag=true]{touch-action:none}\n.row-main{flex:1;min-width:0;display:flex;align-items:center;gap:11px;height:100%;padding:0 6px 0 10px;border:0;background:transparent;border-radius:11px;cursor:pointer;text-align:left;color:inherit}\n.row[data-drag=true] .row-main{cursor:grab}\n.row-main:focus-visible{outline:none}\n.row:has(.row-main:focus-visible){outline:2px solid var(--agent);outline-offset:2px}\n.row.is-dragging{outline:none !important}\n.row-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .2s}\n.row .switch{margin-left:auto}\n.row:hover{border-color:var(--line-2);box-shadow:var(--shadow-md)}\n.row[data-st=unset]{border-style:dashed;border-color:var(--line-2);background:color-mix(in srgb,var(--surface) 55%,transparent);box-shadow:none}\n.row[data-st=unset] .row-name{color:var(--text-3)}\n.row[data-st=unset] .tile{filter:grayscale(1);opacity:.42}\n.row[data-st=off]{border-style:dashed;border-color:var(--line-2);box-shadow:none}\n.row[data-st=off] .row-name{color:var(--text-3)}\n.row[data-st=off] .tile{filter:grayscale(1);opacity:.42}\n.row[data-st=live]{border-color:var(--text);box-shadow:var(--shadow-sm)}\n.row[data-st=wait]{border-style:dashed;border-color:var(--warn-line);background:var(--warn-soft);box-shadow:none}\n.row[data-st=wait] .tile{filter:grayscale(1);opacity:.5}\n.row[data-st=bad],.row[data-st=err]{border-color:var(--line);background:color-mix(in srgb,var(--surface-2) 62%,var(--surface))}\n.row[data-st=bad] .tile,.row[data-st=err] .tile{opacity:.5;filter:saturate(.3)}\n.row[data-st=bad] .row-name,.row[data-st=err] .row-name{color:var(--text-3)}\n.row .tile{transition:filter .5s var(--ease),opacity .5s var(--ease)}\n/* 参考 Magpie 0.1.1978 的 .rt-accts .tag：右上悬浮，不挤占名称或开关。\n   动画只提示本次错误；最近失败的简短原因继续留在原供应商，直到重验或配置改变。 */\n.row-fault{position:absolute;right:10px;top:-14px;z-index:5;display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border:1px solid transparent;border-radius:6px;background:var(--err-solid);color:#fff;font:600 12px/1.35 var(--font);font-variant-numeric:tabular-nums;max-width:calc(100% - 20px);white-space:nowrap;pointer-events:none;opacity:0;transform:translateY(4px) scale(.96);transform-origin:right bottom;transition:opacity .2s var(--ease),transform .25s var(--ease),background-color .2s,color .2s}\n.row.has-fault .row-fault{opacity:1;transform:none}\n.row-fault[data-tone=partial]{background:var(--surface);border-color:var(--warn-line);color:var(--warn-text)}\n.row-fault-code{font:600 11.5px/1.35 var(--mono);font-variant-numeric:tabular-nums}\n.row-fault-sep{opacity:.72}\n.row.is-fault-flash{border-color:var(--err);box-shadow:0 0 0 2px var(--err-soft)}\n.row.flash-ok{animation:row-ok .85s var(--ease)}\n@keyframes row-ok{0%{border-color:var(--agent);box-shadow:0 0 0 0 var(--agent-soft)}35%{border-color:var(--agent);box-shadow:0 0 0 5px var(--agent-soft)}}\n.row.is-hl{border-color:var(--line-2)}\n.row.is-searching{animation:searching 1s var(--ease) infinite}\n@keyframes searching{0%,100%{box-shadow:0 0 0 3px var(--agent-soft)}50%{box-shadow:0 0 0 6px var(--agent-soft)}}\n.row.tick{animation:tick .55s var(--spring)}\n.row.tick .tile{animation:lightup .7s var(--ease)}\n@keyframes tick{35%{transform:scale(1.025)}}\n@keyframes lightup{from{filter:grayscale(1);opacity:.42}}\n.row.enter{animation:row-in .42s var(--ease) both;animation-delay:calc(var(--i,0) * 45ms)}\n@keyframes row-in{from{opacity:0;transform:translateY(6px)}}\n.shake{animation:shake .38s var(--ease)}\n@keyframes shake{20%{transform:translateX(-4px)}40%{transform:translateX(4px)}60%{transform:translateX(-2px)}80%{transform:translateX(2px)}}\n/* 参考 Magpie 的 rthit：450ms 衰减轻颤；translate 不占用拖拽的 transform。 */\n.row.is-jolt,.node.is-jolt{animation:route-jolt .45s linear}\n.row.is-jolt-soft{animation:route-jolt-soft .3s linear}\n@keyframes route-jolt{0%,100%{translate:0 0}20%{translate:-5px 0}40%{translate:4px 0}60%{translate:-2px 0}80%{translate:1px 0}}\n@keyframes route-jolt-soft{0%,100%{translate:0 0}18%{translate:-1.5px 0}38%{translate:1.2px 0}60%{translate:-.7px 0}80%{translate:.3px 0}}\n\n/* 拖拽 */\n.rg-rows.is-sorting .row:not(.is-dragging){transition:transform .22s var(--ease),border-color .2s,box-shadow .2s}\n.row.is-dragging{z-index:6;border-color:var(--line-2);box-shadow:var(--shadow-drag)}\n.row.is-dragging .row-main{cursor:grabbing}\n.drop-ghost{position:absolute;left:0;right:0;z-index:0;border:1.5px dashed var(--agent-ring);border-radius:12px;background:var(--agent-soft);pointer-events:none;transition:transform .22s var(--ease)}\n.dsg-root.is-grabbing,.dsg-root.is-grabbing *{cursor:grabbing !important}\n\n/* logo 方块：官方原图不改，只做统一尺寸、底板与灰度滤镜 */\n.tile{--s:28px;position:relative;width:var(--s);height:var(--s);flex:none;border-radius:calc(var(--s) * .27);display:grid;place-items:center;overflow:hidden;transition:filter .3s var(--ease),opacity .3s var(--ease)}\n.tile img{display:block;width:100%;height:100%;object-fit:cover}\n.tile[data-fit=contain]{background:var(--tile);box-shadow:inset 0 0 0 1px var(--tile-line)}\n.tile[data-fit=contain] img{width:var(--k,62%);height:var(--k,62%);object-fit:contain}\n.tile[data-plate=light]{background:#f4f5f7}\n.tile[data-ring=true]::after{content:\"\";position:absolute;inset:0;border-radius:inherit;box-shadow:inset 0 0 0 1px rgba(255,255,255,.16);pointer-events:none}\n.tile-glyph{background:var(--tile);box-shadow:inset 0 0 0 1px var(--tile-line);color:var(--text-2)}\n.tile-glyph svg{width:62%;height:62%}\n\n/* 开关 */\n.switch{position:relative;width:34px;height:20px;flex:none;border-radius:999px;border:0;padding:0;background:var(--line-2);transition:background-color .2s var(--ease),opacity .2s}\n.switch i{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.22),0 0 0 .5px rgba(0,0,0,.04);display:grid;place-items:center;color:var(--btn-primary);transition:transform .26s var(--spring)}\n.switch[aria-checked=true]{background:var(--btn-primary)}\n.switch[aria-checked=true] i{transform:translateX(14px)}\n.switch:hover:not(:disabled){filter:brightness(1.04)}\n.switch-lg{width:42px;height:24px}\n.switch-lg i{width:20px;height:20px}\n.switch-lg[aria-checked=true] i{transform:translateX(18px)}\n[data-theme=dark] .switch{background:#3a3e46}\n[data-theme=dark] .switch[aria-checked=true]{background:#5873ff}\n\n/* 底部配置文件条 */\n.rc-foot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px 11px 20px;font-size:12px;color:var(--text-3)}\n.cf-label{white-space:nowrap}\n.cf-path{font:500 11.5px/1.5 var(--mono);color:var(--text-2);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:1px 7px;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.tag{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:999px;font-size:11px;font-weight:550;background:var(--surface-2);color:var(--text-3);border:1px solid var(--line);white-space:nowrap;line-height:1}\n.tag[data-tone=agent]{background:var(--agent-soft);color:var(--agent);border-color:transparent}\n.tag[data-tone=warn]{background:var(--warn-soft);color:var(--warn);border-color:transparent}\n.tag[data-tone=ok]{background:var(--ok-soft);color:var(--ok-text);border-color:transparent}\n.cf-spacer{flex:1}\n.rc-foot .btn svg{width:14px;height:14px}\n\n/* ---------- 弹窗 ---------- */\n.overlay{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:24px;background:var(--scrim);backdrop-filter:blur(2px);animation:fade-in .16s var(--ease)}\n.overlay[hidden]{display:none}\n.overlay.is-closing{animation:fade-out .15s var(--ease) forwards}\n.dialog{width:min(600px,100%);max-height:min(780px,calc(100vh - 48px));display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-lg);overflow:hidden;animation:dlg-in .22s var(--ease)}\n.overlay.is-closing .dialog{animation:dlg-out .15s var(--ease) forwards}\n.dialog.is-in{animation:none}\n.dialog.shake{animation:shake .38s var(--ease)}\n@keyframes fade-in{from{opacity:0}}\n@keyframes fade-out{to{opacity:0}}\n@keyframes dlg-in{from{opacity:0;transform:translateY(8px) scale(.98)}}\n@keyframes dlg-out{to{opacity:0;transform:translateY(4px) scale(.985)}}\n\n.dlg-head{display:flex;align-items:center;gap:12px;padding:16px 14px 14px 20px;border-bottom:1px solid var(--line)}\n.dlg-head > .tile{--s:40px}\n.dlg-titles{flex:1;min-width:0}\n.dlg-titles h2{margin:0;font-size:16px;font-weight:650;letter-spacing:-.005em;line-height:1.3}\n.dlg-sub{margin:2px 0 0;font-size:12px;color:var(--text-3);display:flex;align-items:center;gap:4px 8px;flex-wrap:wrap}\n.dlg-link{color:var(--agent);text-decoration:none;display:inline-flex;align-items:center;gap:2px;white-space:nowrap;font-weight:550}\n.dlg-link:hover{text-decoration:underline}\n.head-switch{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-2);white-space:nowrap;cursor:pointer}\n.head-switch[data-pending=true]{color:var(--text-3);cursor:default}\n.head-switch[data-pending=true] .switch{opacity:.48;cursor:default}\n.head-switch[data-pending=true] .switch:hover{filter:none}\n.dlg-head .icon-btn{margin-left:2px}\n\n.dlg-body{padding:4px 20px 8px;overflow:auto;overscroll-behavior:contain}\n.dlg-form{margin:0}\n.field{display:grid;grid-template-columns:112px minmax(0,1fr);column-gap:16px;align-items:start;padding:12px 0;border-bottom:1px solid var(--hair)}\n.field:last-child{border-bottom:0}\n.f-label{padding-top:8px;font-size:12.5px;font-weight:550;color:var(--text);display:flex;flex-direction:column;gap:1px}\n.f-label small{font-weight:400;color:var(--text-3);font-size:11px}\n.f-label small:has(.ic){display:inline-flex;align-items:center;gap:4px}\n.f-ctl{min-width:0;display:flex;flex-direction:column;gap:6px}\n.f-help{font-size:11.5px;color:var(--text-3);line-height:1.5;margin:0}\n.f-help code,.note code{font:500 11px var(--mono);color:var(--text-2);background:var(--field);border-radius:4px;padding:0 4px}\n.f-msg{font-size:11.5px;line-height:1.45;display:flex;gap:5px;align-items:flex-start;margin:0}\n.f-msg svg{flex:none;margin-top:2px}\n.f-msg[data-tone=err]{color:var(--err-text)}\n.f-msg[data-tone=warn]{color:var(--warn-text)}\n\n.input{position:relative;display:flex;align-items:center;height:34px;min-width:0;border-radius:9px;background:var(--field);border:1px solid transparent;transition:background-color .15s,border-color .15s,box-shadow .15s}\n.input:hover{background:var(--field-hover)}\n.input:focus-within{background:var(--field-focus);border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft)}\n.input[data-invalid=true]{border-color:var(--err);box-shadow:0 0 0 3px var(--err-soft)}\n.input[data-health=true]{border-color:color-mix(in srgb,var(--err) 55%,transparent)}\n.input input{flex:1;min-width:0;height:100%;border:0;background:transparent;outline:none;padding:0 10px;font-size:12.5px}\n.input input.mono{font-family:var(--mono);font-size:12px}\n.input input::placeholder{color:var(--text-4)}\n.input .in-act{display:flex;gap:1px;padding-right:3px}\n.input.is-readonly{background:transparent;border:1px dashed var(--line-2)}\n.input.is-readonly input{color:var(--text-3)}\n.save-error{color:var(--err-text);border:1px solid var(--err-soft)}\n\n.seg{display:inline-flex;align-self:flex-start;max-width:100%;padding:3px;gap:2px;border-radius:10px;background:var(--field)}\n.seg button{border:0;background:transparent;height:28px;padding:0 12px;border-radius:7px;font-size:12.5px;font-weight:550;color:var(--text-2);white-space:nowrap;transition:background-color .15s,color .15s,box-shadow .15s}\n.seg button:hover{color:var(--text)}\n.seg button[aria-checked=true]{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm),0 0 0 1px var(--line)}\n.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}\n.chips .f-help{margin-right:2px}\n.chip{height:24px;padding:0 9px;border-radius:999px;border:1px solid var(--line);background:var(--surface);font:500 11.5px var(--mono);color:var(--text-2);transition:border-color .15s,color .15s,background-color .15s}\n.chip:hover{border-color:var(--line-2);color:var(--text)}\n.chip[aria-pressed=true]{border-color:var(--agent);color:var(--agent);background:var(--agent-soft)}\n\n.checks{display:flex;flex-direction:column;gap:2px}\n.check{position:relative;display:flex;align-items:flex-start;gap:9px;padding:6px 8px;margin:0 -8px;border-radius:8px;cursor:pointer}\n.check:hover{background:var(--surface-2)}\n.check input{position:absolute;opacity:0;pointer-events:none}\n.check .box{flex:none;width:16px;height:16px;margin-top:1px;border-radius:5px;border:1.5px solid var(--line-2);background:var(--surface);display:grid;place-items:center;color:#fff;transition:background-color .15s,border-color .15s}\n.check .box svg{width:11px;height:11px;opacity:0;transform:scale(.6);transition:opacity .15s,transform .2s var(--spring)}\n.check input:checked + .box{background:var(--btn-primary);border-color:var(--btn-primary)}\n.check input:checked + .box svg{opacity:1;transform:none}\n.check input:focus-visible + .box{outline:2px solid var(--agent);outline-offset:2px}\n.check.is-disabled{cursor:not-allowed}\n.check.is-disabled .box,.check.is-disabled .c-text{opacity:.45}\n.check .c-text{display:flex;flex-direction:column;font-size:12.5px;font-weight:550}\n.check .c-text small{color:var(--text-3);font-size:11.5px;font-weight:400}\n\n.keylist{display:flex;flex-direction:column;gap:6px}\n.key-row{display:flex;gap:6px;align-items:center}\n.key-row .input{flex:1}\n.key-row.enter{animation:row-in .25s var(--ease)}\n.add-key{align-self:flex-start;display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 10px;border-radius:8px;border:1px dashed var(--line-2);background:transparent;color:var(--text-2);font-size:12px;transition:border-color .15s,color .15s,background-color .15s}\n.add-key:hover{border-color:var(--agent);color:var(--agent);background:var(--agent-soft)}\n\n.dlg-foot{display:flex;align-items:center;gap:8px;padding:12px 16px 12px 14px;border-top:1px solid var(--line);background:var(--surface-2)}\n.foot-note{flex:1;min-width:0;font-size:11.5px;color:var(--text-3);text-align:right;padding-right:4px}\n.foot-note b{color:var(--warn);font-weight:600}\n\n/* 中继弹窗 */\n.sec{padding:12px 0 4px;border-bottom:1px solid var(--line)}\n.sec:last-child{border-bottom:0}\n.sec-h{margin:4px 0 2px;font-size:11px;font-weight:650;letter-spacing:.06em;color:var(--text-3);display:flex;align-items:center;gap:8px}\n.prog{display:flex;align-items:center;flex-wrap:wrap;gap:8px 10px;padding:10px 10px 10px 12px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line)}\n.prog-main{flex:1;min-width:190px;display:flex;flex-direction:column;gap:2px}\n.prog-title{font-weight:600;font-size:12.5px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}\n.prog-path{font:500 11.5px var(--mono);color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n.order{margin:2px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px;counter-reset:o}\n.order li{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-3)}\n.order li::before{counter-increment:o;content:counter(o);width:17px;height:17px;flex:none;border-radius:50%;display:grid;place-items:center;font-size:10px;font-weight:650;background:var(--field);color:var(--text-3)}\n.order li.is-hit{color:var(--text)}\n.order li.is-hit::before{background:var(--btn-primary);color:#fff}\n.stepper{display:inline-flex;align-items:center;align-self:flex-start;height:34px;border-radius:9px;background:var(--field);border:1px solid transparent;transition:background-color .15s,border-color .15s,box-shadow .15s}\n.stepper:focus-within{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft);background:var(--field-focus)}\n.stepper button{width:30px;height:30px;margin:0 1px;border:0;background:transparent;border-radius:8px;color:var(--text-2);display:grid;place-items:center}\n.stepper button:hover:not(:disabled){background:var(--field-hover);color:var(--text)}\n.stepper button:disabled{opacity:.3}\n.stepper input{width:58px;height:100%;border:0;background:transparent;text-align:center;font:600 12.5px var(--mono);outline:none;-moz-appearance:textfield;appearance:textfield}\n.stepper input::-webkit-inner-spin-button,.stepper input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}\n.stepper .unit{font-size:11.5px;color:var(--text-3);margin:0 2px 0 -6px}\n.stepper.is-readonly{background:transparent;border:1px dashed var(--line-2);color:var(--text-3)}\n.static-val{display:inline-flex;align-items:center;gap:8px;min-height:34px;font-size:12.5px;color:var(--text);flex-wrap:wrap}\n.adv-toggle{display:flex;align-items:center;gap:6px;width:100%;padding:13px 0 11px;border:0;background:transparent;font-size:12.5px;font-weight:600;color:var(--text-2);text-align:left}\n.adv-toggle:hover{color:var(--text)}\n.adv-toggle .adv-hint{font-weight:400;color:var(--text-3);font-size:11.5px}\n.adv-toggle svg{transition:transform .25s var(--ease)}\n.adv-toggle[aria-expanded=true] svg{transform:rotate(90deg)}\n.adv{display:grid;grid-template-rows:0fr;transition:grid-template-rows .32s var(--ease)}\n.adv.is-open{grid-template-rows:1fr}\n.adv > div{overflow:hidden;min-height:0}\n.sub-h{margin:12px 0 0;padding-top:12px;border-top:1px solid var(--line);font-size:11.5px;font-weight:650;color:var(--text-2);display:flex;align-items:center;gap:6px}\n.note{display:flex;gap:8px;align-items:flex-start;padding:9px 11px;border-radius:10px;background:var(--surface-2);font-size:11.5px;color:var(--text-2);line-height:1.55;margin:8px 0}\n.note svg{flex:none;margin-top:1px;color:var(--text-3)}\n.search-result{border:1px solid var(--err-soft);background:var(--err-soft)}\n.search-result svg{color:var(--err-text)}\n.search-result span{min-width:0;white-space:pre-line;overflow-wrap:anywhere}\n.search-result strong{display:block;margin-bottom:2px;font-weight:600;color:var(--err-text)}\n\n/* ---------- 加载骨架 ---------- */\n.skel{display:inline-block;height:10px;border-radius:5px;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}\n.route-card.is-loading .row{border-style:solid;border-color:transparent;box-shadow:none;background:linear-gradient(90deg,var(--field) 0 30%,var(--field-hover) 50%,var(--field) 70%) 0 0/300% 100%;animation:shimmer 1.2s linear infinite}\n.route-card.is-loading .row > *{visibility:hidden}\n.route-card.is-loading .wires,.route-card.is-loading .port{opacity:0}\n.route-card.is-loading .rc-foot .cf-path,.route-card.is-loading .rc-foot .tag{opacity:.4}\n@keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}\n\n/* ---------- toast ---------- */\n.toasts{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;width:max-content;max-width:calc(100vw - 32px)}\n.toast{pointer-events:auto;display:flex;align-items:center;gap:9px;min-height:38px;max-width:100%;padding:7px 7px 7px 13px;border-radius:12px;background:var(--toast-bg);color:var(--toast-text);font-size:12.5px;box-shadow:0 10px 30px rgba(0,0,0,.25);animation:toast-in .28s var(--spring)}\n.toast.no-act{padding-right:15px}\n.toast.is-out{animation:toast-out .18s var(--ease) forwards}\n.toast .t-ic{flex:none;display:grid;place-items:center}\n.toast[data-tone=ok] .t-ic{color:#3ccb7f}\n.toast[data-tone=err] .t-ic{color:#ff6b70}\n.toast[data-tone=warn] .t-ic{color:#f0b04a}\n.toast[data-tone=info] .t-ic{color:#93a6ff}\n[data-theme=dark] .toast[data-tone=ok] .t-ic{color:#12a150}\n[data-theme=dark] .toast[data-tone=err] .t-ic{color:#e5484d}\n[data-theme=dark] .toast[data-tone=warn] .t-ic{color:#b86e00}\n[data-theme=dark] .toast[data-tone=info] .t-ic{color:#4d6bfe}\n.toast .t-text{min-width:0}\n.toast .t-act{flex:none;display:inline-flex;align-items:center;gap:4px;border:0;background:var(--toast-act);color:inherit;height:26px;padding:0 10px 0 8px;border-radius:7px;font-size:12px;font-weight:600;white-space:nowrap}\n.toast .t-act:hover{filter:brightness(1.15)}\n@keyframes toast-in{from{opacity:0;transform:translateY(10px) scale(.96)}}\n@keyframes toast-out{to{opacity:0;transform:translateY(6px) scale(.98)}}\n\n@media (prefers-reduced-motion:reduce){\n  *,*::before,*::after{animation-duration:.001ms !important;animation-delay:0s !important;animation-iteration-count:1 !important;transition-duration:.001ms !important;transition-delay:0s !important;scroll-behavior:auto !important}\n}\n\n/* 独立历史层只隔离数据；连线、光点、闪光和抖动复用测试搜索。 */\n.route-card,.log-card{--rp-blue:#5276d6;--rp-blue-text:#3b5fae;--rp-blue-soft:rgba(82,118,214,.09);--rp-amber:#bd8a45;--rp-amber-text:#946329;--rp-coral:#cf7470;--rp-coral-text:#a3504c}\n[data-theme=dark] .route-card,[data-theme=dark] .log-card{--rp-blue:#88a8f4;--rp-blue-text:#aac1f8;--rp-blue-soft:rgba(136,168,244,.10);--rp-amber:#d7ae72;--rp-amber-text:#dfba88;--rp-coral:#db8a84;--rp-coral-text:#e3a09a}\n.history-bar{position:absolute;inset:0 0 0 88px;display:flex;align-items:center;gap:12px;z-index:4;min-width:0}\n.history-bar[hidden],.history-stage[hidden],.history-note[hidden],.history-context[hidden],.history-actions [hidden]{display:none}\n.history-label{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:550;color:var(--text-2);white-space:nowrap;font-variant-numeric:tabular-nums}\n.history-label::before{content:\"\";width:5px;height:5px;border-radius:50%;background:var(--rp-blue);box-shadow:0 0 0 3px var(--rp-blue-soft)}\n.history-phase{min-width:0;color:var(--text-3);font-size:12px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}\n.history-actions{display:flex;align-items:center;gap:6px;margin-left:auto;flex:none}\n.history-context{position:absolute;z-index:3;display:flex;flex-direction:column;justify-content:center;gap:5px;min-width:0;pointer-events:none}\n.history-context[data-compact=true]{flex-direction:row;justify-content:flex-start;align-items:center;gap:12px}\n.history-context[data-compact=true] .history-query{flex:1;min-width:0;max-width:none}\n.history-query{flex-shrink:0;font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}\n.history-route.lroute{align-self:flex-start;flex-wrap:nowrap;width:100%;max-width:none;min-height:28px;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;pointer-events:auto}\n.history-context[data-compact=true] .history-route{flex:0 1 700px;align-self:center}\n.history-bar[data-phase=done]{inset:0 calc(var(--history-actions-width,320px) + 14px) 0 auto;height:32px;gap:8px}\n.history-bar[data-phase=done] .history-label::before{background:var(--text-4);box-shadow:none}\n.history-bar[data-phase=done] .history-label{font-size:11px;color:var(--text-3)}\n.history-bar[data-phase=done] .history-phase{display:none}\n.history-bar[data-phase=done] .history-return{color:var(--text-2)}\n.history-bar[data-phase=done] .history-dismiss{width:22px}\n.route-card[data-history=true] > #stage,.route-card[data-history=true] > #bannerSlot,.route-card[data-history=true] > .rc-foot{visibility:hidden}\n.route-card[data-history=true] #statusPill,.route-card[data-history=true] .rc-actions{visibility:hidden}\n.history-stage{position:absolute;overflow:visible;background:var(--stage);background-image:radial-gradient(var(--dot) 1px,transparent 1.3px);background-size:16px 16px;background-position:8px 8px;border-block:1px solid var(--line);pointer-events:none}\n.history-stage .hr-node{position:absolute;z-index:2;box-sizing:border-box}\n.history-stage .hr-node.node{cursor:default;transform:none;filter:none}\n.history-stage .node-name::before{display:none}\n.history-stage .hr-node[data-hs] .node-logo,.history-stage .hr-node[data-hs] .hub-glyph{filter:none;opacity:1}\n.history-stage .hr-node[data-hs] .hub-glyph{color:var(--agent)}\n.history-stage .hr-node.node-hub{border-color:color-mix(in srgb,var(--text) 82%,transparent);box-shadow:var(--shadow-sm)}\n.history-stage .hr-node.node-hub.is-busy{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm)}\n.history-stage .hr-node.node-hub.is-falling{border-color:var(--warn-line);box-shadow:0 0 0 3px var(--warn-soft),var(--shadow-sm)}\n.history-stage .hr-node.node-hub.is-falling .hub-glyph{color:var(--warn)}\n.history-stage .hr-node.node-hub .hub-pill{background:var(--text);color:var(--surface)}\n.history-stage .hr-node.node-hub.is-falling .hub-pill{background:var(--warn-line);color:#fff}\n.history-stage .node-meta{font:500 11px/1.5 var(--font);color:var(--text-3);margin-top:2px}\n.history-stage .history-official{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:11px 8px;gap:1px}\n.history-official .node-logo{width:26px;height:26px;margin-bottom:6px}\n.history-official .node-name{font-size:12px}\n.hr-provider{display:flex;align-items:center;gap:11px;padding:0 11px}\n.hr-provider .tile{--s:28px;flex:none}\n.hr-provider[data-hs=idle] .hr-provider-name{color:var(--text-3)}\n.history-stage .hr-provider[data-st=on],.history-stage .hr-provider[data-st=live]{box-shadow:var(--shadow-sm);border-style:solid}\n.history-stage .hr-provider[data-st=on] .tile,.history-stage .hr-provider[data-st=live] .tile{filter:none;opacity:1}\n.history-stage .hr-provider[data-st=live]{border-color:var(--text)}\n.history-stage .hr-provider.is-fault-flash{border-color:var(--err);box-shadow:0 0 0 2px var(--err-soft)}\n.hr-provider-name{font-size:13px;font-weight:600;flex:1;min-width:0;white-space:nowrap}\n.hr-result{font-size:11px;color:var(--text-3);white-space:nowrap;display:inline-flex;align-items:center;gap:5px}\n.hr-result:not(:empty)::before{content:\"\";width:4px;height:4px;border-radius:50%;background:currentColor}\n[data-hs=hit] > .hr-result,[data-hs=back] > .hr-result{color:var(--agent-text)}\n[data-hs=fail] > .hr-result{color:var(--err-text)}\n.hr-port{left:0;top:50%}\n.hr-port.out{left:100%}\n.hr-port.bottom{left:50%;top:100%}\n.hr-port.top{left:50%;top:0}\n.hr-fault[hidden]{display:none}\n.hr-label{position:absolute;font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--text-3)}\n.history-note{position:absolute;bottom:12px;left:20px;right:20px;margin:0;color:var(--text-3);font-size:12px;line-height:1.5;white-space:nowrap}\n.replay-control,.lr-replay{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;padding:0 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--text-2);box-shadow:0 1px 1px var(--hair);font-size:12px;font-weight:550;line-height:1;white-space:nowrap;transition:background-color .18s,border-color .18s,color .18s,box-shadow .18s,transform .12s}\n.replay-control .ic,.lr-replay .ic{width:13px;height:13px;flex:none;transition:transform .22s var(--ease)}\n.replay-control:hover:not(:disabled),.lr-replay:hover:not(:disabled){border-color:color-mix(in srgb,var(--rp-blue) 34%,var(--line));background:var(--rp-blue-soft);color:var(--rp-blue-text);box-shadow:0 1px 3px var(--hair)}\n.replay-control:active:not(:disabled),.lr-replay:active:not(:disabled){transform:translateY(1px) scale(.97);box-shadow:none}\n.lr-replay:hover:not(:disabled):not([aria-pressed=true]) .ic{transform:rotate(-30deg)}\n.lr-replay[aria-pressed=true],#historyStop{color:var(--rp-blue-text);border-color:color-mix(in srgb,var(--rp-blue) 30%,var(--line));background:var(--rp-blue-soft)}\n.replay-control:focus-visible,.lr-replay:focus-visible{outline:2px solid var(--rp-blue);outline-offset:2px}\n.history-return{background:transparent;border-color:transparent;box-shadow:none}\n.history-dismiss{width:28px;padding:0;border-color:transparent;box-shadow:none;background:transparent}\n#historyStop,.lr-replay{min-width:70px}\n.lr-replay:disabled{color:var(--text-4);opacity:.5;background:transparent;box-shadow:none}\n@media(prefers-reduced-motion:reduce){.history-stage *,.replay-control,.lr-replay,.lr-replay .ic{transition:none!important}}\n\n/* Account quota is separate from a historical request's usage. */\n#quotaSlot{overflow:clip;overflow-clip-margin:6px}\n.quota-panel{padding:16px 0 12px;border-top:1px solid var(--line);margin-top:4px;container-type:inline-size}\n.qp-head{display:flex;align-items:center;gap:8px;min-height:30px;margin-bottom:12px}\n.qp-heading{display:flex;align-items:baseline;gap:8px;flex:1;min-width:0}\n.qp-head h3{font-size:13px;font-weight:600;line-height:1.5;margin:0;white-space:nowrap}\n.qp-tools{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:none;margin-left:auto}\n.qp-key{display:flex;align-items:center;font-size:13px;color:var(--text-2)}\n.qp-key select{border:1px solid var(--line);background:var(--surface-2);border-radius:7px;height:30px;padding:0 6px;max-width:94px;cursor:pointer}\n.qp-refresh{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-width:30px;height:30px;padding:0 7px;flex:none;border:0;border-radius:7px;background:transparent;color:var(--text-2);transition:background-color .15s,color .15s,transform .12s}\n.qp-refresh.is-retry{color:var(--agent-text);font-size:13px;font-weight:550;white-space:nowrap}\n.qp-refresh .ic{width:15px;height:15px}\n.qp-refresh:hover:not(:disabled){background:var(--field);color:var(--text)}\n.qp-refresh:active:not(:disabled){transform:scale(.94)}\n.qp-refresh:disabled{color:var(--text-3);opacity:.55}\n.qp-refresh[aria-busy=true]{opacity:1;color:var(--agent-text)}\n.qp-refresh[aria-busy=true] .ic{animation:spin .9s linear infinite}\n.qp-stats{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}\n.qp-stat{min-width:0}\n.qp-stat.is-primary{text-align:right}\n.qp-label{display:block;font-size:13px;line-height:1.6;color:var(--text-2);margin-bottom:3px}\n.qp-amount{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}\n.qp-stat.is-primary .qp-amount{justify-content:flex-end}\n.qp-value{font-size:24px;font-weight:600;letter-spacing:-.025em;line-height:1.2;color:var(--text-2);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}\n.qp-stat.is-primary .qp-value,.qp-wallet .qp-value{color:var(--agent-text)}\n.qp-value.is-unknown{font-size:14px;font-weight:500;letter-spacing:0;line-height:28.8px;color:var(--text-3)}\n.qp-unit{font-size:13px;font-weight:400;line-height:1.5;color:var(--text-3)}\n.qp-currency{font-size:20px;color:var(--agent-text)}\n.qp-meter{height:4px;border-radius:4px;background:var(--field);margin:10px 0 7px;overflow:hidden}\n.qp-meter i{display:block;width:100%;height:100%;border-radius:inherit;background:var(--agent);transform-origin:left}\n.qp-meter.is-unreported{background:var(--field)}\n.qp-summary{display:flex;align-items:center;gap:4px 10px;min-height:30px;flex-wrap:wrap;font-size:13px;line-height:1.6;color:var(--text-3)}\n.qp-account-meta{display:inline-flex;align-items:center;gap:4px;min-width:0}\n.qp-total{overflow-wrap:anywhere}\n.qp-total b{font-weight:500;color:var(--text-2);font-variant-numeric:tabular-nums}\n.qp-updated{display:inline-flex;align-items:center;gap:4px;margin-left:auto;min-width:0}\n.qp-updated[data-state=error]{color:var(--warn-text)}\n.qp-info{display:inline-grid;place-items:center;flex:none;width:24px;height:24px;padding:0;border:0;border-radius:50%;background:transparent;color:inherit;vertical-align:middle;transition:background-color .15s,color .15s}\n.qp-info .ic{width:14px;height:14px}\n.qp-info:hover,.qp-info:focus-visible{background:var(--field);color:var(--text)}\n.qp-console{font-size:11px;font-weight:550;line-height:1.5}\n.qp-console .ic{width:11px;height:11px}\n.qp-wallet{padding:0 0 9px}\n.qp-empty{min-height:36px;display:flex;align-items:center;justify-content:space-between;gap:8px 12px}\n.qp-placeholder{display:flex;align-items:center;gap:6px;min-width:0;font-size:13px;line-height:1.65;color:var(--text-2);margin:0;overflow-wrap:anywhere}\n.qp-placeholder .qp-info{margin-left:-5px;margin-right:-5px}\n.qp-state-icon{width:14px;height:14px;color:var(--text-3)}\n.qp-placeholder[data-state=error]{color:var(--warn-text)}\n.qp-placeholder[data-state=loading]{color:var(--agent-text)}\n.quota-panel[data-state=loading] .qp-updated{color:var(--agent-text)}\n@container (max-width:479px){\n  .qp-summary{gap:3px 8px}\n  .qp-summary .qp-updated{margin-left:0}\n  .qp-stats{gap:12px}\n}\n@container (max-width:359px){\n  .qp-stats{grid-template-columns:minmax(0,1fr);gap:10px}\n  .qp-stat.is-primary{text-align:left}\n  .qp-stat.is-primary .qp-amount{justify-content:flex-start}\n  .qp-head{gap:4px}\n  .qp-tools{gap:3px}\n  .qp-key select{max-width:76px}\n  .qp-refresh.is-retry span{display:none}\n}\n@media (max-width:520px){\n  .dialog:has(#quotaPanel) .field{grid-template-columns:minmax(0,1fr);gap:6px}\n  .dialog:has(#quotaPanel) .f-label{padding-top:0}\n  .dialog:has(#quotaPanel) .dlg-head{flex-wrap:wrap;gap:8px}\n  .dialog:has(#quotaPanel) .dlg-titles{flex-basis:calc(100% - 84px)}\n  .dialog:has(#quotaPanel) .head-switch{margin-left:auto}\n  .dialog:has(#quotaPanel) .dlg-foot{flex-wrap:wrap}\n  .dialog:has(#quotaPanel) .foot-note{flex-basis:100%;order:2;text-align:left}\n}\n\n\n/* ---------- 搜索接管日志 ---------- */\n/* 链路表示最终通道，而不是上游不可观测的逐跳处理时间线。 */\n.route-card,.log-card{--lg3:#626a77;--lg-label:#515966;--lg-blue:#3559d8;--lg-plate:#edf1ff}\n.log-card{position:relative;container-type:inline-size;margin-top:14px;background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-sm);overflow:hidden;transition:background-color .25s,border-color .25s;animation:log-enter .26s var(--ease)}\n[data-theme=dark] .route-card,[data-theme=dark] .log-card{--lg3:#9aa1ac;--lg-label:#c4c9d2;--lg-blue:#9eb0ff;--lg-plate:#252d46}\n@keyframes log-enter{from{opacity:0;transform:translateY(5px)}}\n.lc-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 20px 13px}\n.lc-title{min-width:0}\n.lc-title h3{margin:0;font-size:15px;font-weight:650;color:var(--text);display:flex;align-items:center;gap:8px}\n.lc-count{font:500 12px var(--mono);color:var(--lg3);font-variant-numeric:tabular-nums}\n.lc-sub{margin:4px 0 0;font-size:13px;color:var(--lg3);line-height:1.6}\n.lc-actions{display:flex;align-items:center;gap:7px;flex:none}\n.lc-filters{position:relative;display:flex;gap:2px;padding:3px;background:var(--field);border-radius:9px}\n.lc-filters button{position:relative;z-index:1;border:0;background:transparent;height:28px;padding:0 10px;font-size:13px;font-weight:500;color:var(--lg3);border-radius:7px;transition:color .15s}\n.lc-filters button[aria-checked=true]{color:var(--text)}\n.lc-filter-active{position:absolute;top:3px;left:3px;height:28px;pointer-events:none;background:var(--surface);box-shadow:var(--shadow-sm);border:1px solid var(--line);border-radius:7px;transition:transform .19s var(--ease),width .19s var(--ease)}\n.lc-privacy{display:grid;place-items:center;width:34px;height:34px;border:1px solid transparent;border-radius:9px;background:transparent;color:var(--lg3);transition:background-color .15s,color .15s,transform .12s}\n.lc-privacy:hover{background:var(--field);color:var(--text)}\n.lc-privacy:active{transform:scale(.96)}\n.lc-privacy[aria-pressed=true]{background:var(--lg-plate);color:var(--lg-blue)}\n.log-card button:focus-visible{outline:2px solid var(--agent);outline-offset:2px}\n.log-list{padding:2px 20px 10px;min-height:88px;max-height:620px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;overflow-anchor:none}\n.log-entry{position:relative;border:0;border-bottom:1px solid var(--hair);margin:0;background:var(--surface)}\n.log-entry.is-new{animation:log-drop .3s var(--ease)}\n@keyframes log-drop{\n  from{transform:translateY(-6px);opacity:0}\n  to{transform:none;opacity:1}\n}\n.log-entry.is-final{animation:log-settle .38s var(--ease)}\n@keyframes log-settle{from{opacity:.72}to{opacity:1}}\n.le-head{display:block;height:52px;width:100%;padding:14px 0 10px;border:0;background:var(--surface);text-align:left;color:inherit;font:inherit;border-radius:5px}\n.le-top{display:grid;grid-template-columns:minmax(0,104px) minmax(0,1fr) auto 68px 16px;align-items:center;gap:14px;min-width:0}\n.log-card .le-head:focus-visible{outline-offset:-2px}\n.le-time{font:550 12px var(--mono);color:var(--text-2);font-variant-numeric:tabular-nums;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}\n.le-query{display:block;min-width:0;font-size:14px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text);transition:color .16s}\n.le-query[data-private=true]{font-weight:400;color:var(--lg3)}\n.le-head:hover .le-query{color:var(--lg-blue)}\n.le-state{display:flex;gap:10px;justify-content:flex-end;flex-wrap:nowrap}\n.le-chip{font-size:12px;font-weight:600;padding:2px 7px;line-height:18px;border-radius:6px;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}\n.le-dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}\n.le-chip[data-t=ok]{color:var(--lg-blue);background:var(--lg-plate)}\n.le-chip[data-t=warn]{color:var(--warn-text);background:var(--warn-soft)}\n.le-chip[data-t=err]{color:var(--err-text);background:var(--err-soft)}\n.le-chip[data-t=idle]{color:var(--lg-label);background:var(--field)}\n.le-chip[data-t=run]{color:var(--lg-blue);background:var(--lg-plate)}\n.le-chip[data-t=run] .le-dot{animation:log-pulse 1.6s ease-in-out infinite}\n@keyframes log-pulse{50%{opacity:.3}}\n.le-dur{text-align:right;font:500 12px var(--mono);color:var(--lg3);font-variant-numeric:tabular-nums;white-space:nowrap}\n.le-chevron{display:grid;place-items:center;color:var(--lg3);transition:transform .19s var(--ease)}\n.le-chevron .ic{width:13px;height:13px}\n.log-entry.is-open .le-chevron{transform:rotate(90deg)}\n\n.lband{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:20px;align-items:center;height:48px;padding:0 0 10px;min-width:0}\n.lroute-viewport{display:flex;align-items:center;min-width:0;height:38px;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent;border-radius:5px}\n.lroute-viewport:focus-visible{outline:2px solid var(--agent);outline-offset:2px}\n.lroute{display:flex;align-items:center;flex-wrap:wrap;gap:4px 0;min-width:0;max-width:540px}\n.lroute-viewport>.lroute{flex-wrap:nowrap;flex:none;width:min(640px,100%);min-width:max-content;max-width:none}\n.lroute-viewport .lwire{flex:1 0 20px;min-width:20px}\n.lnode{display:flex;align-items:center;gap:6px;flex:none;padding:3px 6px;border-radius:6px;border:1px solid transparent;min-width:0}\n.lnode .tile{--s:18px;border-radius:4px;background:transparent;border-color:transparent;flex:none}\n.lnode[data-s=off] .tile{filter:grayscale(1);opacity:.5}\n.lnode .lhub{display:grid;place-items:center;width:18px;height:18px;color:var(--lg3)}\n.lnode .lhub .ic{width:15px;height:15px}\n.lnode .ln-name{font-size:12px;color:var(--lg-label);white-space:nowrap}\n.lnode[data-s=hit]{background:var(--lg-plate)}\n.lnode[data-s=hit] .ln-name,.lnode[data-s=hit] .lhub{color:var(--lg-blue)}\n.lnode[data-s=hit][data-tone=warn]{background:var(--warn-soft)}\n.lnode[data-s=hit][data-tone=warn] .ln-name{color:var(--warn-text)}\n.lnode[data-s=fail]{background:var(--err-soft)}\n.lnode[data-s=fail] .ln-name{color:var(--err-text)}\n.lnode[data-s=off]{border-style:dashed;border-color:var(--line-2)}\n.lnode[data-s=off] .ln-name{color:var(--lg3)}\n.lwire{position:relative;flex:0 0 24px;min-width:15px;height:1px;margin:0 5px;color:var(--agent);background:repeating-linear-gradient(90deg,var(--line-2) 0 3px,transparent 3px 6px)}\n.lwire[data-s=flow],.lwire[data-s=back]{background:currentColor}\n.lwire[data-s=back]{color:var(--warn)}\n.lwire[data-s=dead]{color:var(--err);background:repeating-linear-gradient(90deg,currentColor 0 3px,transparent 3px 6px)}\n.lwire[data-s=flow]::before,.lwire[data-s=back]::before{content:\"\";position:absolute;right:0;top:-2px;width:5px;height:5px;border-top:1px solid currentColor;border-right:1px solid currentColor;transform:rotate(45deg)}\n.log-entry.is-replaying .lroute > *,.history-route.is-replaying > *{opacity:.35}\n.log-entry.is-replaying .lroute > .is-replay-seen,.history-route.is-replaying > .is-replay-seen{opacity:1}\n.log-entry.is-replaying .lnode[data-s=hit],.history-route.is-replaying .lnode[data-s=hit]{background:var(--rp-blue-soft)}\n.log-entry.is-replaying .lnode[data-s=fail],.history-route.is-replaying .lnode[data-s=fail]{background:color-mix(in srgb,var(--rp-coral) 8%,var(--surface))}\n.log-entry.is-replaying .lnode[data-s=fail] .ln-name,.history-route.is-replaying .lnode[data-s=fail] .ln-name{color:var(--rp-coral-text)}\n.log-entry.is-replaying .lwire[data-s=dead],.history-route.is-replaying .lwire[data-s=dead]{color:var(--rp-coral)}\n.log-entry.is-replaying .lwire[data-s=flow],.history-route.is-replaying .lwire[data-s=flow]{color:var(--rp-blue)}\n.log-entry.is-replaying .lwire[data-s=back],.history-route.is-replaying .lwire[data-s=back]{color:var(--rp-amber)}\n\n.ldet{display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .26s var(--ease),opacity .18s}\n.ldet-inner{overflow:hidden;min-height:0}\n.log-entry.is-open .ldet{grid-template-rows:1fr;opacity:1}\n.ldet-body{padding:0}\n.lquery{min-width:0;padding:6px 0 14px}\n.ldet code{font:500 12px var(--mono);color:var(--lg-label);background:var(--field);border-radius:4px;padding:1px 5px}\n.log-usage{padding-top:1px}\n.lu-table{overflow-x:auto;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}\n.lu-columns,.lu-row{display:grid;grid-template-columns:minmax(110px,1fr) minmax(65px,.65fr) minmax(100px,1fr) minmax(130px,1.2fr);gap:12px;align-items:center;min-width:0}\n.lu-columns{font-size:12px;color:var(--lg3);line-height:1.6;padding:0 0 5px}\n.lu-columns>[role=columnheader]{display:flex;align-items:center;gap:5px}\n.lu-row{padding:7px 0;min-height:35px;font-size:13px;line-height:1.6}\n.lu-row+.lu-row{border-top:1px solid var(--hair)}\n.lu-provider{display:flex;align-items:center;gap:7px;font-weight:550}\n.lu-provider .tile{--s:18px;border-radius:4px;flex:none}\n.lu-provider small{font-size:12px;font-weight:400;color:var(--lg3);margin-left:7px}\n.lu-provider .lhub{width:18px;height:18px;display:grid;place-items:center;color:var(--lg3)}\n.lu-operation{color:var(--lg-label)}\n.lu-result{display:flex;align-items:center;gap:6px;color:var(--lg-label);flex-wrap:wrap}\n.lu-result[data-result=failed]{color:var(--err-text)}\n.lu-result[data-result=running]{color:var(--lg-blue)}\n.lu-result code{font-size:11px;font-weight:500;max-width:160px;overflow-wrap:anywhere}\n.lu-charge{font-variant-numeric:tabular-nums;font-weight:550;display:flex;align-items:center;gap:7px;flex-wrap:wrap}\n.lu-charge small{font-size:11px;font-weight:400;color:var(--lg3)}\n.lu-charge[data-basis=estimated] small{color:var(--warn-text)}\n.lu-unknown{display:inline-flex;align-items:center;gap:5px;color:var(--lg3);font-size:12px}\n.lu-info{display:inline-flex;align-items:center;justify-content:center;flex:none;width:20px;height:20px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--lg3);cursor:help;vertical-align:middle;transition:color .15s var(--ease),background-color .15s var(--ease)}\n.lu-info-icon{display:block;width:16px;height:16px;stroke:currentColor;stroke-width:1.25;stroke-linecap:round}\n.lu-info-icon circle{fill:var(--surface)}\n.lu-info:hover,.lu-info:focus-visible{color:var(--lg-blue);background:var(--lg-plate)}\n[data-theme=dark] .lu-info-icon circle{fill:#f4f5f7;stroke:#f4f5f7}\n[data-theme=dark] .lu-info-icon path{stroke:#555e6d}\n.lu-empty,.lu-empty-row{margin:0;padding:7px 0;color:var(--lg3);font-size:12px;line-height:1.65}\n.lc-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px 9px 20px;border-top:1px solid var(--hair);font-size:12px;color:var(--lg3)}\n.log-card #logClear{color:var(--lg3);height:28px;font-size:13px}\n.lc-empty{display:grid;gap:6px;justify-items:center;padding:38px 20px 40px;text-align:center}\n.lc-empty p{margin:0;font-size:13px;color:var(--text-2)}\n.lc-empty small{font-size:13px;color:var(--lg3)}\n\n@container (max-width:680px){\n  .lc-head{flex-wrap:wrap;padding:16px}\n  .lc-actions{flex-wrap:wrap}\n  .log-list{padding-inline:10px}\n  .le-top{grid-template-columns:78px minmax(0,1fr) auto 48px 14px;gap:9px}\n  .le-state{gap:6px}\n  .lband{gap:12px}\n  .lu-columns,.lu-row{min-width:520px}\n  .lc-foot{padding-left:16px;flex-wrap:wrap}\n}\n@container (max-width:420px){\n  .le-head{height:78px}\n  .le-top{grid-template-columns:minmax(0,1fr) auto auto 14px;row-gap:9px}\n  .le-time{grid-area:1/1}\n  .le-state{grid-area:1/2}\n  .le-top>.le-dur{grid-area:1/3}\n  .le-chevron{grid-area:1/4}\n  .le-query{grid-area:2/1/3/5}\n}\n\n.dlg-form:has(#quotaPanel) .f-help{font-size:13px;line-height:1.65}\n.dlg-form:has(#quotaPanel) .field:has(+ #quotaSlot){border-bottom:0}\n.log-card{min-width:0}\n\n.route-tooltip:is([data-kind=log],[data-kind=quota]){max-height:min(280px,calc(100vh - 24px));overflow-y:auto;animation:log-tip-in .14s var(--ease)}\n@keyframes log-tip-in{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}\n\n@media(prefers-reduced-motion:reduce){.ldet,.le-chevron,.lu-info,.route-tooltip:is([data-kind=log],[data-kind=quota]){transition:none!important;animation:none!important}.le-chip[data-t=run] .le-dot{animation:none!important}}\n";
+    const ROUTE_CARD = "<section class=\"route-card\" id=\"routeCard\" data-layout=\"wide\" aria-labelledby=\"routeTitle\">\n  <div class=\"rc-head\">\n    <div class=\"rc-title\">\n      <h3 id=\"routeTitle\" tabindex=\"-1\">搜索路由</h3>\n      <span class=\"pill\" id=\"statusPill\" data-s=\"load\"><i class=\"pill-dot\" aria-hidden=\"true\"></i><span id=\"statusText\">读取配置…</span></span>\n    </div>\n    <div class=\"rc-actions\">\n      <div class=\"strip-slot\" id=\"stripSlot\"><div><div class=\"strip\" id=\"strip\" role=\"group\" aria-label=\"搜索顺序与最近验证状态\"></div></div></div>\n      <button type=\"button\" class=\"btn\" id=\"testBtn\"></button>\n      <div class=\"popover\" id=\"testPop\" role=\"dialog\" aria-modal=\"false\" aria-labelledby=\"testPopTitle\" hidden>\n        <p class=\"pop-title\" id=\"testPopTitle\">测试全部已开启的搜索来源？</p>\n        <p class=\"pop-text\">会逐一测试已开启的搜索来源及其 Key，各次测试会消耗相应额度。</p>\n        <div class=\"pop-actions\">\n          <button type=\"button\" class=\"btn btn-ghost btn-sm\" data-pop=\"cancel\">取消</button>\n          <button type=\"button\" class=\"btn btn-primary btn-sm\" data-pop=\"go\">开始测试</button>\n        </div>\n      </div>\n    </div>\n      <div class=\"history-bar\" id=\"historyBar\" hidden>\n        <span class=\"history-label\" id=\"historyLabel\"></span>\n        <span class=\"history-phase\" id=\"historyPhase\" aria-hidden=\"true\"></span>\n        <div class=\"history-actions\">\n          <button type=\"button\" class=\"replay-control\" id=\"historyStop\">停止</button>\n          <button type=\"button\" class=\"replay-control history-return\" id=\"historyReturn\">返回该条日志</button>\n          <button type=\"button\" class=\"replay-control history-dismiss\" id=\"historyDismiss\" aria-label=\"关闭回放提示\" hidden></button>\n        </div>\n      </div>\n  </div>\n    <div class=\"history-context\" id=\"historyContext\" hidden>\n      <span class=\"history-query\" id=\"historyQuery\"></span>\n      <div class=\"lroute history-route\" id=\"historyRoute\" role=\"img\" aria-label=\"这条历史记录的完整结果链路\" title=\"最终结果路径，不表示上游网络请求的先后顺序。\"></div>\n    </div>\n  <div class=\"banner-slot\" id=\"bannerSlot\"></div>\n  <div class=\"stage\" id=\"stage\" data-layout=\"wide\" role=\"group\" aria-label=\"搜索路由图\">\n    <svg class=\"wires\" id=\"wires\" aria-hidden=\"true\"></svg>\n    <div class=\"col-agent\" id=\"colAgent\">\n      <div class=\"node node-dsh\" id=\"nodeDsh\" title=\"宿主：DeepSeek Harness 的 web_search 工具\">\n        <span class=\"port\" data-port=\"dsh-out\"></span>\n        <span class=\"port\" data-port=\"dsh-alt\"></span>\n        <img class=\"node-logo\" data-logo=\"dsh\" alt=\"\">\n        <span class=\"node-name\">DeepSeek Harness</span>\n        <span class=\"node-meta\">web_search</span>\n      </div>\n      <div class=\"node node-official\" id=\"nodeOfficial\" aria-hidden=\"true\">\n        <span class=\"port\" data-port=\"off-in\"></span>\n        <img class=\"node-logo\" data-logo=\"deepseek\" alt=\"\">\n        <span class=\"off-text\">\n          <span class=\"node-name\">DeepSeek 官方搜索</span>\n          <span class=\"node-meta\">内置 · 已恢复</span>\n        </span>\n      </div>\n    </div>\n    <div class=\"col-hub\">\n      <button type=\"button\" class=\"node node-hub\" id=\"nodeHub\" aria-label=\"Grok Search Rs 设置\">\n        <span class=\"port\" data-port=\"hub-in\"></span>\n        <span class=\"port\" data-port=\"hub-out\"></span>\n        <span class=\"hub-glyph\" id=\"hubGlyph\" aria-hidden=\"true\"></span>\n        <span class=\"hub-text\">\n          <span class=\"node-name\">Grok Search Rs</span>\n          <span class=\"node-meta\" id=\"hubMeta\">准备中…</span>\n        </span>\n        <span class=\"hub-pill\" id=\"hubPill\"><span id=\"hubPillText\">按顺序</span><span aria-hidden=\"true\">›</span></span>\n      </button>\n    </div>\n    <div class=\"col-list\" id=\"colList\">\n      <div class=\"rgroup\" data-group=\"primary\">\n        <div class=\"rg-label\">主搜索</div>\n        <div class=\"rg-rows\" id=\"rowsPrimary\"></div>\n      </div>\n      <div class=\"rgroup\" data-group=\"supp\">\n        <div class=\"rg-label\">补充来源 <span class=\"rg-hint\">拖动排序</span></div>\n        <div class=\"rg-rows\" id=\"rowsSupp\"></div>\n      </div>\n      <div class=\"rgroup\" data-group=\"extract\">\n        <div class=\"rg-label\">专用抽取</div>\n        <div class=\"rg-rows\" id=\"rowsExtract\"></div>\n      </div>\n    </div>\n  </div>\n    <div class=\"history-stage\" id=\"historyStage\" role=\"group\" aria-label=\"历史搜索结果链路\" hidden></div>\n    <p class=\"history-note\" id=\"historyNote\" hidden>历史结果路径 · 动效不代表原始请求时序</p>\n\n  <footer class=\"rc-foot\">\n    <span class=\"cf-label\">配置文件</span>\n    <code class=\"cf-path\" id=\"cfgPath\"></code>\n    <span class=\"tag\" id=\"cfgTag\"></span>\n    <span class=\"cf-spacer\"></span>\n    <button type=\"button\" class=\"btn btn-ghost btn-sm\" data-open=\"file\">打开文件</button>\n    <button type=\"button\" class=\"btn btn-ghost btn-sm\" data-open=\"folder\">打开文件夹</button>\n  </footer>\n</section>\n\n  <section class=\"log-card\" id=\"logCard\" data-region=\"插件提供的界面\" aria-labelledby=\"logTitle\">\n    <div class=\"lc-head\">\n      <div class=\"lc-title\">\n        <h3 id=\"logTitle\">最近搜索 <span class=\"lc-count\" id=\"logCount\">0</span></h3>\n        <p class=\"lc-sub\">点击记录查看查询与消耗</p>\n      </div>\n      <div class=\"lc-actions\">\n        <div class=\"lc-filters\" role=\"radiogroup\" aria-label=\"筛选搜索记录\">\n          <span class=\"lc-filter-active\" id=\"logFilterActive\" aria-hidden=\"true\"></span>\n          <button type=\"button\" role=\"radio\" data-logfilter=\"all\" aria-checked=\"true\" tabindex=\"0\">全部</button>\n          <button type=\"button\" role=\"radio\" data-logfilter=\"ok\" aria-checked=\"false\" tabindex=\"-1\">成功</button>\n          <button type=\"button\" role=\"radio\" data-logfilter=\"fallback\" aria-checked=\"false\" tabindex=\"-1\">回退</button>\n          <button type=\"button\" role=\"radio\" data-logfilter=\"failed\" aria-checked=\"false\" tabindex=\"-1\">失败</button>\n        </div>\n        <button type=\"button\" class=\"lc-privacy\" id=\"logPrivacy\" aria-pressed=\"false\" aria-label=\"隐藏搜索内容\" title=\"隐藏搜索内容\"></button>\n      </div>\n    </div>\n    <div class=\"log-list\" id=\"logList\" role=\"list\" aria-label=\"最近搜索与路由事件\"></div>\n    <footer class=\"lc-foot\">\n      <span id=\"logNote\">仅内存 · 最近 20 条 · 停用或退出 DSH 后清空</span>\n      <button type=\"button\" class=\"btn btn-ghost btn-sm\" id=\"logClear\">清空记录</button>\n    </footer>\n    <div class=\"sr-only\" id=\"logAnnouncer\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"></div>\n  </section>\n\n<div class=\"route-tooltip\" id=\"logTooltip\" role=\"tooltip\" hidden></div>\n";
     const ROUTE_LAYER = "<div class=\"overlay\" id=\"overlay\" hidden>\n  <div class=\"dialog\" id=\"dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"dlgTitle\"></div>\n</div>\n<div class=\"route-tooltip\" id=\"routeTooltip\" role=\"tooltip\" hidden></div>\n<div class=\"toasts\" id=\"toasts\" aria-live=\"polite\"></div>\n<div class=\"sr-only\" id=\"announcer\" aria-live=\"polite\"></div>\n";
     const codec = function createSettingsCodec(typeSymbol, jsonSchema) {
   const invalid = () => { throw new TypeError('Invalid settings payload.'); };
@@ -2991,7 +4606,7 @@ return Object.freeze({
     get jsonSchema() { return structuredClone(jsonSchema); },
   });
 };
-    const descriptors = [{"id":"dsh-grok-search#grokSearchSettings/snapshot","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"snapshot","description":"Read redacted Grok shared configuration and current takeover state.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#Snapshot","jsonSchema":{"type":"object","properties":{"control":{"type":"object","properties":{"available":{"type":"boolean"},"phase":{"type":"string"},"policy":{"anyOf":[{"type":"string"},{"type":"null"}]},"revision":{"type":"number"},"canStop":{"type":"boolean"},"completionCommitted":{"type":"boolean"},"routeVerified":{"type":"boolean"},"routeChanged":{"type":"boolean"},"releaseOperationId":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["available","phase","policy","revision","canStop","completionCommitted","routeVerified","routeChanged","releaseOperationId","error"],"additionalProperties":false},"program":{"anyOf":[{"type":"null"},{"type":"object","properties":{"phase":{"type":"string"},"program":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]},"configPath":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]},"configuration":{"type":"object","additionalProperties":true}},"required":["phase","program","configPath","error"],"additionalProperties":false}]},"config":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"exists":{"type":"boolean"},"revision":{"type":"string"},"fields":{"type":"object","additionalProperties":true},"unknownFields":{"type":"array","items":{"type":"string"}},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["path","exists","revision","fields","unknownFields"],"additionalProperties":false},"capabilities":{"type":"object","properties":{"secretsAllowed":{"type":"boolean"},"transport":{"type":"string"},"reason":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["secretsAllowed","transport","reason"],"additionalProperties":false},"route":{"anyOf":[{"type":"null"},{"type":"object","properties":{"at":{"type":"number"},"origin":{"type":"string"},"outcome":{"type":"string"},"served":{"anyOf":[{"type":"string"},{"type":"null"}]},"grokCode":{"anyOf":[{"type":"string"},{"type":"null"}]},"fallbackUsed":{"type":"boolean"},"code":{"type":"string"},"failures":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["at","origin","outcome","served","grokCode","fallbackUsed","failures"],"additionalProperties":false}]},"plugin":{"type":"object","properties":{"budgetMs":{"anyOf":[{"type":"number"},{"type":"null"}]},"programConfigured":{"type":"boolean"},"configSource":{"type":"string"}},"required":["budgetMs","programConfigured","configSource"],"additionalProperties":false},"available":{"type":"boolean"},"phase":{"type":"string"},"policy":{"anyOf":[{"type":"string"},{"type":"null"}]},"revision":{"type":"number"},"canStop":{"type":"boolean"},"completionCommitted":{"type":"boolean"},"routeVerified":{"type":"boolean"},"routeChanged":{"type":"boolean"},"releaseOperationId":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["control","program","config","capabilities","available","phase","policy","revision","canStop","completionCommitted","routeVerified","routeChanged","releaseOperationId","error"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/save","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"save","description":"Save validated changes to the shared Grok configuration with CAS.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SaveRequest","jsonSchema":{"type":"object","properties":{"expectedRevision":{"type":"string"},"updates":{"type":"object","additionalProperties":true}},"required":["expectedRevision","updates"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SaveResult","jsonSchema":{"type":"object","properties":{"config":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"exists":{"type":"boolean"},"revision":{"type":"string"},"fields":{"type":"object","additionalProperties":true},"unknownFields":{"type":"array","items":{"type":"string"}},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["path","exists","revision","fields","unknownFields"],"additionalProperties":false}},"required":["config"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/restoreConfig","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"restoreConfig","description":"Restore one verified configuration history revision with CAS over a secure connection.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RestoreRequest","jsonSchema":{"type":"object","properties":{"expectedRevision":{"type":"string"},"revision":{"type":"string"}},"required":["expectedRevision","revision"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RestoreResult","jsonSchema":{"type":"object","properties":{"config":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"exists":{"type":"boolean"},"revision":{"type":"string"},"fields":{"type":"object","additionalProperties":true},"unknownFields":{"type":"array","items":{"type":"string"}},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["path","exists","revision","fields","unknownFields"],"additionalProperties":false}},"required":["config"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/reveal","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"reveal","description":"Explicitly reveal one credential over an authenticated secure connection.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RevealRequest","jsonSchema":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RevealResult","jsonSchema":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"},"readOnly":{"type":"boolean"}},"required":["key","value","source","readOnly"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/prepareProgram","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"prepareProgram","description":"Discover or prepare the verified private Grok program.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#PrepareResult","jsonSchema":{"type":"object","properties":{"phase":{"type":"string"},"program":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]},"configPath":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]},"configuration":{"type":"object","additionalProperties":true}},"required":["phase","program","configPath","error"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/openConfigLocation","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"openConfigLocation","description":"Open the shared Grok configuration file or its folder on the local host.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#OpenConfigRequest","jsonSchema":{"type":"object","properties":{"kind":{"type":"string"}},"required":[],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#OpenConfigResult","jsonSchema":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"opened":{"type":"boolean"},"exists":{"type":"boolean"},"kind":{"type":"string"}},"required":["path","opened"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/diagnose","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"diagnose","description":"Check every enabled source and every configured key without exposing secrets.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#DiagnosticsResult","jsonSchema":{"type":"array","items":{"type":"object","additionalProperties":true}}}},{"id":"dsh-grok-search#grokSearchSettings/diagnoseProvider","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"diagnoseProvider","description":"Check one search engine or source (every configured key) with a real request.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#DiagnoseProviderRequest","jsonSchema":{"type":"object","properties":{"provider":{"type":"string"},"operationId":{"type":"string"}},"required":["provider"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#ProviderDiagnosis","jsonSchema":{"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"code":{"type":"string"},"message":{"type":"string"},"elapsedMs":{"type":"number"},"keys":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["provider","status","code","message"],"additionalProperties":true}}},{"id":"dsh-grok-search#grokSearchSettings/cancelDiagnosis","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"cancelDiagnosis","description":"Cancel only a settings diagnosis owned by this plugin; accepted requests may still be billed upstream.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#CancelDiagnosisRequest","jsonSchema":{"type":"object","properties":{"operationId":{"type":"string"}},"required":["operationId"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#CancelDiagnosisResult","jsonSchema":{"type":"object","properties":{"cancelled":{"type":"boolean"}},"required":["cancelled"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/testSearch","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"testSearch","description":"Run a real test search and report fallback metadata.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#TestSearchRequest","jsonSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#TestSearchResult","jsonSchema":{"type":"object","properties":{"sources":{"type":"array","items":{"type":"object","additionalProperties":true}},"fallbackUsed":{"type":"boolean"},"provider":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["sources","fallbackUsed","provider"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/preferences","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"preferences","description":"Read plugin-private route preferences.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#PreferencesResult","jsonSchema":{"type":"object","properties":{"value":{"type":"object","additionalProperties":true},"revision":{"type":"string"}},"required":["value","revision"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/savePreferences","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"savePreferences","description":"Save plugin-private route preferences with CAS.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SavePreferencesRequest","jsonSchema":{"type":"object","properties":{"expectedRevision":{"type":"string"},"value":{"type":"object","additionalProperties":true}},"required":["expectedRevision","value"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SavePreferencesResult","jsonSchema":{"type":"object","properties":{"value":{"type":"object","additionalProperties":true},"revision":{"type":"string"}},"required":["value","revision"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/stop","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"stop","description":"Compatibility endpoint for older clients; native switch is preferred.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#StopResult","jsonSchema":{"type":"object","properties":{"outcome":{"type":"object","additionalProperties":true},"snapshot":{"type":"object","properties":{"available":{"type":"boolean"},"phase":{"type":"string"},"policy":{"anyOf":[{"type":"string"},{"type":"null"}]},"revision":{"type":"number"},"canStop":{"type":"boolean"},"completionCommitted":{"type":"boolean"},"routeVerified":{"type":"boolean"},"routeChanged":{"type":"boolean"},"releaseOperationId":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["available","phase","policy","revision","canStop","completionCommitted","routeVerified","routeChanged","releaseOperationId","error"],"additionalProperties":false}},"required":["outcome","snapshot"],"additionalProperties":false}}}].map(descriptor => ({
+    const descriptors = [{"id":"dsh-grok-search#grokSearchSettings/readSearchLog","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"readSearchLog","description":"Read or clear plugin-owned volatile search history, or close only this secure view.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#readSearchLogRequest","jsonSchema":{"type":"object","properties":{"sessionId":{"type":"string"}},"required":["sessionId"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#readSearchLogResult","jsonSchema":{"type":"object","properties":{"records":{"type":"array","items":{"type":"object","additionalProperties":true}},"closed":{"type":"boolean"}},"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/clearSearchLog","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"clearSearchLog","description":"Read or clear plugin-owned volatile search history, or close only this secure view.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#clearSearchLogRequest","jsonSchema":{"type":"object","properties":{"sessionId":{"type":"string"}},"required":["sessionId"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#clearSearchLogResult","jsonSchema":{"type":"object","properties":{"records":{"type":"array","items":{"type":"object","additionalProperties":true}},"closed":{"type":"boolean"}},"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/closeSearchLog","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"closeSearchLog","description":"Read or clear plugin-owned volatile search history, or close only this secure view.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#closeSearchLogRequest","jsonSchema":{"type":"object","properties":{"sessionId":{"type":"string"}},"required":["sessionId"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#closeSearchLogResult","jsonSchema":{"type":"object","properties":{"records":{"type":"array","items":{"type":"object","additionalProperties":true}},"closed":{"type":"boolean"}},"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/toolCallRoute","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"toolCallRoute","description":"Return the exact recorded routes for one session tool call; no query text or credentials.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#ToolCallRouteRequest","jsonSchema":{"type":"object","properties":{"sessionId":{"type":"string"},"callId":{"type":"string"}},"required":["sessionId","callId"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#ToolCallRouteResult","jsonSchema":{"type":"object","properties":{"known":{"type":"boolean"},"state":{"type":"string"},"routes":{"type":"array","items":{"type":"object","properties":{"served":{"type":["string","null"]},"outcome":{"type":"string"},"fallbackUsed":{"type":"boolean"},"code":{"type":"string"},"resultProviders":{"type":"array","items":{"type":"string"}},"resultProvidersComplete":{"type":"boolean"}},"required":["served","outcome","fallbackUsed","code"],"additionalProperties":false}},"routesComplete":{"type":"boolean"}},"required":["known","state","routes"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/accountQuota","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"accountQuota","description":"Query only the saved provider account; never returns credentials.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#AccountQuotaRequest","jsonSchema":{"type":"object","properties":{"provider":{"type":"string"},"keyIndex":{"type":"number"},"expectedRevision":{"type":"string"},"operationId":{"type":"string"},"quotaRevision":{"type":"string"}},"required":["provider","expectedRevision","operationId","quotaRevision"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#AccountQuotaResult","jsonSchema":{"type":"object","properties":{"supported":{"type":"boolean"},"value":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]}},"required":["supported","value"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/snapshot","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"snapshot","description":"Read redacted Grok shared configuration and current takeover state.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#Snapshot","jsonSchema":{"type":"object","properties":{"control":{"type":"object","properties":{"available":{"type":"boolean"},"phase":{"type":"string"},"policy":{"anyOf":[{"type":"string"},{"type":"null"}]},"revision":{"type":"number"},"canStop":{"type":"boolean"},"completionCommitted":{"type":"boolean"},"routeVerified":{"type":"boolean"},"routeChanged":{"type":"boolean"},"releaseOperationId":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["available","phase","policy","revision","canStop","completionCommitted","routeVerified","routeChanged","releaseOperationId","error"],"additionalProperties":false},"program":{"anyOf":[{"type":"null"},{"type":"object","properties":{"phase":{"type":"string"},"program":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]},"configPath":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]},"configuration":{"type":"object","additionalProperties":true}},"required":["phase","program","configPath","error"],"additionalProperties":false}]},"config":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"exists":{"type":"boolean"},"revision":{"type":"string"},"quotaRevision":{"type":"string"},"fields":{"type":"object","additionalProperties":true},"unknownFields":{"type":"array","items":{"type":"string"}},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["path","exists","revision","fields","unknownFields"],"additionalProperties":false},"capabilities":{"type":"object","properties":{"secretsAllowed":{"type":"boolean"},"transport":{"type":"string"},"reason":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["secretsAllowed","transport","reason"],"additionalProperties":false},"route":{"anyOf":[{"type":"null"},{"type":"object","properties":{"at":{"type":"number"},"origin":{"type":"string"},"outcome":{"type":"string"},"served":{"anyOf":[{"type":"string"},{"type":"null"}]},"grokCode":{"anyOf":[{"type":"string"},{"type":"null"}]},"fallbackUsed":{"type":"boolean"},"resultProviders":{"type":"array","items":{"type":"string"}},"resultProvidersComplete":{"type":"boolean"},"provenance":{"type":"string"},"code":{"type":"string"},"failures":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["at","origin","outcome","served","grokCode","fallbackUsed","failures"],"additionalProperties":false}]},"plugin":{"type":"object","properties":{"budgetMs":{"anyOf":[{"type":"number"},{"type":"null"}]},"programConfigured":{"type":"boolean"},"configSource":{"type":"string"}},"required":["budgetMs","programConfigured","configSource"],"additionalProperties":false},"available":{"type":"boolean"},"phase":{"type":"string"},"policy":{"anyOf":[{"type":"string"},{"type":"null"}]},"revision":{"type":"number"},"canStop":{"type":"boolean"},"completionCommitted":{"type":"boolean"},"routeVerified":{"type":"boolean"},"routeChanged":{"type":"boolean"},"releaseOperationId":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["control","program","config","capabilities","available","phase","policy","revision","canStop","completionCommitted","routeVerified","routeChanged","releaseOperationId","error"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/save","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"save","description":"Save validated changes to the shared Grok configuration with CAS.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SaveRequest","jsonSchema":{"type":"object","properties":{"expectedRevision":{"type":"string"},"updates":{"type":"object","additionalProperties":true}},"required":["expectedRevision","updates"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SaveResult","jsonSchema":{"type":"object","properties":{"config":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"exists":{"type":"boolean"},"revision":{"type":"string"},"quotaRevision":{"type":"string"},"fields":{"type":"object","additionalProperties":true},"unknownFields":{"type":"array","items":{"type":"string"}},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["path","exists","revision","fields","unknownFields"],"additionalProperties":false}},"required":["config"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/restoreConfig","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"restoreConfig","description":"Restore one verified configuration history revision with CAS over a secure connection.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RestoreRequest","jsonSchema":{"type":"object","properties":{"expectedRevision":{"type":"string"},"revision":{"type":"string"}},"required":["expectedRevision","revision"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RestoreResult","jsonSchema":{"type":"object","properties":{"config":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"exists":{"type":"boolean"},"revision":{"type":"string"},"quotaRevision":{"type":"string"},"fields":{"type":"object","additionalProperties":true},"unknownFields":{"type":"array","items":{"type":"string"}},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["path","exists","revision","fields","unknownFields"],"additionalProperties":false}},"required":["config"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/reveal","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"reveal","description":"Explicitly reveal one credential over an authenticated secure connection.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RevealRequest","jsonSchema":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#RevealResult","jsonSchema":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"},"readOnly":{"type":"boolean"}},"required":["key","value","source","readOnly"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/prepareProgram","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"prepareProgram","description":"Discover or prepare the verified private Grok program.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#PrepareResult","jsonSchema":{"type":"object","properties":{"phase":{"type":"string"},"program":{"anyOf":[{"type":"object","additionalProperties":true},{"type":"null"}]},"configPath":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]},"configuration":{"type":"object","additionalProperties":true}},"required":["phase","program","configPath","error"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/openConfigLocation","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"openConfigLocation","description":"Open the shared Grok configuration file or its folder on the local host.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#OpenConfigRequest","jsonSchema":{"type":"object","properties":{"kind":{"type":"string"}},"required":[],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#OpenConfigResult","jsonSchema":{"type":"object","properties":{"path":{"type":"string"},"displayPath":{"type":"string"},"opened":{"type":"boolean"},"exists":{"type":"boolean"},"kind":{"type":"string"}},"required":["path","opened"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/diagnose","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"diagnose","description":"Check every enabled source and every configured key without exposing secrets.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#DiagnosticsResult","jsonSchema":{"type":"array","items":{"type":"object","additionalProperties":true}}}},{"id":"dsh-grok-search#grokSearchSettings/diagnoseProvider","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"diagnoseProvider","description":"Check one search engine or source (every configured key) with a real request.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#DiagnoseProviderRequest","jsonSchema":{"type":"object","properties":{"provider":{"type":"string"},"operationId":{"type":"string"}},"required":["provider"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#ProviderDiagnosis","jsonSchema":{"type":"object","properties":{"provider":{"type":"string"},"status":{"type":"string"},"code":{"type":"string"},"message":{"type":"string"},"elapsedMs":{"type":"number"},"keys":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["provider","status","code","message"],"additionalProperties":true}}},{"id":"dsh-grok-search#grokSearchSettings/cancelDiagnosis","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"cancelDiagnosis","description":"Cancel only a settings diagnosis owned by this plugin; accepted requests may still be billed upstream.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#CancelDiagnosisRequest","jsonSchema":{"type":"object","properties":{"operationId":{"type":"string"}},"required":["operationId"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#CancelDiagnosisResult","jsonSchema":{"type":"object","properties":{"cancelled":{"type":"boolean"}},"required":["cancelled"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/testSearch","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"testSearch","description":"Run a real test search and report fallback metadata.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#TestSearchRequest","jsonSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#TestSearchResult","jsonSchema":{"type":"object","properties":{"sources":{"type":"array","items":{"type":"object","additionalProperties":true}},"fallbackUsed":{"type":"boolean"},"provider":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["sources","fallbackUsed","provider"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/preferences","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"preferences","description":"Read plugin-private route preferences.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#PreferencesResult","jsonSchema":{"type":"object","properties":{"value":{"type":"object","additionalProperties":true},"revision":{"type":"string"}},"required":["value","revision"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/savePreferences","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"savePreferences","description":"Save plugin-private route preferences with CAS.","invocation":{"kind":"direct"},"parameters":[{"name":"request","wire":"request","source":"json","codec":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SavePreferencesRequest","jsonSchema":{"type":"object","properties":{"expectedRevision":{"type":"string"},"value":{"type":"object","additionalProperties":true}},"required":["expectedRevision","value"],"additionalProperties":false}}}],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#SavePreferencesResult","jsonSchema":{"type":"object","properties":{"value":{"type":"object","additionalProperties":true},"revision":{"type":"string"}},"required":["value","revision"],"additionalProperties":false}}},{"id":"dsh-grok-search#grokSearchSettings/stop","service":"grokSearchSettings","namespace":"grokSearchSettings","method":"stop","description":"Compatibility endpoint for older clients; native switch is preferred.","invocation":{"kind":"direct"},"parameters":[],"result":{"mode":"strict","typeSymbol":"dsh-grok-search/settings#StopResult","jsonSchema":{"type":"object","properties":{"outcome":{"type":"object","additionalProperties":true},"snapshot":{"type":"object","properties":{"available":{"type":"boolean"},"phase":{"type":"string"},"policy":{"anyOf":[{"type":"string"},{"type":"null"}]},"revision":{"type":"number"},"canStop":{"type":"boolean"},"completionCommitted":{"type":"boolean"},"routeVerified":{"type":"boolean"},"routeChanged":{"type":"boolean"},"releaseOperationId":{"anyOf":[{"type":"string"},{"type":"null"}]},"error":{"anyOf":[{"type":"object","properties":{"code":{"type":["string","null"]},"message":{"type":"string"}},"required":["code","message"],"additionalProperties":false},{"type":"null"}]}},"required":["available","phase","policy","revision","canStop","completionCommitted","routeVerified","routeChanged","releaseOperationId","error"],"additionalProperties":false}},"required":["outcome","snapshot"],"additionalProperties":false}}}].map(descriptor => ({
       ...descriptor,
       parameters: descriptor.parameters.map(parameter => ({
         ...parameter, codec: codec(parameter.codec.typeSymbol, parameter.codec.jsonSchema),
@@ -2999,6 +4614,63 @@ return Object.freeze({
       result: codec(descriptor.result.typeSymbol, descriptor.result.jsonSchema),
     }));
     const text = { title: 'Grok 搜索', configure: 'Grok 搜索设置' };
+    // Session-only log privacy: survives settings remounts, cleared with the plugin's log.
+    const logMemory = { private: false };
+
+    function ProjectLink({ theme }) {
+      const element = useRef(null);
+      useEffect(() => {
+        const shadow = element.current.shadowRoot || element.current.attachShadow({ mode: 'open' });
+        // This is our slot content only: no host selectors, global styles or remote calls.
+        shadow.innerHTML = `<style>
+          :host{display:inline-flex;flex:none;width:24px;height:24px;vertical-align:middle}
+          .project{position:relative;display:inline-flex;--focus:#4d6bfe}
+          .project[data-theme=dark]{--focus:#9aabff}
+          a{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:24px;height:24px;border-radius:6px;text-decoration:none;cursor:pointer}
+          img{display:block;width:16px;height:16px;object-fit:contain;opacity:.7;transition:opacity 140ms ease}
+          a:hover img,a:focus-visible img{opacity:1}
+          a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+          a:active img{opacity:.85}
+          [role=tooltip]{position:absolute;top:calc(100% + 8px);left:50%;z-index:10;transform:translate(-50%,-2px);padding:5px 9px;border:1px solid #ffffff16;border-radius:7px;background:#26282d;color:#f5f6f8;box-shadow:0 4px 12px #0002;font:500 12px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;white-space:nowrap;opacity:0;visibility:hidden;pointer-events:none;transition:opacity 140ms ease,transform 140ms ease,visibility 140ms}
+          [role=tooltip]::before{content:"";position:absolute;bottom:100%;left:0;right:0;height:8px}
+          .project:not([data-dismissed]):is(:hover,:focus-within) [role=tooltip]{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,0)}
+          @media(prefers-reduced-motion:reduce){img,[role=tooltip]{transition:none}}
+        </style><span class="project"><a href="https://github.com/Lain-in-coding/dsh-grok-search" target="_blank" rel="noopener noreferrer" aria-label="打开 dsh-grok-search 的 GitHub 项目首页（新窗口）" aria-describedby="project-tip"><img alt="" aria-hidden="true" width="16" height="16" draggable="false"></a><span id="project-tip" role="tooltip">用着还行？给个star</span></span>`;
+        const root = shadow.querySelector('.project');
+        const image = shadow.querySelector('img');
+        const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+        const updateTheme = () => {
+          const dark = theme?.current ?? systemTheme.matches;
+          root.dataset.theme = dark ? 'dark' : 'light';
+          image.src = dark ? LOGOS.githubDark : LOGOS.github;
+        };
+        const show = () => root.removeAttribute('data-dismissed');
+        const dismiss = () => root.setAttribute('data-dismissed', '');
+        const keydown = event => { if (event.key === 'Escape' && root.matches(':hover,:focus-within')) dismiss(); };
+        root.addEventListener('pointerenter', show);
+        root.addEventListener('focusin', show);
+        document.addEventListener('keydown', keydown);
+        root.addEventListener('click', dismiss);
+        theme?.listeners.add(updateTheme);
+        systemTheme.addEventListener('change', updateTheme);
+        updateTheme();
+        return () => {
+          theme?.listeners.delete(updateTheme);
+          systemTheme.removeEventListener('change', updateTheme);
+          root.removeEventListener('pointerenter', show);
+          root.removeEventListener('focusin', show);
+          document.removeEventListener('keydown', keydown);
+          root.removeEventListener('click', dismiss);
+          shadow.replaceChildren();
+        };
+      }, [theme]);
+      return jsx('span', { ref: element, 'data-dsg-project': '1' });
+    }
+
+    function ProjectBadge({ subject, theme }) {
+      return subject?.kind === 'bundle' && subject.pkg?.name === 'dsh-grok-search'
+        ? jsx(ProjectLink, { theme }) : null;
+    }
 
     function remoteAdapter(remote) {
       return Object.fromEntries(descriptors.map(({ method }) => [method, async (...args) => {
@@ -3037,13 +4709,16 @@ return Object.freeze({
         const layerShadow = layerHost.attachShadow({ mode: 'open' });
         layerShadow.innerHTML = `<style>${ROUTE_CSS}</style><div class="dsg-surface dsg-layer">${ROUTE_LAYER}</div>`;
         document.body.appendChild(layerHost);
+        const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+        const currentTheme = () => theme?.current === null || theme?.current === undefined ? systemTheme.matches : theme.current;
         const controller = ROUTE_CONTROLLER({
           root, layer: layerShadow.querySelector('.dsg-layer'),
           remote: remoteAdapter(remote), logos: LOGOS, sourceChain: SOURCE_CHAIN, memory: memory.current,
+          logMemory,
+          createSearchLogView: SEARCH_LOG, createQuotaView: QUOTA_VIEW,
+          dark: currentTheme(),
         });
-        const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
-        const updateTheme = () => controller.setTheme(theme?.current === null || theme?.current === undefined
-          ? systemTheme.matches : theme.current);
+        const updateTheme = () => controller.setTheme(currentTheme());
         theme?.listeners.add(updateTheme);
         systemTheme.addEventListener('change', updateTheme);
         updateTheme();
@@ -3077,6 +4752,13 @@ return Object.freeze({
       // The optional theme fiber must never gate a working settings page.
       // Older/no-theme shells use prefers-color-scheme until it is available.
       const ui = ctx.inject(['remote.grokSearchSettings', 'slots', 'locale'], settingsCtx => {
+        settingsCtx.slots.inject('plugins.detail.badge', () => settingsCtx.slots.register({
+          name: 'plugins.detail.badge',
+          id: 'dsh-grok-search-project',
+          locale: NS,
+          order: 30,
+          inject: () => ({ theme }),
+        }, ProjectBadge));
         settingsCtx.slots.inject('plugins.bundle.config', () => settingsCtx.slots.register({
           name: 'plugins.bundle.config',
           key: 'dsh-grok-search',
@@ -3084,6 +4766,28 @@ return Object.freeze({
           order: 30,
           inject: () => ({ remote: settingsCtx.remote, theme }),
         }, RoutePage));
+        settingsCtx.slots.inject('tool.call.toolview', () => {
+          let stopped = false, selected = null, wrapper = null, remove = null;
+          const refresh = () => {
+            if (stopped) return;
+            const entry = settingsCtx.slots.entries('tool.call.toolview')
+              .find(row => row.options.key === 'web_search' && row.component !== wrapper);
+            if (entry === selected) return;
+            remove?.(); remove = null; selected = entry;
+            // The supported hosts publish a plain WebRow. Never strip another
+            // extension's injected props, stores or child-slot authority.
+            if (!entry || entry.inject || entry.store || entry.children || entry.select) return;
+            wrapper = TOOL_ROUTE_VIEW({ React, jsx, remote: remoteAdapter(settingsCtx.remote),
+              Original: entry.component }).Component;
+            remove = settingsCtx.slots.register({
+              name: 'tool.call.toolview', key: 'web_search', locale: entry.locale,
+              priority: (entry.options.priority ?? 0) - 1,
+            }, wrapper);
+          };
+          const unsubscribe = settingsCtx.slots.subscribe('tool.call.toolview', refresh);
+          refresh();
+          return () => { stopped = true; unsubscribe(); remove?.(); };
+        });
       });
       try {
         await ui;
@@ -3094,11 +4798,12 @@ return Object.freeze({
         throw error;
       }
       return async () => {
+        logMemory.private = false;
         await ui.dispose();
         await themeView.dispose();
         await unmountRemote();
       };
     }
-    return { NS, inject, apply, __test: Object.freeze({ descriptors, sourceChain: SOURCE_CHAIN }) };
+    return { NS, inject, apply, __test: Object.freeze({ descriptors, sourceChain: SOURCE_CHAIN, toolRouteView: TOOL_ROUTE_VIEW }) };
   },
 });

@@ -5,13 +5,15 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { runMcpSearch, executionEnvironment } from '../src/core/mcp-search.mjs';
 
-const runtimeRoot = process.env.DSH_TEST_RUNTIME_ROOT;
-const realSdk = runtimeRoot ? () => import(pathToFileURL(join(runtimeRoot, 'node_modules', '@modelcontextprotocol', 'client', 'dist', 'index.mjs')).href) : undefined;
+// The installed, pinned product SDK is also a valid offline protocol runtime.
+// A missing optional override must not silently skip the whole protocol gate.
+const runtimeRoot = process.env.DSH_TEST_RUNTIME_ROOT ?? fileURLToPath(new URL('../', import.meta.url));
+const realSdk = () => import(pathToFileURL(join(runtimeRoot, 'node_modules', '@modelcontextprotocol', 'client', 'dist', 'index.mjs')).href);
 const fixture = fileURLToPath(new URL('../fixtures/mcp/grok-server.mjs', import.meta.url));
 const sourceFixture = fileURLToPath(new URL('../fixtures/internal-candidate/mcp-sources.mjs', import.meta.url));
 const executable = process.env.DSH_TEST_NODE ?? process.execPath;
 const configPath = join(tmpdir(), 'dsh-internal-unread-config.toml');
-const integration = runtimeRoot ? test : test.skip;
+const integration = test;
 const options = (mode = 'structured', extra = {}) => {
   const deadline = performance.now() + 4_000;
   return { executable, executableArgs: [fixture, mode], configPath,
@@ -62,8 +64,25 @@ for (const mode of ['structured', 'text-json', 'fragmented', 'coalesced', 'fallb
     checkReaped(result.diagnostic);
   });
 }
+for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
+  integration(`真实 SDK：内部 ${provider} 回退保留非枚举来源标签与脱敏归属`, async () => {
+    const result = await runMcpSearch(options('attribution-' + provider));
+    assert.equal(result.sources[0].provider, `${provider}_fallback`);
+    assert.deepEqual(result.diagnostic.sourceProvenance, {
+      resultProviders: [provider], resultProvidersComplete: true,
+      fallbackProviders: [provider], enrichmentProviders: [],
+    });
+    assert.doesNotMatch(JSON.stringify(result), /_fallback|sourceProvenance|provider/);
+    checkReaped(result.diagnostic);
+  });
+}
 for (const [mode, code] of [
-  ['init-error', 'GROK_MCP_ERROR'], ['rpc-error', 'GROK_MCP_ERROR'], ['tool-error', 'GROK_TOOL_ERROR'],
+  ['init-error', 'GROK_MCP_ERROR'], ['init-empty-spoof', 'GROK_MCP_ERROR'],
+  ['rpc-error', 'GROK_MCP_ERROR'], ['tool-error', 'GROK_TOOL_ERROR'],
+  ['rpc-empty-sources', 'grok_sources_empty'], ['rpc-empty-budget', 'grok_sources_empty'],
+  ['rpc-empty-auth', 'grok_auth_error'], ['rpc-empty-unknown', 'GROK_MCP_ERROR'],
+  ['rpc-empty-spoof', 'GROK_MCP_ERROR'], ['rpc-empty-wrong-code', 'GROK_MCP_ERROR'],
+  ['rpc-empty-no-prefix', 'GROK_MCP_ERROR'],
   ['malformed-result', 'GROK_INVALID_RESULT'], ['init-exit', 'GROK_CHILD_EXIT'], ['call-exit', 'GROK_CHILD_EXIT'],
   ['stdout-limit', 'GROK_STDOUT_LIMIT'], ['invalid-frame', 'GROK_PROTOCOL_ERROR'], ['invalid-json', 'GROK_PROTOCOL_ERROR'],
 ]) {
@@ -71,6 +90,7 @@ for (const [mode, code] of [
     await assert.rejects(runMcpSearch(options(mode, { maxMessageBytes: 16_384 })), error => {
       assert.equal(error.code, code);
       assert.ok(!String(error.stack).includes('never-retain-this-secret'));
+      assert.ok(!JSON.stringify(error).includes('never-retain-this-secret'));
       checkReaped(error.diagnostic);
       return true;
     });
@@ -109,6 +129,18 @@ integration('真实 SDK：来源补取中取消必须报错，不能返回部分
   try {
     await assert.rejects(runMcpSearch(options('structured', { executableArgs: [sourceFixture, 'source-hang'], signal: controller.signal })), error => { assert.equal(error, reason); checkReaped(error.diagnostic); return true; });
   } finally { clearTimeout(timer); }
+});
+integration('真实 SDK：分页补取来源标签进入同一结果，主搜引用和补充回退可同时确认', async () => {
+  const result = await runMcpSearch(options('structured', { executableArgs: [sourceFixture, 'source-attribution'] }));
+  assert.equal(result.diagnostic.sourceRecovery, 'completed');
+  assert.deepEqual(result.sources.map(source => source.provider), ['grok_responses', 'tavily_fallback', 'tavily_fallback']);
+  assert.deepEqual(result.diagnostic.sourceProvenance, {
+    resultProviders: ['grok', 'tavily'], resultProvidersComplete: true,
+    fallbackProviders: ['tavily'], enrichmentProviders: [],
+  });
+  assert.equal(result.diagnostic.fallbackUsed, true);
+  assert.doesNotMatch(JSON.stringify(result), /provider|tavily_fallback/);
+  checkReaped(result.diagnostic);
 });
 integration('真实 SDK：合并帧总量超过单消息上限时仍按各消息分别检查', async () => {
   const result = await runMcpSearch(options('structured', { executableArgs: [sourceFixture, 'large-coalesced'], maxMessageBytes: 2_048 }));

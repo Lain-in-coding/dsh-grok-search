@@ -13,6 +13,28 @@ export const PRODUCT_HOST_ID = randomUUID();
 
 export const selectedId = value => typeof value?.get === 'function' ? value.get() : value;
 
+// Cordis 4.0 exposes the resolved object as config; 4.1 retains raw input there.
+// Do not fall back to raw input on a new fiber that has not resolved yet.
+export function effectiveConfig(fiber) {
+  return fiber && 'effectiveConfig' in fiber ? fiber.effectiveConfig : fiber?.config;
+}
+
+/** Adapt the public config hook without mutating the user's raw configuration. */
+export function createSearchConfigHook({ required, resolveConfig }) {
+  return function (input, next) {
+    // 4.0: this = Fiber, first argument = raw config.
+    // 4.1: first argument = Fiber; next() already includes schema validation.
+    const modern = typeof input?.resolveConfig === 'function';
+    const fiber = modern ? input : this;
+    const value = next();
+    if (fiber?.entry?.options.id !== 'web'
+      || fiber.entry.options.name !== '@deepseek-ai/dsh-web'
+      || fiber.parent?.fiber?.entry === fiber.entry || !required()) return value;
+    const candidate = { ...rawConfig(value), searchProvider: PRODUCT_PROVIDER_ID };
+    return modern ? resolveConfig(fiber.runtime, candidate) : candidate;
+  };
+}
+
 export function readSelection(ctx) {
   const path = join(ctx.profileContext.dir, 'package.json');
   const text = readFileSync(path, 'utf8');
@@ -36,7 +58,7 @@ export function authorConfig(ctx) {
 
 export function authorSearchProvider(ctx) {
   const entry = webEntry(ctx);
-  const fiber = selectedId(entry.fiber.config?.searchProvider);
+  const fiber = selectedId(effectiveConfig(entry.fiber)?.searchProvider);
   if (fiber !== undefined && fiber !== null && fiber !== PRODUCT_PROVIDER_ID) return fiber;
   const runtime = runtimeService(entry);
   const active = selectedId(runtime?.searchProviderId ?? runtime?.config?.searchProvider);
@@ -222,7 +244,7 @@ function runtimeService(entry) {
 
 export function effectiveSearchProvider(entry) {
   const runtime = runtimeService(entry);
-  return selectedId(entry.fiber.config?.searchProvider)
+  return selectedId(effectiveConfig(entry.fiber)?.searchProvider)
     ?? selectedId(runtime?.searchProviderId ?? runtime?.config?.searchProvider)
     ?? selectedId(entry.options.config?.searchProvider)
     ?? process.env.DSH_WEB_SEARCH_PROVIDER ?? null;
@@ -230,7 +252,7 @@ export function effectiveSearchProvider(entry) {
 
 export function effectiveFetchProvider(entry) {
   const runtime = runtimeService(entry);
-  return selectedId(entry.fiber.config?.fetchProvider)
+  return selectedId(effectiveConfig(entry.fiber)?.fetchProvider)
     ?? selectedId(runtime?.fetchProviderId)
     ?? selectedId(runtime?.config?.fetchProvider)
     ?? selectedId(entry.options.config?.fetchProvider)
@@ -243,8 +265,8 @@ async function updateWebEntry(entry, next, preserveEntryConfig = false) {
       'The loader entry cannot apply a volatile route update.');
   }
   const entryConfig = entry.options?.config;
-  if (entry.options && entry.fiber?.config) {
-    entry.options.config = { ...entryConfig, ...rawConfig(entry.fiber.config) };
+  if (entry.options && effectiveConfig(entry.fiber)) {
+    entry.options.config = { ...entryConfig, ...rawConfig(effectiveConfig(entry.fiber)) };
   }
   try {
     await entry.update({ config: next });
@@ -264,7 +286,7 @@ export async function takeOverAuthorRoute(ctx, acquisition, lease) {
     throw new ControlRecordError('CONTROL_ROUTE_OWNERSHIP_CONFLICT',
       'The current web route is neither the recorded author nor the product provider.');
   }
-  const current = rawConfig(entry.fiber.config);
+  const current = rawConfig(effectiveConfig(entry.fiber));
   const rollback = async () => {
     try { await updateWebEntry(entry, current, true); } catch {}
   };
@@ -298,7 +320,7 @@ export async function restoreAuthorRoute(ctx, priorIntent) {
     throw new ControlRecordError('CONTROL_ROUTE_OWNERSHIP_CONFLICT',
       'The current web route was changed by another owner; the recorded author was not restored.');
   }
-  const current = rawConfig(entry.fiber.config);
+  const current = rawConfig(effectiveConfig(entry.fiber));
   const next = { ...current };
   if (authorPresent) next.searchProvider = author;
   else delete next.searchProvider;
@@ -307,8 +329,23 @@ export async function restoreAuthorRoute(ctx, priorIntent) {
   return { routeChanged: changed, actualSearchProvider: effectiveSearchProvider(entry) };
 }
 
+const suspendedCores = new WeakMap();
+
+// Pause this plugin's own queries once per core; a retried stop reuses the
+// same disposal instead of disposing the executor again.
+export function suspendCore(core, reason) {
+  if (suspendedCores.has(core)) return suspendedCores.get(core);
+  core.releaseBarrier.invalidate({ reason });
+  let task;
+  try { task = Promise.resolve(core.dispose()); }
+  catch (error) { task = Promise.reject(error); }
+  task.catch(() => {});
+  suspendedCores.set(core, task);
+  return task;
+}
+
 export function createProductReleaseController({ ctx, priorIntent, core, routeVerifier = null, onState = () => {},
-  disposeTimeoutMs = 2_000, counterSnapshot = null }) {
+  disposeTimeoutMs = 2_000, counterSnapshot = null, pendingTakeovers = () => Promise.resolve() }) {
   if (!core || !core.releaseBarrier || typeof core.dispose !== 'function') {
     throw new ControlRecordError('CONTROL_RELEASE_CORE_REQUIRED',
       'The query core and its release barrier must be present before an explicit release.');
@@ -329,24 +366,23 @@ export function createProductReleaseController({ ctx, priorIntent, core, routeVe
     invalidate({ reason }) {
       if (!stopping) {
         try { routeBefore = effectiveSearchProvider(webEntry(routeContext)); } catch { routeBefore = null; }
-        barrier.invalidate({ reason });
+        disposeTask = suspendCore(core, reason);
         stopping = true;
         onState('stopping');
-        try { disposeTask = core.dispose(); }
-        catch (error) { disposeTask = Promise.reject(error); }
-        disposeTask?.catch?.(() => {});
       }
       return { stopping: true, available: false };
     },
     async drain() {
       if (!stopping) throw new ControlRecordError('CONTROL_RELEASE_BARRIER_NOT_INVALIDATED');
+      // A takeover already awaiting the host must settle before the author route is restored.
+      const settled = Promise.all([disposeTask ?? Promise.resolve(), pendingTakeovers()]);
       let timer;
       const disposeBound = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new ControlRecordError(
-          'CONTROL_RELEASE_DRAIN_TIMEOUT', 'The query executor did not settle before the release deadline.')), disposeTimeoutMs);
+        timer = setTimeout(() => reject(new ControlRecordError('CONTROL_RELEASE_DRAIN_TIMEOUT',
+          'The query executor or a pending route takeover did not settle before the release deadline.')), disposeTimeoutMs);
       });
       const results = await Promise.allSettled([
-        Promise.race([disposeTask ?? Promise.resolve(), disposeBound]),
+        Promise.race([settled, disposeBound]),
         barrier.drain(),
       ]).finally(() => clearTimeout(timer));
       const rejected = results.find(result => result.status === 'rejected');

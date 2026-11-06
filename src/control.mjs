@@ -4,7 +4,7 @@ import { commitExplicitRelease } from './core/release-transaction.mjs';
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID,
   createAcquisition, createLease, createProductReleaseController, createProductStore,
-  originalSearchCounter, readSelection, takeOverAuthorRoute,
+  originalSearchCounter, readSelection, suspendCore, takeOverAuthorRoute,
 } from './core/product-control.mjs';
 
 export const name = 'dsh-grok-search-control';
@@ -15,6 +15,8 @@ export function projectPublicSnapshot(current, disposed = false) {
     || Boolean(current.record?.releaseCompletion)
     || Boolean(current.record?.recovery);
   return {
+    // The control service itself is reachable; search readiness is reported separately.
+    available: !disposed,
     phase: current.phase,
     policy: current.record?.policy ?? null,
     revision: current.revision,
@@ -40,6 +42,10 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
   let task = null;
   let releaseTask = null;
   let acquired = false;
+  // An explicit stop wins over any later or still-pending host route update;
+  // release drain waits for pending takeovers before restoring the author.
+  let stopRequested = false;
+  const takeovers = new Set();
   ctx.inject(['grokSearchRouteVerifier'], () => { routeVerifier = ctx.get('grokSearchRouteVerifier'); });
   let releaseOperationId = null;
   const state = {
@@ -103,6 +109,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
   });
   const refresh = () => {
     if (releaseTask) return releaseTask;
+    if (stopRequested) return Promise.resolve(snapshot());
     if (task) return task;
     state.phase = 'checking';
     task = (async () => {
@@ -167,13 +174,21 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       const core = ctx.get('grokSearchCore');
       if (!core) throw new ControlRecordError('CONTROL_RELEASE_CORE_REQUIRED',
         'The query core must be loaded before the product owner can take over search.');
-      const takeover = await takeOverAuthorRoute(ctx, existing.intent.acquisition, existing.intent.lease);
+      const pending = takeOverAuthorRoute(ctx, existing.intent.acquisition, existing.intent.lease);
+      takeovers.add(pending);
+      let takeover;
+      try { takeover = await pending; }
+      finally { takeovers.delete(pending); }
+      // The release restores the author after this late host update settles.
+      if (stopRequested) return snapshot();
       acquired = true;
       state.phase = 'required';
       state.error = null;
       state.routeChanged = takeover.routeChanged;
       return snapshot();
     })().catch(error => {
+      // A superseded takeover failure must not overwrite the explicit stop state.
+      if (stopRequested) return snapshot();
       state.phase = 'incomplete';
       state.error = { code: error.code ?? null, message: error.message };
       throw error;
@@ -183,6 +198,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
   const stop = (reason, { unloading = false } = {}) => {
     if (disposed) return Promise.reject(new ControlRecordError('CONTROL_OWNER_ABSENT', 'The product owner is absent.'));
     if (releaseTask) return releaseTask;
+    stopRequested = true;
     const stopFailure = error => {
       state.phase = 'incomplete';
       state.error = { code: error?.code ?? null, message: error?.message ?? String(error) };
@@ -192,6 +208,12 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     };
     let before, priorIntent, owner, controller, counterBaseline;
     try {
+      const core = ctx.get('grokSearchCore');
+      // Pause this plugin's own queries before any prelude check can fail; the
+      // record and route are released by the transaction below.
+      if (core?.releaseBarrier && typeof core.dispose === 'function') {
+        suspendCore(core, typeof reason === 'string' && reason ? reason : 'explicit-user-release');
+      }
       before = store.read();
       if (!before) throw new ControlRecordError('CONTROL_RELEASE_RECORD_MISSING',
         'No control record exists to release.');
@@ -207,11 +229,11 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       releaseOperationId ??= before.intent.release?.operationId ?? randomUUID();
       state.releaseOperationId = releaseOperationId;
       priorIntent = before.intent.policy === 'required' ? before.intent : before.intent.priorIntent;
-      const core = ctx.get('grokSearchCore');
       counterBaseline = (counterSnapshot ? counterSnapshot() : originalSearchCounter(ctx)).calls;
       owner = createLease(ctx);
       controller = createProductReleaseController({ ctx, priorIntent, core, routeVerifier,
         ...(unloading && counterSnapshot ? { counterSnapshot } : {}),
+        pendingTakeovers: () => Promise.allSettled([...takeovers]),
         onState: phase => { state.phase = phase; } });
     } catch (error) {
       stopFailure(error);

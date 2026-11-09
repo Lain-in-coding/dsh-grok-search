@@ -124,6 +124,22 @@ test('independent plugin instances never share private search history', () => {
   first.dispose(); second.dispose();
 });
 
+test('parent duration uses the tool-call wall clock including post-search completion, never a sum', () => {
+  let clock = 1000;
+  const log = createSearchLog({ now: () => clock });
+  const scope = log.beginCall({ sessionId: randomUUID(), callId: 'timing' });
+  clock = 1010;
+  const first = log.begin('first', { logScope: scope });
+  const second = log.begin('second', { logScope: scope });
+  clock = 1020; log.finish(first, { outcome: 'ok', served: 'tavily' });
+  clock = 1030; log.finish(second, { outcome: 'ok', served: 'tavily' });
+  clock = 1400; log.finishCall(scope);
+  const row = log.snapshot(randomUUID()).records[0];
+  assert.equal(row.ms, 400);
+  assert.deepEqual(row.queries.map(query => query.ms), [10, 20]);
+  log.dispose();
+});
+
 test('routed search records actual results only, not diagnostics or replay requests', async () => {
   const routed = createRoutedSearch({
     grok: { search: async () => ({ content: '', sources: [{ url: 'https://result.test' }] }) },

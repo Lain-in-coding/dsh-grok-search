@@ -7,6 +7,7 @@ import test from 'node:test';
 import { apply as applySettings, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { createConnectionSecurity } from '../src/core/connection-security.mjs';
+import { createConfigLocationOpener } from '../src/core/config-opener.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
 import { createToolRouteContext } from '../src/core/tool-route-context.mjs';
 
@@ -82,6 +83,26 @@ test('configuration history restore requires both owner and secret-write authori
   assert.throws(() => codec.parse({ expectedRevision: 'missing', revision: 1 }), /Invalid settings payload/);
 });
 
+test('private cache repair has its own owner-checked RPC and does not accept a caller path or version', async () => {
+  let Gateway, deny = false, repairs = 0;
+  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
+  const state = { phase: 'ready', configPath: '/synthetic/config.toml', program: null, error: null, canRepair: false };
+  const gateway = new Gateway({
+    get: name => name === 'grokSearchConnectionSecurity'
+      ? { requireOwner() { if (deny) throw new GrokSearchError('SETTINGS_AUTH_REQUIRED', 'denied'); } }
+      : name === 'grokSearchProgram' ? { repair: async () => { repairs++; return state; } } : null,
+    provide() {},
+  });
+  assert.deepEqual(await gateway.repairProgram(), state);
+  deny = true;
+  await assert.rejects(gateway.repairProgram(), { code: 'SETTINGS_AUTH_REQUIRED' });
+  assert.equal(repairs, 1);
+  const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'repairProgram');
+  assert.equal(descriptor.parameters.length, 0);
+  assert.equal(descriptor.result.create().safeParse(state).success, true);
+  assert.ok(SETTINGS_DESCRIPTORS.some(row => row.method === 'prepareProgram'), 'existing RPC stays compatible');
+});
+
 test('remote HTTP cannot redirect stored credentials by changing a service URL', async () => {
   let Gateway;
   applySettings({ plugin(Plugin) { Gateway = Plugin; } });
@@ -127,6 +148,28 @@ test('remote HTTP cannot redirect stored credentials by changing a service URL',
 
 test('legacy stop RPC remains available without requiring a user-visible stop button', () => {
   assert.equal(SETTINGS_DESCRIPTORS.some(descriptor => descriptor.method === 'stop'), true);
+});
+
+test('all settings methods remain SRC-discoverable when an old host caches older Typert metadata', () => {
+  let Gateway;
+  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
+  for (const descriptor of SETTINGS_DESCRIPTORS) {
+    const text = Gateway.prototype[descriptor.method].toString();
+    const parameters = /^\s*async function\s*\(([^)]*)\)/.exec(text)?.[1].trim();
+    assert.equal(parameters, descriptor.parameters.map(parameter => parameter.name).join(', '), descriptor.method);
+    assert.doesNotMatch(parameters, /\.\.\.|=|[{[]/);
+  }
+});
+
+test('SRC dispatch keeps draft validation and owner-only protection without the cached strict descriptor', async () => {
+  const { gateway } = viewGateway();
+  const before = await gateway.snapshot();
+  const request = { provider: 'tavily', expectedRevision: before.config.revision,
+    quotaRevision: before.config.quotaRevision, operationId: randomUUID(),
+    draft: { apiKey: 'synthetic', unexpected: 'never accepted' } };
+  await assert.rejects(gateway.previewAccountQuota(request), { code: 'SETTINGS_REQUEST_INVALID' });
+  await assert.rejects(gateway.previewAccountQuota({ ...request, draft: { apiKey: 'bad\nheader' } }),
+    { code: 'CONFIG_VALUE_INVALID' });
 });
 
 test('search history uses separate secure owner RPCs; ordinary snapshot stays redacted', async () => {
@@ -184,7 +227,8 @@ test('quota RPC rejects stale revisions, unknown providers and cancelled operati
   const { gateway, path } = viewGateway();
   writeFileSync(path, 'tavily_api_key = "synthetic"\n');
   const snapshot = await gateway.snapshot();
-  await assert.rejects(gateway.accountQuota({ provider: 'tavily', expectedRevision: 'stale', operationId: randomUUID() }), { code: 'CONFIG_CONFLICT' });
+  await assert.rejects(gateway.accountQuota({ provider: 'tavily', expectedRevision: 'stale',
+    quotaRevision: snapshot.config.quotaRevision, operationId: randomUUID() }), { code: 'CONFIG_CONFLICT' });
   await assert.rejects(gateway.accountQuota({ provider: 'unknown', expectedRevision: snapshot.config.revision,
     quotaRevision: snapshot.config.quotaRevision, operationId: randomUUID() }), { code: 'QUOTA_QUERY_FAILED' });
   const operationId = randomUUID();
@@ -246,6 +290,33 @@ test('quota response cannot cross a concurrent config revision or a cancellation
   }
 });
 
+test('authenticated draft quota query and cancellation never save a file or config history', async () => {
+  const { createServer } = await import('node:http');
+  const { existsSync } = await import('node:fs');
+  const { gateway, path } = viewGateway();
+  const server = createServer((request, response) => {
+    assert.equal(request.url, '/usage');
+    assert.equal(request.headers.authorization, 'Bearer unsaved-synthetic');
+    response.end(JSON.stringify({ account: { plan_usage: 3, plan_limit: 10 } }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const snapshot = await gateway.snapshot();
+    const request = { provider: 'tavily', expectedRevision: snapshot.config.revision,
+      quotaRevision: snapshot.config.quotaRevision, operationId: randomUUID(),
+      draft: { baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'unsaved-synthetic' } };
+    const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'accountQuota');
+    assert.equal(descriptor.parameters[0].codec.create().safeParse(request).success, true);
+    assert.equal((await gateway.accountQuota(request)).value.remaining, 7);
+    assert.equal(existsSync(path), false, 'query does not create shared config');
+    assert.equal((await gateway.snapshot()).config.revision, snapshot.config.revision);
+    const operationId = randomUUID();
+    await gateway.cancelDiagnosis({ operationId });
+    await assert.rejects(gateway.accountQuota({ ...request, operationId }), { code: 'SETTINGS_DIAGNOSIS_CANCELLED' });
+    assert.equal(existsSync(path), false);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
 test('strict RPC codec implements the actual gateway parse boundary', () => {
   const codec = SETTINGS_DESCRIPTORS.find(row => row.method === 'save').parameters[0].codec.create();
   const request = { expectedRevision: 'missing', updates: { grok_api_key: 'sentinel' } };
@@ -274,6 +345,7 @@ function diagnosticGateway({ core = {}, sourceRouter = {}, preferences } = {}) {
     writeFileSync(join(directory, 'grok-search', 'preferences.json'), JSON.stringify(preferences));
   }
   const services = new Map([
+    ['grokSearchProgram', { snapshot: () => ({ configPath: join(directory, 'config.toml') }) }],
     ['grokSearchCore', core],
     ['grokSearchSourceRouter', sourceRouter],
     ['grokSearchConnectionSecurity', { requireOwner() {}, requireSecret() {},
@@ -281,6 +353,21 @@ function diagnosticGateway({ core = {}, sourceRouter = {}, preferences } = {}) {
   ]);
   return new Gateway({ profileContext: { dir: directory }, get: name => services.get(name), provide: () => {} });
 }
+
+test('diagnostic results cannot validate a key replaced while the request is in flight', async () => {
+  let complete, entered;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const gateway = diagnosticGateway({ sourceRouter: { diagnoseProvider: () => {
+    entered(); return new Promise(resolve => { complete = resolve; });
+  } } });
+  const before = await gateway.snapshot();
+  const result = gateway.diagnoseProvider({ provider: 'tavily', expectedRevision: before.config.revision,
+    configIdentity: before.config.quotaRevision });
+  await ready;
+  writeFileSync(gateway._configPath(), 'tavily_api_key = "changed"\n');
+  complete({ provider: 'tavily', status: 'ok', code: 'OK', keys: [] });
+  await assert.rejects(result, { code: 'CONFIG_CONFLICT' });
+});
 
 test('provider diagnostics can be cancelled and join the core release drain', async () => {
   const active = new Set(), aborts = [];
@@ -557,6 +644,76 @@ test('openConfigLocation validates the target and never opens anything it cannot
     assert.equal(result.exists, false);
   }
   assert.equal((await local.gateway.openConfigLocation()).kind, 'folder');
+});
+
+test('config opening keeps the old wire schema, local gate and actual opener errors', async () => {
+  const { gateway, path } = viewGateway({});
+  writeFileSync(path, 'not valid TOML is still editable\n');
+  let calls = 0;
+  gateway.configOpener = { open: async request => {
+    calls++;
+    assert.equal(request.path, path);
+    assert.equal(request.kind, 'file');
+    return { opened: true, exists: true };
+  } };
+  const result = await gateway.openConfigLocation({ kind: 'file' });
+  assert.equal(result.opened, true);
+  const codec = SETTINGS_DESCRIPTORS.find(row => row.method === 'openConfigLocation').result.create();
+  assert.deepEqual(codec.parse(result), result);
+  assert.deepEqual(Object.keys(result).sort(), ['displayPath', 'exists', 'kind', 'opened', 'path']);
+  gateway.configOpener.open = async () => { throw new GrokSearchError('CONFIG_OPEN_FAILED', '系统拒绝打开。', { osCode: 5 }); };
+  await assert.rejects(gateway.openConfigLocation({ kind: 'file' }), error =>
+    error.code === 'CONFIG_OPEN_FAILED' && error.details.osCode === 5);
+  const remote = viewGateway({ configPath: path, transport: 'restricted' });
+  remote.gateway.configOpener = { open: async () => { calls++; throw new Error('must not open'); } };
+  assert.equal((await remote.gateway.openConfigLocation({ kind: 'file' })).opened, false);
+  assert.equal(calls, 1);
+  assert.equal(readFileSync(path, 'utf8'), 'not valid TOML is still editable\n');
+});
+
+test('config opening does not hide inaccessible locations behind an existence precheck', async () => {
+  const { gateway } = viewGateway({});
+  let spawned = false;
+  gateway.configOpener = createConfigLocationOpener({
+    stat() { throw Object.assign(new Error('private filesystem detail'), { code: 'EACCES' }); },
+    spawnImpl() { spawned = true; throw new Error('must not spawn'); },
+  });
+  for (const kind of ['file', 'folder']) {
+    await assert.rejects(gateway.openConfigLocation({ kind }), error =>
+      error.code === 'CONFIG_OPEN_ACCESS_FAILED' && error.details.cause === 'EACCES'
+      && !error.message.includes('private filesystem detail'));
+  }
+  assert.equal(spawned, false);
+});
+
+test('editor fallback is observable without changing the legacy opening schema', async () => {
+  const { gateway } = viewGateway({});
+  gateway.configOpener = { open: async () => ({
+    exists: true, opened: true, editor: 'classic', fallbackReason: 'early-exit',
+  }) };
+  const value = await gateway.openConfigLocationWithStatus({ kind: 'file' });
+  const statusCodec = SETTINGS_DESCRIPTORS.find(row => row.method === 'openConfigLocationWithStatus').result.create();
+  assert.deepEqual(statusCodec.parse(value), value);
+  assert.equal(value.editor, 'classic');
+  assert.equal(value.fallbackReason, 'early-exit');
+  const legacy = await gateway.openConfigLocation({ kind: 'file' });
+  assert.deepEqual(Object.keys(legacy).sort(), ['displayPath', 'exists', 'kind', 'opened', 'path']);
+  assert.equal(legacy.opened, true);
+});
+
+test('remote HTTPS and unknown transports cannot launch a host editor', async () => {
+  for (const transport of ['https', 'restricted', 'future-transport']) {
+    const { gateway } = viewGateway({ transport });
+    let launched = false;
+    gateway.configOpener = { open: async () => { launched = true; throw new Error('must not launch'); } };
+    const result = await gateway.openConfigLocationWithStatus({ kind: 'file' });
+    assert.equal(result.opened, false);
+    assert.equal(result.copyOnly, true);
+    assert.equal(launched, false);
+    assert.equal((await gateway.openConfigLocation({ kind: 'folder' })).opened, false);
+    await assert.rejects(gateway.openConfigLocationWithStatus({ kind: 'file', path: '/untrusted' }),
+      { code: 'SETTINGS_REQUEST_INVALID' });
+  }
 });
 
 test('preferences are only the plugin-private DSH switches', async () => {

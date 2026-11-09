@@ -12,7 +12,7 @@ test('0.2.2-rc.1 适配同步版本、宿主声明与锁文件，不放宽到未
   const manifest = readJson('package.json');
   const lock = readJson('package-lock.json');
   const matrix = readJson('support-matrix.json');
-  assert.equal(manifest.version, '0.2.0');
+  assert.equal(manifest.version, '0.2.1');
   assert.equal(lock.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
   assert.equal(matrix.packageVersion, manifest.version);

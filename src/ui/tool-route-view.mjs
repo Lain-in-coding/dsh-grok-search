@@ -53,8 +53,12 @@ export function createToolRouteView({ React, jsx, remote, Original }) {
           // A start-phase miss keeps its own wording; a settled miss waits for the last retry.
           setAnswer({ identity, result, reading: !result.known && phase === 'result' && retry });
           if (retry) timer = setTimeout(poll, 750);
-        } catch {
-          if (active) setAnswer({ identity, result: null, unreadable: true });
+        } catch (error) {
+          if (active) {
+            const code = /^[\w./-]{1,80}$/.test(error?.code || '') ? error.code : 'SETTINGS_UNAVAILABLE';
+            setAnswer({ identity, result: null, unreadable: true, code });
+            if (++attempts < 3) timer = setTimeout(poll, 750);
+          }
         }
       };
       if (readable) void poll();
@@ -64,7 +68,7 @@ export function createToolRouteView({ React, jsx, remote, Original }) {
     const label = readable && (!matched || answer.reading)
       ? { known: false, tone: 'unknown', text: '正在读取本次来源…' }
       : matched && answer.unreadable
-        ? { known: false, tone: 'unknown', text: '本次来源暂不可读' }
+        ? { known: false, tone: 'unknown', text: `本次来源暂不可读 · ${answer.code}` }
         : describe(matched ? answer.result : null, phase, block?.isError);
     return jsx('div', { 'data-dsg-search-card': callId, children: [
       jsx('style', { children: styles }, 'style'),

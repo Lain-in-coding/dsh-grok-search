@@ -124,7 +124,7 @@ test('排队时间占用工作预算，过期查询不会派发', async () => {
   const first = executor.search({ query: '运行' });
   const firstRejected = assert.rejects(first, error => error.code === 'GROK_TIMEOUT');
   const second = executor.search({ query: '等待' });
-  await assert.rejects(second, error => error.code === 'GROK_TIMEOUT');
+  await assert.rejects(second, error => error.code === 'GROK_QUEUE_TIMEOUT');
   await firstRejected;
   assert.equal(calls, 1); await executor.dispose();
 });
@@ -183,4 +183,21 @@ test('上游错误直接传播，不调用任何替代搜索', async () => {
   const executor = createSearchExecutor({ snapshot: () => ({}), runQuery: async () => { calls++; throw failure; } });
   await assert.rejects(executor.search({ query: '明确失败' }), error => error === failure);
   assert.equal(calls, 1); await executor.dispose();
+});
+
+test('queued chat searches run before waiting diagnostics without interrupting an active request', async () => {
+  const gate = deferred(), order = [];
+  const executor = createSearchExecutor({ snapshot: () => ({}), runQuery: async ({ request }) => {
+    order.push(request.query);
+    if (order.length === 1) await gate.promise;
+    return answer;
+  } });
+  const active = executor.search({ query: 'active', testPrimary: true });
+  await tick();
+  const diagnosis = executor.search({ query: 'diagnosis', testPrimary: true });
+  const chat = executor.search({ query: 'chat' });
+  gate.resolve();
+  await Promise.all([active, diagnosis, chat]);
+  assert.deepEqual(order, ['active', 'chat', 'diagnosis']);
+  await executor.dispose();
 });

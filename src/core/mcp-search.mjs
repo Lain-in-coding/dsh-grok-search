@@ -5,7 +5,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createSessionOwner } from './session-owner.mjs';
 import { GrokSearchError, isRecord, timeoutError } from './errors.mjs';
-import { decodeGrokResult, mapSearchResult, searchSourceProvenance } from './result-map.mjs';
+import { assertSearchReferences, decodeGrokResult, mapSearchResult, searchSourceProvenance } from './result-map.mjs';
 import { parse } from 'smol-toml';
 
 const FRAME_BYTES = 1_048_576;
@@ -16,6 +16,10 @@ const SYSTEM_ENV = new Set([
   'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
 ]);
 const GROK_ENV = /^(?:GROK_SEARCH_[A-Z0-9_]+|OPENAI_COMPATIBLE_(?:API_URL|API_KEY|MODEL)|GITHUB_TOKEN|(?:TAVILY|EXA|FIRECRAWL)_(?:API_KEY|API_URL|ENABLED)|TINYFISH_(?:API_KEY|SEARCH_API_URL|FETCH_API_URL|ENABLED))$/;
+const PRIMARY_ONLY_ENV = Object.freeze({
+  GROK_SEARCH_EXTRA_SOURCES: '0', GROK_SEARCH_FALLBACK_SOURCES: '0',
+  TAVILY_ENABLED: 'false', EXA_ENABLED: 'false', TINYFISH_ENABLED: 'false', FIRECRAWL_ENABLED: 'false',
+});
 const failure = (code, message) => new GrokSearchError(code, message);
 const safeLabel = value => typeof value === 'string' && /^[\w.+-]{1,80}$/.test(value) ? value : null;
 const EMPTY_SEARCH_REASONS = Object.freeze({
@@ -37,8 +41,36 @@ function classifyEmptySearch(error) {
     ? failure(reason, EMPTY_SEARCH_REASONS[reason]) : error;
 }
 
+function primaryDoctorFailure(result) {
+  // v0.1.26 web_search drops the HTTP status, but doctor preserves it. Parse
+  // only its fixed prefix; never forward the body, URL, credential or free text.
+  let payload = result?.structuredContent;
+  if (!payload) {
+    const texts = result?.content?.filter(block => block.type === 'text');
+    if (texts?.length !== 1) return null;
+    try { payload = JSON.parse(texts[0].text); } catch { return null; }
+  }
+  if (payload?.grok?.reachable !== false || typeof payload.grok.detail !== 'string') return null;
+  const detail = payload.grok.detail;
+  const match = /^provider error: (?:Grok Responses|OpenAI-compatible) returned HTTP ([45]\d{2})(?:\s|:|$)/.exec(detail);
+  if (match) {
+    const status = Number(match[1]);
+    const message = status === 401 ? 'API Key 无效或鉴权失败'
+      : status === 403 ? '接口访问被拒绝，请检查账户、模型或权限'
+        : status === 429 ? '接口请求受限，请检查限流或额度'
+          : status === 402 ? '账户额度或计费受限'
+            : [404, 405].includes(status) ? '接口路径或协议不匹配'
+              : [400, 422].includes(status) ? '请求参数或模型不受支持'
+                : status >= 500 ? '上游服务异常' : '上游拒绝请求';
+    return new GrokSearchError(`HTTP_${status}`, `${message}（HTTP ${status}）。`, { httpStatus: status, evidence: 'primary-doctor' });
+  }
+  return detail.startsWith('upstream timeout:') ? failure('grok_timeout', EMPTY_SEARCH_REASONS.grok_timeout)
+    : /^provider error: (?:Grok Responses|OpenAI-compatible) request failed:/.test(detail)
+      ? failure('GROK_NETWORK_ERROR', '无法连接 Grok 接口，请检查网络、代理或证书。') : null;
+}
+
 // 继承模式只传系统、代理及已知上游变量；配置文件由子进程自行读取。
-export function executionEnvironment(overrides = {}, configPath) {
+export function executionEnvironment(overrides = {}, configPath, primaryOnly = false) {
   if (!isRecord(overrides)) throw new TypeError('环境覆盖必须是对象。');
   const values = new Map();
   const identity = key => process.platform === 'win32' ? key.toUpperCase() : key;
@@ -50,6 +82,14 @@ export function executionEnvironment(overrides = {}, configPath) {
     if (value === null) values.delete(identity(key)); else values.set(identity(key), [key, value]);
   }
   if (configPath !== undefined) values.set(identity('GROK_SEARCH_CONFIG'), ['GROK_SEARCH_CONFIG', configPath]);
+  // Upstream v0.1.26 speculates max(extra_sources, fallback_sources) alongside
+  // Grok. A single-provider diagnostic must disable BOTH budgets and all four
+  // source switches, after caller overrides, only in this child environment.
+  // Never mutate process.env or the shared config; include these flags in the
+  // managed identity so a normal connection cannot leak into a diagnostic.
+  if (primaryOnly === true) {
+    for (const [key, value] of Object.entries(PRIMARY_ONLY_ENV)) values.set(identity(key), [key, value]);
+  }
   return Object.fromEntries(values.values());
 }
 
@@ -238,7 +278,7 @@ export function createManagedMcpSearch({ idleMs = 300_000, onError } = {}) {
   return {
     async run(options) {
       options.signal?.throwIfAborted();
-      const environment = executionEnvironment(options.envOverrides, options.configPath);
+      const environment = executionEnvironment(options.envOverrides, options.configPath, options.request?.testPrimary === true);
       const envValue = name => Object.entries(environment)
         .find(([key]) => process.platform === 'win32' ? key.toUpperCase() === name : key === name)?.[1];
       const configPath = envValue('GROK_SEARCH_CONFIG')
@@ -260,6 +300,14 @@ export function createManagedMcpSearch({ idleMs = 300_000, onError } = {}) {
         catch { throw failure('GROK_CONFIG_INVALID', 'Grok 配置文件不是有效 TOML。'); }
         fileMaxChars = values.response_max_chars;
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      const assertConfiguration = () => {
+        if (options.expectedConfigRevision === undefined) return;
+        let revision = 'missing';
+        try { revision = createHash('sha256').update(readFileSync(configPath)).digest('hex'); }
+        catch (error) { if (error.code !== 'ENOENT') throw failure('GROK_CONFIG_INVALID', '无法读取共享配置。'); }
+        if (revision !== options.expectedConfigRevision) throw failure('CONFIG_CONFLICT', '共享配置已更新，请按新配置重新搜索。');
+      };
+      assertConfiguration();
       const envMaxChars = envValue('GROK_SEARCH_RESPONSE_MAX_CHARS');
       const maxChars = envMaxChars === undefined || envMaxChars === '' ? fileMaxChars ?? 45_000
         : /^\d+$/.test(envMaxChars) ? Number(envMaxChars) : NaN;
@@ -270,7 +318,7 @@ export function createManagedMcpSearch({ idleMs = 300_000, onError } = {}) {
       })).digest('hex');
       return owner.run({ identity, configuration: options, signal: options.signal,
         operation: (session, signal) => runMcpSearch({ ...options, signal, maxChars: Math.min(500_000, maxChars),
-          connection: session.connection, capturedEnvironment: environment, keepAlive: true }),
+          connection: session.connection, capturedEnvironment: environment, keepAlive: true, assertConfiguration }),
       });
     },
     snapshot: owner.snapshot,
@@ -280,6 +328,7 @@ export function createManagedMcpSearch({ idleMs = 300_000, onError } = {}) {
 
 export async function runMcpSearch({
   executable, executableArgs = [], configPath, envOverrides = {}, request, signal,
+  assertConfiguration = () => {},
   remainingMs = () => 118_000, cleanupMs = 2_000, maxMessageBytes = FRAME_BYTES,
   maxChars = 45_000,
   sdkFactory = defaultSdkFactory,
@@ -322,11 +371,11 @@ export async function runMcpSearch({
     if (sdkFactory === defaultSdkFactory) sdkEntry = import.meta.resolve('@modelcontextprotocol/client');
     budget();
     if (typeof sdk.Client !== 'function' || typeof sdk.ReadBuffer !== 'function' || typeof sdk.serializeMessage !== 'function') throw failure('GROK_SDK_UNSUPPORTED', 'MCP SDK 缺少所需公开接口，请检查依赖版本。');
-    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.2.0' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
+    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.2.1' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
     connection.client = client;
     // 所有可能拒绝的 framing 参数先校验，再启动本次进程。
     const buffer = new sdk.ReadBuffer({ maxBufferSize: maxMessageBytes + 1 });
-    const child = spawn(executable, executableArgs, { env: capturedEnvironment ?? executionEnvironment(envOverrides, configPath), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(executable, executableArgs, { env: capturedEnvironment ?? executionEnvironment(envOverrides, configPath, request.testPrimary === true), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     transport = new OwnedStdioTransport(child, sdk, { cleanupMs, maxMessageBytes, buffer });
     connection.transport = transport;
     await Promise.race([client.connect(transport, { signal: activeSignal, timeout: budget(), resetTimeoutOnProgress: false }), aborted, transport.fatal]);
@@ -342,11 +391,31 @@ export async function runMcpSearch({
       result = { serverVersion, toolsDeclared: true };
     } else {
     try {
+      // An external editor may save while a new MCP process is starting.
+      // Check before sending a billable request; never write a second config.
+      assertConfiguration();
       payload = decodeGrokResult(await race(client.callTool({ name: 'web_search', arguments: { query: request.query, response_format: 'concise' } }, options())));
     } catch (caught) {
       activeSignal.throwIfAborted();
       if (transport.failure) throw transport.failure;
-      throw classifyEmptySearch(caught);
+      const classified = classifyEmptySearch(caught);
+      if (request.testPrimary === true && classified?.code === 'grok_provider_error') {
+        // This child is primary-only: all source switches and both fan-out
+        // budgets were disabled when it was created. A bounded diagnostic
+        // cannot spend supplementary quota or turn failure into search success.
+        try {
+          assertConfiguration();
+          const detail = primaryDoctorFailure(await race(client.callTool({ name: 'doctor', arguments: {} },
+            { ...options(), timeout: Math.min(10_000, budget()) })));
+          if (detail) throw detail;
+        } catch (error) {
+          activeSignal.throwIfAborted();
+          if (transport.failure) throw transport.failure;
+          if (error instanceof GrokSearchError) throw error;
+          // Older/unsupported doctors retain the original, honest diagnosis.
+        }
+      }
+      throw classified;
     }
     budget();
     const total = payload.sources_count ?? payload.total_sources ?? payload.sources.length;
@@ -372,6 +441,7 @@ export async function runMcpSearch({
     }
     budget();
     result = mapSearchResult(payload, { maxResults: request.maxResults, maxChars });
+    assertSearchReferences(payload, result, request.maxResults);
     budget();
     }
   } catch (caught) {

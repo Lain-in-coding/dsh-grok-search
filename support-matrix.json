@@ -1,7 +1,8 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.2.0",
-  "channel": "正式版本：npm latest（next 同版本入口）与 GitHub Release 使用同一个安装包",
+  "packageVersion": "0.2.1",
+  "channel": "正式版；npm latest 与 GitHub Release 使用同一个安装包。next 可能指向旧版",
+  "verificationBaseline": "targets 保留对应平台的既有宿主证据。0.2.1 已补验 Windows rc.5 和 0.2.2-rc.1 的配置、搜索、日志、额度、安装和旧版升级保留，并完成人工验收；未变路径按输入哈希复用，不把旧包安装或源码审查冒充本版全部平台实测",
   "supportPolicy": "targets 列出本版本的兼容支持组合，verificationLevel 单独说明验证依据。支持声明不要求逐个官方 Desktop 发行包实测：rc.4 Desktop 经关键源码一致性审查并结合已有宿主证据纳入支持，但不宣称原包实测通过。后续版本仍须完成受影响验证并审核后发布。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
   "verificationLevels": {
     "host-tested": "有对应系统、架构、入口和版本的宿主自动化测试记录；具体场景见 verification。运行时未变时可按源码哈希复用原范围证据，不把旧包安装写成新包安装，也不表示真实付费接口通过。",
@@ -127,7 +128,7 @@
     }
   ],
   "realKeyVerification": {
-    "win32-x64": "Grok 主搜索的作者人工通过记录来自 0.1.x，不是 0.2.0 当前主搜验收。0.2.0 开发期间曾验证四个补充来源、三家账户额度及 GitHub 认证；2026-11-06 复核时部分既有 Key 返回 401，仅 Firecrawl 回退成功，此后的第三方 Grok 网关未返回可核验引用。历史成功、当前凭据状态和隔离合成测试分别记录，不把内部回退当作主搜通过。",
+    "win32-x64": "0.2.1 的真实 Tavily、Firecrawl、TinyFish 搜索与额度查询通过；Windows rc.5 和 0.2.2-rc.1 的真实 Tavily Session、来源与日志一致，聊天模型为合成测试模型。Exa 现有测试 Key 返回401，Grok 指定测试网关未取得真实主搜成功证据。用户已确认本版人工验收通过，但未逐项报告上游与模型，不据此补写未取得的服务证据；历史成功、当前凭据与隔离合成测试分别记录。",
     "darwin-arm64": "尚未做真实付费接口验收",
     "linux-x64": "尚未做真实付费接口验收"
   },
@@ -140,6 +141,8 @@
     "DSH 0.2.2-alpha.2（不在 engines.dsh 范围内，安装会被拒绝）"
   ],
   "notTested": [
+    "Windows 10 桌面配置文件打开：已有经典记事本分支回归，不等同 Windows 10 实机验证",
+    "原生 Linux 桌面的配置文件打开：无桌面 CLI/Web 行为单独验证",
     "DSH 0.2.1-rc.4 Desktop 官方原包实测：已纳入兼容支持，但仅有关键源码审查与关联宿主证据，不把该版本 CLI/Web 测试写成 Desktop 实测",
     "原生 Linux（非 WSL）上用 npm 全局安装 DSH CLI 的完整路径",
     "macOS 和 Linux 上的真实付费接口",

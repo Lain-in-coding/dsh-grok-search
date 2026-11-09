@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { isCancellation } from './errors.mjs';
 
 const providers = new Set(['grok', 'grok-sources', 'tavily', 'exa', 'tinyfish', 'firecrawl']);
 const identity = (value, limit) => typeof value === 'string' && value.length > 0
@@ -57,13 +58,16 @@ export function createToolRouteContext({ capacity = 20, searchLog = null } = {})
       finally {
         if (active.get(id) === entry) active.delete(id);
         entry.finished = true;
-        entry.failed = rejected && !exec.signal?.aborted || result?.isError === true;
-        entry.cancelled = exec.signal?.aborted === true;
+        const reported = failure ?? result?.error?.info ?? result?.error;
+        const cancelled = exec.signal?.aborted === true && isCancellation(exec.signal.reason, true)
+          && (!reported || isCancellation(reported));
+        entry.failed = !cancelled && (rejected || result?.isError === true || exec.signal?.aborted === true);
+        entry.cancelled = cancelled;
         for (const route of entry.routes) if (route.outcome === 'running') {
-          route.outcome = exec.signal?.aborted ? 'cancelled' : 'failed';
+          route.outcome = cancelled ? 'cancelled' : 'failed';
           route.code = 'TOOL_ROUTE_INCOMPLETE';
         }
-        entry.omitted[exec.signal?.aborted ? 'cancelled' : 'failed'] += entry.omitted.running;
+        entry.omitted[cancelled ? 'cancelled' : 'failed'] += entry.omitted.running;
         entry.omitted.running = 0;
         if (entry.logScope) searchLog.finishCall(entry.logScope, {
           failed: entry.failed, cancelled: entry.cancelled,

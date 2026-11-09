@@ -50,6 +50,29 @@ test('request contracts follow grok-search-rs v0.1.26 for every source', async (
   assert.ok(calls.every(call => call.init.redirect === 'error'));
 });
 
+test('a slow first source cannot consume the whole fallback window', async () => {
+  const config = without(baseConfig(), 'tinyfish', 'firecrawl');
+  const { instance, calls } = router({ config, fetchImpl: (url, { signal }) => {
+    if (url.includes('tavily')) return new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    return json({ results: [{ url: 'https://result.test' }] });
+  } });
+  const deadline = performance.now() + 250;
+  const result = await instance.search({ query: 'q', remainingMs: () => deadline - performance.now() });
+  assert.equal(result.search_provider, 'exa');
+  assert.equal(calls.length, 2);
+  assert.ok(performance.now() < deadline + 100);
+});
+
+test('empty keys do not become successful keys when another Tavily key works', async () => {
+  const { instance } = router({ config: { ...baseConfig(), tavily_api_key: 'one,two' },
+    fetchImpl: async (url, init, index) => json({ results: index === 1 ? [{ url: 'https://result.test' }] : [] }) });
+  const result = await instance.diagnoseProvider('tavily');
+  assert.equal(result.partial, true);
+  assert.match(result.message, /1\/2/);
+});
+
 test('observed calls report actual retries and interface credits, never credential values', async () => {
   const observed = [];
   const config = without({ ...baseConfig(), tavily_api_key: 'first,second' }, 'exa', 'tinyfish', 'firecrawl');
@@ -107,6 +130,23 @@ test('only tavily splits comma separated keys', async () => {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].init.headers['x-api-key'], 'exa,with,commas');
   assert.deepEqual(result.sources, [{ url: 'https://exa.example', snippet: 's', publishedAt: '2026-01-01' }]);
+});
+
+test('exhausted Tavily keys are all tried before the next supplier', async () => {
+  const config = { ...baseConfig(), source_providers: ['tavily', 'firecrawl', 'exa', 'tinyfish'],
+    tavily_api_key: 'synthetic-one,synthetic-two,synthetic-three,synthetic-four' };
+  const events = [];
+  const { instance, calls } = router({ config,
+    fetchImpl: async url => url.startsWith('https://tavily.test/')
+      ? json({}, 429) : json({ data: { web: [{ url: 'https://result.test/after-exhaustion' }] } }) });
+  const result = await instance.search({ query: 'q', onCall: event => events.push(event) });
+  assert.equal(result.search_provider, 'firecrawl');
+  assert.deepEqual(calls.map(call => new URL(call.url).hostname),
+    ['tavily.test', 'tavily.test', 'tavily.test', 'tavily.test', 'firecrawl.test']);
+  assert.deepEqual(events.map(event => [event.provider, event.keyIndex, event.result]),
+    [['tavily', 0, 'failed'], ['tavily', 1, 'failed'], ['tavily', 2, 'failed'],
+      ['tavily', 3, 'failed'], ['firecrawl', 0, 'ok']]);
+  assert.deepEqual(result.diagnostic.failures.map(row => [row.provider, row.code]), [['tavily', 'HTTP_429']]);
 });
 
 test('unusable result URLs do not count as success or prevent the next source', async () => {
@@ -181,14 +221,11 @@ test('diagnosis covers every key, skips disabled sources and separates empty fro
   await assert.rejects(() => instance.diagnoseProvider('unknown'), error => error.code === 'SOURCE_UNKNOWN');
 });
 
-test('github diagnosis reports anonymous use, token failure and never sends an empty token', async () => {
-  const anonymous = router({ fetchImpl: async () => json({ resources: { core: { limit: 60, remaining: 59 } } }) });
+test('github diagnosis skips unconfigured and disabled targets and reports actual token failure', async () => {
+  const anonymous = router({ fetchImpl: async () => assert.fail('unconfigured GitHub must not be requested') });
   const open = await anonymous.instance.diagnoseProvider('github');
-  assert.equal(open.status, 'ok');
-  assert.equal(open.authenticated, false);
-  assert.equal(open.limit, 60);
-  assert.equal(anonymous.calls[0].url, 'https://api.github.com/rate_limit');
-  assert.equal(anonymous.calls[0].init.headers.authorization, undefined);
+  assert.equal(open.status, 'not-configured');
+  assert.equal(anonymous.calls.length, 0);
 
   const config = { ...baseConfig(), github_token: 'ghp_bad' };
   const rejected = router({ config, fetchImpl: async () => json({ message: 'Bad credentials ghp_bad' }, 401) });
@@ -198,7 +235,7 @@ test('github diagnosis reports anonymous use, token failure and never sends an e
   assert.match(failed.message, /Token/);
   assert.ok(!JSON.stringify(failed).includes('ghp_bad'));
 
-  const disabled = router({ prefs: prefsOf({ githubEnabled: false }), fetchImpl: async () => json({}) });
+  const disabled = router({ config, prefs: prefsOf({ githubEnabled: false }), fetchImpl: async () => assert.fail() });
   assert.equal((await disabled.instance.diagnoseProvider('github')).status, 'disabled');
   assert.equal(disabled.calls.length, 0);
 });

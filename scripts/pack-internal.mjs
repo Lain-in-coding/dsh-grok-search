@@ -39,11 +39,17 @@ export async function packInternal(directory, options = {}) {
   if (metadata.name !== manifest.name || metadata.version !== manifest.version
     || metadata.filename !== `${manifest.name}-${manifest.version}.tgz`) throw new Error('压缩包身份与候选不一致。');
   const allowed = path => ['package.json', 'README.md', 'cordis.patch.yml', 'support-matrix.json', 'LICENSE', 'src/bundle.mjs', 'src/program.mjs', 'src/index.mjs', 'src/provider.mjs', 'src/control.mjs', 'src/recovery.mjs', 'src/route-verifier.mjs', 'src/settings-ui.mjs', 'src/typert.host.mjs', 'src/client.js'].includes(path)
+    || ['locale/zh.json', 'locale/en.json', 'docs/plugin-detail.zh.md', 'docs/plugin-detail.en.md'].includes(path)
     || /^src\/core\/[a-z-]+\.mjs$/.test(path);
   const unexpected = metadata.files.filter(file => !allowed(file.path));
   if (unexpected.length) throw new Error('打包白名单失效：' + unexpected.map(file => file.path).join(', '));
   for (const expected of ['package.json', 'README.md', 'cordis.patch.yml', 'support-matrix.json', 'LICENSE', 'src/bundle.mjs', 'src/program.mjs', 'src/index.mjs', 'src/provider.mjs', 'src/control.mjs', 'src/recovery.mjs', 'src/route-verifier.mjs', 'src/settings-ui.mjs', 'src/typert.host.mjs', 'src/client.js', 'src/core/release-transaction.mjs']) {
     if (!metadata.files.some(file => file.path === expected)) throw new Error('压缩包遗漏文件：' + expected);
+  }
+  for (const language of ['zh', 'en']) {
+    const locale = `locale/${language}.json`;
+    const detail = JSON.parse(readFileSync(join(project, locale), 'utf8')).meta.detail;
+    for (const path of [locale, detail]) if (!metadata.files.some(file => file.path === path)) throw new Error('短介绍遗漏文件：' + path);
   }
   const readme = readFileSync(join(project, 'README.md'), 'utf8');
   for (const match of readme.matchAll(/\]\(\.\/([^)#]+)(?:#[^)]*)?\)/g)) {

@@ -1,6 +1,8 @@
 import { GrokSearchError } from './errors.mjs';
 import { mapSearchResult } from './result-map.mjs';
 import { createSourceChain } from './source-chain.mjs';
+import { searchConfigValues } from './search-config.mjs';
+import { isCancellation } from './errors.mjs';
 
 const sourceChain = createSourceChain();
 
@@ -19,7 +21,7 @@ const sourceChain = createSourceChain();
  */
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const DIAGNOSE_TIMEOUT_MS = 15_000;
+const GITHUB_METADATA_TIMEOUT_MS = 15_000;
 const KEY_SCOPED_STATUS = new Set([401, 403, 429, 432, 433]);
 const TAVILY_MIN_SCORE = 0.1;
 const DIAGNOSE_QUERY = 'DeepSeek Harness';
@@ -169,21 +171,13 @@ function classify(error) {
   return { code: 'NETWORK', message: '无法连接服务，请检查网络、代理或 BaseUrl。', ...(cause ? { cause } : {}) };
 }
 
-function configValues(getConfig) {
-  const value = getConfig?.();
-  if (!value) return {};
-  const fields = value.fields ?? value;
-  return Object.fromEntries(Object.entries(fields).map(([key, item]) => [
-    key, item && typeof item === 'object' && Object.hasOwn(item, 'value') ? item.value : item,
-  ]));
-}
-
-export function createSourceRouter({ getConfig, getPreferences, fetchImpl = globalThis.fetch } = {}) {
+export function createSourceRouter({ getConfig, getPreferences, fetchImpl = globalThis.fetch,
+  budgetMs = 120_000, cleanupMs = 2_000 } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('需要可用的 fetch 实现。');
   let tavilyCursor = 0;
 
-  const current = () => {
-    const config = configValues(getConfig);
+  const current = configuration => {
+    const config = searchConfigValues(configuration ?? getConfig?.());
     const preferences = getPreferences?.();
     const prefs = preferences?.value ?? preferences ?? {};
     // One shared chain: order and on/off come from the same effective
@@ -201,6 +195,8 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     });
     return { config, prefs, order, sources };
   };
+  const requestTimeout = config => Math.max(1, Math.min(budgetMs - cleanupMs,
+    (Number.isSafeInteger(config.timeout_seconds) ? Math.min(300, Math.max(5, config.timeout_seconds)) : 60) * 1000));
 
   const attempt = async (source, key, query, limit, { signal, timeoutMs }) => {
     const controller = new AbortController();
@@ -209,6 +205,7 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
     try {
+      combined.throwIfAborted();
       const request = source.spec.request(source.base, key, query, limit);
       const response = await fetchImpl(request.url, { ...request.init, redirect: 'error', signal: combined });
       if (!response.ok) {
@@ -238,13 +235,22 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     : source.state === 'not-configured' ? { status: 'not-configured', code: 'NOT_CONFIGURED', message: '尚未填写 API Key。' }
       : { status: 'failed', code: 'URL_INVALID', message: 'BaseUrl 无效，只支持 http 或 https 地址。' };
 
-  const diagnoseSource = async (source, signal) => {
+  const diagnoseSource = async (source, signal, config, schedule) => {
     if (source.state !== 'available') {
       return { provider: source.id, ...notRunnable(source), keyCount: source.keys.length, elapsedMs: 0, keys: [] };
     }
     const keys = [];
     for (const [keyIndex, key] of source.keys.entries()) {
-      const outcome = await attempt(source, key, DIAGNOSE_QUERY, 1, { signal, timeoutMs: DIAGNOSE_TIMEOUT_MS });
+      signal?.throwIfAborted();
+      const work = (activeSignal, remainingMs = () => Infinity) => attempt(source, key, DIAGNOSE_QUERY, 1,
+        { signal: activeSignal, timeoutMs: Math.min(requestTimeout(config), Math.max(1, remainingMs())) });
+      const started = performance.now();
+      let outcome;
+      try { outcome = schedule ? await schedule(work, signal) : await work(signal); }
+      catch (error) {
+        if (signal?.aborted || !['GROK_TIMEOUT', 'GROK_QUEUE_TIMEOUT'].includes(error?.code)) throw error;
+        outcome = { status: 'failed', code: error.code, message: error.message, elapsedMs: Math.round(performance.now() - started) };
+      }
       const { sources, keyScoped, ...rest } = outcome;
       keys.push({ keyIndex, ...rest, ...(outcome.status === 'ok' ? { code: 'OK', message: '连接成功。', results: sources.length } : {}) });
     }
@@ -252,27 +258,32 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     const failed = keys.filter(item => item.status === 'failed');
     const elapsedMs = keys.reduce((total, item) => total + item.elapsedMs, 0);
     const label = index => keys.length > 1 ? `Key ${index + 1}/${keys.length}：` : '';
-    const summary = ok.length ? { status: 'ok', code: 'OK', partial: failed.length > 0,
-      message: failed.length ? `${ok.length}/${keys.length} 个 Key 可用。` : keys.length > 1 ? `${keys.length} 个 Key 均可用。` : '连接成功。' }
+    const summary = ok.length ? { status: 'ok', code: 'OK', partial: ok.length < keys.length,
+      message: ok.length < keys.length ? `${ok.length}/${keys.length} 个 Key 返回结果。` : keys.length > 1 ? `${keys.length} 个 Key 均可用。` : '连接成功。' }
       : failed.length === 0 ? { status: 'empty', code: 'EMPTY', message: '连接正常，但本次测试没有返回结果。' }
         : { status: 'failed', code: failed[0].code, ...(failed[0].httpStatus ? { httpStatus: failed[0].httpStatus } : {}),
           message: label(failed[0].keyIndex) + failed[0].message };
     return { provider: source.id, ...summary, keyCount: keys.length, elapsedMs, keys };
   };
 
-  const diagnoseGithub = async signal => {
-    const { config, prefs } = current();
+  const diagnoseGithub = async (signal, configuration) => {
+    const { config, prefs } = current(configuration);
     if (prefs.githubEnabled === false) {
       return { provider: 'github', status: 'disabled', code: 'DISABLED', message: '已停用，测试时跳过。', keyCount: 0, elapsedMs: 0, keys: [] };
     }
     const token = text(config.github_token);
+    if (!token) {
+      return { provider: 'github', status: 'not-configured', code: 'NOT_CONFIGURED',
+        message: '尚未配置 GitHub Token，测试时跳过。', keyCount: 0, elapsedMs: 0, keys: [] };
+    }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(sourceFailure('SOURCE_TIMEOUT', 'GitHub 请求超时。')), DIAGNOSE_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(sourceFailure('SOURCE_TIMEOUT', 'GitHub 请求超时。')), GITHUB_METADATA_TIMEOUT_MS);
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
     const base = { provider: 'github', keyCount: token ? 1 : 0, keys: [] };
     try {
+      combined.throwIfAborted();
       const response = await fetchImpl(GITHUB_RATE_LIMIT, { method: 'GET', redirect: 'error', signal: combined,
         headers: { accept: 'application/vnd.github+json', 'user-agent': 'dsh-grok-search',
           'x-github-api-version': '2022-11-28', ...(token ? { authorization: `Bearer ${token}` } : {}) } });
@@ -305,7 +316,9 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       const keyIndex = (start + offset) % count;
       try { last = await attempt(source, source.keys[keyIndex], query, limit, { signal, timeoutMs: remaining }); }
       catch (error) {
-        onCall?.({ provider: source.id, keyIndex, result: 'cancelled', code: 'CANCELLED' });
+        const cancelled = isCancellation(error, signal?.aborted === true);
+        onCall?.({ provider: source.id, keyIndex, result: cancelled ? 'cancelled' : 'failed',
+          code: cancelled ? 'CANCELLED' : 'TIMEOUT' });
         throw error;
       }
       onCall?.({ provider: source.id, keyIndex, operation: offset ? 'retry' : 'search',
@@ -317,8 +330,8 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
   };
 
   return Object.freeze({
-    snapshot: () => {
-      const { order, sources } = current();
+    snapshot: configuration => {
+      const { order, sources } = current(configuration);
       const enabled = sources.filter(source => source.state === 'available').map(source => source.id);
       return { order, enabled, states: Object.fromEntries(sources.map(source => [source.id, source.state])),
         available: enabled.length > 0 };
@@ -326,8 +339,9 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     /** Legacy flat per-key list for older clients; skipped sources are reported once. */
     async diagnose({ signal } = {}) {
       const results = [];
-      for (const source of current().sources) {
-        const result = await diagnoseSource(source, signal);
+      const { sources, config } = current();
+      for (const source of sources) {
+        const result = await diagnoseSource(source, signal, config);
         if (result.keys.length === 0) {
           results.push({ provider: result.provider, ok: false, status: result.status, code: result.code, message: result.message });
         } else {
@@ -336,15 +350,18 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       }
       return results;
     },
-    async diagnoseProvider(provider, { signal } = {}) {
-      if (provider === 'github') return diagnoseGithub(signal);
-      const source = current().sources.find(item => item.id === provider);
+    async diagnoseProvider(provider, { signal, configuration, schedule } = {}) {
+      if (provider === 'github') return schedule
+        ? schedule(activeSignal => diagnoseGithub(activeSignal, configuration), signal) : diagnoseGithub(signal, configuration);
+      const { sources, config } = current(configuration);
+      const source = sources.find(item => item.id === provider);
       if (!source) throw new GrokSearchError('SOURCE_UNKNOWN', '未知补充来源。');
-      return diagnoseSource(source, signal);
+      return diagnoseSource(source, signal, config, schedule);
     },
-    async search({ query, maxResults = 5, signal, reason = 'grok-unavailable', onCall } = {}) {
+    async search({ query, maxResults = 5, signal, reason = 'grok-unavailable', onCall, configuration, remainingMs } = {}) {
       if (typeof query !== 'string' || !query.trim()) throw new GrokSearchError('SOURCE_QUERY_INVALID', '搜索查询不能为空。');
-      const { config, sources } = current();
+      signal?.throwIfAborted();
+      const { config, sources } = current(configuration);
       if (config.response_max_chars !== undefined
         && (!Number.isSafeInteger(config.response_max_chars) || config.response_max_chars < 100)) {
         throw new GrokSearchError('GROK_CONFIG_INVALID', '回复字符上限至少需要 100 字符，请检查共享配置。');
@@ -361,11 +378,17 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       }
       const fallbackSources = Number.isSafeInteger(config.fallback_sources) && config.fallback_sources > 0 ? config.fallback_sources : 5;
       const limit = Math.max(1, Math.min(Number.isSafeInteger(maxResults) && maxResults > 0 ? maxResults : 5, fallbackSources));
-      const timeoutSeconds = Number.isSafeInteger(config.timeout_seconds) ? Math.min(300, Math.max(5, config.timeout_seconds)) : 60;
-      const deadline = performance.now() + timeoutSeconds * 1000;
+      const deadline = performance.now() + Math.min(requestTimeout(config), remainingMs ? remainingMs() : Infinity);
       const failures = [];
-      for (const source of available) {
-        const outcome = await searchSource(source, query, limit, { signal, deadline, onCall });
+      for (const [index, source] of available.entries()) {
+        signal?.throwIfAborted();
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) {
+          throw new GrokSearchError('SOURCE_BUDGET_EXHAUSTED', '搜索预算已用尽，部分备用来源尚未尝试。',
+            { failures, unattempted: available.slice(index).map(item => item.id) });
+        }
+        const sourceDeadline = performance.now() + remaining / (available.length - index);
+        const outcome = await searchSource(source, query, limit, { signal, deadline: sourceDeadline, onCall });
         if (outcome.status === 'ok') {
           const maxChars = config.response_max_chars === undefined ? 45_000 : Math.min(500_000, config.response_max_chars);
           const mapped = mapSearchResult({ content: '', sources: outcome.sources }, { maxResults: limit, maxChars });
@@ -382,9 +405,8 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
         }
         failures.push({ provider: source.id, code: outcome.code,
           ...(outcome.httpStatus ? { httpStatus: outcome.httpStatus } : {}), message: outcome.message });
-        if (outcome.code === 'TIMEOUT' && deadline - performance.now() <= 0) break;
       }
-      throw new GrokSearchError('SOURCE_ALL_FAILED', '主搜索与已开启的补充来源均未返回结果。', { failures });
+      throw new GrokSearchError('SOURCE_ALL_FAILED', '已尝试的补充来源均未返回可用结果。', { failures });
     },
   });
 }

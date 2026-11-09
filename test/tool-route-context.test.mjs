@@ -387,3 +387,17 @@ test('whole-tool cancellation and post-provider failure are not displayed as suc
   assert.equal(context.read(session, 'render-error').state, 'failed');
   context.dispose(); history.dispose();
 });
+
+test('host ABORTED error envelopes remain cancelled, while timeout envelopes remain failed', async () => {
+  for (const reason of ['ABORTED', 'TIMEOUT']) {
+    const context = createToolRouteContext(), session = randomUUID(), controller = new AbortController();
+    await context.run({ ...exec(session, reason), signal: controller.signal }, () => {
+      const attribution = context.capture();
+      attribution.finish({ outcome: 'failed', cancelled: reason === 'ABORTED', code: reason });
+      controller.abort(Object.assign(new Error(reason), { code: reason }));
+      return { isError: true, error: { info: { code: reason } } };
+    });
+    assert.equal(context.read(session, reason).state, reason === 'ABORTED' ? 'cancelled' : 'failed');
+    context.dispose();
+  }
+});

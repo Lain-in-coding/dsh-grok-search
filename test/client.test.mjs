@@ -200,6 +200,8 @@ test('approved compact quota removes detail panels without discarding query safe
   assert.doesNotMatch(quota, /quota-details|quotaDetailsOpen|qp-key-hint|qp-disclosure|qp-details/);
   assert.match(quota, /data-quota-kind/);
   assert.match(quota, /当前 Key 最多还可用/);
+  assert.match(quota, /AUTH: '额度接口鉴权失败'/);
+  assert.doesNotMatch(quota, /AUTH: '.*无查询权限/);
   assert.match(quota, /<header class="qp-head"><div class="qp-heading">.*?\$\{tools\}<\/header>/);
   assert.match(quota, /自定义服务的账户余额请以该服务提供方为准/);
   assert.match(quota, /cancelAnimations\(\);\s*hideTip\?\.\(\)/);
@@ -216,7 +218,7 @@ test('capability revocation invalidates pending log reads before polling can def
   assert.match(controller, /S\.capabilities = snapshot\.capabilities;[\s\S]*?if \(S\.capabilities && !S\.capabilities\.secretsAllowed\) void logView\?\.read\(\);/);
   const read = log.slice(log.indexOf('async function read()'), log.indexOf('async function clearRemoteLog()'));
   assert.ok(read.indexOf('if (!S.capabilities?.secretsAllowed)') < read.indexOf('if (readTask) return;'));
-  assert.match(read, /if \(!logRestricted\) \{\s*generation\+\+;/);
+  assert.match(read, /if \(!S\.capabilities\?\.secretsAllowed\) \{[\s\S]*?restrict\(\)/);
   assert.match(read, /mine !== generation \|\| !S\.capabilities\?\.secretsAllowed/);
 });
 
@@ -259,6 +261,10 @@ test('quota auto-load deduplicates, expires per account and keeps refresh indepe
     DEF: { tavilyUrl: 'https://quota.example.test', exaUrl: 'https://exa.example.test' },
     SUPP: ['tavily', 'exa', 'tinyfish', 'firecrawl'], dialogBusy: () => false,
     uuid: () => String(++sequence), remote: {
+      previewAccountQuota(request) {
+        calls.push(request);
+        return Promise.resolve({ value: { kind: 'credits', remaining: 100 } });
+      },
       accountQuota(request) {
         calls.push(request);
         if (failNext) { failNext = false; return Promise.reject(new Error('synthetic failure')); }
@@ -293,12 +299,13 @@ test('quota auto-load deduplicates, expires per account and keeps refresh indepe
   assert.equal(calls.length, 6, 'effective configuration identity invalidates old balances');
   dialog.draft.url = 'https://unsaved.example.test'; view.render();
   await view.open();
-  assert.equal(calls.length, 6, 'unsaved destinations never issue quota requests');
+  assert.equal(calls.length, 7, 'explicit draft lookup uses the form without saving');
+  assert.equal(calls.at(-1).draft.baseUrl, 'https://unsaved.example.test');
   dialog = makeDialog('exa'); await view.open();
-  assert.equal(calls.length, 6, 'no invented Exa endpoint');
+  assert.equal(calls.length, 7, 'no invented Exa endpoint');
   S.capabilities.secretsAllowed = false; dialog = makeDialog(); await view.open();
-  assert.equal(calls.length, 6, 'unsafe connections never automatically query');
-  assert.equal(calls.every(call => Object.keys(call).sort().join(',') ===
+  assert.equal(calls.length, 7, 'unsafe connections never automatically query');
+  assert.equal(calls.slice(0, 6).every(call => Object.keys(call).sort().join(',') ===
     'expectedRevision,keyIndex,operationId,provider,quotaRevision'), true, 'RPC never sends key or arbitrary URL from the UI');
   view.dispose();
 });
@@ -323,7 +330,7 @@ test('quota draft changes, closed dialogs and disposal reject late replies even 
   dialog = makeDialog();
   const first = view.open();
   dialog.draft.url = 'https://changed.example.test'; view.render();
-  assert.deepEqual(cancelled, ['1']);
+  assert.deepEqual(cancelled, [pending[0].request.operationId]);
   dialog.draft.url = ''; view.render();
   pending[0].resolve({ value: { kind: 'credits', remaining: 100 } }); await first;
   const second = view.open();
@@ -335,7 +342,7 @@ test('quota draft changes, closed dialogs and disposal reject late replies even 
   assert.equal(pending.length, 3, 'closed-dialog reply was not cached');
   view.dispose();
   pending[2].resolve({ value: { kind: 'credits', remaining: 300 } }); await third;
-  assert.deepEqual(cancelled, ['1', '2', '3']);
+  assert.deepEqual(cancelled, pending.map(item => item.request.operationId));
   await view.open();
   assert.equal(pending.length, 3, 'disposed UI starts no new query');
 });
@@ -450,7 +457,7 @@ test('tool route mount and phase changes stay neutral while reading, until the f
     reading(render('result', 'unreadable'));
     requests.shift().reject(new Error('synthetic RPC unavailable'));
     await Promise.resolve();
-    assert.equal(render('result', 'unreadable').children, '本次来源暂不可读');
+    assert.equal(render('result', 'unreadable').children, '本次来源暂不可读 · SETTINGS_UNAVAILABLE');
   } finally { unmount(); t.mock.timers.reset(); }
 });
 

@@ -37,7 +37,7 @@ export function createSearchExecutor({ snapshot, runQuery = runMcpSearch, budget
   async function execute(record) {
     let holdSlot = false;
     try {
-      const current = await Promise.race([Promise.resolve().then(snapshot), record.aborted]);
+      const current = await Promise.race([Promise.resolve().then(() => snapshot(record.request)), record.aborted]);
       record.controller.signal.throwIfAborted();
       if (!isRecord(current)) throw new GrokSearchError('GROK_CONFIG_INVALID', '当前查询配置无效，请检查插件设置。');
       const captured = { ...current, ...(current.executableArgs ? { executableArgs: [...current.executableArgs] } : {}),
@@ -92,8 +92,12 @@ export function createSearchExecutor({ snapshot, runQuery = runMcpSearch, budget
       };
       record.controller.signal.addEventListener('abort', record.onAbort, { once: true });
       signal?.addEventListener('abort', record.onCallerAbort, { once: true });
-      record.timer = setTimeout(() => record.controller.abort(timeoutError()), budgetMs - cleanupMs);
-      queue.push(record);
+      record.timer = setTimeout(() => record.controller.abort(record.state === 'queued'
+        ? new GrokSearchError('GROK_QUEUE_TIMEOUT', '等待搜索队列超时，本次请求尚未开始。') : timeoutError()), budgetMs - cleanupMs);
+      // Do not interrupt a sent diagnostic (it may already be billed). Chat
+      // requests get the next free slot, preserving FIFO within each class.
+      const firstDiagnostic = request.testPrimary ? -1 : queue.findIndex(item => item.request.testPrimary);
+      if (firstDiagnostic < 0) queue.push(record); else queue.splice(firstDiagnostic, 0, record);
       if (signal?.aborted) record.onCallerAbort(); else drain();
       return promise;
     },

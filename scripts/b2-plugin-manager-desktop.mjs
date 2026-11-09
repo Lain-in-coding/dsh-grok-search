@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
+import { desktopAcceptancePaths, desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
+import { discoverGrokCandidates } from '../src/core/program-discovery.mjs';
 import {
   cleanEnvironment, commandResult, configSecrets, freshRun, project, receipt, redact, sha256, writeJson,
 } from './lib/internal-candidate-utils.mjs';
@@ -99,6 +101,7 @@ for (const row of expectedProductReceipt.sourceHashes) {
   assert.equal(sha256(join(project, row.file)), row.sha256, 'Frozen package source differs: ' + row.file);
 }
 const results = [], children = [];
+const upgradeEnvironments = new Map();
 let serial = 0, currentVersion = null;
 function protocolAssociation() {
   if (process.platform !== 'win32') return null;
@@ -510,6 +513,10 @@ async function prepare(runtime, folder) {
   const value = JSON.parse(execution.rawStdout);
   assert.equal(value.dependencyInstall, false);
   assert.equal(value.originalAsarUnmodified, true);
+  if (upgradeFrom && process.platform === 'win32') {
+    writeFileSync(join(folder, 'dsh-home/profiles/desktop/cordis.patch.yml'),
+      JSON.stringify([desktopWorkspacePatch(folder)], null, 2) + '\n');
+  }
 }
 
 async function start(runtime, folder, phase) {
@@ -523,7 +530,7 @@ async function start(runtime, folder, phase) {
   const args = [...(process.platform === 'win32' ? [runtime.archivePath] : []),
     '--user-data-dir=' + control.userData, '--remote-debugging-address=127.0.0.1',
     '--remote-debugging-port=' + debuggerPort, '--lang=zh-CN'];
-  const env = cleanEnvironment(folder, {
+  const extraEnvironment = {
     DSH_HOME: control.dshHome,
     ...(process.platform === 'win32' ? {
       DSH_DESKTOP_DSH_DIR: control.runtime,
@@ -544,10 +551,26 @@ async function start(runtime, folder, phase) {
     npm_config_update_notifier: 'false',
     ...(sourceOnlyConfig ? { GROK_SEARCH_CONFIG: sourceOnlyConfig } : {}),
     ...(manualAcceptance ? { DSH_MANUAL_ACCEPTANCE: '1' } : {}),
-    ...(firstUse || upgradeFrom ? { PATH: process.platform === 'win32'
+    ...(firstUse || upgradeFrom && process.platform !== 'win32' ? { PATH: process.platform === 'win32'
       ? join(process.env.SystemRoot ?? 'C:/Windows', 'System32')
       : '/usr/bin:/bin:/usr/sbin:/sbin' } : {}),
-  });
+  };
+  let env;
+  if (upgradeFrom && process.platform === 'win32') {
+    desktopAcceptancePaths(folder);
+    // Prepare this owned profile once, before its first launch. The official
+    // Host later serializes UI changes as YAML; retain those changes and reuse
+    // the same process-local boundary rather than rewriting its profile.
+    if (!upgradeEnvironments.has(folder)) {
+      upgradeEnvironments.set(folder, prepareDesktopAcceptanceEnvironment(folder, extraEnvironment).env);
+    }
+    env = { ...upgradeEnvironments.get(folder), ...extraEnvironment };
+  } else env = cleanEnvironment(folder, extraEnvironment);
+  if (upgradeFrom && process.platform === 'win32') {
+    const system = process.env.SystemRoot ?? 'C:/Windows';
+    env.PATH = [join(system, 'System32'), system, join(system, 'System32', 'WindowsPowerShell', 'v1.0')].join(';');
+    assert.deepEqual(discoverGrokCandidates({ env }), [], 'The upgrade must use only its retained private program cache.');
+  }
   secrets.add(control.token);
   for (const name of ['pnpm-home', 'pnpm-store']) mkdirSync(join(temporary, name), { recursive: true });
   const prefix = runtime.app.version + '-' + phase + '-' + serial;
@@ -1163,8 +1186,13 @@ async function productionDiagnosticsFlow(host, stub) {
       ['exa', 'tavily', 'tinyfish', 'firecrawl'].every(id => calls.some(row => row.provider === id)));
     check('both-Tavily-keys-tested', ['valid', 'invalid'].every(slot =>
       calls.some(row => row.provider === 'tavily' && row.keySlot === slot)));
-    check('Grok-failed-backup-shown-without-search-failure', partial.state === 'fallback'
-      && partial.status === '已静默回退' && partial.announcer.includes('已静默回退'));
+    check('Grok-failed-diagnosis-reports-backup-availability-without-inventing-chat-fallback', partial.state === 'backup'
+      && partial.status === '补充来源可用' && partial.announcer.includes('Grok 未通过')
+      && !partial.announcer.includes('已静默回退'));
+    check('Grok-invalid-key-retains-real-401-status', partial.rows.some(row =>
+      row.id === 'grok' && row.fault?.includes('401') && row.fault?.includes('鉴权失败')));
+    check('unconfigured-GitHub-is-not-a-diagnostic-target',
+      !partial.keys.some(row => row.id === 'github'));
     check('Tavily-partial-key-status-is-accurate', partial.keys.some(row =>
       row.id === 'tavily' && row.dots.includes('ok') && row.dots.includes('err')));
     check('TinyFish-error-has-real-403-short-code', partial.rows.some(row =>
@@ -1220,13 +1248,21 @@ async function productionDiagnosticsFlow(host, stub) {
       check('output-budget-failover-does-not-call-official',
         (await host.probe('snapshot')).calls.original === originalBefore);
     } finally { writeFileSync(budgetPath, originalBudgetText); }
+    // The previous assertion changed the file outside the UI. Import the
+    // restored revision before starting the next test; otherwise its deliberate
+    // CAS guard correctly cancels a stale-form diagnosis.
+    await renderer.evaluate(`document.querySelector('button[aria-label="返回插件"]').click(); true`);
+    await waitForRenderer(renderer, current => current.evaluate(`!document.querySelector('[data-dsg-route]')`));
+    await waitForRenderer(renderer, current => current.evaluate(`!!document.querySelector('button[aria-label="查看 dsh-grok-search"]')`));
+    await renderer.evaluate(`document.querySelector('button[aria-label="查看 dsh-grok-search"]').click(); true`);
+    await waitForRenderer(renderer, current => current.evaluate(`${q('#routeCard')}?.dataset.s==='backup'`));
     stub.state.mode = 'failed';
     const allFailedStart = stub.requests.length;
     await runTest();
     await completed();
     const failed = await snapshotUi();
     check('all-failed-diagnosis-is-clear', failed.state === 'err'
-      && failed.status === '搜索失败' && failed.announcer.includes('全部不可用'));
+      && failed.status === '最近检查未通过' && failed.announcer.includes('测试未通过'));
     check('disabled-Grok-is-not-tested', !stub.requests.slice(allFailedStart)
       .some(row => row.provider === 'grok'));
     check('failed-diagnosis-keeps-all-source-status-codes',

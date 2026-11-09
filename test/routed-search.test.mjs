@@ -32,13 +32,80 @@ function harness({ grok, sources = {}, prefs = { grokEnabled: true }, barrier = 
 }
 
 test('Grok success is recorded as served by grok', async () => {
-  const { routed, barrier } = harness({ grok: async () => ({ content: 'ok', sources: [] }) });
+  const { routed, barrier } = harness({ grok: async () => ({ content: 'ok', sources: [{ url: 'https://g.test' }] }) });
   assert.equal(routed.routeSnapshot(), null);
   const result = await routed.search({ query: QUERY }, undefined);
   assert.equal(result.content, 'ok');
   assert.deepEqual(routed.routeSnapshot(), { at: 1_000, origin: 'search', outcome: 'ok', served: 'grok',
     grokCode: null, fallbackUsed: false, failures: [] });
   assert.deepEqual(barrier.snapshot().activeOperationIds, []);
+});
+
+test('primary references lost to the output budget use the configured fallback and record its actual route', async () => {
+  const { routed, calls } = harness({
+    getConfig: () => ({ response_max_chars: 100 }),
+    grok: async () => ({ content: 'answer', sources: [{ url: 'https://g.test/' + 'x'.repeat(400) }] }),
+    sources: { search: async () => sourceResult('exa') },
+  });
+  try {
+    const result = await routed.search({ query: QUERY });
+    assert.equal(result.sources.length, 1);
+    assert.equal(calls.grok, 1);
+    assert.equal(calls.sources.length, 1);
+    assert.ok(JSON.stringify(result).length <= 100);
+    assert.equal(routed.routeSnapshot().served, 'exa');
+    assert.equal(routed.routeSnapshot().grokCode, 'OUTPUT_LIMIT');
+    const [record] = routed.searchLog.snapshot(randomUUID()).records;
+    assert.equal(record.kind, 'fallback');
+    assert.equal(record.served, 'exa');
+    assert.equal(record.reason, 'OUTPUT_LIMIT');
+    assert.equal(record.calls[0].result, 'failed');
+  } finally { await routed.dispose(); }
+});
+
+for (const [sources, code] of [
+  [[], 'grok_sources_empty'],
+  [[{ url: 'javascript:alert(1)' }], 'grok_sources_empty'],
+  [[{ url: 'https://g.test/' + 'x'.repeat(400) }], 'OUTPUT_LIMIT'],
+]) {
+  test(`primary ${code} fails explicitly without a fallback instead of recording success`, async () => {
+    const { routed, calls } = harness({
+      getConfig: () => ({ response_max_chars: 100 }),
+      grok: async () => ({ content: 'answer', sources }), sources: { available: false },
+    });
+    try {
+      await assert.rejects(routed.search({ query: QUERY }), { code });
+      assert.equal(calls.sources.length, 0);
+      assert.equal(routed.routeSnapshot().outcome, 'failed');
+      assert.equal(routed.searchLog.snapshot(randomUUID()).records[0].kind, 'failed');
+    } finally { await routed.dispose(); }
+  });
+}
+
+test('an explicit zero-reference request remains successful without unnecessary fallback', async () => {
+  const { routed, calls } = harness({
+    grok: async () => ({ content: 'answer', sources: [{ url: 'https://g.test' }] }),
+  });
+  try {
+    const result = await routed.search({ query: QUERY, maxResults: 0 });
+    assert.deepEqual(result.sources, []);
+    assert.equal(result.content, 'answer');
+    assert.equal(routed.routeSnapshot().outcome, 'ok');
+    assert.equal(calls.sources.length, 0);
+  } finally { await routed.dispose(); }
+});
+
+test('primary diagnosis enforces the same reference contract without invoking fallback', async () => {
+  const { routed, calls } = harness({
+    grok: async () => ({ content: 'answer', sources: [] }),
+  });
+  try {
+    await assert.rejects(routed.testGrok({ query: QUERY }), { code: 'grok_sources_empty' });
+    assert.equal(calls.sources.length, 0);
+    assert.equal(routed.routeSnapshot(), null);
+    assert.equal(routed.searchLog.snapshot(randomUUID()).records.length, 0);
+    assert.deepEqual(await routed.testGrok({ query: QUERY, maxResults: 0 }), { sources: [], diagnostic: null });
+  } finally { await routed.dispose(); }
 });
 
 test('shared response character cap bounds both Grok and source-only serialized outputs', async () => {
@@ -56,13 +123,13 @@ test('shared response character cap bounds both Grok and source-only serialized 
   }
 });
 
-test('the shared store effective fields envelope controls the real outer output budget', async () => {
+test('the shared store effective fields envelope controls the outer budget for explicit zero-reference requests', async () => {
   for (const maxChars of [5000, 90000]) {
     const { routed } = harness({
       getConfig: () => ({ fields: { response_max_chars: { value: maxChars, source: 'file' } } }),
       grok: async () => ({ content: 'x'.repeat(80000), sources: [] }),
     });
-    const answer = await routed.search({ query: 'q' });
+    const answer = await routed.search({ query: 'q', maxResults: 0 });
     assert.ok(JSON.stringify(answer).length <= maxChars);
     assert.equal(answer.truncated, maxChars < 80000);
     const envelopeLength = JSON.stringify({ content: '', sources: [], truncated: true }).length;
@@ -131,13 +198,79 @@ test('stop aborts in-flight sources and rejects queued requests before barrier d
   assert.equal(routed.routeSnapshot(), null);
 });
 
-test('a single total budget ends Grok without giving sources another full timeout', async () => {
+test('a single total budget ends Grok when no fallback is available', async () => {
   const { routed, calls } = harness({ budgetMs: 80, cleanupMs: 20,
     grok: (request, signal) => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
-    sources: { search: async () => sourceResult('exa') } });
+    sources: { available: false, search: async () => sourceResult('exa') } });
   await assert.rejects(routed.search({ query: 'q' }), { code: 'GROK_TIMEOUT' });
   assert.equal(calls.sources.length, 0);
   await routed.dispose();
+});
+
+test('a slow primary leaves time for a configured fallback within the original deadline', async () => {
+  const { routed, calls } = harness({ budgetMs: 240, cleanupMs: 20,
+    grok: (request, signal) => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
+    sources: { search: async ({ signal, remainingMs }) => {
+      assert.equal(signal.aborted, false);
+      assert.ok(remainingMs() > 0 && remainingMs() < 100);
+      return sourceResult('exa');
+    } } });
+  try {
+    const answer = await routed.search({ query: 'q' });
+    assert.equal(answer.search_provider, 'exa');
+    assert.equal(calls.sources.length, 1);
+    assert.equal(routed.routeSnapshot().grokCode, 'GROK_STAGE_TIMEOUT');
+  } finally { await routed.dispose(); }
+});
+
+test('one dispatched request retains its original source configuration after a concurrent save', async () => {
+  let config = { tavily_api_key: 'old', timeout_seconds: 60 };
+  const { routed } = harness({ getConfig: () => config,
+    grok: async () => { config = { tavily_api_key: 'new', timeout_seconds: 5 }; throw new Error('unavailable'); },
+    sources: { search: async ({ configuration }) => {
+      assert.equal(configuration.tavily_api_key, 'old');
+      return sourceResult('tavily');
+    } } });
+  try { await routed.search({ query: 'q' }); } finally { await routed.dispose(); }
+});
+
+test('an old in-flight result stays in history but cannot validate a replacement credential', async () => {
+  let config = { tavily_api_key: 'old-key', response_max_chars: 5000 };
+  let finish;
+  const { routed } = harness({
+    prefs: { grokEnabled: false }, getConfig: () => config,
+    sources: { search: () => new Promise(resolve => { finish = resolve; }) },
+  });
+  try {
+    const pending = routed.search({ query: 'configuration attribution' });
+    await new Promise(resolve => setImmediate(resolve));
+    config = { ...config, tavily_api_key: 'new-key' };
+    finish(sourceResult('tavily'));
+    assert.equal((await pending).sources.length, 1, 'the valid in-flight response still completes');
+    assert.equal(routed.routeSnapshot(), null, 'current health must not inherit the old credential result');
+    const records = routed.searchLog.snapshot(randomUUID()).records;
+    assert.equal(records.length, 1);
+    assert.equal(records[0].served, 'tavily');
+    assert.equal(records[0].kind, 'sources');
+  } finally { await routed.dispose(); }
+});
+
+test('route health expires on effective configuration changes and unreadable configuration', async () => {
+  let config = { grok_api_key: 'first-key' }, broken = false;
+  const { routed } = harness({
+    getConfig: () => { if (broken) throw new GrokSearchError('CONFIG_PARSE_FAILED', 'invalid TOML'); return config; },
+    grok: async () => ({ content: 'ok', sources: [{ url: 'https://g.test' }] }),
+  });
+  try {
+    await routed.search({ query: 'first' });
+    assert.equal(routed.routeSnapshot().served, 'grok');
+    config = { grok_api_key: 'other-key' };
+    assert.equal(routed.routeSnapshot(), null);
+    await routed.search({ query: 'second' });
+    assert.equal(routed.routeSnapshot().served, 'grok');
+    broken = true;
+    assert.equal(routed.routeSnapshot(), null);
+  } finally { await routed.dispose(); }
 });
 
 test('output budget captured at dispatch rejects bad config instead of silent fallback', async () => {
@@ -150,11 +283,11 @@ test('output budget captured at dispatch rejects bad config instead of silent fa
 });
 
 test('grok-search-rs internal fallback is recorded as grok-sources with a stable reason only', async () => {
-  const { routed } = harness({ grok: async () => ({ sources: [], diagnostic: { fallbackUsed: true, fallbackReason: 'grok_auth_error' } }) });
+  const { routed } = harness({ grok: async () => ({ sources: [{ url: 'https://g.test' }], diagnostic: { fallbackUsed: true, fallbackReason: 'grok_auth_error' } }) });
   await routed.search({ query: QUERY });
   assert.deepEqual(routed.routeSnapshot(), { at: 1_000, origin: 'search', outcome: 'ok', served: 'grok-sources',
     grokCode: 'grok_auth_error', fallbackUsed: true, failures: [] });
-  const free = harness({ grok: async () => ({ sources: [], diagnostic: { fallbackUsed: true, fallbackReason: 'upstream said: bad key sk-123' } }) });
+  const free = harness({ grok: async () => ({ sources: [{ url: 'https://g.test' }], diagnostic: { fallbackUsed: true, fallbackReason: 'upstream said: bad key sk-123' } }) });
   await free.routed.search({ query: QUERY });
   assert.equal(free.routed.routeSnapshot().grokCode, 'grok_provider_error');
 });
@@ -404,7 +537,7 @@ test('an aborted search is not recorded and does not fall back', async () => {
 });
 
 test('the origin is kept so settings can tell tests from real searches', async () => {
-  const { routed } = harness({ grok: async () => ({ sources: [] }) });
+  const { routed } = harness({ grok: async () => ({ sources: [{ url: 'https://g.test' }] }) });
   await routed.search({ query: QUERY }, undefined, 'test');
   assert.equal(routed.routeSnapshot().origin, 'test');
 });

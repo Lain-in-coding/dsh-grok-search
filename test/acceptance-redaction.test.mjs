@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configSecrets, redact } from '../scripts/lib/internal-candidate-utils.mjs';
+import { assertSecretFreeEvidence, configSecrets, redact } from '../scripts/lib/internal-candidate-utils.mjs';
 
 test('acceptance evidence redacts authorized TOML secrets and every comma-separated key', () => {
   const root = mkdtempSync(join(tmpdir(), 'dsh-acceptance-redaction-'));
@@ -46,4 +46,20 @@ test('invalid acceptance TOML never echoes credential source lines', () => {
   assert.throws(() => configSecrets(config), error =>
     error.message === 'Cannot safely parse the explicitly supplied acceptance configuration.'
     && !error.message.includes('synthetic-secret'));
+});
+
+test('short invalid test keys do not reject numeric acceptance evidence', () => {
+  const evidence = { status: 'passed', httpStatus: 200, count: 1, elapsedMs: 123,
+    version: '0.2.1', hash: 'abcdef123' };
+  assert.equal(assertSecretFreeEvidence(evidence, ['1', '2', '3']), evidence);
+  assert.throws(() => assertSecretFreeEvidence({ key: '1' }, ['1']),
+    { code: 'EVIDENCE_SECRET_REJECTED' });
+});
+
+test('acceptance guard still rejects raw and encoded full-length credentials', () => {
+  const secret = 'synthetic-"quoted"/key+long';
+  for (const value of [secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]) {
+    assert.throws(() => assertSecretFreeEvidence({ diagnostic: value }, [secret]),
+      { code: 'EVIDENCE_SECRET_REJECTED' });
+  }
 });

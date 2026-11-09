@@ -18,6 +18,22 @@ export function freshRun(prefix = 'internal-candidate') {
 export function writeJson(path, value) {
   writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
 }
+// Synthetic one-character keys must not collide with numeric counts, timing or
+// hashes. Long credentials remain substring-checked, including encoded forms;
+// short credentials are rejected when present as a complete JSON string value.
+export function assertSecretFreeEvidence(value, secrets = []) {
+  const text = JSON.stringify(value);
+  for (const secret of secrets) {
+    if (typeof secret !== 'string' || !secret) continue;
+    const found = secret.length < 5 ? text.includes(JSON.stringify(secret))
+      : [secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]
+        .some(encoded => text.includes(encoded) || text.includes(JSON.stringify(encoded).slice(1, -1)));
+    if (found) {
+      throw Object.assign(new Error('Evidence redaction guard'), { code: 'EVIDENCE_SECRET_REJECTED' });
+    }
+  }
+  return value;
+}
 export function cleanEnvironment(root, extra = {}) {
   const env = {};
   const windows = process.platform === 'win32';

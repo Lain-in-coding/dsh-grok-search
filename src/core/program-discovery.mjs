@@ -121,6 +121,16 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
   return { path: actual, version, sha256: createHash('sha256').update(programBytes).digest('hex') };
 }
 
+function isUnixLauncher(path) {
+  let descriptor;
+  try {
+    descriptor = openSync(path, 'r');
+    const header = Buffer.alloc(2);
+    return readSync(descriptor, header, 0, 2, 0) === 2 && header.toString('ascii') === '#!';
+  } catch { return false; } // Unreadable candidates retain their inspection error.
+  finally { if (descriptor !== undefined) closeSync(descriptor); }
+}
+
 export async function findExistingGrok(options = {}) {
   const candidates = discoverGrokCandidates(options);
   const inspect = options.inspect ?? inspectGrokProgram;
@@ -130,11 +140,16 @@ export async function findExistingGrok(options = {}) {
     try { return { ...await inspect(candidate.path, options), source: candidate.source, found: true }; }
     catch (error) {
       if (options.signal?.aborted || error.code === 'GROK_PROGRAM_REAP_FAILED' || candidate.explicit) throw error;
+      // npm's Unix bin entry has no extension. Ignore an automatically found
+      // script after inspection refused it; never execute or rewrite it.
+      if ((options.platform ?? process.platform) !== 'win32'
+        && ['GROK_PROGRAM_NOT_NATIVE', 'GROK_PROGRAM_MISSING'].includes(error.code)
+        && isUnixLauncher(candidate.path)) continue;
       failures.push({ code: error.code ?? 'GROK_PROGRAM_INVALID' });
     }
   }
   // An installed but unsupported/broken program is not permission to silently
   // download another copy. Let the user inspect it or choose private repair.
-  if (candidates.length) throw new GrokSearchError(failures[0]?.code ?? 'GROK_PROGRAM_INVALID', '已发现 Grok，但验证未通过；请检查现有程序或明确选择重新准备。');
+  if (failures.length) throw new GrokSearchError(failures[0]?.code ?? 'GROK_PROGRAM_INVALID', '已发现 Grok，但验证未通过；请检查现有程序或明确选择重新准备。');
   return { found: false, candidates: 0 };
 }

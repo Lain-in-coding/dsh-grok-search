@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPrivateProgramInstaller, resolveGrokProgram, unpackPlatformArchive, verifyArchiveIntegrity } from '../src/core/program-install.mjs';
+import { createProgramController } from '../src/program.mjs';
 const NAME = '@epsiekygrr_zedxx/grok-search-rs-win32-x64';
 const VERSION = '0.1.26';
 const PLATFORM = { packageName: NAME, version: VERSION, platform: 'win32' };
@@ -31,11 +32,12 @@ const validRows = () => [
 ];
 const integrity = data => 'sha512-' + createHash('sha512').update(data).digest('base64');
 function fixture({ latest = VERSION, archive = tar(validRows()), mutateMetadata, failOfficial = false,
-  redirect = null, failOfficialArchive = false, handshakeFailure = false } = {}) {
+  redirect = null, failOfficialArchive = false, handshakeFailure = false, failAll = false, handshake } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-installer-test-'));
   const urls = [], versions = [];
   const fetchImpl = async url => {
     urls.push(url);
+    if (failAll) return new Response('', { status: 503 });
     if (failOfficial && url.startsWith('https://registry.npmjs.org')) throw new Error('offline');
     if (url.endsWith('/latest')) return Response.json({ name: 'grok-search-rs', version: latest });
     if (url.endsWith('/' + VERSION)) {
@@ -56,7 +58,7 @@ function fixture({ latest = VERSION, archive = tar(validRows()), mutateMetadata,
     return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
   };
   return { directory, urls, versions, installer: createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64', fetchImpl, inspect,
-    handshake: async () => ({ version: VERSION, toolsDeclared: !handshakeFailure, exited: true }) }) };
+    handshake: handshake ?? (async () => ({ version: VERSION, toolsDeclared: !handshakeFailure, exited: true })) }) };
 }
 
 test('platform archive accepts only the expected manifest and native binary', () => {
@@ -124,6 +126,30 @@ test('untrusted redirect is rejected before fetching its target', async () => {
   await assert.rejects(installer.install(), error => error.code === 'GROK_DOWNLOAD_ORIGIN');
   assert.ok(urls.every(url => !url.includes('example.invalid')));
 });
+for (const [label, init, expectedCode] of [
+  ['HTTP failure', { status: 503 }, 'GROK_DOWNLOAD_HTTP'],
+  ['oversized Content-Length', { headers: { 'content-length': String(1_048_577) } }, 'GROK_DOWNLOAD_SIZE'],
+]) {
+  test(`rejected download ${label} cancels every unread response before trying the mirror`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-installer-response-'));
+    let requests = 0, cancellations = 0;
+    const cancelledBeforeRequest = [];
+    const installer = createPrivateProgramInstaller({
+      directory, platform: 'win32', arch: 'x64',
+      fetchImpl: async () => {
+        cancelledBeforeRequest.push(cancellations);
+        requests++;
+        return new Response(new ReadableStream({ cancel() { cancellations++; } }), init);
+      },
+    });
+    await assert.rejects(installer.install(), { code: expectedCode });
+    assert.equal(requests, 2);
+    assert.equal(cancellations, 2);
+    assert.deepEqual(cancelledBeforeRequest, [0, 1], 'close the previous body before trying the mirror');
+    assert.equal(existsSync(join(directory, '.install.lock')), false);
+    assert.equal(existsSync(join(directory, 'active.json')), false);
+  });
+}
 test('failed handshake never promotes the prepared binary', async () => {
   const { installer, directory } = fixture({ handshakeFailure: true });
   await assert.rejects(installer.install(), error => error.code === 'GROK_PROTOCOL_UNVERIFIED');
@@ -150,6 +176,115 @@ test('cache damage is detected before executing a modified binary', async () => 
   writeFileSync(result.path, 'modified');
   await assert.rejects(installer.active(), error => error.code === 'GROK_CACHE_DAMAGED');
   assert.equal(versions.length, 1);
+});
+
+function damagedCache(directory, missing = false) {
+  mkdirSync(join(directory, 'damaged'));
+  const executable = 'damaged/grok-search-rs.exe';
+  if (!missing) writeFileSync(join(directory, executable), 'damaged-never-executed');
+  const record = JSON.stringify({ schemaVersion: 1, version: VERSION, executable,
+    sha256: '0'.repeat(64), mcpHandshakeValidated: true });
+  writeFileSync(join(directory, 'active.json'), record);
+  return record;
+}
+for (const missing of [false, true]) {
+  test(`explicit cache repair recovers ${missing ? 'a missing binary' : 'hash damage'} without consulting unverified latest`, async () => {
+    const { installer, directory, urls, versions } = fixture({ latest: '99.0.0' });
+    const original = damagedCache(directory, missing);
+    await assert.rejects(installer.active(), { code: 'GROK_CACHE_DAMAGED' });
+    const [first, second] = await Promise.all([installer.repair(), installer.repair()]);
+    assert.equal(first.path, second.path);
+    assert.equal(first.version, VERSION);
+    assert.equal(versions.length, 1, 'the damaged binary is never executed');
+    assert.ok(urls.every(url => !url.endsWith('/latest')));
+    assert.equal(urls.length, 2);
+    assert.notEqual(readFileSync(join(directory, 'active.json'), 'utf8'), original);
+    assert.equal((await installer.active()).path, first.path);
+    if (!missing) assert.equal(readFileSync(join(directory, 'damaged/grok-search-rs.exe'), 'utf8'), 'damaged-never-executed');
+  });
+}
+for (const [name, options, code] of [
+  ['download', { failAll: true }, 'GROK_DOWNLOAD_HTTP'],
+  ['integrity', { mutateMetadata: data => { data.dist.integrity = integrity(Buffer.from('wrong')); } }, 'GROK_DOWNLOAD_INTEGRITY'],
+  ['handshake', { handshakeFailure: true }, 'GROK_PROTOCOL_UNVERIFIED'],
+]) {
+  test(`failed cache repair during ${name} preserves active record and shared configuration`, async () => {
+    const { installer, directory } = fixture(options);
+    const original = damagedCache(directory);
+    const shared = join(directory, '../config-' + directory.split(/[\\/]/).at(-1) + '.toml');
+    writeFileSync(shared, 'tavily_api_key = "synthetic-unchanged"\n', { flag: 'wx' });
+    const bytes = readFileSync(shared);
+    await assert.rejects(installer.repair(), { code });
+    assert.equal(readFileSync(join(directory, 'active.json'), 'utf8'), original);
+    assert.deepEqual(readFileSync(shared), bytes);
+    assert.equal(existsSync(join(directory, '.install.lock')), false);
+  });
+}
+test('cache repair respects cancellation and another installation lock, then succeeds on retry', async () => {
+  const { installer, directory, urls } = fixture();
+  const original = damagedCache(directory);
+  const cancellation = new AbortController();
+  const reason = new Error('cancel repair'); cancellation.abort(reason);
+  await assert.rejects(installer.repair({ signal: cancellation.signal }), error => error === reason);
+  writeFileSync(join(directory, '.install.lock'), 'other-owner');
+  await assert.rejects(installer.repair(), { code: 'GROK_INSTALL_BUSY' });
+  assert.equal(urls.length, 0);
+  assert.equal(readFileSync(join(directory, 'active.json'), 'utf8'), original);
+  assert.equal(readFileSync(join(directory, '.install.lock'), 'utf8'), 'other-owner');
+  unlinkSync(join(directory, '.install.lock')); // This test owns the synthetic lock.
+  assert.equal((await installer.repair()).version, VERSION);
+});
+test('cache repair cannot follow a record outside its managed directory', async () => {
+  const { installer, directory, urls } = fixture();
+  const original = JSON.stringify({ schemaVersion: 1, version: VERSION, executable: '../outside.exe',
+    sha256: '0'.repeat(64), mcpHandshakeValidated: true });
+  writeFileSync(join(directory, 'active.json'), original);
+  await assert.rejects(installer.repair(), { code: 'GROK_CACHE_PATH_INVALID' });
+  assert.equal(readFileSync(join(directory, 'active.json'), 'utf8'), original);
+  assert.equal(urls.length, 0);
+});
+test('cache repair cannot write through a linked cache root', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-cache-link-'));
+  const outside = mkdtempSync(join(tmpdir(), 'dsh-cache-outside-'));
+  const directory = join(root, 'linked-cache');
+  symlinkSync(outside, directory, 'junction');
+  let downloads = 0;
+  const installer = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64',
+    fetchImpl: async () => { downloads++; throw new Error('must not download'); } });
+  await assert.rejects(installer.repair(), { code: 'GROK_CACHE_PATH_INVALID' });
+  assert.equal(downloads, 0);
+  assert.equal(existsSync(join(outside, '.install.lock')), false);
+  assert.equal(existsSync(join(outside, 'active.json')), false);
+});
+test('cancellation after repair handshake never promotes the new program', async () => {
+  const controller = new AbortController(), reason = new Error('cancel at handshake');
+  const { installer, directory } = fixture({ handshake: async () => {
+    controller.abort(reason);
+    return { version: VERSION, toolsDeclared: true, exited: true };
+  } });
+  const original = damagedCache(directory);
+  await assert.rejects(installer.repair({ signal: controller.signal }), error => error === reason);
+  assert.equal(readFileSync(join(directory, 'active.json'), 'utf8'), original);
+  assert.equal(existsSync(join(directory, '.install.lock')), false);
+});
+test('the real controller and resolver recover a damaged private cache without resetting configuration', async () => {
+  const { installer, directory } = fixture();
+  damagedCache(directory);
+  const configPath = join(directory, 'shared.toml');
+  const configuration = 'tavily_api_key = "synthetic-preserved"\n';
+  writeFileSync(configPath, configuration);
+  const manager = createProgramController({ directory, installer, configuration: { configPath },
+    env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: '' }) });
+  try {
+    await assert.rejects(manager.prepare(), { code: 'GROK_CACHE_DAMAGED' });
+    assert.equal(manager.snapshot().canRepair, true);
+    const recovered = await manager.repair();
+    assert.equal(recovered.phase, 'ready');
+    assert.equal(recovered.canRepair, false);
+    assert.equal(recovered.program.source, 'private-cache');
+    assert.equal(manager.execution().configPath, configPath);
+    assert.equal(readFileSync(configPath, 'utf8'), configuration);
+  } finally { await manager.dispose(); }
 });
 test('stale lock is never reclaimed automatically', async () => {
   const { installer, directory } = fixture();

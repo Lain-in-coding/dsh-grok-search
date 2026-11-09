@@ -3,6 +3,7 @@ import { statSync } from 'node:fs';
 import { createSearchExecutor } from './core/search-executor.mjs';
 import { GrokSearchError } from './core/errors.mjs';
 import { createManagedMcpSearch } from './core/mcp-search.mjs';
+import { SEARCH_EXECUTION } from './core/search-config.mjs';
 
 export const PROVIDER_ID = 'grok-search';
 
@@ -21,13 +22,16 @@ export function createGrokProvider({ configuration, sdkFactory, runQuery, execut
     budgetMs,
     maxRunning: 1,
     runQuery: runQuery ?? session.run,
-    snapshot: () => {
-      const current = executionConfiguration();
-      if (!executableReady()) throw new GrokSearchError('GROK_PROGRAM_MISSING', 'Grok 程序不存在，请在插件设置中检查程序状态。');
+    snapshot: request => {
+      const current = request?.[SEARCH_EXECUTION] ?? executionConfiguration();
+      if (typeof current.executable !== 'string' || !isAbsolute(current.executable) || !statSync(current.executable, { throwIfNoEntry: false })?.isFile()) {
+        throw new GrokSearchError('GROK_PROGRAM_MISSING', 'grok-search-rs 程序不存在，请在插件设置中检查程序状态。');
+      }
       if (current.configPath && !isAbsolute(current.configPath)) throw new GrokSearchError('GROK_CONFIG_INVALID', 'Grok 配置文件必须使用绝对路径。');
       return { executable: current.executable, executableArgs: [...(current.executableArgs ?? [])],
         ...(current.configPath ? { configPath: current.configPath } : {}),
         ...(current.envOverrides ? { envOverrides: { ...current.envOverrides } } : {}),
+        ...(current.expectedConfigRevision ? { expectedConfigRevision: current.expectedConfigRevision } : {}),
         ...(sdkFactory ? { sdkFactory } : {}) };
     },
   });

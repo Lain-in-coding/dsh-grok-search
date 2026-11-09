@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { queryAccountQuota } from '../src/core/account-quota.mjs';
+import { queryAccountQuota, quotaDraftConfiguration } from '../src/core/account-quota.mjs';
 
 const json = body => new Response(JSON.stringify(body));
 test('Tavily custom endpoints query the configured origin and separate account/key scopes', async () => {
@@ -9,7 +9,7 @@ test('Tavily custom endpoints query the configured origin and separate account/k
     fetchImpl: async (url, init) => {
       assert.equal(url, 'https://custom.test/api/usage');
       assert.equal(init.headers.authorization, 'Bearer second');
-      assert.equal(init.redirect, 'error');
+      assert.equal(init.redirect, 'manual');
       return json({ account: { plan_usage: 5, plan_limit: 100, paygo_usage: 123 },
         key: { usage: 2, limit: 10 } });
     } });
@@ -82,4 +82,51 @@ test('real HTTP redirects are refused instead of forwarding custom credentials',
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   }
+});
+
+test('quota failures keep precise bounded HTTP/parse/network evidence without response bodies', async () => {
+  for (const [status, category] of [[401, 'AUTH'], [403, 'PERMISSION'], [429, 'RATE_LIMIT'],
+    [402, 'BILLING'], [404, 'ENDPOINT'], [503, 'UPSTREAM'], [302, 'REDIRECT']]) {
+    await assert.rejects(queryAccountQuota({ provider: 'tavily', config: { tavily_api_key: 'synthetic' },
+      fetchImpl: async () => new Response('upstream-secret-not-for-ui', { status }) }),
+    error => error.details.category === category && error.details.httpStatus === status
+      && !JSON.stringify(error).includes('upstream-secret'));
+  }
+  await assert.rejects(queryAccountQuota({ provider: 'tavily', config: { tavily_api_key: 'synthetic' },
+    fetchImpl: async () => { throw Object.assign(new TypeError('secret'), { cause: { code: 'ENOTFOUND' } }); } }),
+  error => error.details.category === 'NETWORK' && error.details.networkCode === 'ENOTFOUND');
+  await assert.rejects(queryAccountQuota({ provider: 'tavily', config: { tavily_api_key: 'synthetic' },
+    fetchImpl: async () => new Response('<html>secret</html>') }),
+  error => error.details.category === 'UNREPORTED');
+});
+
+test('draft queries use the selected current form key and leave the saved snapshot unchanged', async () => {
+  const effective = { tavily_api_url: { value: 'https://saved.test' }, tavily_api_key: { value: 'saved-one,saved-two' } };
+  const before = structuredClone(effective);
+  const query = quotaDraftConfiguration({ provider: 'tavily', keyIndex: 1, effective,
+    draft: { baseUrl: 'https://draft.test', apiKey: 'draft-key' } });
+  await queryAccountQuota({ provider: 'tavily', ...query, fetchImpl: async (url, init) => {
+    assert.equal(url, 'https://draft.test/usage'); assert.equal(init.headers.authorization, 'Bearer draft-key');
+    return json({ account: { plan_usage: 0, plan_limit: 100 } });
+  } });
+  assert.deepEqual(effective, before);
+  for (const draft of [{ baseUrl: 'http://remote.test' }, { apiKey: 'a\nb' }, { apiKey: null }, { unknown: 'value' }]) {
+    assert.throws(() => quotaDraftConfiguration({ provider: 'tavily', effective, draft }));
+  }
+  assert.throws(() => quotaDraftConfiguration({ provider: 'tavily',
+    effective: { tavily_api_key: { value: 'env-key', readOnly: true } }, draft: { apiKey: 'draft-key' } }),
+  { code: 'CONFIG_FIELD_READ_ONLY' });
+});
+
+test('draft destination-only edits use the selected saved multi-key and do not redirect to an official API', async () => {
+  const effective = { tavily_api_url: { value: 'https://saved.test' },
+    tavily_api_key: { value: 'first,second' } };
+  const query = quotaDraftConfiguration({ provider: 'tavily', keyIndex: 1, effective,
+    draft: { baseUrl: 'https://other-custom.test/path' } });
+  await queryAccountQuota({ provider: 'tavily', ...query, fetchImpl: async (url, init) => {
+    assert.equal(url, 'https://other-custom.test/path/usage');
+    assert.equal(init.headers.authorization, 'Bearer second');
+    return json({ key: { usage: 0, limit: 1 } });
+  } });
+  assert.equal(effective.tavily_api_url.value, 'https://saved.test');
 });

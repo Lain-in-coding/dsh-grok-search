@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discoverGrokCandidates, findExistingGrok, grokPlatformPackage, inspectGrokProgram } from '../src/core/program-discovery.mjs';
@@ -68,6 +68,57 @@ test('a healthy native installation is reusable despite an orphan shim elsewhere
   });
   assert.equal(result.path, binary);
 });
+for (const [platform, arch] of [['linux', 'x64'], ['darwin', 'arm64']]) {
+  const unixFixture = (text = '#!/usr/bin/env node\nthrow new Error("must never run");\n') => {
+    const root = setup(), cargo = join(root, 'cargo'), bin = join(cargo, 'bin');
+    const wrapper = makeFile(join(bin, 'grok-search-rs'));
+    writeFileSync(wrapper, text); chmodSync(wrapper, 0o700);
+    // Windows cannot represent a POSIX PATH drive separator. Cargo discovery
+    // reaches the same automatic-candidate branch; native Unix also uses PATH.
+    const env = { HOME: root, USERPROFILE: root, CARGO_HOME: cargo,
+      PATH: process.platform === 'win32' ? '' : bin };
+    return { root, wrapper, bin, env };
+  };
+  test(`${platform}: a launcher-only installation reuses private cache or prepares it without executing the script`, async () => {
+    for (const header of ['#!/usr/bin/env node', '#!/bin/sh']) {
+      for (const cached of [{ path: 'private-cache', found: true }, null]) {
+        const { env } = unixFixture(header + '\nexit 99\n');
+        let actives = 0, installs = 0;
+        const result = await resolveGrokProgram({ env, platform, arch, installer: {
+          active: async () => { actives++; return cached; },
+          install: async () => { installs++; return { path: 'prepared', found: true }; },
+        } });
+        assert.equal(actives, 1);
+        assert.equal(installs, cached ? 0 : 1);
+        assert.equal(result.path, cached ? 'private-cache' : 'prepared');
+      }
+    }
+  });
+  test(`${platform}: a manually selected launcher remains an explicit error`, async () => {
+    const { env, wrapper } = unixFixture();
+    for (const selection of [{ override: wrapper }, { configured: wrapper }]) {
+      await assert.rejects(resolveGrokProgram({ ...selection, env, platform, arch,
+        installer: { active: () => assert.fail('must not fall back'), install: () => assert.fail('must not install') } }),
+      { code: 'GROK_PROGRAM_NOT_NATIVE' });
+    }
+  });
+  test(`${platform}: launcher discovery still finds a valid native npm program`, async () => {
+    const { env, wrapper, bin } = unixFixture();
+    const binary = makeFile(join(bin, 'node_modules', grokPlatformPackage(platform, arch), 'bin/grok-search-rs'));
+    const result = await findExistingGrok({ env, platform, arch, inspect: (path, options) =>
+      path === wrapper ? inspectGrokProgram(path, options) : Promise.resolve({ path, version: '0.1.26' }) });
+    assert.equal(result.path, binary);
+    assert.equal(result.source, 'npm');
+    await assert.rejects(findExistingGrok({ env, platform, arch, inspect: (path, options) =>
+      path === wrapper ? inspectGrokProgram(path, options)
+        : Promise.reject(Object.assign(new Error('unverified native version'), { code: 'GROK_VERSION_UNVERIFIED' })) }),
+    { code: 'GROK_VERSION_UNVERIFIED' });
+  });
+  test(`${platform}: arbitrary damaged bytes are not silently treated as an ignorable launcher`, async () => {
+    const { env } = unixFixture('damaged-native-file');
+    await assert.rejects(findExistingGrok({ env, platform, arch }), { code: 'GROK_PROGRAM_NOT_NATIVE' });
+  });
+}
 test('PATH and cargo discovery de-duplicate the same native program', () => {
   const root = setup();
   const binary = makeFile(join(root, '.cargo/bin/grok-search-rs'));

@@ -70,3 +70,25 @@ test('unreaped verification process prevents retry from launching a replacement'
   assert.equal(calls, 1);
   await manager.dispose();
 });
+
+test('cache recovery is explicit, deduplicated and remains retryable after a failed download', async () => {
+  const attempts = [];
+  const manager = setup(async ({ repair }) => {
+    attempts.push(repair);
+    if (!repair) throw new GrokSearchError('GROK_CACHE_DAMAGED', 'damaged');
+    if (attempts.length === 2) throw new GrokSearchError('GROK_DOWNLOAD_HTTP', 'offline');
+    return program;
+  });
+  try {
+    await assert.rejects(manager.repair(), { code: 'GROK_CACHE_REPAIR_UNAVAILABLE' });
+    await assert.rejects(manager.prepare(), { code: 'GROK_CACHE_DAMAGED' });
+    assert.equal(manager.snapshot().canRepair, true);
+    await assert.rejects(manager.repair(), { code: 'GROK_DOWNLOAD_HTTP' });
+    assert.equal(manager.snapshot().canRepair, true);
+    await Promise.all([manager.repair(), manager.repair()]);
+    assert.deepEqual(attempts, [false, true, true]);
+    assert.equal(manager.snapshot().phase, 'ready');
+    assert.equal(manager.snapshot().canRepair, false);
+    assert.equal(manager.execution().executable, program.path);
+  } finally { await manager.dispose(); }
+});

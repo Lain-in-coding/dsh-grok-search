@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
+import { assertSecretFreeEvidence, cleanEnvironment, commandResult, freshRun, project, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
 
 // Explicit opt-in: credentials remain in memory/child environment, never arguments
 // or evidence. This command does not save configuration or touch a DSH profile.
@@ -28,13 +28,7 @@ const failureCodes = error => (error?.details?.failures ?? []).map(row => ({
   provider: ['grok', 'tavily', 'exa', 'tinyfish', 'firecrawl'].includes(row.provider) ? row.provider : 'unknown',
   code: codeOf(row),
 }));
-const assertSecretFree = value => {
-  const text = JSON.stringify(value);
-  for (const secret of secrets) for (const encoded of [secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]) {
-    if (encoded && text.includes(encoded)) throw Object.assign(new Error('Evidence redaction guard'), { code: 'EVIDENCE_SECRET_REJECTED' });
-  }
-  return value;
-};
+const assertSecretFree = value => assertSecretFreeEvidence(value, secrets);
 const record = row => {
   assertSecretFree(row);
   results.push(row);
@@ -72,6 +66,7 @@ try {
   const { createReleaseBarrier } = await load('src/core/release-transaction.mjs');
   const { queryAccountQuota } = await load('src/core/account-quota.mjs');
   const { createGrokProvider } = await load('src/provider.mjs');
+  const { searchSourceProvenance } = await load('src/core/result-map.mjs');
   configPath = resolveSharedConfigPath();
   const store = createSharedConfigStore({ path: configPath });
   const initial = store.snapshot();
@@ -89,7 +84,7 @@ try {
   });
   const query = 'DeepSeek Harness GitHub official repository';
   const sourceRuns = [];
-  const testRouted = async ({ caseName, config, grokEnabled = false, grok, fetchImpl, expectedServed }) => {
+  const testRouted = async ({ caseName, config, grokEnabled = false, grok, fetchImpl, expectedServed, expectedKind }) => {
     const router = createSourceRouter({ getConfig: () => config, fetchImpl });
     const routed = createRoutedSearch({ grok: grok ?? { search: async () => { throw Object.assign(new Error('Isolated primary failure'), { code: 'LIVE_TEST_PRIMARY_UNAVAILABLE' }); } },
       sourceRouter: router, preferences: { snapshot: () => ({ value: { grokEnabled } }) },
@@ -107,7 +102,7 @@ try {
       assert.equal(rows.length, 1);
       const log = rows[0];
       assert.equal(log.official, null);
-      assert.equal(log.kind, error ? 'failed' : grokEnabled ? 'fallback' : 'sources');
+      assert.equal(log.kind, error ? 'failed' : expectedKind ?? (grokEnabled ? 'fallback' : 'sources'));
       if (result) {
         assert.ok(result.sources.length > 0);
         if (expectedServed) assert.equal(log.served, expectedServed);
@@ -155,7 +150,11 @@ try {
       code: github.code, authenticated: github.authenticated, elapsedMs: github.elapsedMs });
   }
 
-  if (program.found) {
+  const primaryConfigured = Boolean(String(values.grok_api_key ?? '').trim()
+    || String(values.openai_compatible_api_key ?? '').trim() || values.grok_auth_mode === 'oauth');
+  const configuredSource = providers.some(id => values[`${id}_enabled`] !== false
+    && String(values[sourceSpec[id].key] ?? '').trim());
+  if (program.found && (primaryConfigured || asConfigured && configuredSource)) {
     const envOverrides = cleanEnvironment(root);
     // Clear inherited MCP-specific variables, then capture the effective values
     // once. New process home and config path are isolated; no key file is made.
@@ -206,7 +205,13 @@ try {
           const log = routed.searchLog.snapshot(id).records[0];
           const fallback = answer.diagnostic?.fallbackUsed === true;
           assert.equal(log.kind, fallback ? 'fallback' : 'ok');
-          assert.equal(log.served, fallback ? 'grok-sources' : 'grok');
+          const provenance = searchSourceProvenance(answer.sources);
+          const fallbackProviders = provenance.fallbackProviders;
+          const expectedSource = !fallback ? 'grok' : fallbackProviders.length === 1
+            ? fallbackProviders[0] : provenance.resultProviders.length === 1
+              && provenance.resultProviders[0] === 'grok' && provenance.resultProvidersComplete
+              ? 'grok' : 'grok-sources';
+          assert.equal(log.served, expectedSource, 'history must name the supplier actually reported by MCP');
           const pid = answer.diagnostic.childPid;
           assert.ok(Number.isInteger(pid) && pid > 0);
           if (pass === 1) firstPid = pid; else assert.equal(pid, firstPid, 'managed MCP process is reused');
@@ -273,7 +278,8 @@ try {
           code: codeOf(error.cause ?? error), rawResponseSaved: false });
       }
     }
-  } else record({ case: 'grok-primary', status: 'not-configured', code: 'GROK_PROGRAM_MISSING' });
+  } else record({ case: 'grok-primary', status: 'not-configured',
+    code: program.found ? 'NOT_CONFIGURED' : 'GROK_PROGRAM_MISSING' });
 
   const usable = sourceRuns.filter(row => row.ok);
   if (usable.length) {
@@ -282,15 +288,19 @@ try {
       grokEnabled: true, expectedServed: next, fetchImpl: networkFetch(next, 'fallback') });
     if (usable.length > 1) {
       const first = usable[0].provider, second = usable[1].provider;
+      const firstKeyCount = sourceSpec[first].multiKey
+        ? String(values[sourceSpec[first].key]).split(',').filter(key => key.trim()).length : 1;
       let injected = 0;
       const outcome = await testRouted({ caseName: 'injected-quota-exhaustion-to-live-next-source',
         config: isolatedValues([first, second], [first, second, ...providers.filter(id => id !== first && id !== second)]),
-        expectedServed: second,
+        expectedServed: second, expectedKind: 'fallback',
         fetchImpl: async (url, init) => {
-          if (injected++ === 0) return new Response('{}', { status: 429 });
+          // Exhaust all keys of the first supplier, not only its first key.
+          // Retrying another Tavily key is not a request to the next supplier.
+          if (injected++ < firstKeyCount) return new Response('{}', { status: 429 });
           return networkFetch(second, 'fallback-after-injected-429')(url, init);
         } });
-      assert.equal(injected, 2);
+      assert.equal(injected, firstKeyCount + 1);
       assert.equal(outcome.ok, true);
     }
   }
@@ -300,11 +310,12 @@ try {
   const configUnchanged = configPath && existsSync(configPath) ? sha256(configPath) === configHash : false;
   const sourceUnchanged = packageReceipt.sourceHashes.every(row => sha256(join(project, row.file)) === row.sha256);
   const programUnchanged = program?.found ? sha256(program.path) === program.sha256 : null;
+  const configuredSearches = results.filter(row => row.status !== 'not-configured'
+    && /^(?:source-|grok-primary|configured-mcp)/.test(row.case));
   const summary = { runId: run.runId, scope: 'real-credentials-packaged-core-no-desktop',
     grokTransport: grokDirect ? 'isolated-child-without-proxy-triage' : 'inherited-proxy-as-configured',
     invariantsPassed: !fatalCode && configUnchanged && sourceUnchanged && programUnchanged !== false,
-    allConfiguredSearchesPassed: results.filter(row => /^(?:source-|grok-primary|configured-mcp)/.test(row.case))
-      .every(row => row.status === 'passed'),
+    allConfiguredSearchesPassed: configuredSearches.length > 0 && configuredSearches.every(row => row.status === 'passed'),
     primaryGrokVerified: results.some(row => row.primaryVerified === true),
     fatalCode, results, network, cleanup, configUnchanged, configSha256: configHash,
     sourceUnchanged, programUnchanged, programVersion: program?.version ?? null,

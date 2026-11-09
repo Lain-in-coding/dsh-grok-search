@@ -1,14 +1,15 @@
-import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { randomUUID, createHmac, randomBytes } from 'node:crypto';
-import { dirname, isAbsolute, join, sep } from 'node:path';
+import { isAbsolute, join, sep } from 'node:path';
 import { createSharedConfigStore, CONFIG_FIELDS } from './core/shared-config.mjs';
 import { resolveSharedConfigPath } from './core/config-path.mjs';
 import { GrokSearchError } from './core/errors.mjs';
 import { createPrivatePreferences } from './core/private-preferences.mjs';
-import { queryAccountQuota } from './core/account-quota.mjs';
+import { queryAccountQuota, quotaDraftConfiguration } from './core/account-quota.mjs';
 import { createSettingsCodec as codec } from './core/settings-codec.mjs';
+import { SEARCH_SNAPSHOT } from './core/search-config.mjs';
+import { createConfigLocationOpener } from './core/config-opener.mjs';
 
 // The peer is supplied by DSH at runtime. Keeping a tiny test fallback lets
 // schema-only checks run in this package's dependency-free checkout while the
@@ -46,7 +47,6 @@ export const inject = [
 const REMOTE_SERVICE = 'grokSearchSettings';
 const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-methods';
 const DIAGNOSABLE_SOURCES = Object.freeze(['tavily', 'exa', 'tinyfish', 'firecrawl', 'github']);
-const GROK_DIAGNOSE_TIMEOUT_MS = 60_000;
 
 // Short, fixed copy for primary-engine failures. Codes come from this plugin or
 // from grok-search-rs' stable fallback_reason identifiers; never free text.
@@ -58,6 +58,8 @@ const GROK_MESSAGES = Object.freeze({
   grok_content_empty: 'Grok 未返回回答内容。',
   grok_sources_empty: 'Grok 未返回引用链接。',
   GROK_TIMEOUT: 'Grok 响应超时。',
+  GROK_QUEUE_TIMEOUT: '等待搜索队列超时，本次测试尚未开始。',
+  CONFIG_CONFLICT: '配置已更新，请按当前配置重新测试。',
   GROK_PROGRAM_MISSING: 'Grok 程序尚未就绪，请等待自动准备完成。',
   GROK_CONFIG_INVALID: 'Grok 配置文件无效。',
   GROK_TOOL_ERROR: 'Grok 搜索报告错误，请检查 API Key、BaseUrl 和模型。',
@@ -67,7 +69,10 @@ const GROK_MESSAGES = Object.freeze({
   GROK_QUEUE_FULL: '搜索队列已满，请稍后再测。',
   GROK_SEARCH_STOPPING: '插件正在停止，暂不能测试。',
 });
-const grokMessage = code => GROK_MESSAGES[code] ?? 'Grok 查询失败，请检查程序和配置。';
+const grokMessage = code => code === 'HTTP_401' ? 'API Key 无效或鉴权失败（HTTP 401）。'
+  : /^HTTP_[45]\d{2}$/.test(code) ? `Grok 接口返回 HTTP ${code.slice(5)}，请核对对应的接口、权限或服务状态。`
+    : code === 'GROK_NETWORK_ERROR' ? '无法连接 Grok 接口，请检查网络、代理或证书。'
+      : GROK_MESSAGES[code] ?? 'Grok 查询失败，请检查程序和配置。';
 // A short form for the route view; the full path stays in `path`.
 const displayPath = path => {
   const home = homedir();
@@ -128,6 +133,7 @@ const programSchema = {
         program: { anyOf: [{ type: 'object', additionalProperties: true }, { type: 'null' }] },
         configPath: nullableString,
         error: nullableError,
+        canRepair: { type: 'boolean' },
         configuration: { type: 'object', additionalProperties: true },
       },
       required: ['phase', 'program', 'configPath', 'error'],
@@ -237,6 +243,7 @@ const prepareJsonSchema = {
     program: { anyOf: [{ type: 'object', additionalProperties: true }, { type: 'null' }] },
     configPath: nullableString,
     error: nullableError,
+    canRepair: { type: 'boolean' },
     configuration: { type: 'object', additionalProperties: true },
   },
   required: ['phase', 'program', 'configPath', 'error'],
@@ -338,15 +345,17 @@ const descriptors = [
       }, required: ['known', 'state', 'routes'], additionalProperties: false,
     }),
   },
-  {
-    id: 'dsh-grok-search#grokSearchSettings/accountQuota',
-    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'accountQuota',
-    description: 'Query only the saved provider account; never returns credentials.',
+  ...['accountQuota', 'previewAccountQuota'].map(method => ({
+    id: `dsh-grok-search#grokSearchSettings/${method}`,
+    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method,
+    description: 'Query a saved account or a transient form draft without saving or returning credentials.',
     invocation: { kind: 'direct' },
     parameters: [{ name: 'request', wire: 'request', source: 'json',
       codec: codec('dsh-grok-search/settings#AccountQuotaRequest', {
         type: 'object', properties: { provider: { type: 'string' }, keyIndex: { type: 'number' },
-          expectedRevision: { type: 'string' }, operationId: { type: 'string' }, quotaRevision: { type: 'string' } },
+          expectedRevision: { type: 'string' }, operationId: { type: 'string' }, quotaRevision: { type: 'string' },
+          draft: { type: 'object', properties: { baseUrl: { type: 'string' }, apiKey: { type: 'string' } },
+            additionalProperties: false } },
         required: ['provider', 'expectedRevision', 'operationId', 'quotaRevision'], additionalProperties: false,
       }) }],
     result: codec('dsh-grok-search/settings#AccountQuotaResult', {
@@ -354,7 +363,7 @@ const descriptors = [
         value: { anyOf: [{ type: 'object', additionalProperties: true }, { type: 'null' }] } },
       required: ['supported', 'value'], additionalProperties: false,
     }),
-  },
+  })),
   {
     id: 'dsh-grok-search#grokSearchSettings/snapshot',
     service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'snapshot',
@@ -414,8 +423,15 @@ const descriptors = [
     result: codec('dsh-grok-search/settings#PrepareResult', prepareJsonSchema),
   },
   {
-    id: 'dsh-grok-search#grokSearchSettings/openConfigLocation',
-    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'openConfigLocation',
+    id: 'dsh-grok-search#grokSearchSettings/repairProgram',
+    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'repairProgram',
+    description: 'Explicitly repair damaged private program content using a verified version.',
+    invocation: { kind: 'direct' }, parameters: [],
+    result: codec('dsh-grok-search/settings#PrepareResult', prepareJsonSchema),
+  },
+  ...['openConfigLocation', 'openConfigLocationWithStatus'].map(method => ({
+    id: `dsh-grok-search#grokSearchSettings/${method}`,
+    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method,
     description: 'Open the shared Grok configuration file or its folder on the local host.',
     invocation: { kind: 'direct' },
     parameters: [{
@@ -425,8 +441,13 @@ const descriptors = [
         required: [], additionalProperties: false,
       }),
     }],
-    result: codec('dsh-grok-search/settings#OpenConfigResult', openJsonSchema),
-  },
+    // Keep the old response exact: older hosts may retain its strict codec.
+    result: method === 'openConfigLocation'
+      ? codec('dsh-grok-search/settings#OpenConfigResult', openJsonSchema)
+      : codec('dsh-grok-search/settings#OpenConfigStatusResult', { ...openJsonSchema,
+        properties: { ...openJsonSchema.properties, editor: nullableString, fallbackReason: nullableString,
+          copyOnly: { type: 'boolean' } } }),
+  })),
   {
     id: 'dsh-grok-search#grokSearchSettings/diagnose',
     service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'diagnose',
@@ -442,7 +463,8 @@ const descriptors = [
     parameters: [{
       name: 'request', wire: 'request', source: 'json',
       codec: codec('dsh-grok-search/settings#DiagnoseProviderRequest', {
-        type: 'object', properties: { provider: { type: 'string' }, operationId: { type: 'string' } },
+        type: 'object', properties: { provider: { type: 'string' }, operationId: { type: 'string' },
+          expectedRevision: { type: 'string' }, configIdentity: { type: 'string' } },
         required: ['provider'], additionalProperties: false,
       }),
     }],
@@ -532,6 +554,7 @@ class GrokSearchSettingsGateway extends Service {
     });
     this.diagnostics = new Map();
     this.cancelledDiagnostics = new Map();
+    this.configOpener = createConfigLocationOpener();
     // Never expose an unkeyed secret hash or reuse identities across lifetimes.
     this.quotaIdentityKey = randomBytes(32);
     const cancel = () => {
@@ -545,6 +568,7 @@ class GrokSearchSettingsGateway extends Service {
     ctx.effect?.(() => () => {
       unregister?.();
       cancel();
+      this.configOpener.dispose();
       this.cancelledDiagnostics.clear();
     });
   }
@@ -668,30 +692,36 @@ class GrokSearchSettingsGateway extends Service {
     return this.program.prepare();
   }
 
+  async repairProgram() {
+    this._owner();
+    if (!this.program?.repair) throw new GrokSearchError('GROK_PROGRAM_UNAVAILABLE', '程序管理器当前不可用。');
+    return this.program.repair();
+  }
+
   async openConfigLocation(request = {}) {
+    const value = await this._openConfigLocation(request);
+    return { path: value.path, displayPath: value.displayPath, exists: value.exists, kind: value.kind, opened: value.opened };
+  }
+
+  async openConfigLocationWithStatus(request = {}) {
+    return this._openConfigLocation(request);
+  }
+
+  async _openConfigLocation(request = {}) {
     this._owner();
     const kind = request?.kind ?? 'folder';
     if (kind !== 'file' && kind !== 'folder') throw new GrokSearchError('CONFIG_OPEN_INVALID', '只能打开配置文件或所在文件夹。');
     const path = this._configPath();
-    const exists = existsSync(path);
-    const result = { path, displayPath: displayPath(path), exists, kind, opened: false };
+    const result = { path, displayPath: displayPath(path), exists: false, kind, opened: false };
     // A remote browser cannot see this host's desktop; it gets the path to copy.
-    if (this._capabilities().transport === 'restricted') return result;
-    const folder = dirname(path);
-    if (kind === 'file' ? !exists : !existsSync(folder)) return result;
-    const [command, args] = process.platform === 'win32'
-      ? ['explorer.exe', kind === 'file' ? [path] : exists ? ['/select,' + path] : [folder]]
-      : process.platform === 'darwin'
-        ? ['open', kind === 'file' ? ['-t', path] : exists ? ['-R', path] : [folder]]
-        : ['xdg-open', [kind === 'file' ? path : folder]];
-    // A missing opener reports through the `error` event; never let it crash the host.
-    result.opened = await new Promise(resolve => {
-      let child;
-      try { child = spawn(command, args, { detached: true, stdio: 'ignore', shell: false }); }
-      catch { resolve(false); return; }
-      child.once('error', () => resolve(false));
-      child.once('spawn', () => { child.unref(); resolve(true); });
-    });
+    if (this._capabilities().transport !== 'loopback') {
+      result.exists = existsSync(path);
+      result.copyOnly = true;
+      return result;
+    }
+    // The opener distinguishes missing targets from denied access. A boolean
+    // existence precheck here would silently hide its actionable I/O errors.
+    Object.assign(result, await this.configOpener.open({ path, kind, signal: this.ctx.invocation?.signal }));
     return result;
   }
 
@@ -707,10 +737,21 @@ class GrokSearchSettingsGateway extends Service {
     if (provider !== 'grok' && !DIAGNOSABLE_SOURCES.includes(provider)) {
       throw new GrokSearchError('SOURCE_UNKNOWN', '未知搜索来源。');
     }
-    return this._diagnosisWork(request, signal => {
-      if (provider === 'grok') return this._diagnoseGrok(signal);
-      if (!this.sourceRouter?.diagnoseProvider) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
-      return this.sourceRouter.diagnoseProvider(provider, { signal });
+    const store = this._store(), captured = store.readSnapshot();
+    const identity = this._quotaRevision(store, captured.effective);
+    const preferences = this.preferenceStore.snapshot().revision;
+    const conflict = () => new GrokSearchError('CONFIG_CONFLICT', '配置已更新，本次结果不再用于当前配置；请重新测试。');
+    if (request.expectedRevision !== undefined && request.expectedRevision !== captured.snapshot.revision
+      || request.configIdentity !== undefined && request.configIdentity !== identity) throw conflict();
+    if (this.program?.execution && this.program.snapshot()?.phase === 'ready') captured.execution = this.program.execution();
+    return this._diagnosisWork(request, async signal => {
+      if (provider !== 'grok' && !this.sourceRouter?.diagnoseProvider) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
+      const result = provider === 'grok' ? await this._diagnoseGrok(signal, captured)
+        : await this.sourceRouter.diagnoseProvider(provider, { signal, configuration: captured.effective,
+          schedule: this.core?.scheduleDiagnosis });
+      if (store.snapshot().revision !== captured.snapshot.revision || this._quotaRevision(store) !== identity
+        || this.preferenceStore.snapshot().revision !== preferences) throw conflict();
+      return result;
     });
   }
 
@@ -766,7 +807,7 @@ class GrokSearchSettingsGateway extends Service {
     return { cancelled: Boolean(controller) };
   }
 
-  async _diagnoseGrok(signal) {
+  async _diagnoseGrok(signal, captured) {
     const base = { provider: 'grok', keys: [] };
     if (this.preferenceStore.snapshot().value?.grokEnabled === false) {
       return { ...base, status: 'disabled', code: 'DISABLED', message: '已关闭，搜索直接走补充来源。', elapsedMs: 0 };
@@ -774,10 +815,9 @@ class GrokSearchSettingsGateway extends Service {
     if (!this.core?.testGrok) throw new GrokSearchError('GROK_UNAVAILABLE', 'Grok 查询核心当前未加载。');
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
-    const timeout = AbortSignal.timeout(GROK_DIAGNOSE_TIMEOUT_MS);
-    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     try {
-      const result = await this.core.testGrok({ query: 'DeepSeek Harness', maxResults: 3 }, combined);
+      // The core owns queue + work + cleanup budgets. No unrelated 60s timer.
+      const result = await this.core.testGrok({ query: 'DeepSeek Harness', maxResults: 3, [SEARCH_SNAPSHOT]: captured }, signal);
       const diagnostic = result?.diagnostic ?? {};
       // grok-search-rs falls back to its own sources when Grok itself fails;
       // that answer is not evidence that the Grok key or model works.
@@ -791,8 +831,10 @@ class GrokSearchSettingsGateway extends Service {
         : { ...base, status: 'empty', code: 'EMPTY', message: '连接正常，但本次测试没有返回来源。', elapsedMs: elapsed() };
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
-      const code = timeout.aborted ? 'GROK_TIMEOUT' : typeof error?.code === 'string' ? error.code : 'GROK_SEARCH_FAILED';
-      return { ...base, status: 'failed', code, message: grokMessage(code), elapsedMs: elapsed() };
+      const code = typeof error?.code === 'string' ? error.code : 'GROK_SEARCH_FAILED';
+      return { ...base, status: 'failed', code, message: grokMessage(code), elapsedMs: elapsed(),
+        ...(Number.isInteger(error?.details?.httpStatus) ? { httpStatus: error.details.httpStatus,
+          evidence: 'primary-doctor' } : {}) };
     }
   }
 
@@ -851,24 +893,34 @@ class GrokSearchSettingsGateway extends Service {
       ?? { known: false, state: 'unknown', routes: [] };
   }
 
-  async accountQuota(request = {}) {
+  async _accountQuota(request = {}) {
     this._privateView();
     const store = this._store();
-    const revision = store.snapshot().revision;
-    const effective = store.readEffective();
+    const captured = store.readSnapshot();
+    const revision = captured.snapshot.revision;
+    const effective = captured.effective;
     const identity = this._quotaRevision(store, effective);
     if (typeof request.expectedRevision !== 'string' || request.expectedRevision !== revision) {
       throw new GrokSearchError('CONFIG_CONFLICT', '配置已变更，请重新读取后查询。');
     }
     if (request.quotaRevision !== identity) throw new GrokSearchError('CONFIG_CONFLICT', '有效配置已变更，请重新读取后查询。');
+    const query = quotaDraftConfiguration({ provider: request.provider, keyIndex: request.keyIndex ?? 0,
+      effective, draft: request.draft });
     return this._diagnosisWork(request, async signal => {
-      const result = await queryAccountQuota({ provider: request.provider, keyIndex: request.keyIndex ?? 0,
-        config: effective, signal });
+      const result = await queryAccountQuota({ provider: request.provider, ...query, signal });
       if (store.snapshot().revision !== revision || this._quotaRevision(store) !== identity) {
         throw new GrokSearchError('CONFIG_CONFLICT', '配置已变更，请重新读取后查询。');
       }
       return result;
     });
+  }
+
+  async accountQuota(request) {
+    return this._accountQuota(request);
+  }
+
+  async previewAccountQuota(request) {
+    return this._accountQuota(request);
   }
 
   async savePreferences(request = {}) {
@@ -887,18 +939,37 @@ class GrokSearchSettingsGateway extends Service {
 // Typert serializes only its public RemoteError type with a stable code;
 // ordinary Error.code is otherwise reduced to gateway/internal. Keep unknown
 // implementation errors (potentially containing paths or keys) off the wire.
-for (const { method } of descriptors) {
+for (const descriptor of descriptors) {
+  const { method } = descriptor;
   const implementation = GrokSearchSettingsGateway.prototype[method];
+  const invoke = async (self, args) => {
+    try {
+      // rc.5 may retain an older package's Typert manifest after an in-process
+      // update and discover newly added methods from their SRC signatures.
+      // Keep the same validation on both dispatch paths.
+      for (const [index, parameter] of descriptor.parameters.entries()) {
+        if (args[index] !== undefined) {
+          const parsed = parameter.codec.create().safeParse(args[index]);
+          if (!parsed.success) {
+            self._owner();
+            if (['readSearchLog', 'clearSearchLog', 'closeSearchLog', 'accountQuota', 'previewAccountQuota'].includes(method)) self._privateView();
+            throw new GrokSearchError('SETTINGS_REQUEST_INVALID', '设置请求格式无效，请刷新插件页后重试。');
+          }
+        }
+      }
+      return await implementation.apply(self, args);
+    } catch (error) {
+      if (self.ctx.invocation?.signal?.aborted) throw self.ctx.invocation.signal.reason;
+      if (error instanceof GrokSearchError) throw new RemoteError(error.code, error.message, jsonDetails(error.details));
+      throw new RemoteError('SETTINGS_OPERATION_FAILED', '设置操作失败，请重试。', {});
+    }
+  };
   Object.defineProperty(GrokSearchSettingsGateway.prototype, method, {
     configurable: true, writable: true,
-    value: async function (...args) {
-      try { return await implementation.apply(this, args); }
-      catch (error) {
-        if (this.ctx.invocation?.signal?.aborted) throw this.ctx.invocation.signal.reason;
-        if (error instanceof GrokSearchError) throw new RemoteError(error.code, error.message, jsonDetails(error.details));
-        throw new RemoteError('SETTINGS_OPERATION_FAILED', '设置操作失败，请重试。', {});
-      }
-    },
+    // Host SRC discovery accepts plain named parameters only, never ...args or
+    // defaults. Method arity and wire names must match the actual descriptor.
+    value: descriptor.parameters.length === 0 ? async function () { return invoke(this, []); }
+      : async function (request) { return invoke(this, [request]); },
   });
 }
 

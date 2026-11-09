@@ -6,7 +6,7 @@
 
 可视化配置 · 自动回退 · 日志回放 · 账户额度
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-5264FF?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/releases) [![DSH](https://img.shields.io/badge/DSH-0.2.1%20rc.2%E2%80%93rc.5%20%7C%200.2.2%20rc.1-24292f?style=flat-square)](#支持范围) [![MIT](https://img.shields.io/badge/License-MIT-24292f?style=flat-square)](./LICENSE) [![Stars](https://img.shields.io/github/stars/Lain-in-coding/dsh-grok-search?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/stargazers)
+[![Version](https://img.shields.io/badge/Version-0.2.1-5264FF?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/releases/tag/v0.2.1) [![DSH](https://img.shields.io/badge/DSH-0.2.1%20rc.2%E2%80%93rc.5%20%7C%200.2.2%20rc.1-24292f?style=flat-square)](#支持范围) [![MIT](https://img.shields.io/badge/License-MIT-24292f?style=flat-square)](./LICENSE) [![Stars](https://img.shields.io/github/stars/Lain-in-coding/dsh-grok-search?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/stargazers)
 
 [快速开始](#快速开始) · [更新已有版本](#更新已有版本) · [支持范围](#支持范围) · [来源与排序](#来源与排序)
 
@@ -45,6 +45,8 @@
 
 DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵向排列。每行只有图标、名称和开关，点击图标或名称即可配置。
 
+本页图片与录屏保留真实的 **0.2.0** 版本标注，不作为 0.2.1 实录。安装流程仍适用，具体界面与行为以安装版本及文字说明为准。
+
 <p align="center">
   <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-mockup.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-mockup.png" alt="0.2.0 深色界面效果图：搜索路由、供应商开关、共享配置入口与最近搜索位于同一详情页" width="960"></a>
   <br><sub>深色界面效果图 · 点击查看大图</sub>
@@ -71,7 +73,7 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 ## 快速开始
 
-两种方式任选其一。可下载版本以 [Releases](https://github.com/Lain-in-coding/dsh-grok-search/releases) 为准；已安装的用户可直接看[更新已有版本](#更新已有版本)。
+当前版本为 **0.2.1**，可从 [npm](https://www.npmjs.com/package/dsh-grok-search?activeTab=versions) 或 [GitHub Release](https://github.com/Lain-in-coding/dsh-grok-search/releases/tag/v0.2.1) 安装。两种方式任选其一；已安装的用户可直接看[更新已有版本](#更新已有版本)。
 
 ### 方式一：在 DSH 中按名称安装
 
@@ -86,7 +88,7 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 按完整包名即可定位安装，无需从搜索结果中挑选。若提示已经安装，返回已安装列表打开详情。
 
-**安装指定版本：** 填写 `dsh-grok-search@0.2.0`。新版本刚发布时，DSH 的安全等待策略可能让裸包名安装到较早版本；下方录屏使用「包名@版本」，安装后请核对显示的版本号，无需关闭安全策略。
+**安装指定版本：** 从 npm 发布列表选择所需版本，填写 `dsh-grok-search@版本号`，将“版本号”替换成实际已发布的号码。新版本刚发布时，DSH 的安全等待策略可能让裸包名安装到较早版本；下方录屏以 `dsh-grok-search@0.2.0` 演示，安装后请核对版本，无需关闭安全策略。
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-by-name-020-hd.mp4"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-by-name-020-hd.png" alt="0.2.0 按名称安装实录：进入 DSH 插件页，添加插件，输入 dsh-grok-search@0.2.0，点击安装，最后显示已安装和版本 0.2.0，不点击启用" width="960"></a>
@@ -100,10 +102,10 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 1. 打开 [GitHub Releases](https://github.com/Lain-in-coding/dsh-grok-search/releases)，在所需版本的 **Assets（附件）** 下载 `dsh-grok-search-<版本>.tgz`。请选择插件包，`Source code` 是源码归档。
 2. 复制下载文件的绝对路径。
-3. 打开 **「插件 → 添加插件」**，在 **「包名或地址」** 粘贴该路径，不加引号。例如：
+3. 打开 **「插件 → 添加插件」**，在 **「包名或地址」** 粘贴该路径，不加引号。路径格式如下，`<版本>` 必须换成下载文件的实际版本：
 
    ```text
-   C:\DSH-Plugins\dsh-grok-search-0.2.0.tgz
+   C:\DSH-Plugins\dsh-grok-search-<版本>.tgz
    ```
 
 4. 点击 **「安装」**，看到 **「已安装」** 后继续[首次配置](#首次配置)。
@@ -117,7 +119,7 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 <details>
 <summary>macOS / Linux 路径、解压目录导入与注意事项</summary>
 
-`.tgz` 文件直接填绝对路径，例如 `/Users/你的用户名/Downloads/dsh-grok-search-0.2.0.tgz`，不用加 `file:`。路径必须位于运行 DSH 的电脑；远程 Web 不能使用浏览器所在电脑的本地文件路径。
+`.tgz` 文件直接填绝对路径，例如 `/Users/你的用户名/Downloads/dsh-grok-search-<版本>.tgz`，将用户名和版本替换成实际值，不用加 `file:`。路径必须位于运行 DSH 的电脑；远程 Web 不能使用浏览器所在电脑的本地文件路径。
 
 若已经解压，进入内层 `package` 文件夹，确认能直接看到 `package.json`、`cordis.patch.yml` 和 `src`，在同一个输入框填写 **`file:` 加文件夹绝对路径**：
 
@@ -165,7 +167,9 @@ Windows 可在该文件夹按 `Alt+D`、`Ctrl+C` 复制地址。目录前的 `fi
 dsh plugin --profile web add dsh-grok-search
 ```
 
-按包名安装使用 npm 的 `latest` 入口；`next` 为同版本入口。若镜像尚未同步，在安装弹窗的 **「安装源」** 选择 npm 官方源，或改用 Release 包，无需修改全局 npm 源。
+按包名安装使用 npm 的 `latest` 入口。`next` 可能仍指向旧版，不作为更新入口。若镜像尚未同步，在安装弹窗的 **「安装源」** 选择 npm 官方源，或改用 Release 包，无需修改全局 npm 源。「自定义安装源」填写 npm registry（如 `https://registry.npmjs.org/`），不要填写项目的 GitHub 地址。
+
+若只填名称却提示版本不兼容，先看报错中的**实际解析版本**：宿主的新版本等待策略可能仍选到旧包。可从 npm 发布列表选择兼容的精确版本，按 `dsh-grok-search@版本号` 填写，或使用 Release `.tgz`。精确版本仍受宿主安装策略约束，不需要关闭安全检查、卸载现有插件或清缓存。
 
 </details>
 
@@ -173,21 +177,36 @@ dsh plugin --profile web add dsh-grok-search
 
 **正常更新不用重填 Key、不用清缓存，也不用重新安装兼容的 `grok-search-rs`。** 配置和程序缓存与插件包分开保存；请继续使用原来的 DSH 配置环境，不要清空应用数据。
 
-**准备升级到 DSH `0.2.2-rc.1`？先把插件更新到 `0.2.0`，再更新 DSH。** 若已经更新 DSH，直接安装新版插件即可；旧插件 `0.1.1` 不支持该宿主，不要通过忽略版本检查强行启用。
+**准备升级到 DSH `0.2.2-rc.1`？先选择已发布且声明支持该宿主的插件版本，再更新 DSH。** 插件 `0.2.0` 已加入该宿主支持；旧插件 `0.1.1` 不支持。若已经更新 DSH，直接安装兼容版本，不要通过忽略版本检查强行启用。
 
-DSH `0.2.2-rc.1` 已提供第三方插件更新入口：从 npm 按包名安装的插件，可在插件管理页检查更新并选择新版本。镜像未同步时可改用下面的 Release 安装包；无需修改全局 npm 源。
+**DSH `0.2.2-rc.1`：优先在插件面板内更新。** 从 npm 按包名安装的用户：
 
-各受支持版本通用的方式是直接导入新版 `.tgz`，**不必先卸载旧插件**：
+1. 打开 **「插件 → 已安装 → dsh-grok-search」**，**「版本」** 区域会自动检查；需要时点击 **「重新检查」**。
+2. 选择兼容版本，点击 **「更新到 …」**，等待更新完成；**不需要手动卸载再安装**。
+3. 确认显示的新版本、原有配置和开关；仅在 DSH 提示需要重启时重启。
+
+查不到新版本时，先核对安装源及发布等待提示；不要清缓存或强行忽略兼容检查。本地目录、Git 或 `.tgz` 来源不一定具备此更新入口，可用下面的方式。
+
+<details>
+<summary>旧版 DSH 或本地包用户：导入新版 .tgz</summary>
+
+各受支持版本均可直接导入新版 `.tgz`，**不必先卸载旧插件**：
 
 1. 在 [Releases](https://github.com/Lain-in-coding/dsh-grok-search/releases) 确认目标版本已发布且支持你的 DSH，先下载对应 `.tgz`，等待正在进行的搜索结束。
 2. 在 **「插件 → 添加插件 → 包名或地址」** 填写新 `.tgz` 的绝对路径，点击 **「安装」**。
 3. 安装后若显示 **「立即启用」**，点击启用，否则点击 **「完成」**；从托盘完整退出并重开 DSH，确认版本已更新、原配置仍在。
 
-按包名或解压目录安装时，DSH 可能提示“已经安装”；此时先在插件详情中卸载，再安装新版即可，配置和程序缓存仍保留。若升级失败，可用原版本 `.tgz` 恢复，不要通过删除配置或缓存排障。
+旧宿主按包名或解压目录安装可能提示“已经安装”，优先改用新版 `.tgz`。确实无法原地更新时，才考虑在插件详情卸载后重新安装；正常卸载保留配置和程序缓存。
 
-Windows Desktop `0.2.1-rc.2/.3/.5` 已验证 `0.1.1 → 0.2.0` 配置保留；另验证了“rc.5 更新插件 → 更新宿主到 0.2.2-rc.1 → 回退”的隔离流程。其他入口的升级路径尚未逐项验证。新版插件包需要下载，已有兼容的搜索程序继续复用。
+</details>
+
+更新失败时，DSH `0.2.2-rc.1` 会尝试恢复旧包，但恢复本身也可能失败。先查看更新结果，必要时用**兼容当前宿主**的已发布 `.tgz` 恢复；不要删除配置或缓存。
+
+Windows Desktop `0.2.2-rc.1` 已在隔离测试源验证 `0.2.0 → 0.2.1` 面板更新，无需重启；原开关状态、Key 配置和程序缓存保留，下载校验失败、启动失败及下载取消后可恢复旧版。`0.2.1-rc.5` 的 `0.1.1 → 0.2.1` 原地导入、重启与配置保留也已验证。这些测试不保证所有网络故障下都能恢复。新版插件包需要下载，已有兼容的搜索程序继续复用。
 
 ## 支持范围
+
+下表列出兼容范围与累计宿主证据；不表示每个候选安装包都已在所有组合重新实测。各版本的验证依据与未覆盖环境见[支持矩阵](./support-matrix.json)。
 
 | 系统 | 入口 | 兼容的 DSH 版本 | 验证情况 |
 | --- | --- | --- | --- |
@@ -196,7 +215,9 @@ Windows Desktop `0.2.1-rc.2/.3/.5` 已验证 `0.1.1 → 0.2.0` 配置保留；�
 | Linux x64（WSL Ubuntu 22.04） | CLI/Web | `0.2.1-rc.2` ～ `rc.5`、`0.2.2-rc.1` | 五个版本均已测 |
 
 - **共用一个安装包**。rc.4 Desktop 的关键宿主源码与已测 rc.3 / rc.5 一致，未单独实测官方 rc.4 桌面发行包。
+- **版本分别看**：DSH、DSH Plugin Hub 和 `dsh-grok-search` 各自独立编号。插件 `0.1.1` 不支持 DSH `0.2.2-rc.1`；插件 `0.2.0` 同时支持表中旧宿主与新宿主。真正的 DSH `0.1.0` 不在本项目支持范围，新旧版本不会自动互相兼容。
 - **区分入口**：Windows/macOS 的独立 CLI/Web 不在本次支持范围；Linux 使用 WSL 验证，macOS 使用自动化测试环境。
+- **操作系统版本**：Windows 11 x64、macOS 15 Apple Silicon、WSL Ubuntu 22.04 是现有验证环境；DSH 版本兼容不等于所有操作系统版本已实测。Windows 10 与原生 Linux 桌面的文件打开尚无实机验证。
 - **运行时要求**：DSH `0.2.2-rc.1` 需要 Node.js ≥ `24.9`；Desktop 自带运行时，CLI/Web 用户须自行满足此要求。插件没有自动升级全局 Node.js。
 - **复用已有后端**：已验证 `grok-search-rs` 程序版本为 `0.1.26`；优先复用兼容安装，缺少时准备私有缓存，不升级全局程序或自动采用未经验证的版本。
 - **升级 DSH 前核对[支持矩阵](./support-matrix.json)**。超出范围时宿主可能跳过插件、按原设置搜索；表外平台与版本不作兼容承诺。
@@ -241,12 +262,19 @@ Windows Desktop `0.2.1-rc.2/.3/.5` 已验证 `0.1.1 → 0.2.0` 配置保留；�
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/demo-020-fallback.mp4"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/demo-020-fallback.png" alt="0.2.0 回退演示：Grok 认证失败后短暂红边和轻颤，路由转向 Tavily，最终显示已静默回退" width="960"></a>
-  <br><sub>0.2.0 离线诊断演示：主搜索失败后静默回退，逐项展示结果 · 点击观看高清 MP4。</sub>
+  <br><sub>0.2.0 旧版离线示意：展示异常与路由动效，不作为实际搜索回退的证据 · 点击观看高清 MP4。</sub>
 </p>
 
 ## 测试搜索
 
-「测试搜索」会逐个检查**全部已开启的来源**和 **Tavily 的每个 Key**，不会因为某个来源成功就跳过其余来源。GitHub 单独检测认证或匿名访问，不参与补充搜索。
+「测试搜索」会逐个检查**全部已开启且已配置的来源**和 **Tavily 的每个 Key**，不会因为某个来源成功就跳过其余来源。GitHub 仅在已填写 Token 且开启检测时单独检查认证，不参与补充搜索。
+
+Grok 单项测试不额外调用补充来源，也不修改共享配置；上游未提供明确错误状态时，可能补发一次限时的 Grok 诊断请求。测试显示各来源是否可用；
+只有真实搜索发生回退时，才显示「已静默回退」。
+
+测试时显示已完成项、当前来源和等待秒数，可随时点击「停止测试」。每个独立请求遵守共享超时配置和插件预算，整轮逐项测试可能超过两分钟；空结果会明确标注，不当作 Key 失效。
+
+真实搜索共用一次总预算（默认 120 秒，含排队与回收）。有可用备用来源时会预留回退时间，慢来源不会独占插件直接管理的回退窗口；全部未返回可用结果时明确结束，不无限重试，也不自动切到官方付费搜索。上游内部预取仍由 grok-search-rs 管理。
 
 图标点亮表示已配置并开启，Key 可用性以测试结果为准。右上角图标与小圆点显示最近一次测试；出错来源短暂红边、轻颤，并显示简短原因，如 `403 · 访问被拒绝`。
 
@@ -300,7 +328,7 @@ Windows Desktop `0.2.1-rc.2/.3/.5` 已验证 `0.1.1 → 0.2.0` 配置保留；�
 | TinyFish | 钱包余额 |
 | Exa | 尚未接入普通 Key 余额接口，可从标题旁「服务控制台」查看 |
 
-自定义 Base URL 同样尝试查询，查不到显示「额度查询失败」，可点击重试；刷新失败时保留并标明上次结果。「服务控制台」始终打开对应供应商的官方控制台，自定义服务的余额以该服务提供方为准。
+自定义 Base URL 同样尝试查询；失败时显示原因和已获得的 HTTP 状态，可点击重试，刷新失败时保留并标明上次结果。当前表单的 Base URL 和 Key 无需先保存即可查询，查询不写配置，取消不会保存草稿。「服务控制台」始终打开对应供应商的官方控制台，自定义服务的余额以该服务提供方为准。
 
 **账户额度可能含其他应用的调用，不等于本次搜索消耗。** 日志只展示接口实际报告的消耗，缺失显示「未报告」，说明收在旁边的圆形提示图标中，不按余额差值推算。
 
@@ -325,7 +353,9 @@ Windows Desktop `0.2.1-rc.2/.3/.5` 已验证 `0.1.1 → 0.2.0` 配置保留；�
 - 保存保留注释和未编辑字段。同一字段被其他窗口修改时，草稿会保留；修改 Key 或 Base URL 遇到新修订也不会自动合并。点击「读取最新配置」，核对后再保存，避免把新 Key 配到尚未确认的地址。
 - 已保存到文件的 Key 可继续修改；「环境变量 · 只读」表示启动环境提供了覆盖值，需要在该环境修改或移除，插件不擅改系统环境变量。
 - Key 默认遮蔽，可在安全连接下点眼睛查看或点击复制，访问限制见[隐私与费用](#隐私与费用)。
-- 远程 Web 页面打开的是 **DSH 服务器**上的文件，不是浏览器所在电脑的文件；无法打开时可以复制路径。
+- 远程 Web 页面只提供 **DSH 服务器**上的配置路径，供复制后在宿主查看；不会打开浏览器所在电脑的文件。无桌面 Linux 同样保留路径入口。
+- Windows 优先使用已安装的新版记事本，不可用时尝试一次系统经典记事本；无需安装编辑器或设置 TOML 文件关联。macOS 使用默认文本编辑器。始终打开原配置文件，失败会说明原因，不影响已保存的 Key。
+- Windows「打开文件夹」使用系统资源管理器，并确认目标目录窗口可见；无法确认时可复制路径手动打开，不会仅因系统接受请求就报告成功。
 
 </details>
 
@@ -346,10 +376,12 @@ DSH 的插件开关与详情中的组件开关是两层独立设置。若插件�
 | `404` / `405` | 核对 Base URL 与接口路径 |
 | 网络 / 超时 / TLS | 检查网络、代理、证书与超时设置，不要关闭证书校验 |
 | Grok 未返回引用链接 | 回答没有可识别的来源；核对模型联网能力与接口引用格式，不等于 API Key 无效 |
+| `OUTPUT_LIMIT` / 回复上限过小 | 输出预算未能保留搜索链接；在「Grok Search Rs」中调大「回复字符上限」，不等于 Key 失效 |
 | `CONFIG_CONFLICT` | 读取最新配置，核对草稿后再保存 |
 | `CONFIG_COMMIT_UNCERTAIN` | 先回读确认文件状态，不要反复点击覆盖 |
 | `CONFIG_BUSY` / `PREFERENCES_BUSY` | 检查并发保存或上次中断；插件不会强抢遗留锁 |
-| 程序准备 / 下载错误 | 检查网络或 `grok-search-rs` 程序缓存，在「Grok Search Rs」中间节点查看原因并重新检测；不会覆盖全局程序 |
+| 程序准备 / 下载错误 | 在「Grok Search Rs」中间节点查看原因，检查网络后按界面提示重新检测或重新准备 |
+| `GROK_CACHE_DAMAGED` / 程序缓存损坏 | 点击「重新准备」，验证成功后自动使用新的私有程序；保留共享配置和 Key，不覆盖全局安装 |
 | `GROK_VERSION_UNVERIFIED` /「Grok 版本未经验证」 | 指 `grok-search-rs` 程序版本，不是 Grok 模型版本；未经插件验证不会自动安装、升级或覆盖，请等待插件更新 |
 
 </details>
@@ -364,6 +396,20 @@ DSH 的插件开关与详情中的组件开关是两层独立设置。若插件�
 - **费用**：搜索和诊断均可能消耗额度。Grok API 或兼容网关按各自规则计费，聊天订阅不等于免费 API。主搜索可能预取补充来源；失败、超时或取消仍可能产生费用。
 
 ## 常见问题
+
+<details>
+<summary>Plugin Hub / dsh-market / 按名称安装失败，怎么处理？</summary>
+
+先看报错发生在哪一步：
+
+- **装到了旧版本**：如报错写的是 `dsh-grok-search@0.1.1` 与 DSH `0.2.2-rc.1` 不兼容，说明实际安装的并非新版。DSH Plugin Hub 的 npm 包名是 `dsh-plugin`；v1.6.6 较旧，建议更新 Hub。Hub 自 [v2.3.2](https://github.com/dshplugin/dsh-plugin-hub/releases/tag/v2.3.2) 起锁定已过发布时间限制的版本，但刚发布时仍可能选择旧版；目录显示版本也可能滞后。可在 **DSH 原生「添加插件」** 中填写 `dsh-grok-search@0.2.1`，使用默认源或 npm 官方源，并核对实际安装版本。不要把带版本的名称直接填进 Hub 的裸包名输入框。精确版本仍须通过宿主策略。
+- **`Cannot find module ...pnpm/bin/pnpm.mjs`**：DSH 自带安装工具缺失或其路径失效，尚未执行插件代码；改用 Hub、本地目录或 `.tgz` 也依赖它。完整退出 DSH，通过[官方发行页](https://github.com/deepseek-ai/deepseek-harness/releases)修复或重新安装**完整应用程序**，保留现有用户数据目录与 `grok-search-rs` 共享配置。不要仅复制一个 `pnpm.mjs`、清空 `.dsh` 或重配 Key；全局安装 pnpm 也不能补齐该应用内路径。
+
+若更换安装源，GitHub 项目网址应放在「包名或地址」，不属于 npm registry。安装器恢复正常后再重试；仍失败时附上 DSH、Hub、实际插件版本及脱敏错误日志。
+
+新版本刚发布时，pnpm 的默认非严格策略可能在安装精确版本后，自动记录**当前 profile、该精确版本**的等待期例外；严格策略则可能拒绝。无需手动关闭安全检查，安装结果以宿主提示为准。
+
+</details>
 
 <details>
 <summary>为什么还需要 grok-search-rs？需要再手动安装吗？</summary>
@@ -396,7 +442,7 @@ profile 通常位于 `<DSH 主目录>/profiles/<profile 名>`；Desktop 使用 `
 <summary>还有哪些验证边界？</summary>
 
 - **宿主验证**：范围见[支持范围](#支持范围)，自动化使用隔离宿主与合成上游；兼容支持与真实付费接口成功分别记录。
-- **真实服务**：开发期间 Windows 曾验证四个补充来源、三家账户额度与 GitHub 认证；最终复核时部分现有 Key 失效，仅 Firecrawl 回退成功，不能沿用历史成功证明当前 Key 可用。Grok 主搜索人工通过来自 0.1.x；此后的第三方网关未返回可核验引用，补充来源回退不算主搜索通过。
+- **真实服务**：0.2.1 发布前的 Windows 隔离验证已通过 Tavily、Firecrawl、TinyFish 的真实搜索与额度查询；DSH rc.5 和 0.2.2-rc.1 的真实 Tavily 调用、来源及日志一致，聊天模型为合成测试模型，不等同真实 DeepSeek 账号对话。Exa 现有测试 Key 返回 401，未取得有效 Key 的本候选验证。Grok 主搜索人工通过来自 0.1.x；本候选指定的第三方网关在绕过插件后仍返回空正文、零工具调用，尚无真实主搜成功证据，补充来源回退不算主搜索通过。
 - **尚未完整覆盖**：原生 Linux 安装链路、macOS/Linux 真实付费接口、源码热替换、多文件写入中途崩溃、所有并发组合及 DSH 官方联网网页抓取。
 - **事务边界**：本地冲突检查不保证网络文件系统、跨文件事务或断电恢复；备份不是加密。
 

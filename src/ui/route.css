@@ -68,6 +68,28 @@ a{color:inherit}
 .ic-sm{width:13px;height:13px}
 
 /* ---------- 路由卡 ---------- */
+.plugin-intro{margin:0 0 18px;padding:12px 0;border-block:.5px solid var(--line-2)}
+.intro-title{display:flex;align-items:center;gap:7px;margin:0 0 4px;font-size:15px;line-height:22px;font-weight:600;letter-spacing:.01em}
+.intro-github{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;opacity:.68;transition:opacity 140ms var(--ease),background-color 140ms var(--ease)}
+.intro-github .tile{width:15px;height:15px;background:none;box-shadow:none}
+.intro-github:hover,.intro-github:focus-visible{opacity:1;background:var(--surface-2)}
+.intro-illustration{position:relative;width:min(502px,100%);height:44px;margin:0;user-select:none}
+.intro-illustration::before{content:"";position:absolute;left:30px;top:21.5px;width:32px;height:1px;background:color-mix(in srgb,var(--agent) 38%,var(--line))}
+.intro-network{position:relative;width:calc(100% - 62px);height:44px;margin-left:62px}
+.intro-lines{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none}
+.intro-branch{stroke:color-mix(in srgb,var(--agent) 38%,var(--line));stroke-width:1;stroke-linecap:round;stroke-linejoin:round}
+.intro-junction{fill:var(--agent)}
+.intro-core{position:absolute;left:0;top:9px;width:26px;height:26px;display:grid;place-items:center;color:var(--agent-text);border-radius:6px}
+.intro-core svg{width:22px;height:22px}
+.intro-source,.intro-host{position:absolute;display:grid;place-items:center;width:30px;height:30px;border:1px solid var(--line);border-radius:9px;background:var(--surface);box-shadow:0 1px 2px var(--hair)}
+.intro-source{top:12px;transform:translateX(-50%)}
+.intro-host{left:0;top:7px}
+.intro-source-grok{left:23.409%}.intro-source-tavily{left:41.136%}.intro-source-exa{left:58.864%}.intro-source-firecrawl{left:76.591%}.intro-source-tinyfish{left:94.318%}
+.intro-source .tile,.intro-host .tile{width:22px;height:22px;border-radius:5px;box-shadow:none}
+.intro-source,.intro-core,.intro-host{text-decoration:none;transition:border-color 140ms var(--ease),background-color 140ms var(--ease),box-shadow 140ms var(--ease)}
+.intro-source:hover,.intro-host:hover{border-color:var(--agent-ring);background:var(--surface-2);box-shadow:0 0 0 2px var(--agent-soft)}
+.intro-core:hover{background:var(--agent-soft)}
+@media(prefers-reduced-motion:reduce){.intro-source,.intro-core,.intro-host,.intro-github{transition:none}}
 .route-card{position:relative;width:100%;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow-md);padding:18px 20px 0;transition:background-color .25s,border-color .25s}
 .rc-head{position:relative;display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:8px 12px}
 .rc-title{display:flex;align-items:center;align-content:center;flex-wrap:wrap;gap:4px 10px;min-width:0;min-height:32px}
@@ -274,7 +296,7 @@ a{color:inherit}
 
 /* 官方搜索节点：只在插件关闭时浮现在 DSH 下方，绝对定位，不挤动主行 */
 .node-official{position:absolute;left:50%;top:calc(100% + 44px);width:136px;display:flex;flex-direction:column;align-items:center;text-align:center;padding:11px 8px 10px;gap:1px;opacity:0;visibility:hidden;translate:-50% -6px;scale:.98;transition:opacity .22s var(--ease),translate .35s var(--ease),scale .35s var(--ease),visibility 0s linear .35s,border-color .2s,background-color .25s,box-shadow .2s}
-.route-card[data-plugin=off] .node-official{opacity:1;visibility:visible;translate:-50% 0;scale:1;border-color:color-mix(in srgb,var(--agent) 55%,var(--line));box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm);transition:opacity .3s var(--ease) .1s,translate .4s var(--ease) .1s,scale .4s var(--ease) .1s,visibility 0s linear 0s,border-color .2s,background-color .25s,box-shadow .2s}
+.route-card[data-s=off] .node-official{opacity:1;visibility:visible;translate:-50% 0;scale:1;border-color:color-mix(in srgb,var(--agent) 55%,var(--line));box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm);transition:opacity .3s var(--ease) .1s,translate .4s var(--ease) .1s,scale .4s var(--ease) .1s,visibility 0s linear 0s,border-color .2s,background-color .25s,box-shadow .2s}
 .node-official .node-logo{width:26px;height:26px;margin-bottom:6px}
 .node-official .off-text{display:flex;flex-direction:column;align-items:center}
 .node-official .node-name{font-size:12px}

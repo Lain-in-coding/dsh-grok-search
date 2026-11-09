@@ -1,6 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
+import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
   renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { GrokSearchError } from './errors.mjs';
@@ -70,13 +70,14 @@ export function unpackPlatformArchive(archive, { packageName, version, platform 
 }
 
 async function readResponse(response, limit, signal) {
-  if (!response.ok) fail('GROK_DOWNLOAD_HTTP', `程序下载服务返回 HTTP ${response.status}。`);
-  if (Number(response.headers.get('content-length')) > limit) fail('GROK_DOWNLOAD_SIZE', '下载文件超过限制。');
-  const reader = response.body?.getReader();
-  if (!reader) fail('GROK_DOWNLOAD_EMPTY', '下载服务未返回文件内容。');
+  let reader;
   const chunks = [];
   let size = 0;
   try {
+    if (!response.ok) fail('GROK_DOWNLOAD_HTTP', `程序下载服务返回 HTTP ${response.status}。`);
+    if (Number(response.headers.get('content-length')) > limit) fail('GROK_DOWNLOAD_SIZE', '下载文件超过限制。');
+    reader = response.body?.getReader();
+    if (!reader) fail('GROK_DOWNLOAD_EMPTY', '下载服务未返回文件内容。');
     for (;;) {
       signal?.throwIfAborted();
       const { value, done } = await reader.read();
@@ -85,7 +86,12 @@ async function readResponse(response, limit, signal) {
       if (size > limit) fail('GROK_DOWNLOAD_SIZE', '下载文件超过限制。');
       chunks.push(value);
     }
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally {
+    if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    // A rejected status/header still owns an unread body. Release it before
+    // retrying the mirror instead of waiting for nondeterministic GC.
+    else await response.body?.cancel?.().catch(() => {});
+  }
   return Buffer.concat(chunks);
 }
 
@@ -94,6 +100,12 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
   if (typeof directory !== 'string' || !isAbsolute(directory)) fail('GROK_CACHE_PATH_INVALID', '程序缓存必须使用绝对路径。');
   const packageName = grokPlatformPackage(platform, arch);
   let pending = null;
+  const checkCacheRoot = () => {
+    let stat;
+    try { stat = lstatSync(directory); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) fail('GROK_CACHE_PATH_INVALID', '程序缓存必须是插件自管的实际目录。');
+  };
   const fetchBytes = async (url, limit, signal) => {
     for (let redirects = 0; redirects < 4; redirects++) {
       let parsed;
@@ -127,18 +139,27 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
   };
   const active = async ({ signal } = {}) => {
     const file = join(directory, 'active.json');
-    if (!existsSync(file)) return null;
     try {
-      if (!lstatSync(file).isFile() || lstatSync(file).isSymbolicLink() || lstatSync(file).size > 65536) throw new Error();
+      signal?.throwIfAborted();
+      checkCacheRoot();
+      let stat;
+      try { stat = lstatSync(file); }
+      catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+      if (!stat.isFile() || stat.isSymbolicLink()) fail('GROK_CACHE_PATH_INVALID', '程序缓存记录不能指向目录或符号链接。');
+      if (stat.size > 65536) throw new Error();
       const record = JSON.parse(readFileSync(file, 'utf8'));
-      if (record.schemaVersion !== 1 || record.mcpHandshakeValidated !== true || !safePath(record.executable)
+      if (typeof record.executable === 'string' && !safePath(record.executable)) {
+        fail('GROK_CACHE_PATH_INVALID', '程序缓存记录包含不安全路径。');
+      }
+      if (record.schemaVersion !== 1 || record.mcpHandshakeValidated !== true || typeof record.executable !== 'string'
         || !VERIFIED_GROK_VERSIONS.includes(record.version)) throw new Error();
       const path = resolve(directory, record.executable);
       const inside = relative(directory, path);
-      if (!inside || inside.startsWith('..' + sep) || isAbsolute(inside)) throw new Error();
+      if (!inside || inside.startsWith('..' + sep) || isAbsolute(inside)) fail('GROK_CACHE_PATH_INVALID', '程序缓存路径超出了自管目录。');
       const actualInside = relative(realpathSync(directory), realpathSync(path));
       if (!actualInside || actualInside.startsWith('..' + sep) || isAbsolute(actualInside)
-        || lstatSync(path).isSymbolicLink() || lstatSync(path).size > 50 * 1024 * 1024) throw new Error();
+        || lstatSync(path).isSymbolicLink()) fail('GROK_CACHE_PATH_INVALID', '程序缓存路径指向了其他位置。');
+      if (lstatSync(path).size > 50 * 1024 * 1024) throw new Error();
       if (sha256(readFileSync(path)) !== record.sha256) fail('GROK_CACHE_DAMAGED', '私有 Grok 程序校验失败，请重新准备。');
       const result = await inspect(path, { signal, platform });
       if (result.version !== record.version) throw new Error();
@@ -146,11 +167,15 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof GrokSearchError) throw error;
+      if (['EACCES', 'EPERM'].includes(error.code)) fail('GROK_CACHE_ACCESS_DENIED', '没有读取程序缓存的权限，请检查目录权限。');
       fail('GROK_CACHE_DAMAGED', '私有 Grok 缓存记录无效，请重新准备。');
     }
   };
-  const install = ({ signal, onProgress = () => {} } = {}) => {
+  const install = ({ signal, onProgress = () => {}, version: requestedVersion } = {}) => {
     if (signal?.aborted) return Promise.reject(signal.reason);
+    if (requestedVersion !== undefined && !VERIFIED_GROK_VERSIONS.includes(requestedVersion)) {
+      return Promise.reject(new GrokSearchError('GROK_VERSION_UNVERIFIED', '重新准备的程序版本尚未通过兼容验证。'));
+    }
     if (pending) return pending;
     const notify = event => { try { onProgress(event); } catch { /* observation cannot change publication */ } };
     const controller = new AbortController();
@@ -158,16 +183,20 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     pending = (async () => {
       combined.throwIfAborted();
+      checkCacheRoot();
       mkdirSync(directory, { recursive: true, mode: 0o700 });
-      if (lstatSync(directory).isSymbolicLink()) fail('GROK_CACHE_PATH_INVALID', '程序缓存不能指向符号链接。');
+      checkCacheRoot();
       const lock = join(directory, '.install.lock');
       let fd;
       try {
         try { fd = openSync(lock, 'wx', 0o600); }
-        catch (error) { if (error.code === 'EEXIST') fail('GROK_INSTALL_BUSY', '另一个实例正在准备程序，或上次准备被中断。'); throw error; }
+        catch (error) {
+          if (error.code === 'EEXIST') fail('GROK_INSTALL_BUSY', '另一个实例正在准备程序，或上次准备被中断。');
+          if (['EACCES', 'EPERM'].includes(error.code)) fail('GROK_CACHE_ACCESS_DENIED', '没有写入程序缓存的权限，请检查目录权限。');
+          throw error;
+        }
         notify({ phase: 'checking-version' });
-        const latest = await metadata('grok-search-rs', 'latest', combined);
-        const version = latest.data.version;
+        const version = requestedVersion ?? (await metadata('grok-search-rs', 'latest', combined)).data.version;
         if (!VERIFIED_GROK_VERSIONS.includes(version)) fail('GROK_VERSION_UNVERIFIED', `上游最新版本 ${version} 尚未通过兼容验证，未自动安装。`);
         const resolved = await metadata(packageName, version, combined);
         const { data } = resolved;
@@ -233,12 +262,27 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     })().finally(() => { clearTimeout(timer); pending = null; });
     return pending;
   };
-  return { active, install };
+  const repair = async ({ signal, onProgress } = {}) => {
+    signal?.throwIfAborted();
+    try {
+      const usable = await active({ signal });
+      if (usable) return usable;
+    } catch (error) {
+      // Repair content damage only. Unsafe paths, access denial and uncertain
+      // process ownership must retain their original errors.
+      if (error.code !== 'GROK_CACHE_DAMAGED') throw error;
+    }
+    // Explicit recovery uses a version verified by this plugin. Normal first
+    // installation keeps its existing latest/version compatibility policy.
+    return install({ signal, onProgress, version: VERIFIED_GROK_VERSIONS.at(-1) });
+  };
+  return { active, install, repair };
 }
 
-export async function resolveGrokProgram({ installer, signal, onProgress, ...discovery } = {}) {
+export async function resolveGrokProgram({ installer, signal, onProgress, repair = false, ...discovery } = {}) {
   const existing = await findExistingGrok({ ...discovery, signal });
   if (existing.found) return existing;
+  if (repair) return installer.repair({ signal, onProgress });
   const cached = await installer.active({ signal });
   return cached ?? installer.install({ signal, onProgress });
 }

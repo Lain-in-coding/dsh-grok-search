@@ -4,7 +4,7 @@
  */
 export function createQuotaView(host) {
 const { $, S, getDialog, dlg, active, DEF, SUPP, svg, EXT, esc, reduced, dialogBusy,
-  remote, uuid, hideTip } = host;
+  remote, uuid, hideTip, hidden = () => false } = host;
 let D = null, disposed = false;
 const QUOTA_PROVIDERS = new Set(SUPP);
 const QUOTA_CONSOLE = {
@@ -12,11 +12,14 @@ const QUOTA_CONSOLE = {
   firecrawl: 'https://www.firecrawl.dev/app', tinyfish: 'https://agent.tinyfish.ai/wallet',
 };
 const QUOTA_ERRORS = {
-  AUTH: '额度查询失败 · 无查询权限', RATE_LIMIT: '额度查询失败 · 请求限流',
-  NETWORK: '额度查询失败 · 网络异常', UNAVAILABLE: '额度查询失败', UNREPORTED: '额度查询失败',
+  AUTH: '额度接口鉴权失败', RATE_LIMIT: '额度查询失败 · 请求限流',
+  PERMISSION: '额度接口拒绝访问', BILLING: '账户或计费受限', ENDPOINT: '额度接口不存在',
+  REDIRECT: '额度接口发生重定向', UPSTREAM: '额度服务异常', TIMEOUT: '额度查询超时',
+  NETWORK: '额度查询失败 · 网络异常', CONFIG: '请检查查询参数',
+  UNAVAILABLE: '额度查询失败', UNREPORTED: '额度接口未报告数据',
 };
 const QUOTA_ERROR_HELP = {
-  AUTH: '额度接口拒绝了访问。请检查 Key 的查询权限；这不代表搜索一定不可用。',
+  AUTH: '额度接口鉴权失败。请核对 API Key 和查询权限；这不代表搜索一定不可用。',
   RATE_LIMIT: '额度查询请求受到限流，请稍后重试。',
   NETWORK: '未能完成额度查询，请检查网络或服务地址后重试。',
   UNAVAILABLE: '暂时未能取得额度信息，请稍后重试。额度查询失败不等于搜索不可用。',
@@ -56,28 +59,34 @@ function quotaContext(id, p, keyIndex = 0) {
     : id === 'exa' ? base === DEF.exaUrl
       : id === 'firecrawl' ? base === DEF.fcUrl || base === DEF.fcUrl + '/v2'
         : base === DEF.tfSearch;
-  return { id, keyIndex: index, key, base, official,
-    scope: JSON.stringify([id, base, S.config?.quotaRevision || S.configRevision, index]) };
+  const savedKey = (id === 'tavily' ? D.base.keys[index] : D.base.key) || '';
+  const draftSame = key === savedKey.trim() && base === quotaBase(id, D.base);
+  // Only this dialog retains the current form identity. Cache keys never contain
+  // credentials, and changing away/back cannot revive an in-flight draft reply.
+  const signature = JSON.stringify([id, base, key, index]);
+  if (D.quotaFormIdentity !== signature) {
+    D.quotaFormIdentity = signature;
+    D.quotaDraftId = uuid();
+  }
+  return { id, keyIndex: index, key, base, official, draftSame,
+    scope: JSON.stringify([id, base, S.config?.quotaRevision || S.configRevision, index,
+      draftSame ? 'saved' : D.quotaDraftId]) };
 }
 const quotaNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const quotaFormat = value => quotaNumber(value) ? value.toLocaleString('zh-CN', { maximumFractionDigits: 6 }) : '未报告';
 function quotaView() {
   if (!D || D.kind !== 'card' || !QUOTA_PROVIDERS.has(D.id)) return null;
   const context = quotaContext(D.id, D.draft, D.quotaKeyIndex);
-  const saved = D.base;
-  // A draft edit and an external write are different states: only the first is "changed".
-  const draftSame = JSON.stringify(D.id === 'tavily' ? D.draft.keys : D.draft.key) === JSON.stringify(D.id === 'tavily' ? saved.keys : saved.key) && quotaBase(D.id, saved) === context.base;
   const baselineCurrent = D.configBaseline.revision === S.configRevision && D.configBaseline.quotaRevision === S.config?.quotaRevision;
-  const unchanged = draftSame && baselineCurrent;
   const cached = quotaCache.get(context.scope);
   const status = !S.capabilities?.secretsAllowed ? 'restricted'
-    : !context.key ? 'unconfigured' : !draftSame ? 'changed'
+    : !context.key ? 'unconfigured' : !context.base ? 'invalid'
     : D.id === 'exa' ? 'unsupported'
       : !baselineCurrent ? 'stale'
       : D.quotaRequest?.scope === context.scope ? 'loading'
         : cached?.error ? 'error' : cached?.value ? 'ready' : 'unreported';
-  return { context, status, cached, unchanged,
-    canRefresh: context.key && unchanged && !!context.base && D.id !== 'exa' && status !== 'loading' && !dialogBusy() && S.capabilities?.secretsAllowed };
+  return { context, status, cached, unchanged: baselineCurrent,
+    canRefresh: context.key && baselineCurrent && !!context.base && D.id !== 'exa' && status !== 'loading' && !dialogBusy() && S.capabilities?.secretsAllowed };
 }
 function quotaHtml() {
   const view = quotaView();
@@ -89,10 +98,11 @@ function quotaHtml() {
   const value = ['ready', 'loading', 'error'].includes(status) ? cached?.value : null;
   const credits = value?.kind === 'credits';
   const placeholder = {
-    unconfigured: '填写并保存 API Key 后查看', changed: '保存后查询额度',
+    unconfigured: '填写 API Key 后可查询', invalid: 'Base URL 无效，请检查后查询',
     stale: '配置已在别处修改，读取最新配置后刷新',
     unsupported: '请到服务控制台查看', unreported: '尚未查询额度',
-    error: QUOTA_ERRORS[cached?.error] || '额度查询失败', loading: '正在查询额度…',
+    error: (QUOTA_ERRORS[cached?.error] || '额度查询失败') + (cached?.httpStatus ? ` · HTTP ${cached.httpStatus}` : ''),
+    loading: '正在查询额度…',
     restricted: '请使用本机直连或 HTTPS 查看额度',
   };
   const info = (kind, label, text) => `<button type="button" class="qp-info" data-quota-kind="${kind}" data-quota-tip="${esc(text)}" aria-label="${esc(label)}">${svg('info', 'ic')}</button>`;
@@ -111,14 +121,17 @@ function quotaHtml() {
   const accountInfo = context.id === 'tavily'
     ? keyNote ? info('key', '当前 Key 剩余额度', keyNote) : ''
     : value ? info('account', '额度统计说明', value.note) : '';
-  const errorHelp = QUOTA_ERROR_HELP[cached?.error] || QUOTA_ERROR_HELP.UNAVAILABLE;
-  const stateText = status === 'loading' ? '正在刷新…' : status === 'error' && value ? '刷新失败 · 上次结果'
+  const errorHelp = cached?.message ? `${cached.message} 额度查询失败不等于搜索不可用。`
+    : QUOTA_ERROR_HELP[cached?.error] || QUOTA_ERROR_HELP.UNAVAILABLE;
+  const stateText = status === 'loading' ? '正在刷新…' : status === 'error' && value
+    ? `刷新失败 · 上次结果${cached?.httpStatus ? ` · HTTP ${cached.httpStatus}` : ''}`
     : value ? `更新于 ${cached.updatedAt}` : '';
   const stateIcon = status === 'error' ? info('error', '额度查询失败原因', errorHelp)
-    : status === 'changed' ? info('changed', '配置修改说明', '保存后查询新账户，不沿用上一份 Key 或地址的余额。')
-      : svg('info', 'ic qp-state-icon');
+    : svg('info', 'ic qp-state-icon');
   const retry = status === 'error';
-  const refresh = context.id === 'exa' ? '' : `<button type="button" class="qp-refresh${retry ? ' is-retry' : ''}" data-a="quota-refresh" aria-label="${retry ? '重新查询账户额度' : '刷新账户额度'}" title="${retry ? '重新查询账户额度' : '刷新账户额度'}"${view.canRefresh ? '' : ' disabled'} aria-busy="${status === 'loading'}">${svg('refresh', 'ic')}${retry ? '<span>重试</span>' : ''}</button>`;
+  const refreshHelp = view.canRefresh ? context.draftSame ? '刷新账户额度' : '查询当前表单的额度，不保存配置'
+    : placeholder[status] || '请等待当前操作完成';
+  const refresh = context.id === 'exa' ? '' : `<button type="button" class="qp-refresh${retry ? ' is-retry' : ''}" data-a="quota-refresh" aria-label="${retry ? '重新查询账户额度' : '刷新账户额度'}" title="${esc(refreshHelp)}"${view.canRefresh ? '' : ' disabled'} aria-busy="${status === 'loading'}">${svg('refresh', 'ic')}${retry ? '<span>重试</span>' : ''}</button>`;
   const tools = `<div class="qp-tools">${select}${refresh}</div>`;
   const consoleHelp = context.official ? '打开官方服务控制台'
     : '打开官方服务控制台；自定义服务的账户余额请以该服务提供方为准。';
@@ -191,8 +204,7 @@ function render() {
   if (disposed) return;
   syncDialog();
   const view = quotaView();
-  // A draft edit is not part of the saved account identity. Cancel immediately,
-  // including when the user later restores the old text before the reply arrives.
+  // Both saved and draft reads are cancelled when their account identity changes.
   if (D?.quotaRequest && (!view?.unchanged || !S.capabilities?.secretsAllowed
     || D.quotaRequest.scope !== view.context.scope)) cancel();
   renderQuota();
@@ -211,7 +223,13 @@ async function refresh({ automatic = false } = {}) {
   renderQuota();
   const previous = quotaCache.get(request.scope);
   try {
-    const result = await remote.accountQuota({ provider: view.context.id, keyIndex: view.context.keyIndex,
+    const query = view.context.draftSame ? remote.accountQuota : remote.previewAccountQuota;
+    const savedKey = (D.id === 'tavily' ? D.base.keys[view.context.keyIndex] : D.base.key) || '';
+    const result = await query({ provider: view.context.id, keyIndex: view.context.keyIndex,
+      ...(!view.context.draftSame ? { draft: {
+        ...(view.context.base !== quotaBase(D.id, D.base) ? { baseUrl: view.context.base } : {}),
+        ...(!hidden(view.context.key) && view.context.key !== savedKey.trim() ? { apiKey: view.context.key } : {}),
+      } } : {}),
       expectedRevision: mine.configBaseline.revision, quotaRevision: mine.configBaseline.quotaRevision, operationId: request.operationId });
     if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
     D = mine; mine.quotaRequest = null;
@@ -219,13 +237,18 @@ async function refresh({ automatic = false } = {}) {
     if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
     quotaCache.set(request.scope, { value: result.value, updatedAt: quotaTime(),
       completedAt: Date.now(), error: result.value ? null : 'UNREPORTED' });
-  } catch {
+  } catch (error) {
     if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
     D = mine; mine.quotaRequest = null;
     const current = quotaView();
     if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
+    const category = error?.details?.category;
+    const status = error?.details?.httpStatus;
     quotaCache.set(request.scope, { value: previous?.value ?? null, updatedAt: previous?.updatedAt,
-      completedAt: Date.now(), error: 'UNAVAILABLE' });
+      completedAt: Date.now(), error: Object.hasOwn(QUOTA_ERRORS, category) ? category : 'UNAVAILABLE',
+      httpStatus: Number.isInteger(status) && status >= 300 && status <= 599 ? status : null,
+      message: error?.code === 'QUOTA_QUERY_FAILED' ? error.message
+        : `设置服务返回 ${/^[\w./-]{1,80}$/.test(error?.code || '') ? error.code : '未知错误'}；额度查询失败不代表搜索不可用。` });
   } finally {
     while (quotaCache.size > 16) quotaCache.delete(quotaCache.keys().next().value);
     if (!disposed && getDialog() === mine) { D = mine; renderQuota(); }

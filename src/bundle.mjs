@@ -13,6 +13,7 @@ import { createConnectionSecurity } from './core/connection-security.mjs';
 import { createPrivatePreferences } from './core/private-preferences.mjs';
 import { createSearchLog } from './core/search-log.mjs';
 import { createToolRouteContext } from './core/tool-route-context.mjs';
+import { createToolBudgetController } from './core/tool-budget.mjs';
 import { join } from 'node:path';
 
 export const name = 'dsh-grok-search';
@@ -54,14 +55,17 @@ export async function apply(ctx, configuration) {
   const snapshotCounter = () => normalizeCounterSnapshot(
     typeof counter === 'function' ? counter() : counter.snapshot(), 'host-counter');
   const backgroundError = error => ctx.logger?.error?.(error);
+  const required = () => {
+    if (disabling) return false;
+    try { return store.read()?.intent.policy !== 'released'; }
+    catch (error) { backgroundError(error); return true; }
+  };
+  const budgets = createToolBudgetController({ ctx, budgetMs: configuration.budgetMs ?? 120_000,
+    required, resolveConfig, onError: backgroundError });
+  ctx.provide('grokSearchBudgets', budgets);
   ctx.on('internal/config', createSearchConfigHook({
     resolveConfig,
-    required() {
-      if (disabling) return false;
-      // Read failures cannot authorize an official fallback.
-      try { return store.read()?.intent.policy !== 'released'; }
-      catch (error) { backgroundError(error); return true; }
-    },
+    required,
   }), { global: true, prepend: true });
 
   const explicitDisableReason = () => {
@@ -95,7 +99,7 @@ export async function apply(ctx, configuration) {
   // Observers and child effects are still removed by their owning fiber.
   ctx.effect(() => async () => {
     try { if (releaseTask) await releaseTask; }
-    finally { if (!existingCounter) counter.dispose(); }
+    finally { await budgets.release(); if (!existingCounter) counter.dispose(); }
   });
   await ctx.plugin(program, configuration);
   await Promise.all([
@@ -105,4 +109,5 @@ export async function apply(ctx, configuration) {
     ctx.plugin(control, { counterSnapshot: snapshotCounter }),
     ctx.plugin(settings),
   ]);
+  await budgets.acquire();
 }

@@ -25,6 +25,11 @@ async page => {
   try {
     await page.setViewportSize({ width: 1440, height: 1000 });
     await state('returning');
+    check('approved intro has five independently linked official provider logos',
+      await page.locator('.intro-source').evaluateAll(links => links.map(link => link.href)),
+      ['https://grok.com/', 'https://tavily.com/', 'https://exa.ai/', 'https://firecrawl.dev/', 'https://tinyfish.ai/']);
+    check('intro repository link follows the tagline', await page.locator('.intro-title .intro-github').getAttribute('href'),
+      'https://github.com/Lain-in-coding/dsh-grok-search');
     const projectLink = page.locator('[data-dsg-project] a');
     const projectTip = page.locator('[data-dsg-project] [role=tooltip]');
     check('one title project badge', await page.locator('[data-dsg-project]').count(), 1);
@@ -187,6 +192,16 @@ async page => {
     check('compat mode readback selected', await page.locator('[data-a=mode][data-v=compat]').getAttribute('aria-checked'), 'true');
     await close();
 
+    await state('off');
+    await page.locator('#nodeOfficial').waitFor({ state: 'visible' });
+    await page.evaluate(() => {
+      window.harness.configure({ control: { phase: 'incomplete', error: { code: 'CONTROL_TARGET_MISSING', message: 'synthetic' } } });
+      window.harness.refresh();
+    });
+    await page.locator('#routeCard[data-s=ctlerr]').waitFor();
+    check('startup or control failure never claims official search restored',
+      await page.locator('#nodeOfficial').getAttribute('aria-hidden'), 'true');
+    check('control failure remains visible with its actual code', await page.locator('#bannerSlot').textContent().then(text => text.includes('CONTROL_TARGET_MISSING')));
     await state('fresh');
     await card('grok');
     check('protocol selectors use the approved familiar names', await page.locator('.seg button').allTextContents(),
@@ -342,9 +357,21 @@ async page => {
     }, undefined, { timeout: 15000 });
     check('diagnoses all enabled providers including GitHub', await read(() => window.harness.state.calls.filter(c => c.method === 'diagnoseProvider').map(c => c.request.provider)),
       ['grok', 'tavily', 'exa', 'firecrawl', 'tinyfish', 'github']);
+    check('GitHub has its own completed verification icon',
+      await page.locator('#strip .s-node[data-id=github]').getAttribute('data-health'), 'ok');
     check('partial Tavily key error not whole-source failure', await page.locator('.row[data-id=tavily] .row-fault').getAttribute('data-tone'), 'partial');
     check('real grok code shown without fake HTTP', await page.locator('.row[data-id=grok] .row-fault').textContent().then(text => text.includes('认证')));
-    check('silent fallback summary present', await page.locator('.s-end').textContent().then(text => text.includes('已静默回退')));
+    check('individual diagnosis does not claim actual fallback', await page.locator('.s-end').textContent().then(text =>
+      text.includes('Grok 未通过') && text.includes('4/6 项可用') && !text.includes('已静默回退')));
+    check('availability status is distinct from observed fallback', await page.locator('#statusText').textContent(), '补充来源可用');
+    check('diagnostic banner names all successful supplementary providers', await page.locator('.banner').textContent().then(text =>
+      text.includes('Tavily、Exa、Firecrawl 可用') && !text.includes('已静默回退到')));
+    check('diagnostic route accessible label does not invent a fallback attempt', await page.locator('#strip').getAttribute('aria-label')
+      .then(text => !text?.includes('已尝试静默回退')));
+    check('result insertion keeps every route icon aligned without crossing the result text', await page.locator('#strip').evaluate(strip => {
+      const children = [...strip.children].map(node => node.getBoundingClientRect());
+      return children.every((rect, index) => index === 0 || rect.left >= children[index - 1].right - 1);
+    }));
     check('all keys recorded, not merely first success', await page.locator('.s-node[data-id=tavily] .s-dot').count(), 2);
     check('no duplicate full search spends quota', await read(() => window.harness.state.calls.filter(c => c.method === 'testSearch').length), 0);
     await page.screenshot({ path: run.directory + '/diagnostic-partial-light.png' });
@@ -362,6 +389,49 @@ async page => {
     await page.keyboard.press('Shift+Tab');
     check('focus trapped within layer shadow root', await read(() => Boolean(document.querySelector('[data-dsg-layer]').shadowRoot.activeElement?.closest('#dialog'))));
     await close();
+    await page.evaluate(() => window.harness.remount());
+    await page.locator('#routeCard:not([data-s=load])').waitFor();
+    check('remount preserves diagnostic availability without inventing a search route',
+      await page.locator('#statusText').textContent(), '补充来源可用');
+    check('remount retains accurate diagnostic banner', await page.locator('.banner').textContent().then(text =>
+      text.includes('尚未发生实际搜索回退') && !text.includes('已静默回退到')));
+    await page.locator('.banner [data-act=grok-off]').click();
+    await page.locator('.row[data-id=grok] .switch[aria-checked=false]').waitFor();
+    // The switch is optimistic. Do not reset the synthetic server while its
+    // delayed preference write can still overwrite the next scenario's data.
+    await page.waitForFunction(() => window.harness.state.prefs.value.grokEnabled === false);
+    check('turning off failed Grok uses supplementary mode without retaining its test warning',
+      await page.locator('#statusText').textContent(), '补充来源接管');
+    check('disabled Grok no longer produces the diagnostic failure banner',
+      await page.locator('#bannerSlot').textContent().then(text => text.includes('Grok 测试未通过')), false);
+
+    // A test is not a chat search. Exercise the failure-only and no-result
+    // combinations with reduced motion, retaining each provider's own result.
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    for (const onlyGrok of [true, false]) {
+      await state('returning');
+      await page.evaluate(onlyGrok => {
+        if (onlyGrok) window.harness.inject({ tavily_enabled: false, exa_enabled: false, firecrawl_enabled: false });
+        window.harness.configure({ diagnostics: {
+          grok: ['grok_timeout'], tavily: ['HTTP_401', 'HTTP_429'], exa: ['HTTP_503'], github: ['OK'],
+        } });
+        window.harness.refresh();
+      }, onlyGrok);
+      if (onlyGrok) await page.locator('.row[data-id=tavily] .switch[aria-checked=false]').waitFor();
+      await page.locator('#testBtn').click();
+      await page.locator('[data-pop=go]').click();
+      await page.locator('.s-end:has-text("测试未通过")').waitFor();
+      await page.waitForFunction(() => !document.querySelector('[data-dsg-route]').shadowRoot.querySelector('#testBtn').disabled);
+      check(`${onlyGrok ? 'Grok-only' : 'all-source'} diagnosis failure is not a chat-search failure`,
+        await page.locator('#statusText').textContent(), '最近检查未通过');
+      check(`${onlyGrok ? 'Grok-only' : 'all-source'} diagnostic failure retains exact timeout reason`,
+        await page.locator('.banner').textContent().then(text =>
+          text.includes('grok_timeout') && !text.includes('本次搜索已明确报错') && !text.includes('已静默回退')));
+      check(`${onlyGrok ? 'Grok-only' : 'all-source'} checks continue independently and skip closed sources`,
+        await read(() => window.harness.state.calls.filter(c => c.method === 'diagnoseProvider').map(c => c.request.provider)),
+        onlyGrok ? ['grok', 'github'] : ['grok', 'tavily', 'exa', 'github']);
+    }
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
 
     for (const mode of ['responses', 'compat']) {
       for (const code of ['grok_sources_empty', 'grok_provider_error', 'grok_timeout', 'grok_parse_error', 'HTTP_403', 'HTTP_429']) {
@@ -508,6 +578,29 @@ async page => {
     await page.locator('#testBtn').click();
     await page.locator('[data-pop=go]').click();
     await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'diagnoseProvider'));
+    check('running test exposes an enabled stop action', await page.locator('#testBtn').textContent(), '停止测试');
+    check('actual elapsed time and source count are visible', await page.locator('#statusText').textContent()
+      .then(text => /0\/\d+ · Grok · \d+秒/.test(text)));
+    await page.locator('#testBtn').click();
+    check('explicit stop sends cancellation', await read(() => window.harness.state.calls.some(call => call.method === 'cancelDiagnosis')));
+    check('stopped summary does not claim untested keys failed', await page.locator('.s-end').textContent()
+      .then(text => text.includes('已停止') && text.includes('0/')));
+    check('stop leaves no active provider animation', await page.locator('.row.is-searching').count(), 0);
+    await state('returning');
+    await page.evaluate(() => window.harness.configure({ diagnostics: {
+      grok: ['GROK_QUEUE_TIMEOUT'], tavily: ['GROK_QUEUE_FULL', 'GROK_QUEUE_FULL'], exa: ['GROK_QUEUE_FULL'], github: ['OK'],
+    } }));
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.locator('.s-end:has-text("测试未完成")').waitFor();
+    check('queue refusal never marks an untested key as invalid', await page.locator('.s-dot[data-tone=err]').count(), 0);
+    check('queue refusal does not claim every key was checked', await page.locator('#announcer').textContent()
+      .then(text => text.includes('部分项目未完成') && !text.includes('已检查全部')));
+    await state('returning');
+    await page.evaluate(() => window.harness.configure({ delay: 2500 }));
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'diagnoseProvider'));
     await page.evaluate(() => window.harness.unmount());
     check('unmount dispatches owned cancellation', await read(() => window.harness.state.calls.some(call => call.method === 'cancelDiagnosis')));
     check('cancelling one source stops remaining diagnosis loop', await read(() => window.harness.state.calls.filter(call => call.method === 'diagnoseProvider').length), 1);
@@ -560,11 +653,198 @@ async page => {
       const card = root.querySelector('#routeCard'), text = root.querySelector('.banner .b-text');
       return card.scrollWidth <= card.clientWidth + 1 && text.scrollWidth <= text.clientWidth + 1;
     }));
-    await state('returning');
+    await state('fresh');
     await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.evaluate(() => {
+      window.harness.inject({ tavily_api_key: 'synthetic-only-tavily' });
+      window.harness.configure({ diagnostics: { tavily: ['OK'] } });
+      window.harness.refresh();
+    });
+    await page.locator('.row[data-id=tavily] .switch[aria-checked=true]').waitFor();
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.locator('.s-end:has-text("1/1")').waitFor();
+    check('fresh single-source target list excludes never-configured GitHub',
+      await read(() => window.harness.state.calls.filter(call => call.method === 'diagnoseProvider').map(call => call.request.provider)), ['tavily']);
+    check('unconfigured GitHub has no verification icon', await page.locator('#strip .s-node[data-id=github]').count(), 0);
+    await page.evaluate(() => { window.harness.inject({ github_token: 'ghp_synthetic' }); window.harness.refresh(); });
+    await page.locator('.row[data-id=github] .switch[aria-checked=true]').waitFor();
+    await page.locator('.row[data-id=github] .switch').click();
+    await page.locator('.row[data-id=github] .switch[aria-checked=false]').waitFor();
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.locator('.s-end:has-text("1/1")').waitFor();
+    check('previously configured but closed GitHub is never requested',
+      await read(() => window.harness.state.calls.filter(call => call.method === 'diagnoseProvider' && call.request.provider === 'github').length), 0);
+    await page.locator('.row[data-id=github] .switch').click();
+    await page.locator('.row[data-id=github] .switch[aria-checked=true]').waitFor();
+    await page.evaluate(() => window.harness.configure({ diagnostics: { tavily: ['OK'], github: ['HTTP_403'] } }));
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.locator('.s-end:has-text("1/2")').waitFor();
+    check('GitHub failure remains separate from successful search source',
+      await page.locator('#strip .s-node[data-id=github]').getAttribute('data-health'), 'err');
+    check('GitHub displays its actual failure code',
+      await page.locator('.row[data-id=github] .row-fault-code').textContent(), '403');
+    check('GitHub failure uses the same broken route state',
+      await page.locator('#wires [data-w="hub-github"]').getAttribute('data-ws'), 'broken');
+    await state('fresh');
+    await page.evaluate(() => {
+      window.harness.environment({ tavily_api_key: 'synthetic-env-a' });
+      window.harness.refresh();
+    });
+    await page.locator('.row[data-id=tavily] .switch[aria-checked=true]').waitFor();
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.locator('.s-end:has-text("1/1")').waitFor();
+    check('first environment key has a completed verification',
+      await page.locator('#strip .s-node[data-id=tavily]').getAttribute('data-health'), 'ok');
+    const envBaseline = await read(() => {
+      const config = window.harness.state.snapshot.config;
+      return { revision: config.revision, identity: config.quotaRevision, fields: config.fields };
+    });
+    await page.evaluate(() => {
+      window.harness.environment({ tavily_api_key: 'synthetic-env-b' });
+      window.harness.refresh();
+    });
+    await page.waitForFunction(() => window.harness.state.calls.filter(call => call.method === 'snapshot').length > 1);
+    await page.waitForTimeout(100);
+    check('environment-only replacement preserves the file revision',
+      await read(() => window.harness.state.snapshot.config.revision), envBaseline.revision);
+    check('equal-shaped environment keys keep the same redacted fields',
+      await read(() => window.harness.state.snapshot.config.fields), envBaseline.fields);
+    check('effective identity changes without revealing key values',
+      await page.evaluate(identity => window.harness.state.snapshot.config.quotaRevision !== identity, envBaseline.identity));
+    check('environment key replacement invalidates old verification without writing the shared file',
+      await page.locator('#strip .s-node[data-id=tavily]').getAttribute('data-health'), 'idle');
+    check('environment change clears the completed trace', await page.locator('#strip .s-end').count(), 0);
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.locator('.s-end:has-text("1/1")').waitFor();
+    await page.evaluate(() => {
+      window.harness.environment({ tavily_api_key: 'synthetic-env-c' });
+      window.harness.remount();
+    });
+    await page.locator('#routeCard:not([data-s=load])').waitFor();
+    check('remount also invalidates remembered results when the environment key changed',
+      await page.locator('#strip .s-node[data-id=tavily]').getAttribute('data-health'), 'idle');
+    check('environment identity checks never save credentials',
+      await read(() => window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+    await state('returning');
+    await card('exa');
+    await page.locator('[data-a=eye][data-k=key]').click();
+    await page.locator('input[data-k=key]').fill('synthetic-unsaved-preserved');
+    const secretInput = page.locator('input[data-k=key]');
+    check('authorized form displays the explicitly revealed draft', await secretInput.getAttribute('type'), 'text');
+    await page.evaluate(() => {
+      window.harness.configure({ capabilities: { secretsAllowed: false, transport: 'restricted', reason: 'fixture' } });
+      window.harness.refresh();
+    });
+    await page.locator('.banner:has-text("仅显示脱敏")').waitFor();
+    check('permission revocation removes secret text from the existing DOM', await secretInput.inputValue(), '');
+    check('permission revocation immediately locks the open secret field', await secretInput.getAttribute('readonly') !== null);
+    check('permission revocation immediately disables copy', await page.locator('[data-a=copy][data-k=key]').isDisabled());
+    check('permission revocation immediately disables reveal', await page.locator('[data-a=eye][data-k=key]').isDisabled());
+    await page.evaluate(() => {
+      window.harness.configure({ capabilities: { secretsAllowed: true, transport: 'loopback', reason: null } });
+      window.harness.refresh();
+    });
+    await page.waitForFunction(() => !document.querySelector('[data-dsg-layer]').shadowRoot
+      .querySelector('[data-a=eye][data-k=key]').disabled);
+    check('restoring a safe connection preserves the unsaved draft in password form', await secretInput.inputValue(), 'synthetic-unsaved-preserved');
+    check('restoring permission does not automatically reveal plaintext', await secretInput.getAttribute('type'), 'password');
+    check('permission changes never save the draft', await read(() => window.harness.state.content.exa_api_key), 'exa-synthetic');
+    await close();
+    await state('returning');
+    await card('exa');
+    await page.evaluate(() => window.harness.configure({ revealDelay: 1200 }));
+    await page.locator('[data-a=eye][data-k=key]').click();
+    await page.evaluate(() => {
+      window.harness.configure({ capabilities: { secretsAllowed: false, transport: 'restricted', reason: 'fixture' } });
+      window.harness.refresh();
+    });
+    await page.locator('.banner:has-text("仅显示脱敏")').waitFor();
+    await page.evaluate(() => {
+      window.harness.configure({ capabilities: { secretsAllowed: true, transport: 'loopback', reason: null } });
+      window.harness.refresh();
+    });
+    await page.waitForTimeout(1350);
+    check('old reveal reply cannot populate a dialog even after permission was restored', await secretInput.inputValue(), '');
+    check('old reveal reply retains the explicit reveal requirement', await secretInput.getAttribute('data-hidden'), 'true');
+    await page.evaluate(() => window.harness.configure({ revealDelay: 0 }));
+    await page.locator('[data-a=eye][data-k=key]').click();
+    check('fresh reveal remains functional after permission recovery', await secretInput.inputValue(), 'exa-synthetic');
+    await close();
+    await state('returning');
+    await page.evaluate(() => window.harness.configure({ delay: 800,
+      openError: { code: 'CONFIG_OPEN_UNAVAILABLE', message: 'Windows 系统打开工具不存在，请复制路径后手动打开。' } }));
+    await page.locator('.rc-foot [data-open=file]').click();
+    check('file opening exposes busy state', await page.locator('.rc-foot [data-open=file]').getAttribute('aria-busy'), 'true');
+    check('folder opening is disabled during an existing open request', await page.locator('.rc-foot [data-open=folder]').isDisabled());
+    await page.evaluate(() => window.harness.refresh());
+    await page.evaluate(() => {
+      const root = document.querySelector('[data-dsg-route]').shadowRoot;
+      root.querySelector('.rc-foot [data-open=file]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await page.getByText('Windows 系统打开工具不存在，请复制路径后手动打开。', { exact: true }).waitFor();
+    check('repeated opening clicks send one RPC', await read(() =>
+      window.harness.state.calls.filter(call => call.method === 'openConfigLocationWithStatus').length), 1);
+    check('open failure retains copy-path fallback', await page.getByRole('button', { name: '复制路径', exact: true }).isVisible());
+    check('file open failure restores controls', await page.locator('.rc-foot [data-open=file]').isEnabled());
+    check('file opening never changes shared configuration', await read(() =>
+      window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+    await page.evaluate(() => window.harness.configure({ delay: 0, openError: null }));
+    await state('fresh');
+    await page.locator('.rc-foot [data-open=folder]').click();
+    await page.locator('.rc-foot [data-open=folder]:not([disabled])').waitFor();
+    check('opening a folder cannot enable a nonexistent file', await page.locator('.rc-foot [data-open=file]').isDisabled());
+    await state('returning');
+    await page.evaluate(() => window.harness.configure({ openResult: { opened: true, editor: 'modern', fallbackReason: null } }));
+    await page.locator('.rc-foot [data-open=file]').click();
+    await page.locator('.rc-foot [data-open=file]:not([disabled])').waitFor();
+    check('modern editor success has no fallback notice', await page.getByText('已使用备用文本编辑器打开', { exact: true }).count(), 0);
+    await page.evaluate(() => window.harness.configure({ openResult: { opened: true, editor: 'classic', fallbackReason: 'launch-failed' } }));
+    await page.locator('.rc-foot [data-open=file]').click();
+    await page.getByText('已使用备用文本编辑器打开', { exact: true }).waitFor();
+    check('successful fallback shows one short notice', await page.getByText('已使用备用文本编辑器打开', { exact: true }).isVisible());
+    await state('returning');
+    await page.evaluate(() => window.harness.configure({ openResult: { opened: false, copyOnly: true } }));
+    await page.locator('.rc-foot [data-open=file]').click();
+    await page.getByText('此页面不能打开宿主文件，请复制路径后在 DSH 所在设备打开。', { exact: true }).waitFor();
+    check('remote HTTPS shows host-only path guidance', await page.getByRole('button', { name: '复制路径', exact: true }).isVisible());
+    await state('returning');
     await card('tinyfish');
     await close();
     check('reduced motion dialog usable', await page.locator('#overlay').isVisible(), false);
+    await state('returning');
+    const configurationBeforeRepair = await read(() => JSON.stringify(window.harness.state.content));
+    await page.evaluate(() => {
+      window.harness.configure({ program: { phase: 'error', program: null, canRepair: true,
+        error: { code: 'GROK_CACHE_DAMAGED', message: '程序缓存损坏，请重新准备。' } },
+        nextRepairError: 'GROK_DOWNLOAD_HTTP' });
+      window.harness.refresh();
+    });
+    await page.locator('#hubMeta').filter({ hasText: '准备失败' }).waitFor();
+    await page.locator('#nodeHub').click();
+    const repairButton = page.locator('[data-a=redetect]');
+    check('damaged private cache exposes an actual repair action', (await repairButton.textContent()).trim(), '重新准备');
+    await page.evaluate(() => window.harness.configure({ delay: 250 }));
+    await repairButton.evaluate(button => { button.click(); button.click(); });
+    await page.getByText('合成下载服务暂不可用。', { exact: true }).first().waitFor();
+    await repairButton.waitFor();
+    check('failed repair stays available without leaving the dialog', (await repairButton.textContent()).trim(), '重新准备');
+    check('repeated clicks share one repair RPC', await read(() => window.harness.state.calls.filter(call => call.method === 'repairProgram').length), 1);
+    await page.evaluate(() => window.harness.configure({ delay: 0 }));
+    await repairButton.click();
+    await page.waitForFunction(() => document.querySelector('[data-dsg-layer]').shadowRoot
+      .querySelector('[data-a=redetect]')?.textContent.trim() === '重新检测');
+    check('successful repair restores ready status without restart', await read(() => window.harness.state.snapshot.program.phase), 'ready');
+    check('repair does not rewrite shared configuration', await read(() => JSON.stringify(window.harness.state.content)), configurationBeforeRepair);
+    check('repair sends no config save', await read(() => window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+    await repairButton.click();
+    check('healthy program still uses the compatible detection RPC',
+      await read(() => window.harness.state.calls.some(call => call.method === 'prepareProgram')));
+    await close();
     await page.emulateMedia({ reducedMotion: 'no-preference' });
     await page.evaluate(() => { for (let i = 0; i < 4; i++) window.harness.remount(); });
     await page.locator('#routeCard:not([data-s=load])').waitFor();

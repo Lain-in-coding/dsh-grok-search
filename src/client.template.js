@@ -88,8 +88,10 @@ window.__ModuleLoader__.load({
         try {
           result = await remote.grokSearchSettings[method](...args);
         } catch (error) {
+          const code = typeof error?.code === 'string' && /^(?:SETTINGS_|SEARCH_LOG_|CONFIG_|gateway[/.])[\w./-]{1,64}$/.test(error.code)
+            ? error.code : 'SETTINGS_UNAVAILABLE';
           throw Object.assign(new Error('设置连接不可用，请重新打开插件详情页。'), {
-            code: 'SETTINGS_UNAVAILABLE',
+            code,
           });
         }
         if (result?.ok === true) return result.value;
@@ -140,7 +142,16 @@ window.__ModuleLoader__.load({
           shadow.replaceChildren();
         };
       }, [remote, theme]);
-      return jsx('div', { ref: element, 'data-dsg-route': '1', style: { width: '100%', minWidth: 0 } });
+      return jsx('div', {
+        ref: element, 'data-dsg-route': '1', style: { width: '100%', minWidth: 0 },
+        // rc.1 renders a bordered section even for an empty detail document.
+        // Match only the empty document immediately before our own config slot.
+        // React owns this light-DOM style; it leaves with the page on unmount.
+        children: jsx('style', {
+          'data-dsg-empty-detail': '1',
+          children: `[data-detail-document]:has(> [role="region"] > :only-child:empty):has(+ [data-plugin-config] > [data-slot="plugins.bundle.config"] > [data-dsg-route="1"]) { display: none; }`,
+        }),
+      });
     }
 
     async function apply(ctx) {
@@ -214,6 +225,6 @@ window.__ModuleLoader__.load({
         await unmountRemote();
       };
     }
-    return { NS, inject, apply, __test: Object.freeze({ descriptors, sourceChain: SOURCE_CHAIN, toolRouteView: TOOL_ROUTE_VIEW }) };
+    return { NS, inject, apply, __test: Object.freeze({ descriptors, remoteAdapter, sourceChain: SOURCE_CHAIN, toolRouteView: TOOL_ROUTE_VIEW }) };
   },
 });

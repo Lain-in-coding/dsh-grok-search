@@ -6,13 +6,15 @@ export function createSearchLogView(host) {
 const { $, $$, active, S, card, layer, listen, remote, uuid, clone, esc, svg, tile,
   logoSrc, isDark, reduced, META, SUPP, setTimeout, clearTimeout, requestAnimationFrame,
   cancelAnimationFrame, T, jolts, faultPulses, syncBreak, travel, jolt, pulseFault,
-  flashRow, flashNode, pumpWires, closePop, hideStripTip: hideRouteTip, toast, errText, rowOf, SVGNS, logMemory } = host;
+  flashRow, flashNode, pumpWires, closePop, hideStripTip: hideRouteTip, toast, errText, rowOf, SVGNS, logMemory,
+  onPrivateAccessDenied } = host;
 const HUB_DISPLAY_NAME = 'Grok Search Rs';
 const sessionId = uuid();
 let disposed = false, readTask = null, generation = 0, clearing = false, pollTimer = 0;
 let readSignature = null;
 // The first readable snapshot of a mount is a baseline, not new activity.
 let logBaselined = false, logRestricted = false;
+let logReadError = null;
 
 
 
@@ -354,7 +356,7 @@ function syncLogControls({ snap = false } = {}) {
   privacy.title = logPrivate ? '显示搜索内容' : '隐藏搜索内容';
   const icon = svg(logPrivate ? 'eyeOff' : 'eye');
   if (privacy.innerHTML !== icon) privacy.innerHTML = icon;
-  $('#logCount').textContent = String(logEntries().length);
+  $('#logCount').textContent = logReadError && !logRows.length ? '—' : String(logEntries().length);
   $('#logClear').disabled = !logRows.length;
   syncLogRuntime();
 }
@@ -448,7 +450,9 @@ function renderLog(opt = {}) {
     if (!visibleIds.has(node.dataset.id)) node.remove();
   }
   if (!rows.length) {
-    const blank = logRows.length
+    const blank = logReadError
+      ? ['搜索记录暂不可读', '读取失败不代表未调用插件；恢复连接后自动刷新']
+      : logRows.length
       ? ['没有符合条件的记录', '切换筛选查看其他记录']
       : ['还没有搜索记录', S.plugin ? '下一次搜索完成后，可在这里查看通道' : '官方路由已恢复，当前没有搜索记录'];
     const empty = document.createElement('div');
@@ -1002,21 +1006,39 @@ listen($('#logPrivacy'), 'click', () => {
   $('#logAnnouncer').textContent = logPrivate ? '搜索内容已隐藏，结果通道仍可查看。' : '搜索内容已显示。';
 });
 listen($('#logClear'), 'click', () => { void clearRemoteLog(); });
+function logReadNotice(code) {
+  const reason = code === 'SETTINGS_SECURE_CONNECTION_REQUIRED' ? '请通过本机直连或 HTTPS 查看'
+    : code === 'SETTINGS_AUTH_REQUIRED' ? '宿主身份验证失效，请重新连接'
+      : code === 'SEARCH_LOG_SESSION_INVALID' ? '日志会话失效，请重新打开插件页'
+        : '读取失败，正在重试；这不代表没有搜索记录';
+  return `日志暂不可读 · ${code} · ${reason}`;
+}
+function restrict(code = null) {
+  if (disposed) return;
+  // Explicit RPC denial and a restricted capability snapshot share the same
+  // local revocation. This never deletes the server's search history.
+  if (!logRestricted) {
+    generation++;
+    logRestricted = true;
+    logBaselined = false;
+    logReadError = code;
+    hideStripTip();
+    clearLocalLog({ announce: false });
+    $('#logAnnouncer').textContent = '';
+  }
+  if (code && logReadError !== code) { logReadError = code; renderLog(); }
+  $('#logNote').textContent = logReadError ? logReadNotice(logReadError) : '请通过本机直连或 HTTPS 查看搜索日志';
+}
 async function read() {
-  if (disposed || clearing) return;
+  if (disposed) return;
   // No snapshot yet: the connection is unknown, not restricted.
   if (!S.capabilities) return;
   if (!S.capabilities?.secretsAllowed) {
     // Hide the records once; this is not a user clear and must not repeat on every poll.
-    if (!logRestricted) {
-      generation++;
-      logRestricted = true;
-      logBaselined = false;
-      clearLocalLog({ announce: false });
-      $('#logNote').textContent = '请通过本机直连或 HTTPS 查看搜索日志';
-    }
+    restrict();
     return;
   }
+  if (clearing) return;
   logRestricted = false;
   if (readTask) return;
   const mine = generation;
@@ -1024,10 +1046,12 @@ async function read() {
     try {
       const result = await remote.readSearchLog({ sessionId });
       if (disposed || mine !== generation || !S.capabilities?.secretsAllowed) return;
+      const wasUnreadable = logReadError !== null;
+      logReadError = null;
       const records = (result.records || []).slice(0, LOG_CAP);
       const signature = JSON.stringify([records, S.plugin]);
       $('#logNote').textContent = '仅内存 · 最近 20 条 · 停用或退出 DSH 后清空';
-      if (readSignature === signature) return;
+      if (readSignature === signature) { if (wasUnreadable) renderLog(); return; }
       const before = new Map(logRows.map(row => [row.id, row.kind]));
       logRows = records.map(input => {
         const row = normalizeLog({ ...input, t: new Date(input.at).toLocaleTimeString('zh-CN', { hour12: false }) });
@@ -1043,9 +1067,15 @@ async function read() {
         const row = final || fresh;
         $('#logAnnouncer').textContent = `${logVisibleQuery(row)}，${LOG_CHIP[row.kind][1]}。`;
       }
-    } catch {
+    } catch (error) {
       if (disposed || mine !== generation || !S.capabilities?.secretsAllowed) return;
-      $('#logNote').textContent = '日志暂不可读，请通过安全连接重新打开设置页';
+      const code = /^[\w./-]{1,80}$/.test(error?.code || '') ? error.code : 'SETTINGS_UNAVAILABLE';
+      if (code === 'SETTINGS_AUTH_REQUIRED' || code === 'SETTINGS_SECURE_CONNECTION_REQUIRED') {
+        restrict(code);
+        onPrivateAccessDenied?.(error);
+      }
+      $('#logNote').textContent = logReadNotice(code);
+      if (logReadError !== code) { logReadError = code; renderLog(); }
     }
   })().finally(() => { readTask = null; });
   return readTask;
@@ -1069,7 +1099,7 @@ const poll = async () => {
 };
 pollTimer = setTimeout(poll, 2500);
 return Object.freeze({
-  read,
+  read, restrict,
   hideTip: hideStripTip,
   stop: () => { hideStripTip(); return stopLogRouteReplay(); },
   cancel: () => { hideStripTip(); stopLogRouteReplay(); clearHistoryReturn(); },

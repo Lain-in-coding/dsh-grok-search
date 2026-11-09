@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { runMcpSearch, executionEnvironment } from '../src/core/mcp-search.mjs';
+import { createGrokProvider } from '../src/provider.mjs';
 
 // The installed, pinned product SDK is also a valid offline protocol runtime.
 // A missing optional override must not silently skip the whole protocol gate.
@@ -49,6 +51,79 @@ test('子进程只继承白名单，配置路径覆盖冲突环境项', () => {
   } finally { if (original === undefined) delete process.env.INTERNAL_PARENT_SECRET; else process.env.INTERNAL_PARENT_SECRET = original; }
 });
 
+const diagnosticOnlyEnvironment = {
+  GROK_SEARCH_EXTRA_SOURCES: '0', GROK_SEARCH_FALLBACK_SOURCES: '0',
+  TAVILY_ENABLED: 'false', EXA_ENABLED: 'false', TINYFISH_ENABLED: 'false', FIRECRAWL_ENABLED: 'false',
+};
+const normalEnvironment = {
+  GROK_SEARCH_EXTRA_SOURCES: '3', GROK_SEARCH_FALLBACK_SOURCES: '5',
+  TAVILY_ENABLED: 'true', EXA_ENABLED: 'true', TINYFISH_ENABLED: 'true', FIRECRAWL_ENABLED: 'true',
+};
+const parentFlags = () => Object.fromEntries(Object.keys(normalEnvironment).map(key => [key, process.env[key]]));
+const exited = pid => assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH');
+
+test('独立 Grok 诊断只关闭本次进程的补充与回退，不修改调用方环境', async () => {
+  const parent = parentFlags();
+  const configured = options('diagnostic-environment');
+  const envOverrides = Object.freeze({ ...configured.envOverrides, ...normalEnvironment,
+    ...(process.platform === 'win32' ? { tavily_enabled: 'true' } : {}) });
+  const result = await runMcpSearch({ ...configured, envOverrides,
+    request: { ...configured.request, testPrimary: true } });
+  assert.deepEqual(JSON.parse(result.content).diagnosticEnvironment, diagnosticOnlyEnvironment);
+  assert.equal(envOverrides.TAVILY_ENABLED, 'true');
+  assert.deepEqual(parentFlags(), parent);
+  checkReaped(result.diagnostic);
+});
+
+test('诊断与正常搜索串行切换同一会话所有者，等待在途请求并恢复原补充设置', async () => {
+  const parent = parentFlags();
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-primary-diagnostic-'));
+  const selectedConfig = join(directory, 'config.toml');
+  const config = 'default_extra_sources = 3\nfallback_sources = 5\ntavily_enabled = true\n';
+  writeFileSync(selectedConfig, config);
+  const configured = options('diagnostic-environment');
+  const envOverrides = Object.freeze({ ...configured.envOverrides, ...normalEnvironment });
+  const provider = createGrokProvider({
+    configuration: { executable, executableArgs: [fixture, 'diagnostic-environment'],
+      configPath: selectedConfig, envOverrides },
+    sdkFactory: realSdk,
+  });
+  const query = (query, testPrimary = false, signal) => provider.provider.search({ query, testPrimary }, signal);
+  try {
+    const first = JSON.parse((await query('normal')).content);
+    assert.deepEqual(first.diagnosticEnvironment, normalEnvironment);
+    const pendingNormal = query('hold-before-diagnosis');
+    const pendingDiagnostic = query('primary-only', true);
+    const [normal, diagnostic] = await Promise.all([pendingNormal, pendingDiagnostic]);
+    assert.equal(JSON.parse(normal.content).childPid, first.childPid, 'in-flight normal search is not restarted');
+    const checked = JSON.parse(diagnostic.content);
+    assert.deepEqual(checked.diagnosticEnvironment, diagnosticOnlyEnvironment);
+    assert.notEqual(checked.childPid, first.childPid);
+    exited(first.childPid);
+    const repeated = JSON.parse((await query('another-primary-only', true)).content);
+    assert.equal(repeated.childPid, checked.childPid, 'same diagnostic identity reuses the connection');
+    const restored = JSON.parse((await query('normal-again')).content);
+    assert.deepEqual(restored.diagnosticEnvironment, normalEnvironment);
+    assert.notEqual(restored.childPid, checked.childPid);
+    exited(checked.childPid);
+    assert.equal(JSON.parse((await query('normal-reused')).content).childPid, restored.childPid);
+
+    const held = query('hold-before-diagnosis');
+    const controller = new AbortController(), reason = new Error('cancel queued diagnostic');
+    const cancelled = query('cancelled-primary-only', true, controller.signal);
+    const rejection = assert.rejects(cancelled, error => error === reason);
+    controller.abort(reason);
+    await rejection;
+    assert.equal(JSON.parse((await held).content).childPid, restored.childPid);
+    assert.equal(JSON.parse((await query('after-cancel')).content).childPid, restored.childPid,
+      'cancelled queued diagnosis does not retire the normal connection');
+    assert.equal(readFileSync(selectedConfig, 'utf8'), config);
+    assert.equal(envOverrides.GROK_SEARCH_FALLBACK_SOURCES, '5');
+    assert.deepEqual(parentFlags(), parent);
+  } finally { await provider.dispose(); }
+  assert.equal(provider.snapshot().session.connected, false);
+});
+
 for (const mode of ['structured', 'text-json', 'fragmented', 'coalesced', 'fallback', 'stderr', 'ignore-eof']) {
   integration(`真实 SDK：${mode} 响应与进程回收`, async () => {
     const result = await runMcpSearch(options(mode));
@@ -76,6 +151,27 @@ for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
     checkReaped(result.diagnostic);
   });
 }
+for (const [mode, code] of [['empty-sources', 'grok_sources_empty'],
+  ['invalid-sources', 'grok_sources_empty'], ['long-sources', 'OUTPUT_LIMIT']]) {
+  integration(`真实 SDK：${mode} 不把无可核验引用的结果当成功`, async () => {
+    for (const testPrimary of [false, true]) {
+      const configured = options(mode, { maxChars: 100 });
+      await assert.rejects(runMcpSearch({ ...configured,
+        request: { ...configured.request, testPrimary } }), error => {
+        assert.equal(error.code, code);
+        checkReaped(error.diagnostic);
+        return true;
+      });
+    }
+  });
+}
+integration('真实 SDK：主动要求零条引用仍保留成功语义', async () => {
+  const configured = options('structured');
+  const result = await runMcpSearch({ ...configured, request: { ...configured.request, maxResults: 0 } });
+  assert.deepEqual(result.sources, []);
+  assert.equal(JSON.parse(result.content).initialized, true);
+  checkReaped(result.diagnostic);
+});
 for (const [mode, code] of [
   ['init-error', 'GROK_MCP_ERROR'], ['init-empty-spoof', 'GROK_MCP_ERROR'],
   ['rpc-error', 'GROK_MCP_ERROR'], ['tool-error', 'GROK_TOOL_ERROR'],
@@ -147,4 +243,42 @@ integration('真实 SDK：合并帧总量超过单消息上限时仍按各消息
   assert.equal(result.sources.length, 1);
   assert.ok(result.diagnostic.stdoutBytes > 2_048);
   checkReaped(result.diagnostic);
+});
+
+for (const [mode, code] of [
+  ['doctor-structured', 'HTTP_401'], ['doctor-text', 'HTTP_401'],
+  ['doctor-spoof', 'grok_provider_error'], ['doctor-reachable', 'grok_provider_error'],
+  ['doctor-unsupported', 'grok_provider_error'],
+]) {
+  integration(`Grok 诊断补查：${mode} 只保留可确认状态，不泄漏上游正文`, async () => {
+    await assert.rejects(runMcpSearch(options(mode, { request: { query: 'diagnosis', testPrimary: true } })), error => {
+      assert.equal(error.code, code);
+      assert.equal(error.details?.httpStatus, code === 'HTTP_401' ? 401 : undefined);
+      assert.equal(error.details?.evidence, code === 'HTTP_401' ? 'primary-doctor' : undefined);
+      assert.equal(JSON.stringify(error).includes('never-retain-this-secret'), false);
+      assert.equal(String(error.stack).includes('never-retain-this-secret'), false);
+      checkReaped(error.diagnostic);
+      return true;
+    });
+  });
+}
+
+integration('真实搜索不补发 doctor 请求替换原始错误', async () => {
+  await assert.rejects(runMcpSearch(options('doctor-structured')), error => {
+    assert.equal(error.code, 'grok_provider_error');
+    assert.equal(error.details?.evidence, undefined);
+    checkReaped(error.diagnostic);
+    return true;
+  });
+});
+
+integration('Grok 诊断补查挂起仍受原总截止限制，并确认进程退出', async () => {
+  const deadline = performance.now() + 400;
+  await assert.rejects(runMcpSearch(options('doctor-hang', {
+    request: { query: 'diagnosis', testPrimary: true }, remainingMs: () => deadline - performance.now(),
+  })), error => {
+    assert.equal(error.code, 'GROK_TIMEOUT');
+    checkReaped(error.diagnostic);
+    return true;
+  });
 });

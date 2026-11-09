@@ -427,10 +427,19 @@ async page => {
     check('unknown failure never invents an auth failure',
       await page.locator('#routeTooltip').textContent().then(text => text.includes('不等于搜索不可用') && !text.includes('401')));
     await page.locator('input[data-k=url]').fill('https://custom.test');
-    check('changed URL does not reuse old balance', await page.locator('#quotaPanel').getAttribute('data-state'), 'changed');
-    check('dirty destination cannot query', await page.locator('[data-a=quota-refresh]').isDisabled());
+    check('changed URL does not reuse old balance', await page.locator('#quotaPanel').getAttribute('data-state'), 'unreported');
+    check('dirty destination supports explicit quota query', await page.locator('[data-a=quota-refresh]').isEnabled());
+    const savedQuotaConfig = await read(() => JSON.stringify(window.harness.state.content));
+    await page.evaluate(() => window.harness.configure({ quotaError: false }));
+    await page.locator('[data-a=quota-refresh]').click();
+    await page.locator('#quotaPanel[data-state=ready]').waitFor();
+    check('draft quota keeps configuration dialog open', await page.locator('#overlay').isVisible());
+    check('draft destination sent only for this request',
+      await read(() => window.harness.state.calls.filter(call => call.method === 'previewAccountQuota').at(-1).request.draft.baseUrl), 'https://custom.test');
     await page.locator('[data-a=cancel]').click();
     await page.locator('#overlay').waitFor({ state: 'hidden' });
+    check('cancelling draft quota leaves saved config unchanged',
+      await read(() => JSON.stringify(window.harness.state.content)), savedQuotaConfig);
     await page.evaluate(() => window.harness.configure({ quotaError: false, quotaDelay: 500, quotaIgnoreCancellation: true,
       quotas: { firecrawl: { kind: 'credits', used: null, remaining: 890, plan: null, note: '离线团队余额' } } }));
     await page.locator('#colList .row[data-id=firecrawl] .row-main').click();
@@ -498,8 +507,23 @@ async page => {
     check('unconfigured row remains compact', await page.locator('.qp-empty').evaluate(el => el.getBoundingClientRect().height <= 44));
     check('unconfigured title and console remain visible', await page.locator('.qp-heading .qp-console').isVisible());
     await page.locator('#dialog').screenshot({ path: run.directory + '/quota-unconfigured.png' });
+    const beforeUnsavedKey = await read(() => JSON.stringify(window.harness.state.content));
+    await page.locator('input[data-k=key]').fill('synthetic-unsaved-tinyfish');
+    await page.evaluate(() => window.harness.configure({ quotas: { tinyfish: { kind: 'wallet', balance: 2 } } }));
+    check('new unsaved key can query immediately', await page.locator('[data-a=quota-refresh]').isEnabled());
+    await page.locator('[data-a=quota-refresh]').click();
+    await page.locator('#quotaPanel[data-state=ready]').waitFor();
+    check('current form key is sent in transient draft',
+      await read(() => window.harness.state.calls.filter(call => call.method === 'previewAccountQuota').at(-1).request.draft.apiKey), 'synthetic-unsaved-tinyfish');
+    await page.evaluate(() => window.harness.configure({ quotaError: { category: 'AUTH', httpStatus: 401 } }));
+    await page.locator('[data-a=quota-refresh]').click();
+    await page.locator('#quotaPanel[data-state=error]').waitFor();
+    await page.locator('[data-quota-kind=error]').hover();
+    check('quota failure explains independent quota permissions',
+      await page.locator('#routeTooltip').textContent().then(text => text.includes('不等于搜索不可用')));
     await page.locator('[data-a=cancel]').click();
     await page.locator('#overlay').waitFor({ state: 'hidden' });
+    check('cancel after draft-key test never persists the key', await read(() => JSON.stringify(window.harness.state.content)), beforeUnsavedKey);
     await page.evaluate(() => {
       window.harness.inject({ tinyfish_api_key: 'synthetic-quota-test' });
       window.harness.configure({ quotaError: true });
@@ -524,6 +548,10 @@ async page => {
     await page.locator('#quotaPanel').evaluate(el => Promise.all(el.parentElement.getAnimations({ subtree: true })
       .filter(a => a.effect.getComputedTiming().iterations !== Infinity).map(a => a.finished.catch(() => {}))));
     check('retry displays wallet data without inventing credits', await page.locator('.qp-wallet .qp-value').textContent(), '-1.25');
+    // Focus restoration can start a short CSS transition after the WAAPI
+    // promise settles. Assert bounded quiescence, not the same microtask.
+    await page.waitForFunction(() => document.querySelector('[data-dsg-layer]').shadowRoot
+      .querySelector('#quotaSlot').getAnimations({ subtree: true }).length === 0, undefined, { timeout: 1500 });
     check('settled quota animations release their keyframes', await page.locator('#quotaSlot').evaluate(el => el.getAnimations({ subtree: true }).length), 0);
     await page.locator('[data-a=cancel]').click();
     await page.locator('#overlay').waitFor({ state: 'hidden' });
@@ -561,6 +589,13 @@ async page => {
     await page.locator('#logClear').click();
     await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'clearSearchLog'));
     check('clear removes records', await rows().count(), 0);
+    await page.evaluate(() => { window.harness.configure({ logError: 'gateway/signature-invalid' }); window.harness.refresh(); });
+    await page.locator('.lc-empty:has-text("搜索记录暂不可读")').waitFor();
+    check('failed log reads do not claim zero searches', await page.locator('#logCount').textContent(), '—');
+    check('log errors retain real codes instead of blaming HTTPS', await page.locator('#logNote').textContent().then(text =>
+      text.includes('gateway/signature-invalid') && !text.includes('安全连接')));
+    await page.evaluate(() => { window.harness.configure({ logError: null }); window.harness.refresh(); });
+    await page.locator('.lc-empty:has-text("还没有搜索记录")').waitFor();
     await page.evaluate(() => {
       window.harness.configure({ logs: [{ id: 'search-log-120', at: 1800000009000, q: 'after clear arrives',
         kind: 'ok', served: 'grok', ms: 800, reason: '', calls: [] }] });
@@ -586,6 +621,67 @@ async page => {
       .evaluate(el => el.getRootNode().activeElement === el && el.getAttribute('aria-checked') === 'true'));
     await page.locator('[data-a=cancel]').click();
     await page.locator('#overlay').waitFor({ state: 'hidden' });
+    for (const [method, code] of [
+      ['log', 'SETTINGS_AUTH_REQUIRED'],
+      ['log', 'SETTINGS_SECURE_CONNECTION_REQUIRED'],
+      ['snapshot', 'SETTINGS_AUTH_REQUIRED'],
+    ]) {
+      await page.evaluate(() => {
+        window.harness.configure({ logError: null, snapshotError: null, logs: [{
+          id: 'search-log-121', at: Date.now(), q: 'private-revocation-check', kind: 'sources',
+          served: 'tavily', ms: 500, calls: [{ provider: 'tavily', result: 'ok' }],
+        }] });
+        window.harness.refresh();
+      });
+      await rows().first().locator('.le-query').filter({ hasText: 'private-revocation-check' }).waitFor();
+      await rows().first().locator('.le-head').click();
+      await rows().first().locator('[data-log-replay]').click();
+      const clears = await read(() => window.harness.state.calls.filter(call => call.method === 'clearSearchLog').length);
+      await page.evaluate(({ method, code }) => {
+        window.harness.configure(method === 'log' ? { logError: code } : { snapshotError: code });
+        window.harness.refresh();
+      }, { method, code });
+      await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot.querySelectorAll('.log-entry').length === 0);
+      check(method + '/' + code + ': private query is immediately removed', await rows().count(), 0);
+      check(method + '/' + code + ': unreadable count is not zero', await page.locator('#logCount').textContent(), '—');
+      check(method + '/' + code + ': playback closes', await page.locator('#historyStage').isHidden());
+      check(method + '/' + code + ': replay text is removed', await page.locator('#historyQuery').textContent(), '');
+      check(method + '/' + code + ': rejection code remains actionable', (await page.locator('#logNote').textContent()).includes(code));
+      check(method + '/' + code + ': server history is not deleted',
+        await read(() => window.harness.state.calls.filter(call => call.method === 'clearSearchLog').length), clears);
+    }
+    await page.evaluate(() => {
+      window.harness.configure({ snapshotError: null, logError: null });
+      window.harness.refresh();
+    });
+    await rows().first().waitFor();
+    await page.evaluate(() => { window.harness.configure({ logError: 'SETTINGS_UNAVAILABLE' }); window.harness.refresh(); });
+    await page.locator('#logNote').filter({ hasText: 'SETTINGS_UNAVAILABLE' }).waitFor();
+    check('ordinary log network error retains readable history', await rows().first().locator('.le-query').textContent(), 'private-revocation-check');
+    // A stale authorized snapshot must not undo a newer log rejection.
+    const beforeDeniedRead = await read(() => window.harness.state.calls.filter(call => call.method === 'readSearchLog').length);
+    await page.evaluate(() => {
+      window.harness.configure({ logError: 'SETTINGS_AUTH_REQUIRED', logDelay: 250 });
+      window.harness.refresh();
+    });
+    await page.waitForFunction(count => window.harness.state.calls.filter(call => call.method === 'readSearchLog').length > count, beforeDeniedRead);
+    await page.evaluate(() => {
+      window.harness.configure({ logError: null, snapshotDelay: 700 });
+      window.harness.refresh();
+    });
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot.querySelectorAll('.log-entry').length === 0);
+    await page.evaluate(() => window.harness.configure({ snapshotError: 'SETTINGS_AUTH_REQUIRED' }));
+    await page.waitForTimeout(800);
+    check('late authorized snapshot cannot revive rejected private history', await rows().count(), 0);
+    check('late authorized snapshot cannot re-enable secret controls',
+      await page.locator('.banner:has-text("仅显示脱敏")').count() > 0);
+    await page.evaluate(() => {
+      window.harness.configure({ snapshotError: null, snapshotDelay: 0, logDelay: 0, logError: null });
+      window.harness.refresh();
+    });
+    await rows().first().waitFor();
+    check('fresh authorization and log read restore retained server history',
+      await rows().first().locator('.le-query').textContent(), 'private-revocation-check');
     await page.setViewportSize({width:720,height:900});
     check('main routing UI retains wide topology within its actual container', await page.locator('#routeCard').evaluate(el => {
       const root = el.getRootNode(), stage = root.querySelector('#stage');

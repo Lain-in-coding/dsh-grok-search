@@ -113,3 +113,18 @@ export function mapSearchResult(payload, { maxResults, maxChars = 45_000 } = {})
   }
   return result;
 }
+
+/** Validate usable search output after mapping, without changing the mapper's
+ * legal empty/zero-result contract. Only URL references, never answer text,
+ * establish that a search result can be verified. */
+export function assertSearchReferences(payload, result, maxResults) {
+  if (maxResults === 0 || result.sources.length > 0) return;
+  const hadReference = payload.sources.some(source => {
+    try {
+      const url = new URL(source.url);
+      return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password;
+    } catch { return false; }
+  });
+  if (hadReference) throw new GrokSearchError('OUTPUT_LIMIT', '回复字符上限未能容纳搜索链接，请调大上限后重试。');
+  throw new GrokSearchError('grok_sources_empty', 'Grok 未返回可识别的来源链接。');
+}

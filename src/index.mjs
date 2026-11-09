@@ -20,12 +20,16 @@ export function apply(ctx, config) {
   const program = ctx.get('grokSearchProgram');
   const preferences = ctx.get('grokSearchPreferences');
   const getConfig = () => {
-    const path = program?.snapshot?.()?.configPath;
+    const state = program?.snapshot?.();
+    const path = state?.configPath;
     if (!path) return null;
-    return createSharedConfigStore({ path }).readEffective();
+    // Reading source settings must not require a ready Grok executable.
+    return { ...createSharedConfigStore({ path }).readSnapshot(),
+      execution: state.phase === 'ready' ? program.execution() : { executable: '', configPath: path } };
   };
   const sourceRouter = createSourceRouter({
     getConfig,
+    budgetMs: config.budgetMs ?? 120_000,
     getPreferences: () => preferences?.snapshot?.() ?? null,
   });
   ctx.provide('grokSearchSourceRouter', sourceRouter);
@@ -56,6 +60,7 @@ export function apply(ctx, config) {
     programSnapshot: () => program?.snapshot() ?? null,
     testSearch: (request, signal) => routed.search(request, signal, 'test'),
     testGrok: routed.testGrok,
+    scheduleDiagnosis: routed.scheduleDiagnosis,
     routeSnapshot: routed.routeSnapshot,
     searchLog: routed.searchLog,
     budgetMs: config.budgetMs ?? 120_000,

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
-import { mkdtempSync, writeFileSync, readFileSync, symlinkSync, realpathSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -10,6 +10,8 @@ import {
 } from '../scripts/deferred-release-desktop-prepare.mjs';
 import { captureDesktopSearch, captureDesktopSeam, waitForDesktopRecovery } from '../fixtures/deferred-release/desktop-fixture.mjs';
 import { requestDesktopShutdown } from '../scripts/lib/renderer-cdp.mjs';
+import { desktopAcceptancePaths, desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from '../scripts/lib/desktop-acceptance-environment.mjs';
+import { commandResult } from '../scripts/lib/internal-candidate-utils.mjs';
 
 const fuseBinary = (wire = '101100011', version = 1, length = wire.length) => Buffer.concat([
   Buffer.from('fixture-prefix:dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
@@ -150,4 +152,89 @@ test('Desktop 退出命令必须等待实际退出，不能发送后立刻关掉
   });
   assert.equal(socket.dispatched, true);
   assert.equal(socket.closed, true, 'socket is released only after actual exit');
+});
+
+function acceptanceFixture() {
+  const root = mkdtempSync(join(temporary, 'dsh-deferred-desktop-environment-'));
+  const paths = desktopAcceptancePaths(root);
+  mkdirSync(paths.profile, { recursive: true });
+  const patch = [desktopWorkspacePatch(root)];
+  writeFileSync(join(paths.profile, 'cordis.patch.yml'), JSON.stringify(patch), { flag: 'wx' });
+  return { root, paths, patch };
+}
+
+test('桌面验收准备补齐隔离目录，不修改进程全局环境或替宿主注册工作区', () => {
+  const { root, paths } = acceptanceFixture();
+  const before = { ...process.env };
+  const patchBefore = readFileSync(join(paths.profile, 'cordis.patch.yml'));
+  const prepared = prepareDesktopAcceptanceEnvironment(root);
+  for (const path of [paths.desktop, paths.documents, paths.downloads]) assert.equal(existsSync(path), true);
+  assert.equal(existsSync(paths.workspace), false, 'default workspace belongs to official Host initialization');
+  assert.equal(prepared.env.USERPROFILE, paths.home);
+  assert.equal(prepared.env.DSH_HOME, paths.dshHome);
+  assert.ok(JSON.stringify(Object.entries(process.env).sort()) === JSON.stringify(Object.entries(before).sort()),
+    'global environment values are unchanged');
+  assert.deepEqual(readFileSync(join(paths.profile, 'cordis.patch.yml')), patchBefore);
+  const sentinel = join(paths.desktop, 'keep.txt');
+  writeFileSync(sentinel, 'keep existing data', { flag: 'wx' });
+  prepareDesktopAcceptanceEnvironment(root);
+  assert.equal(readFileSync(sentinel, 'utf8'), 'keep existing data');
+});
+
+test('未明确隔离Documents前拒绝准备，不偷偷回退到真实用户文档', () => {
+  for (const patch of [[], [{ id: 'workspace-controller', disabled: true }],
+    [{ id: 'workspace-controller', config: { documentsDirectory: 'C:/Users/real/Documents' } }]]) {
+    const { root, paths } = acceptanceFixture();
+    writeFileSync(join(paths.profile, 'cordis.patch.yml'), JSON.stringify(patch));
+    assert.throws(() => prepareDesktopAcceptanceEnvironment(root), /Isolate documentsDirectory/);
+    assert.equal(existsSync(paths.desktop), false);
+  }
+});
+
+test('冲突和不可解析的工作区patch阻断准备，保留原文件', () => {
+  const { root, paths, patch } = acceptanceFixture();
+  const file = join(paths.profile, 'cordis.patch.yml');
+  writeFileSync(file, JSON.stringify([...patch, ...patch]));
+  assert.throws(() => prepareDesktopAcceptanceEnvironment(root), /Isolate documentsDirectory/);
+  writeFileSync(file, '- invalid-for-this-dedicated-fixture');
+  assert.throws(() => prepareDesktopAcceptanceEnvironment(root), /explicit JSON workspace patch/);
+  assert.equal(readFileSync(file, 'utf8'), '- invalid-for-this-dedicated-fixture');
+});
+
+test('桌面验收拒绝普通目录、越界profile环境和大小写路径覆盖', () => {
+  assert.throws(() => desktopAcceptancePaths(temporary), /dedicated temporary namespace/);
+  assert.throws(() => desktopAcceptancePaths('relative'), /absolute/);
+  const { root, paths } = acceptanceFixture();
+  for (const extra of [{ USERPROFILE: temporary }, { Path: 'untrusted' }, { DSH_HOME: temporary },
+    { GROK_SEARCH_CONFIG: join(temporary, 'outside.toml') }]) {
+    assert.throws(() => prepareDesktopAcceptanceEnvironment(root, extra));
+  }
+  assert.equal(existsSync(paths.desktop), false);
+});
+
+test('隔离系统目录的外跳链接及文件冲突在创建其他目录前被拒绝', () => {
+  const outside = mkdtempSync(join(temporary, 'dsh-environment-outside-'));
+  const linked = acceptanceFixture();
+  mkdirSync(linked.paths.home);
+  symlinkSync(outside, linked.paths.documents, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => prepareDesktopAcceptanceEnvironment(linked.root), /link/);
+  assert.equal(existsSync(linked.paths.desktop), false);
+  const collision = acceptanceFixture();
+  mkdirSync(collision.paths.home);
+  writeFileSync(collision.paths.desktop, 'not a directory', { flag: 'wx' });
+  assert.throws(() => prepareDesktopAcceptanceEnvironment(collision.root), /unexpected type/);
+  assert.equal(existsSync(collision.paths.downloads), false);
+});
+
+test('Windows桌面验收能按名称找到PowerShell且系统桌面解析到现存隔离目录', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const { root, paths } = acceptanceFixture();
+  const { env } = prepareDesktopAcceptanceEnvironment(root);
+  const result = await commandResult('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)'],
+  { cwd: root, env, timeoutMs: 15_000 });
+  assert.equal(result.exitCode, 0, result.spawnError ?? result.stderr);
+  assert.equal(result.rawStdout.trim(), paths.desktop);
+  assert.equal(env.PATH.includes(join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0')), true);
 });

@@ -2,6 +2,10 @@
 import { createInterface } from 'node:readline';
 
 const mode = process.argv[2] ?? 'structured';
+const diagnosticEnvironment = Object.fromEntries([
+  'GROK_SEARCH_EXTRA_SOURCES', 'GROK_SEARCH_FALLBACK_SOURCES',
+  'TAVILY_ENABLED', 'EXA_ENABLED', 'TINYFISH_ENABLED', 'FIRECRAWL_ENABLED',
+].map(key => [key, process.env[key] ?? null]));
 const lines = createInterface({ input: process.stdin });
 let initialized = false;
 let answered = false;
@@ -49,6 +53,27 @@ lines.on('line', line => {
     return;
   }
   if (request.method !== 'tools/call') return;
+  if (initialized && mode.startsWith('doctor-')) {
+    if (request.params.name === 'web_search') {
+      send({ jsonrpc: '2.0', id: request.id, error: { code: -32001,
+        message: 'provider error: web_search returned no sources: grok_provider_error, and the fallback source budget is 0 (GROK_SEARCH_FALLBACK_SOURCES).' } });
+      return;
+    }
+    if (request.params.name === 'doctor') {
+      if (mode === 'doctor-hang') return;
+      if (mode === 'doctor-unsupported') {
+        send({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'never-retain-this-secret' } });
+        return;
+      }
+      const detail = mode === 'doctor-spoof' ? 'arbitrary text HTTP 401 never-retain-this-secret'
+        : 'provider error: Grok Responses returned HTTP 401 Unauthorized: never-retain-this-secret';
+      const payload = { grok: { reachable: mode === 'doctor-reachable', detail } };
+      result(request.id, mode === 'doctor-text'
+        ? { content: [{ type: 'text', text: JSON.stringify(payload) }] }
+        : { content: [], structuredContent: payload });
+      return;
+    }
+  }
   if (!initialized || request.params.name !== 'web_search' || request.params.arguments.response_format !== 'concise') {
     send({ jsonrpc: '2.0', id: request.id, error: { code: -32602, message: 'invalid fixture handshake or call' } });
     return;
@@ -88,6 +113,7 @@ lines.on('line', line => {
       inheritedSecret: process.env.GROK_FIXTURE_PARENT_SECRET ?? null,
       explicitValue: process.env.GROK_FIXTURE_EXPLICIT ?? null,
       childPid: process.pid,
+      ...(mode === 'diagnostic-environment' ? { diagnosticEnvironment } : {}),
     }),
     sources: [{ url: 'https://example.invalid/grok-fixture', title: 'Fixture', description: 'Offline source', published_date: '2026-10-15' }],
     search_provider: 'offline-fixture',
@@ -103,11 +129,16 @@ lines.on('line', line => {
   }
   if (mode === 'stderr') process.stderr.write('api_key=never-retain-this-secret\n'.repeat(10_000));
   if (mode === 'malformed-result') payload.sources = 'not-an-array';
+  if (mode === 'empty-sources') payload.sources = [];
+  if (mode === 'invalid-sources') payload.sources = [{ url: 'javascript:alert(1)' }];
+  if (mode === 'long-sources') payload.sources = [{ url: 'https://g.test/' + 'x'.repeat(400) }];
   answered = true;
   const response = { content: [{ type: 'text', text: JSON.stringify(payload) }] };
   if (mode !== 'text-json') response.structuredContent = payload;
   if (mode === 'coalesced') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'offline fixture notification' } }) + '\n' + JSON.stringify({ jsonrpc: '2.0', id: request.id, result: response }) + '\n');
+  } else if (mode === 'diagnostic-environment' && request.params.arguments.query === 'hold-before-diagnosis') {
+    setTimeout(() => result(request.id, response), 150);
   } else result(request.id, response, mode === 'fragmented');
 });
 

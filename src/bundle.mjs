@@ -14,6 +14,8 @@ import { createPrivatePreferences } from './core/private-preferences.mjs';
 import { createSearchLog } from './core/search-log.mjs';
 import { createToolRouteContext } from './core/tool-route-context.mjs';
 import { createToolBudgetController } from './core/tool-budget.mjs';
+import { createGithubIntegration } from './core/github-host.mjs';
+import { createSharedConfigStore, resolveSharedConfigPath } from './core/shared-config.mjs';
 import { join } from 'node:path';
 
 export const name = 'dsh-grok-search';
@@ -30,6 +32,7 @@ export async function apply(ctx, configuration) {
   ctx.provide('grokSearchLog', searchLog);
   ctx.provide('grokSearchCallRoutes', callRoutes);
   ctx.on('tools/execute', (exec, next) => callRoutes.run(exec, next), { global: true, prepend: true });
+  ctx.on('tools/result', (exec, result) => callRoutes.finalize(exec, result), { global: true });
   ctx.effect(() => () => { searchLog.dispose(); callRoutes.dispose(); });
   const preferences = createPrivatePreferences({
     path: join(ctx.profileContext.dir, 'grok-search', 'preferences.json'),
@@ -60,6 +63,14 @@ export async function apply(ctx, configuration) {
     try { return store.read()?.intent.policy !== 'released'; }
     catch (error) { backgroundError(error); return true; }
   };
+  const github = createGithubIntegration({ ctx, searchLog, callRoutes, getState: () => {
+    const enabled = required() && preferences.snapshot().value.githubReadEnabled === true;
+    if (!enabled) return { enabled: false, token: '' };
+    const path = ctx.get('grokSearchProgram')?.snapshot?.()?.configPath || resolveSharedConfigPath({});
+    const effective = createSharedConfigStore({ path }).readEffective();
+    return { enabled, token: effective.github_token.value, identity: path };
+  } });
+  ctx.provide('grokSearchGithub', github);
   const budgets = createToolBudgetController({ ctx, budgetMs: configuration.budgetMs ?? 120_000,
     required, resolveConfig, onError: backgroundError });
   ctx.provide('grokSearchBudgets', budgets);
@@ -84,6 +95,7 @@ export async function apply(ctx, configuration) {
     catch (error) { backgroundError(error); return; }
     if (!reason) return;
     disabling = true;
+    github.invalidate();
     const owner = ctx.get('grokSearchControl');
     if (!owner) return;
     releaseTask = owner.stop(reason, { unloading: true });

@@ -2,7 +2,7 @@ async page => {
   await page.reload();
   await page.waitForFunction(() => Boolean(window.harness));
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
-  const checks = [], errors = [], external = [];
+  const checks = [], errors = [], external = [], observations = [];
   const origin = await page.evaluate(() => location.origin);
   page.on('pageerror', error => errors.push(String(error)));
   page.on('request', request => { if (!request.url().startsWith(origin) && /^https?:/.test(request.url())) external.push(request.url()); });
@@ -206,7 +206,7 @@ async page => {
     });
     check('disclosure reaches a non-empty settled state', motion.finalHeight > 0);
     check('disclosure animation presents intermediate geometry', motion.intermediate);
-    checks.push({ name: 'measured disclosure motion (diagnostic only, not an FPS guarantee)', passed: true, measurement: motion });
+    observations.push({ name: 'measured disclosure motion (diagnostic only, not an FPS guarantee)', kind: 'observation', measurement: motion });
     await page.emulateMedia({ reducedMotion: 'reduce' });
     check('reduced motion disables the disclosure transition', await rows().first().locator('.ldet').evaluate(el =>
       getComputedStyle(el).transitionDuration.split(',').every(value => parseFloat(value) < .01)));
@@ -694,7 +694,7 @@ async page => {
     check('all layer hosts removed', await page.locator('[data-dsg-layer]').count(), 0);
     check('no runtime error', errors.length, 0);
     check('no external request', external.length, 0);
-    const summary = { ...run, passed: checks.length, failed: 0, checks, errors, external,
+    const summary = { ...run, passed: checks.length, failed: 0, checks, errors, external, observations,
       fixtureOnly: true, realHostVerified: false };
     const recorded = await page.evaluate(async summary => {
       const response = await fetch('/evidence', { method: 'POST', body: JSON.stringify(summary) });
@@ -702,9 +702,10 @@ async page => {
     }, summary);
     if (!recorded.ok) throw new Error(recorded.text);
     console.log(JSON.stringify({ runId: run.runId, passed: checks.length, failed: 0 }));
+    return { runId: run.runId, passed: checks.length, failed: 0, errors, external, observations };
   } catch (error) {
     await page.screenshot({ path: run.directory + '/failed.png', fullPage: true });
-    const summary = { ...run, checks, errors, external, failed: 1, error: String(error), fixtureOnly: true };
+    const summary = { ...run, checks, errors, external, observations, failed: 1, error: String(error), fixtureOnly: true };
     await page.evaluate(summary => fetch('/evidence', { method: 'POST', body: JSON.stringify(summary) }), summary);
     throw error;
   }

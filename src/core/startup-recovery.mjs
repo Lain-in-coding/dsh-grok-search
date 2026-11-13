@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { ControlRecordError } from './control-intent-store.mjs';
+import { ControlRecordError, writeControlIntent } from './control-intent-store.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -137,7 +137,7 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
   const intent = { ...archivedIntent, policy: 'released', reason: 'legal-load-observed-unselected-at-author',
     priorIntent: structuredClone(prior), recovery, release: null };
   try {
-    const envelope = store.compareAndSwap({ expectedRevision: before.revision, intent, operationId });
+    const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId });
     return outcome('corrected', envelope, { recordCommitted: true, routeVerified: true, routeChanged });
   } catch (error) {
     if (error instanceof ControlRecordError) {
@@ -217,7 +217,7 @@ export async function completeReleaseRecovery({ store, observe, restoreRoute, ve
   };
   const intent = { ...prior, releaseCompletion: completion, recovery };
   try {
-    const envelope = store.compareAndSwap({ expectedRevision: before.revision, intent, operationId });
+    const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId });
     return outcome('completed', envelope, { recordCommitted: true, completionCommitted: true,
       routeVerified: true, routeChanged });
   } catch (error) {

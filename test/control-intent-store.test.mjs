@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import {
   existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
-  readdirSync, statSync, symlinkSync, writeFileSync,
+  readdirSync, realpathSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import test from 'node:test';
@@ -29,7 +31,7 @@ const envelope = (overrides = {}) => ({
 });
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), 'dsh-control-intent-test-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-control-intent-test-'));
   t.diagnostic(`Retained fixture: ${root}`);
   return { root, directory: join(root, 'control') };
 }
@@ -141,12 +143,155 @@ test('an absent store reads as null without creating a storage directory', t => 
   assert.equal(existsSync(directory), false);
 });
 
+function withReadCounter(work) {
+  const original = fs.readFileSync, originalParse = JSON.parse;
+  const state = { revisionReads: 0, envelopeParses: 0 };
+  fs.readFileSync = function (...args) {
+    if (typeof args[0] === 'string' && COMMITTED_NAME.test(basename(args[0]))) state.revisionReads++;
+    return original.apply(this, args);
+  };
+  JSON.parse = function (...args) {
+    if (typeof args[0] === 'string' && args[0].startsWith('{') && args[0].includes(FORMAT)) state.envelopeParses++;
+    return originalParse.apply(this, args);
+  };
+  syncBuiltinESMExports();
+  try { return work(state); }
+  finally {
+    fs.readFileSync = original;
+    JSON.parse = originalParse;
+    syncBuiltinESMExports();
+  }
+}
+
+test('200-revision stable presentation polling reads only the latest file and skips JSON parsing', t => {
+  const { directory } = fixture(t);
+  const files = [];
+  let previousSha256 = null;
+  for (let revision = 1; revision <= 200; revision++) {
+    const bytes = encode(envelope({ revision, previousSha256, intent: requiredIntent({ reason: `revision ${revision}` }) }));
+    files.push([revisionName(revision), bytes]);
+    previousSha256 = sha256(bytes);
+  }
+  seed(directory, files);
+  const store = createControlIntentStore({ directory });
+  const initial = store.readView();
+  assert.equal(initial.revision, 200);
+  assert.ok(Object.isFrozen(initial.intent));
+  const polls = 20;
+  const measure = read => withReadCounter(counters => {
+    const started = performance.now();
+    let result;
+    for (let index = 0; index < polls; index++) result = read();
+    const totalMs = performance.now() - started;
+    assert.deepEqual(result, initial);
+    return { ...counters, totalMs, meanMs: totalMs / polls };
+  });
+  const full = measure(() => store.read());
+  const display = measure(() => store.readView());
+  assert.equal(full.revisionReads, 200 * polls);
+  assert.equal(full.envelopeParses, 200 * polls);
+  assert.equal(display.revisionReads, polls);
+  assert.equal(display.envelopeParses, 0);
+  t.diagnostic(JSON.stringify({ benchmark: 'synthetic-200-revisions', polls, full, display }));
+});
+
+test('presentation polling refreshes the tail and detects an external legacy source', t => {
+  const { root, directory } = fixture(t);
+  const store = createControlIntentStore({ directory }), external = createControlIntentStore({ directory });
+  assert.equal(store.readView(), null);
+  const first = external.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });
+  assert.deepEqual(store.readView(), first);
+  external.compareAndSwap({ expectedRevision: first.revision, intent: requiredIntent({ reason: 'external release intent' }) });
+  const third = external.compareAndSwap({ expectedRevision: 2, intent: requiredIntent({ reason: 'external completion' }) });
+  assert.deepEqual(store.readView(), third);
+
+  const legacyPath = join(root, 'external-legacy.json');
+  const viewer = createControlIntentStore({ directory, legacyPath });
+  assert.deepEqual(viewer.readView(), third);
+  writeFileSync(legacyPath, JSON.stringify(requiredIntent()) + '\n', { flag: 'wx' });
+  expectCode(() => viewer.readView(), 'CONTROL_RECORD_MIGRATION_REQUIRED');
+});
+
+test('presentation checks latest bytes and revision names before accepting its cache', t => {
+  const { directory } = fixture(t);
+  const store = createControlIntentStore({ directory });
+  const first = store.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });
+  assert.deepEqual(store.readView(), first);
+  const firstPath = join(directory, revisionName(1)), original = readFileSync(firstPath);
+  writeFileSync(firstPath, encode({ ...first, schemaVersion: 2 }));
+  expectCode(() => store.readView(), 'CONTROL_RECORD_VERSION_UNSUPPORTED');
+  writeFileSync(firstPath, original);
+  assert.deepEqual(store.readView(), first);
+  writeFileSync(join(directory, 'v1.json'), original, { flag: 'wx' });
+  expectCode(() => store.readView(), 'CONTROL_RECORD_INVALID');
+
+  const gapDirectory = join(directory, 'gap');
+  const gapStore = createControlIntentStore({ directory: gapDirectory });
+  const gapFirst = gapStore.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });
+  assert.deepEqual(gapStore.readView(), gapFirst);
+  writeFileSync(join(gapDirectory, revisionName(3)), encode(envelope({ revision: 3 })), { flag: 'wx' });
+  expectCode(() => gapStore.readView(), 'CONTROL_RECORD_INVALID');
+});
+
+test('old in-place corruption cannot authorize read or CAS through a warm display cache', t => {
+  const { directory } = fixture(t);
+  const store = createControlIntentStore({ directory });
+  store.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });
+  store.compareAndSwap({ expectedRevision: 1, intent: requiredIntent({ reason: 'second' }) });
+  const view = store.readView();
+  writeFileSync(join(directory, revisionName(1)), '{ damaged old evidence\n');
+  // Display-only limitation: unchanged names/latest bytes can retain a prior view.
+  assert.strictEqual(store.readView(), view);
+  const before = diskSnapshot(directory);
+  expectCode(() => store.read(), 'CONTROL_RECORD_INVALID');
+  expectCode(() => store.compareAndSwap({ expectedRevision: 2, intent: requiredIntent() }), 'CONTROL_RECORD_INVALID');
+  expectCode(() => createControlIntentStore({ directory }).readView(), 'CONTROL_RECORD_INVALID');
+  assert.deepEqual(diskSnapshot(directory), before);
+  const latest = readFileSync(join(directory, revisionName(2)));
+  writeFileSync(join(directory, revisionName(3)), encode(envelope({ revision: 3, previousSha256: sha256(latest) })));
+  expectCode(() => store.readView(), 'CONTROL_RECORD_INVALID');
+});
+
+test('presentation cache validates a committed tail migration before trusting it', t => {
+  const { root, directory } = fixture(t);
+  const legacyPath = join(root, 'legacy.json'), legacy = Buffer.from(JSON.stringify(requiredIntent()) + '\n');
+  writeFileSync(legacyPath, legacy, { flag: 'wx' });
+  const store = createControlIntentStore({ directory, legacyPath });
+  const source = store.inspectLegacy();
+  store.migrateLegacy({ expectedRevision: 0, expectedLegacySha256: source.sha256, operationId: randomUUID() });
+  const current = store.read();
+  store.compareAndSwap({ expectedRevision: 1,
+    intent: requiredIntent({ migration: current.intent.migration }) });
+  const before = store.readView();
+  writeFileSync(legacyPath, JSON.stringify(requiredIntent({ reason: 'changed source' })) + '\n');
+  expectCode(() => store.readView(), 'CONTROL_RECORD_MIGRATION_SOURCE_CHANGED');
+  writeFileSync(legacyPath, legacy);
+  assert.deepEqual(store.readView(), before);
+});
+
+test('extended Windows local drive paths are accepted while UNC and device paths stay blocked', t => {
+  const { root, directory } = fixture(t);
+  for (const forbidden of [String.raw`\\server\share\control`, '//server/share/control',
+    String.raw`\\?\UNC\server\share\control`, String.raw`\\.\C:\control`, String.raw`\\?\C:relative`]) {
+    expectCode(() => createControlIntentStore({ directory: forbidden }), 'CONTROL_RECORD_INVALID');
+    expectCode(() => createControlIntentStore({ directory, legacyPath: forbidden }), 'CONTROL_RECORD_INVALID');
+    expectCode(() => createControlIntentStore({ directory, trustedRoot: forbidden }), 'CONTROL_RECORD_INVALID');
+  }
+  if (process.platform !== 'win32') return;
+  const store = createControlIntentStore({ directory: '\\\\?\\' + directory, trustedRoot: '\\\\?\\' + root,
+    legacyPath: '\\\\?\\' + join(root, 'absent-legacy.json') });
+  const first = store.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });
+  assert.deepEqual(store.read(), first);
+  assert.deepEqual(store.readView(), first);
+  assert.deepEqual(createControlIntentStore({ directory }).read(), first);
+});
+
 test('a trusted profile permits aliases above it while rejecting links at or below it', t => {
   if (process.platform === 'win32') {
     t.skip('POSIX directory symlink semantics are required.');
     return;
   }
-  const root = mkdtempSync(join(tmpdir(), 'dsh-control-intent-trusted-root-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-control-intent-trusted-root-'));
   t.diagnostic(`Retained fixture: ${root}`);
   const physical = join(root, 'physical');
   const alias = join(root, 'alias');

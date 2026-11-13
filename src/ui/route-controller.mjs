@@ -1,11 +1,14 @@
+import { NUM, normCard, normHub, validateHub, joinSentences } from './route-form.mjs';
+
 /**
  * v74 presentation, connected to the authenticated host settings gateway.
- * Self-contained so build-client can embed this factory without runtime imports.
+ * Bundled with its browser modules; lifecycle and DOM stay mount-local.
  * root/layer belong to this mount, never the host document's selector namespace.
  */
 export function createRouteController({ root, layer, remote, logos, sourceChain, memory = {}, logMemory = null, createSearchLogView, createQuotaView, dark = false }) {
 let disposed = false;
 let logView = null, quotaView = null;
+let controlRetrying = false;
 let secretEpoch = 0;
 let accessGeneration = 0;
 const timers = new Set(), frames = new Set(), waits = new Set(), listeners = new Set();
@@ -158,7 +161,7 @@ function blankProv() {
     exa: { url: '', key: '', enabled: true },
     tinyfish: { searchUrl: '', fetchUrl: '', key: '', enabled: true },
     firecrawl: { url: '', key: '', enabled: true },
-    github: { token: '', enabled: true }
+    github: { token: '', enabled: false }
   };
 }
 const CARD_FIELDS = {
@@ -173,7 +176,7 @@ const CARD_FIELDS = {
 const HUB_FIELDS = { extra: 'default_extra_sources', fallback: 'fallback_sources', timeout: 'timeout_seconds',
   cache: 'cache_size', maxChars: 'response_max_chars' };
 const S = {
-  loading: true, busy: false, testing: false, bgRun: false, plugin: true,
+  loading: true, busy: false, testing: false, plugin: true,
   config: null, prefs: null, control: null, program: null, pluginInfo: null, capabilities: null, rpcError: null,
   cfgExists: false, readBanner: false, readDismissed: memory.readDismissed === true,
   prov: blankProv(), order: [...SUPP],
@@ -181,7 +184,7 @@ const S = {
   checked: clone(memory.checked || {}), bad: clone(memory.bad || {}), identity: clone(memory.identity || {}),
   providerBad: clone(memory.providerBad || {}),
   configRevision: memory.configRevision || null, configIdentity: memory.configIdentity || null, configPath: memory.configPath || null,
-  marks: {}, trace: null, auxDismissed: memory.auxDismissed || '', lastRouteAt: memory.lastRouteAt || 0,
+  trace: null, auxDismissed: memory.auxDismissed || '', lastRouteAt: memory.lastRouteAt || 0,
   diagnosticOperation: null, lastRoute: clone(memory.lastRoute || null),
 };
 
@@ -202,7 +205,7 @@ function providersFrom(fields, preferences = {}) {
       }
     }
     p[id].enabled = id === 'grok' ? preferences.grokEnabled !== false
-      : id === 'github' ? preferences.githubEnabled !== false : order.enabled[id];
+      : id === 'github' ? preferences.githubReadEnabled === true : order.enabled[id];
   }
   p.grok.authReadOnly = typeof fields.grok_auth_mode?.value === 'string' && fields.grok_auth_mode.value !== 'api_key';
   p.grok.mode = !p.grok.authReadOnly && !fields.grok_api_key?.configured
@@ -222,7 +225,7 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
     S.configRevision && S.configRevision !== snapshot.config?.revision
     || S.configIdentity && S.configIdentity !== snapshot.config?.quotaRevision);
   const preferencesChanged = S.prefs && preferences
-    && (S.prefs.value.grokEnabled !== preferences.value.grokEnabled || S.prefs.value.githubEnabled !== preferences.value.githubEnabled);
+    && (S.prefs.value.grokEnabled !== preferences.value.grokEnabled || S.prefs.value.githubReadEnabled !== preferences.value.githubReadEnabled);
   if (externalRevision || preferencesChanged) cancelTest();
   S.control = snapshot.control || snapshot;
   S.program = snapshot.program;
@@ -286,6 +289,7 @@ function denyPrivateAccess(error) {
   logView?.restrict(code);
   quotaView?.render();
   if (D?.kind === 'card') {
+    if (D.githubOperation) void remote.cancelDiagnosis({ operationId: D.githubOperation }).catch(() => {});
     const top = $('.dlg-body', dlg)?.scrollTop || 0;
     D.show = {};
     renderCard();
@@ -362,6 +366,32 @@ function operationError(error, dialog = false) {
     shake(dlg);
   } else toast(`${code} · ${message}`, { tone: 'err', ms: 5200 });
 }
+async function retryControl() {
+  if (disposed || controlRetrying || S.busy) return;
+  controlRetrying = true;
+  S.busy = true;
+  renderBanner();
+  const generation = accessGeneration;
+  try {
+    // Finish an earlier read before the mutating retry so its late snapshot
+    // cannot overwrite a successful release result.
+    if (readTask) await readTask;
+    if (disposed || generation !== accessGeneration) return;
+    await remote.retryControlRelease();
+    if (!disposed && generation === accessGeneration) await refresh({ force: true });
+  } catch (error) {
+    if (disposed || generation !== accessGeneration) return;
+    operationError(error);
+    await refresh({ force: true });
+    if (!disposed && /^gateway[/.]|^SETTINGS_UNAVAILABLE$/.test(error?.code || '')) {
+      toast('此宿主暂不能执行恢复操作，请通过插件页原生开关重试。', { tone: 'warn' });
+    }
+  } finally {
+    controlRetrying = false;
+    S.busy = false;
+    if (!disposed) syncAll(true);
+  }
+}
 // An external write leaves an open card's baseline behind. When that blocks its
 // quota panel, offer the existing explicit reload; never rebase the draft silently.
 function syncOpenCardBaseline() {
@@ -434,7 +464,7 @@ async function saveConfig(build, baseline = null) {
   }
 }
 async function savePreference(id, on) {
-  const key = id === 'grok' ? 'grokEnabled' : 'githubEnabled';
+  const key = id === 'grok' ? 'grokEnabled' : 'githubReadEnabled';
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const result = await remote.savePreferences({ expectedRevision: S.prefs.revision,
@@ -529,7 +559,7 @@ function ingestRoute(route, first = false) {
 function isSet(id, p = S.prov[id]) {
   if (id === 'grok') return p.authReadOnly || (p.mode === 'compat' ? !!(p.gwUrl.trim() && p.gwKey.trim()) : !!p.key.trim());
   if (id === 'tavily') return p.keys.some((k) => k.trim());
-  if (id === 'github') return !!p.token.trim();
+  if (id === 'github') return !!p.token.trim() || p.enabled === true;
   return !!p.key.trim();
 }
 const isOn = (id) => isSet(id) && S.prov[id].enabled !== false;
@@ -596,7 +626,6 @@ function reconcileChecks(id, prev, next) {
   } else {
     delete S.checked[id]; delete S.bad[id];
   }
-  delete S.marks[id];
 }
 function codeOf(id, map = S.bad) {
   const v = map[id];
@@ -898,7 +927,7 @@ function syncRow(el) {
   const sw = el.querySelector('.switch');
   const name = META[id].name;
   const checked = isOn(id);
-  const label = !isSet(id) ? `${name} 未配置，打开配置` : id === 'github' ? 'DSH 测试时检测 GitHub' : id === 'grok' ? '启用 Grok 主搜索' : `启用 ${name}`;
+  const label = !isSet(id) ? `${name} 未配置，打开配置` : id === 'github' ? '启用 GitHub 读取' : id === 'grok' ? '启用 Grok 主搜索' : `启用 ${name}`;
   sw.setAttribute('aria-checked', String(checked));
   sw.setAttribute('aria-label', label);
   sw.disabled = S.busy || ['down', 'cfgerr', 'ctlerr', 'connecting'].includes(routeStatus());
@@ -969,6 +998,10 @@ function tickTestProgress() {
 }
 function renderHead() {
   const st = routeStatus();
+  const githubTesting = S.testing && S.testProgress?.current === 'GitHub';
+  const hubName = $('#nodeHub .node-name'), agentKind = $('#nodeDsh .node-meta');
+  if (hubName.textContent !== (githubTesting ? 'dsh-grok-search' : 'Grok Search Rs')) hubName.textContent = githubTesting ? 'dsh-grok-search' : 'Grok Search Rs';
+  if (agentKind.textContent !== (githubTesting ? 'GitHub API' : 'web_search')) agentKind.textContent = githubTesting ? 'GitHub API' : 'web_search';
   card.dataset.s = st;
   card.dataset.plugin = S.plugin ? 'on' : 'off';
   card.classList.toggle('is-loading', st === 'load');
@@ -982,12 +1015,15 @@ function renderHead() {
   }
   if ($('#statusText').textContent !== statusText) $('#statusText').textContent = statusText;
   const tb = $('#testBtn');
-  tb.innerHTML = S.testing && !S.bgRun ? `${svg('stop', 'ic ic-sm')}停止测试` : `${svg('play', 'ic ic-sm')}测试搜索`;
-  tb.disabled = !S.testing && (S.busy || ['off', 'wait', 'none', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'prep'].includes(st));
-  tb.title = { off: '插件已关闭，打开插件开关后可测试', wait: '先填写至少一个搜索来源的 Key', none: '先启用 Grok 或至少一个补充来源' }[st] || '';
+  tb.innerHTML = S.testing ? `${svg('stop', 'ic ic-sm')}停止测试` : `${svg('play', 'ic ic-sm')}测试连接`;
+  tb.disabled = !S.testing && (S.busy || ['off', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting'].includes(st)
+    || !isOn('github') && ['wait', 'none', 'prep'].includes(st));
+  tb.title = tb.disabled ? { off: '插件已关闭，打开插件开关后可测试', wait: '先配置搜索来源或开启 GitHub 读取', none: '先开启一个待测项目' }[st] || '' : '';
   $('#testPop .pop-text').textContent = grokOn()
     ? '会逐一测试 Grok 和全部已开启的补充来源，Tavily 的每个 Key 单独检查，各次测试会消耗相应额度。正常搜索仍在补充链首个成功处停止。'
     : `Grok 未启用，会逐一测试 ${enabledSupp().map((id) => META[id].name).join('、') || '补充来源'} 的全部 Key，各次测试会消耗相应额度。正常搜索仍在首个成功处停止。`;
+  if (isOn('github')) $('#testPop .pop-text').textContent = (!grokOn() && !enabledSupp().length ? '未启用网页搜索来源。' : $('#testPop .pop-text').textContent)
+    + ' GitHub 单独验证认证与少量公开内容读取，不代表网页搜索或私有仓库权限通过。';
   $('#hubMeta').innerHTML = `<span class="nw">${esc(S.program?.program?.version ? 'v' + S.program.program.version : programPhase())}</span><span class="nw"><span class="hm-dot">· </span>${esc(programSource())}</span>`;
   const native = S.control?.acquisition?.authorSearchProvider;
   $('#nodeOfficial .node-name').textContent = native ? '原搜索设置' : 'DeepSeek 官方搜索';
@@ -1177,7 +1213,7 @@ function verificationNode(id, trace, order) {
   const running = dots.some((d) => d.tone === 'run');
   const health = running ? 'run' : failed === dots.length ? 'err' : failed ? 'partial'
     : passed === dots.length ? 'ok' : passed ? 'partial' : 'idle';
-  const role = id === 'grok' ? '主搜索' : id === 'github' ? '专用抽取检测' : `补充来源 · 第 ${order.indexOf(id) + 1} 位`;
+  const role = id === 'grok' ? '主搜索' : id === 'github' ? 'GitHub 读取' : `补充来源 · 第 ${order.indexOf(id) + 1} 位`;
   const state = !isSet(id) ? '未配置' : on ? '已启用' : '已关闭';
   return {
     id, role: id === 'grok' ? 'primary' : id === 'github' ? 'extract' : 'supp',
@@ -1280,6 +1316,13 @@ const NETWORK_ERRORS = {
   GROK_PROGRAM_REAP_FAILED: ['回收', '程序回收未完成'], GROK_PROCESS_REAP_FAILED: ['回收', '进程回收未完成'],
   SETTINGS_UNAVAILABLE: ['连接', '设置服务不可用'], SOURCE_UNAVAILABLE: ['来源', '来源服务不可用'],
   FALLBACK_SOURCES_ZERO: ['配置', '回退来源数为 0'],
+  GITHUB_AUTH: ['401', 'Token 无效或鉴权失败'], GITHUB_FORBIDDEN: ['403', '权限不足或上游拒绝访问'],
+  GITHUB_NOT_ACCESSIBLE: ['404', '资源不存在或无权访问'], GITHUB_RATE_LIMIT: ['限流', 'GitHub 请求受限'],
+  GITHUB_NETWORK: ['网络', '无法连接 GitHub'], GITHUB_TIMEOUT: ['超时', '读取时间已到，可继续读取'],
+  GITHUB_CURSOR_INVALID: ['续读', '续读位置已失效'], GITHUB_STATE_CHANGED: ['配置', '配置已变化，请重新读取'],
+  GITHUB_DISABLED: ['停用', 'GitHub 读取已停用'], GITHUB_PERMISSION: ['权限', '读取工具被禁用或拒绝'],
+  GITHUB_OUTPUT_LIMIT: ['上限', '输出空间不足'], GITHUB_CACHE_FULL: ['分段', '已到缓存边界，可续读'],
+  GITHUB_PAGINATION: ['分页', '分页异常，未完整读取'],
 };
 function failureInfo(code) {
   const value = normalizeCode(code).toUpperCase();
@@ -1301,7 +1344,7 @@ function failureHelp(code) {
   if (value === '403') return '检查账号、模型或接口权限；403 本身不证明额度已用完。';
   if (value === '402') return '检查该服务的额度、套餐或计费状态。';
   if (value === '429') return '稍后重试，并检查该服务的限额或额度。';
-  if (['404', '405'].includes(value)) return '核对 BaseURL 与接口路径。';
+  if (['404', '405'].includes(value)) return '核对 Base URL 与接口路径。';
   if (['400', '413', '422'].includes(value)) return '核对模型与请求参数。';
   if (value === 'CERT_HAS_EXPIRED' || value === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') return '核对 HTTPS 证书与代理设置，不要关闭证书校验。';
   if (['408', '504', 'TIMEOUT', 'ETIMEDOUT'].includes(value)) return '核对网络与超时设置，稍后重试。';
@@ -1318,7 +1361,7 @@ function failureHelp(code) {
   if (value.startsWith('GROK_DOWNLOAD_') || value.startsWith('GROK_ARCHIVE_')) return '检查网络或程序缓存，在 Grok Search Rs 设置中重新检测。';
   if (value.startsWith('GROK_PROGRAM_') || value.startsWith('GROK_PROCESS_')) return '检查程序状态，在 Grok Search Rs 设置中重新检测；不会修改全局安装。';
   if (value.startsWith('GROK_')) return '核对 Grok 程序、Base URL 和模型；该错误不单独证明 Key 失效。';
-  if (NETWORK_ERRORS[value]) return '核对 BaseURL、网络或代理设置。';
+  if (NETWORK_ERRORS[value]) return '核对 Base URL、网络或代理设置。';
   if (Number(value) >= 500) return '上游服务异常，可稍后重试。';
   return '检查接口配置或服务端返回详情，不能仅凭此错误判断 Key 失效。';
 }
@@ -1381,7 +1424,8 @@ function renderBanner() {
   } else if (st === 'cfgerr') {
     html = B('err', 'info', '配置文件无法读取', `${esc(S.config.error.code || 'CONFIG_ERROR')} · ${esc(S.config.error.message)} 搜索会明确报错，不会回退官方搜索。`, btn('open-file', '打开文件'));
   } else if (st === 'ctlerr') {
-    html = B('err', 'info', '接管状态异常', `${esc(S.control?.error?.code || S.control?.phase || 'CONTROL_ERROR')} · 尚未确认路由完成，请重试检查。`, btn('retry', '重试'));
+    html = B('err', 'info', '接管状态异常', `${esc(S.control?.error?.code || S.control?.phase || 'CONTROL_ERROR')} · 路由尚未确认；重试继续未完成的停用，否则仅检查状态。`,
+      `<button type="button" class="btn btn-sm" data-act="retry-control"${controlRetrying ? ' disabled aria-busy="true"' : ''}>${controlRetrying ? '处理中…' : '重试'}</button>`);
   } else if (st === 'connecting') {
     html = B('info', 'info', '正在确认搜索接管', '此时不把配置记录当成路由完成；等待宿主实际就绪。');
   } else if (st === 'prep') {
@@ -1539,13 +1583,11 @@ function cancelTest({ preserve = false } = {}) {
   clearTimeout(S.testProgressTimer);
   const progress = S.testProgress;
   S.testProgress = null;
-  S.bgRun = false;
   if (preserve && S.trace) {
     for (const item of S.trace.items) if (item.tone === 'run') { item.tone = 'idle'; item.code = ''; }
     S.trace.done = { tone: 'idle', text: `已停止 · ${progress?.completed ?? 0}/${progress?.total ?? 0} 项完成` };
   } else S.trace = null;
   S.lastRoute = null;
-  S.marks = {};
   clearTimeout(S.traceTimer);
   hideStripTip();
   clearLit();
@@ -1577,6 +1619,7 @@ async function onRowSwitch(id, row) {
   const sw = row.querySelector('.switch');
   if (!isSet(id)) { openCard(id, { from: sw, enable: true }); return; }
   const prev = S.prov[id].enabled !== false, on = !prev;
+  if (id === 'github' && on) { openCard(id, { from: sw, enable: true }); return; }
   cancelTest();
   S.busy = true;
   S.prov[id].enabled = on;
@@ -1590,7 +1633,7 @@ async function onRowSwitch(id, row) {
     if (disposed) return;
     const text = id === 'grok' ? on ? '已启用 Grok 主搜索 · 当场生效'
       : '已关闭 Grok · 搜索直接走补充来源 · 仅对 DSH 生效'
-      : id === 'github' ? `${on ? '已开启' : '已关闭'} DSH 测试时的 GitHub 检测 · Token 未更改`
+      : id === 'github' ? `${on ? '已开启' : '已关闭'} GitHub 读取 · Token 未更改`
         : `已${on ? '启用' : '停用'} ${META[id].name} · 已写入 Grok 共享配置`;
     toast(text, { tone: 'info', undo: async () => {
       if (disposed || S.busy) return;
@@ -1868,9 +1911,20 @@ function closeDialog(force) {
     return;
   }
   quotaView?.cancel();
+  if (D.githubOperation) void remote.cancelDiagnosis({ operationId: D.githubOperation }).catch(() => {});
   const back = D.returnFocus;
   const id = D.id;
   clearTimeout(D.clearTimer);
+  D.closed = true;
+  $$('input[data-k]', dlg).forEach(input => {
+    if (!['key', 'gwKey', 'token', 'keys'].includes(input.dataset.k.split('.')[0])) return;
+    input.value = '';
+    input.removeAttribute('value');
+    input.type = 'password';
+    input.readOnly = true;
+    input.disabled = true;
+  });
+  $$('[data-a=eye], [data-a=copy]', dlg).forEach(button => { button.disabled = true; });
   D = null;
   hideOverlay(() => {
     const target = back && back.isConnected ? back : (id ? rowOf(id)?.querySelector('.row-main') : null);
@@ -1993,7 +2047,7 @@ function healthOf(id) {
   return [{ k, val: (base[k] || '').trim(), code: v }];
 }
 function healthMsg(id, code, summary = false) {
-  const base = `${summary ? '' : '最近一次检查：'}${failureInfo(code).status} · ${errText(code)}。${failureHelp(code)}`;
+  const base = joinSentences(`${summary ? '' : '最近一次检查：'}${failureInfo(code).status} · ${errText(code)}`, failureHelp(code));
   if (id === 'grok') return base + (summary && grokOn() && S.lastRoute?.outcome === 'ok' && S.lastRoute.fallbackUsed === true
     ? '\n搜索已静默回退到补充来源' : '');
   if (id === 'tavily') return base + (!TAVILY_ROTATE.has(code) ? '；正常搜索遇到此错误不会换 Key，逐项测试仍独立检查其他 Key' : isBad('tavily') ? '' : '；其他 Key 的检查结果单独保留');
@@ -2047,7 +2101,8 @@ const FIELDS = {
   github(p) {
     return field({ label: 'API 地址', k: 'ghApi', ctl: txt('ghApi', DEF.ghApi, '', { ro: true }), help: '固定为 GitHub 官方接口，不可修改。' })
       + field({ label: 'Token', k: 'token', ctl: keyIn('token', p.token, 'ghp_... 或 github_pat_...'), help: '匿名约 60 次/小时；填写 Token 可提高限额，并能读取 Token 有权限的私有仓库。' })
-      + note('GitHub、StackExchange、arXiv、Wikipedia 的链接由 Grok 的专用抽取器解析，不参与补充搜索排序。右上角开关只控制 DSH 测试时是否检测 GitHub，不改 Token，也不影响其他客户端。');
+      + note('开启并保存后，通过 GitHub 官方 API 读取你指定的 Issue、PR 和 Release，不参与网页搜索排序。私有内容也会交给当前聊天模型；DSH 可能将工具返回内容保存到会话历史。Token 留空可匿名读取公开内容。')
+      + `<button type="button" class="btn btn-sm" data-a="test-github">测试连接</button>`;
   }
 };
 
@@ -2127,16 +2182,6 @@ function vCard(id, p) {
   }
   return { err, warn };
 }
-function normCard(p) {
-  const o = {};
-  Object.keys(p).forEach((k) => {
-    const v = p[k];
-    if (Array.isArray(v)) o[k] = v.map((x) => x.trim()).filter(Boolean);
-    else o[k] = typeof v === 'string' ? v.trim() : v;
-  });
-  return o;
-}
-const normHub = (h) => ({ ...h, exeOverride: (h.exeOverride || '').trim(), cfgOverride: (h.cfgOverride || '').trim() });
 function isDirty() {
   if (!D) return false;
   const now = D.kind === 'card' ? normCard(D.draft) : normHub(D.draft);
@@ -2167,6 +2212,7 @@ function refreshDialog() {
   }
   const resultBox = $('.search-result', dlg);
   if (resultBox) {
+    resultBox.dataset.tone = 'err';
     resultBox.hidden = !resultFailures.length;
     const details = resultFailures.map(({ slot, code }) =>
       `${D.id === 'tavily' ? `Key ${+slot.split('.')[1] + 1}：` : ''}${healthMsg(D.id, code, true).replaceAll('；', '，')}`).join('\n');
@@ -2248,6 +2294,11 @@ dlg.addEventListener('input', (e) => {
   const t = e.target;
   if (!D || dialogBusy() || !t.matches('input[data-k]') || t.type === 'checkbox') return;
   setDraft(t.dataset.k, t.value);
+  if (D.id === 'github') {
+    D.githubRevision = (D.githubRevision || 0) + 1;
+    const outcome = $('.search-result', dlg);
+    if (outcome) { outcome.hidden = true; outcome.textContent = ''; }
+  }
   D.edited.add(t.dataset.k);
   D.warned = false;
   if (t.dataset.k === 'model') syncChips('model', t.value);
@@ -2283,17 +2334,20 @@ dlg.addEventListener('click', async (e) => {
   if (a === 'close') closeDialog(false);
   else if (a === 'cancel') closeDialog(true);
   else if (a === 'save') save();
+  else if (a === 'test-github') void testGithubDraft(b);
   else if (a === 'eye') toggleEye(b);
   else if (a === 'copy') copyKey(b);
   else if (a === 'mode') setMode(b);
   else if (a === 'pick') pickChip(b);
   else if (a === 'add-key' && !fieldReadOnly('keys')) {
+    const mine = D;
     if (!(await revealFor('keys'))) return;
-    if (!D || dialogBusy()) return;
+    if (D !== mine || dialogBusy()) return;
     D.draft.keys.push(''); rerender(`input[data-k="keys.${D.draft.keys.length - 1}"]`, true);
   }
   else if (a === 'del-key' && !fieldReadOnly('keys')) {
-    if (await revealFor('keys')) delKey(+b.dataset.i);
+    const mine = D;
+    if (await revealFor('keys') && D === mine) delKey(+b.dataset.i);
   }
   else if (a === 'enabled') toggleEnabled(b);
   else if (a === 'clear') clearArm(b);
@@ -2304,24 +2358,64 @@ dlg.addEventListener('click', async (e) => {
   else if (a === 'open-folder') openPath('folder');
   else if (a === 'reload-draft') void reloadDialogDraft();
 });
+async function testGithubDraft(button) {
+  if (!D || D.id !== 'github' || D.githubOperation) return;
+  if (!S.capabilities?.secretsAllowed) { toast('请通过安全连接测试 Token。', { tone: 'warn' }); return; }
+  const mine = D, draftToken = mine.draft.token, operationId = uuid(), epoch = secretEpoch,
+    draftRevision = mine.githubRevision || 0;
+  const current = () => !disposed && D === mine && epoch === secretEpoch
+    && draftRevision === (mine.githubRevision || 0) && draftToken === mine.draft.token && S.capabilities?.secretsAllowed;
+  const resultNode = $('.search-result', dlg);
+  mine.githubOperation = operationId;
+  button.disabled = true;
+  button.innerHTML = `${svg('refresh', 'ic ic-sm')}检测中…`;
+  resultNode.hidden = false;
+  resultNode.dataset.tone = 'run';
+  resultNode.textContent = '正在验证 GitHub 认证与公开内容读取…';
+  try {
+    const result = await remote.previewGithubConnection({ operationId,
+      expectedRevision: mine.configBaseline.revision, configIdentity: mine.configBaseline.quotaRevision,
+      ...(hidden(draftToken) ? {} : { token: draftToken.trim() }) });
+    if (!current()) return;
+    resultNode.textContent = `${result.status === 'ok' ? '连接成功' : result.code} · ${result.message}`;
+    resultNode.dataset.tone = result.status === 'ok' ? 'ok' : 'err';
+  } catch (error) {
+    if (current()) {
+      resultNode.dataset.tone = 'err';
+      resultNode.textContent = `${error.code || '连接失败'} · ${error.message || '请稍后重试。'}`;
+    }
+  } finally {
+    if (D === mine) {
+      mine.githubOperation = null;
+      button.disabled = false;
+      button.textContent = '测试连接';
+      if (!current()) { resultNode.hidden = true; resultNode.textContent = ''; }
+    }
+  }
+}
 async function revealFor(k) {
-  if (!D || D.kind !== 'card') return false;
+  if (!D || D.closed || disposed || D.kind !== 'card') return false;
   if (!S.capabilities?.secretsAllowed) return false;
   const mine = D, keyName = k.startsWith('keys') ? 'keys' : k;
+  const epoch = secretEpoch;
+  const current = () => !disposed && !mine.closed && D === mine && epoch === secretEpoch
+    && S.capabilities?.secretsAllowed === true;
   const configured = keyName === 'keys' ? mine.draft.keys.some(hidden) : hidden(mine.draft[keyName]);
   if (!configured) return true;
-  if (mine.revealing) {
-    const result = await mine.revealing;
-    return result === true && D === mine && !disposed && S.capabilities?.secretsAllowed === true;
+  const pending = mine.revealing;
+  const existing = pending.get(keyName);
+  if (existing?.epoch === epoch) {
+    return await existing.task === true && current();
   }
   const key = CARD_FIELDS[mine.id]?.[keyName];
   if (!key) return false;
   const focused = active(), selection = focused?.selectionStart;
-  const epoch = secretEpoch;
-  mine.revealing = (async () => {
+  const entry = { epoch, task: null };
+  pending.set(keyName, entry);
+  entry.task = (async () => {
     try {
       const revealed = await remote.reveal({ key });
-      if (disposed || D !== mine || epoch !== secretEpoch || !S.capabilities?.secretsAllowed) return false;
+      if (!current()) return false;
       if (keyName === 'keys') {
         const values = String(revealed.value || '').split(',').map(v => v.trim()).filter(Boolean);
         const next = values.length ? values : [''];
@@ -2348,10 +2442,10 @@ async function revealFor(k) {
         if (typeof selection === 'number') focused.setSelectionRange(selection, selection);
       }
       return true;
-    } catch (error) { operationError(error); return false; }
-    finally { if (D === mine) mine.revealing = null; }
+    } catch (error) { if (current()) operationError(error); return false; }
+    finally { if (pending.get(keyName) === entry) pending.delete(keyName); }
   })();
-  return mine.revealing;
+  return await entry.task === true && current();
 }
 async function toggleEye(b) {
   const k = b.dataset.k;
@@ -2426,9 +2520,14 @@ function rerender(focusSel, animateNew) {
 }
 async function save() {
   if (!D || dialogBusy() || S.busy || disposed) return;
-  if (D.revealing) { if (!(await D.revealing)) return; }
-  if (!D || disposed) return;
-  D.submitted = true;
+  const mine = D, epoch = secretEpoch;
+  const current = () => !disposed && !mine.closed && D === mine && epoch === secretEpoch;
+  while (mine.revealing?.size) {
+    const results = await Promise.all(Array.from(mine.revealing.values(), entry => entry.task));
+    if (!current() || results.some(result => result !== true)) return;
+  }
+  if (!current() || dialogBusy() || S.busy) return;
+  mine.submitted = true;
   refreshDialog();
   const ek = Object.keys(D.v.err);
   if (ek.length) {
@@ -2450,7 +2549,6 @@ async function save() {
   const sv = $('[data-a=save]', dlg);
   lockDialog();
   sv.innerHTML = '<span class="spin"></span>保存中…';
-  const mine = D;
   S.busy = true;
   try {
     if (D.kind === 'card') await commitCard(snapshot); else await commitHub(snapshot);
@@ -2551,7 +2649,7 @@ const cardPending = () => !!D && D.kind === 'card' && D.id !== 'github' && !isSe
 const credInput = (id, p) => (id === 'tavily' ? 'keys.0' : id === 'grok' && p.mode === 'compat' ? (p.gwUrl.trim() ? 'gwKey' : 'gwUrl') : credKey(id, p));
 function headState() {
   const pending = cardPending();
-  const text = D.id === 'github' ? '检测 GitHub' : '启用';
+  const text = D.id === 'github' ? '启用读取' : '启用';
   return { pending, on: !pending && D.draft.enabled !== false, text };
 }
 function headSwitch() {
@@ -2592,12 +2690,13 @@ function openCard(id, opt = {}) {
   closePop();
   // 未配置来源的 enabled 只是默认值：草稿按“填好凭据后启用”处理，打开弹窗本身不算修改。
   const base = clone(S.prov[id]);
-  if (!isSet(id, base)) base.enabled = true;
+  if (id !== 'github' && !isSet(id, base)) base.enabled = true;
   const draft = clone(base);
   if (opt.enable) draft.enabled = true;
   D = {
     kind: 'card', id, draft, base, fields: clone(configFields()), configBaseline: clone(S.config),
     orig: JSON.stringify(normCard(base)),
+    revealing: new Map(), closed: false,
     touched: new Set(), edited: new Set(), show: {}, submitted: false, warned: false, saving: false, clearing: false, clearArmed: false, clearTimer: 0,
     returnFocus: opt.from || rowOf(id)?.querySelector('.row-main')
   };
@@ -2608,14 +2707,6 @@ function openCard(id, opt = {}) {
 }
 
 /* ---------- 中继弹窗：Grok Search Rs ---------- */
-const NUM = {
-  extra: { min: 0, max: 10, step: 1, unit: '条' },
-  fallback: { min: 1, max: 10, step: 1, unit: '条' },
-  timeout: { min: 5, max: 300, step: 5, unit: '秒' },
-  cache: { min: 1, max: 4096, step: 64, unit: '条' },
-  maxChars: { min: 5000, max: 500000, step: 5000, unit: '字符' },
-  budget: { min: 30, max: 120, step: 10, unit: '秒' }
-};
 function stepper(k, v) {
   const n = NUM[k];
   const ok = Number.isFinite(v);
@@ -2649,20 +2740,7 @@ function syncStepper(k) {
   set(up, Number.isFinite(v) && v >= n.max);
 }
 function vHub(h) {
-  const err = {};
-  const warn = {};
-  Object.entries(NUM).forEach(([k, n]) => {
-    if (fieldReadOnly(k) || D && Object.is(h[k], D.base[k])) return;
-    const v = h[k];
-    if (!Number.isInteger(v)) err[k] = '请填写整数';
-    else if (v < n.min || v > n.max) err[k] = `可填范围 ${n.min}–${n.max}`;
-  });
-  if (h.fallback === 0 && D && h.fallback !== D.base.fallback && !fieldReadOnly('fallback')) err.fallback = '至少保留 1 条回退来源。';
-  if (!err.timeout && !err.budget && h.timeout > h.budget) {
-    warn.timeout = `请求超时 ${h.timeout} 秒长于单次搜索预算 ${h.budget} 秒，DSH 会先停止等待`;
-    warn.budget = warn.timeout;
-  }
-  return { err, warn };
+  return validateHub(h, { base: D?.base, readOnly: fieldReadOnly });
 }
 function hubBody(h) {
   const config = configLocation();
@@ -2694,7 +2772,7 @@ function hubBody(h) {
     '<section class="sec"><h3 class="sec-h">路由</h3>',
     field({ label: '路由策略', ctl: '<span class="static-val">按顺序<span class="tag">补充来源依次尝试</span></span>', help: '原生 Grok 会并行获取主搜与补充结果。Grok 关闭或程序不可用时，DSH 直接按补充链顺序尝试，首个有结果的来源返回；测试会另行检查全部已开启来源及 Key。' }),
     field({ label: '补充来源数', k: 'extra', ctl: stepper('extra', h.extra), help: 'Grok 正常返回时，额外展示的结果条数，不是供应商数量。供应商由主界面开关控制；设为 0 不附加补充结果，仍可失败回退。' }),
-    field({ label: '回退来源数', k: 'fallback', ctl: stepper('fallback', h.fallback), help: 'Grok 调用失败或缺少可核验引用时，最多返回的回退结果条数，不是供应商数量。至少保留 1 条。' }),
+    field({ label: '回退来源数', k: 'fallback', ctl: stepper('fallback', h.fallback), help: 'Grok 调用失败或缺少可核验引用时，最多返回的回退结果条数，不是供应商数量。' }),
     field({ label: '请求超时', k: 'timeout', ctl: stepper('timeout', h.timeout), help: '整条搜索链共用一个截止时间，不是每个来源各算一次。' }),
     '</section>'
   ].join('');
@@ -2931,15 +3009,14 @@ function flashNode(el) {
    No timer invents network progress, result counts, status codes or duration. */
 async function runTest() {
   const st0 = routeStatus();
-  if (S.testing || S.busy || ['off', 'wait', 'none', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'prep'].includes(st0)) return;
+  if (S.testing || S.busy || ['off', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting'].includes(st0)
+    || !isOn('github') && ['wait', 'none', 'prep'].includes(st0)) return;
   logView?.cancel();
   const my = ++gen;
   const started = performance.now();
   clearToasts();
   $('#announcer').textContent = '';
   S.testing = true;
-  S.bgRun = false;
-  S.marks = {};
   clearTimeout(S.traceTimer);
   S.trace = { bg: false, order: S.order.slice(), items: [], failedSources: [], done: null, reroute: false };
   S.lastRoute = null;
@@ -3029,19 +3106,23 @@ async function runTest() {
       }
       if (!alive()) return;
     }
-    const searchResults = results.filter(result => !['disabled', 'not-configured'].includes(result.status));
+    const searchResults = results.filter(result => result.provider !== 'github' && !['disabled', 'not-configured'].includes(result.status));
+    const github = results.find(result => result.provider === 'github');
     const unfinished = results.filter(result => untestedCode(result.code)
       || result.keys?.some(key => untestedCode(key.code))).length;
     const passed = searchResults.filter(result => result.status === 'ok');
     const empty = searchResults.filter(result => result.status === 'empty');
     const valid = passed.length + empty.length;
     const searchAvailable = [...passed, ...empty].some(result => result.provider !== 'github');
+    const searchAttempted = searchResults.some(result => result.provider !== 'github');
     const seconds = ((performance.now() - started) / 1000).toFixed(1);
     tr.done = { tone: searchAvailable ? 'ok' : 'err',
       text: `${valid}/${searchResults.length} 项连通${empty.length ? ` · ${empty.length} 项无结果` : ''} · ${seconds} 秒` };
     if (!searchAvailable) {
-      tr.done.text = `测试未通过 · ${valid}/${searchResults.length} 项连通 · ${seconds} 秒`;
-      cut('dsh-hub');
+      tr.done.text = searchAttempted ? `搜索未通过 · ${valid}/${searchResults.length} 项连通 · ${seconds} 秒`
+        : `${github?.status === 'ok' ? 'GitHub 读取可用' : 'GitHub 读取未通过'} · 未测试网页搜索`;
+      tr.done.tone = searchAttempted || github?.status !== 'ok' ? 'err' : 'ok';
+      if (searchAttempted || github?.status !== 'ok') cut('dsh-hub');
     } else if (primaryFailed && supplementaryReady) {
       tr.done.text = `Grok 未通过 · ${passed.length}/${searchResults.length} 项可用${empty.length ? ` · ${empty.length} 项无结果` : ''} · ${seconds} 秒`;
       await go('dsh-hub', { back: true });
@@ -3049,11 +3130,12 @@ async function runTest() {
       flashNode($('#nodeDsh'));
     }
     if (unfinished) tr.done.text = `测试未完成 · ${unfinished} 项未完整验证 · ${seconds} 秒`;
+    if (searchAttempted && github) tr.done.text += ` · GitHub ${github.status === 'ok' ? '可用' : '未通过'}`;
     live();
     const failures = searchResults.filter(result => result.status === 'failed')
       .map(result => `${META[result.provider].name} ${normalizeCode(result.code)} · ${errText(result.code)}`);
-    const github = results.find(result => result.provider === 'github');
-    $('#announcer').textContent = `${unfinished ? '部分项目未完成，不能据此判定 Key 失效。' : '已检查全部开启的来源与 Key。'}${tr.done.text}。${failures.join('；')}${github ? `。GitHub：${github.message}` : ''}`;
+    $('#announcer').textContent = joinSentences(unfinished ? '部分项目未完成，不能据此判定 Key 失效' : '已检查全部开启的来源与 Key',
+      tr.done.text, failures.join('；'), github ? `GitHub：${github.message}` : '');
   } finally {
     // 旧测试的 finally 也不能清掉新测试的 loading、trace 或动画。
     if (alive()) {
@@ -3061,7 +3143,6 @@ async function runTest() {
       S.testing = false;
       clearTimeout(S.testProgressTimer);
       S.testProgress = null;
-      S.bgRun = false;
       clearLit();
       S.traceTimer = setTimeout(() => { if (!S.testing && S.trace === tr) { S.trace = null; renderSummary(); pumpWires(200); } }, T.trace);
       syncAll(true);
@@ -3130,6 +3211,7 @@ $('#bannerSlot').addEventListener('click', (e) => {
   if (!b) return;
   const a = b.dataset.act;
   if (a === 'retry') void refresh({ force: true });
+  else if (a === 'retry-control') void retryControl();
   else if (a === 'open-file') void openPath('file');
   else if (a.startsWith('open:')) openCard(a.slice(5), { from: b });
   else if (a === 'grok-off' || a === 'grok-on') { const r = rowOf('grok'); if (isOn('grok') !== (a === 'grok-on')) onRowSwitch('grok', r); }
@@ -3199,6 +3281,7 @@ return Object.freeze({
   refresh: () => refresh({ force: true }),
   dispose() {
     if (disposed) return;
+    if (D?.githubOperation) void remote.cancelDiagnosis({ operationId: D.githubOperation }).catch(() => {});
     logView?.dispose();
     quotaView?.dispose();
     cancelDrag();

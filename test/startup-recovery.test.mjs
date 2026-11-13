@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -63,7 +63,7 @@ function routeReceipt(input, overrides = {}) {
 }
 
 function fixture(t, { intent = requiredIntent(), seed = true } = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'dsh-startup-recovery-test-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-startup-recovery-test-'));
   const directory = join(root, 'control');
   t.diagnostic(`Retained fixture: ${root}`);
   const store = createControlIntentStore({ directory });

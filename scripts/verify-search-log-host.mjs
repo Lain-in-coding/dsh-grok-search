@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, renameSync, symlinkSync, writeFil
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
 import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { createSharedConfigStore, resolveSharedConfigPath, CONFIG_FIELDS } from '../src/core/shared-config.mjs';
@@ -13,7 +14,9 @@ import { cleanEnvironment, commandResult, freshRun, project, receipt, redact, sh
 // Official runtime/ASAR, not a packaged Desktop renderer acceptance.
 // Uses an isolated profile and read-only links to existing exact dependencies.
 const live = process.argv.includes('--allow-live');
-const arguments_ = process.argv.slice(2).filter(value => value !== '--allow-live');
+const storage = process.argv.includes('--storage-governance');
+if (storage && live) throw new Error('Storage governance verification uses only synthetic loopback configuration.');
+const arguments_ = process.argv.slice(2).filter(value => value !== '--allow-live' && value !== '--storage-governance');
 const tarball = resolve(arguments_[0]);
 const executables = arguments_.slice(1);
 if (!executables.length) throw new Error('Provide a tested tarball and official runtime executables.');
@@ -81,12 +84,12 @@ async function start(runtime, folder) {
   });
   const host = {
     child, closed,
-    request(op) {
+    request(op, args = {}) {
       const id = `log-host-${++serial}`;
       return new Promise((resolveReply, reject) => {
         const timer = setTimeout(() => { pending.delete(id); reject(new Error('Host operation timed out: ' + op)); }, 20_000);
         pending.set(id, { resolve: resolveReply, reject, timer });
-        child.send({ id, op }, error => { if (error) { clearTimeout(timer); pending.delete(id); reject(error); } });
+        child.send({ id, op, args }, error => { if (error) { clearTimeout(timer); pending.delete(id); reject(error); } });
       });
     },
     async close() {
@@ -153,10 +156,23 @@ try {
     const preferences = createPrivatePreferences({ path: join(profile, 'grok-search/preferences.json') });
     const preference = preferences.snapshot();
     preferences.save(preference.revision, { ...preference.value, grokEnabled: false, githubEnabled: false });
+    const configBefore = sha256(join(folder, 'isolated-not-configured.toml'));
     const before = { exe: sha256(runtime.executable), asar: sha256(runtime.archivePath) };
     const { host, rpc } = await start(runtime, folder);
     const snapshot = await rpc('snapshot');
     assert.equal(snapshot.capabilities.secretsAllowed, true);
+    if (storage) {
+      const seeded = await host.request('seed-control-history', { count: 55 });
+      assert.equal(seeded.added, 55);
+      const store = createControlIntentStore({ directory: join(profile, 'control-intent.records'),
+        legacyPath: join(profile, 'control-intent.fixture.json'), trustedRoot: profile });
+      const deadline = Date.now() + 20_000;
+      while (!store.inspectStorage().checkpoint && Date.now() < deadline) await new Promise(done => setTimeout(done, 25));
+      assert.ok(store.inspectStorage().checkpoint, 'official Electron worker must publish a checkpoint');
+      const settling = Date.now() + 20_000;
+      while (store.inspectStorage().activeRevisions.length > 50 && Date.now() < settling) await new Promise(done => setTimeout(done, 25));
+      assert.equal(store.inspectStorage().activeRevisions.length, 50);
+    }
     const sessionId = randomUUID();
     assert.deepEqual(await rpc('readSearchLog', { sessionId }), { records: [] });
     const answer = await host.request('direct-search');
@@ -186,11 +202,25 @@ try {
     await rpc('clearSearchLog', { sessionId });
     assert.deepEqual(await rpc('readSearchLog', { sessionId }), { records: [] });
     await rpc('closeSearchLog', { sessionId });
+    if (storage) {
+      sourceMode = 'ok';
+      const outcome = await rpc('stop');
+      assert.equal(outcome.outcome.completionCommitted, true);
+      const final = await host.request('snapshot');
+      assert.equal(final.runtimeWeb.searchProviderId, 'candidate-original');
+      const store = createControlIntentStore({ directory: join(profile, 'control-intent.records'),
+        legacyPath: join(profile, 'control-intent.fixture.json'), trustedRoot: profile });
+      assert.equal(store.read().intent.policy, 'released');
+      assert.equal(store.read().intent.releaseCompletion.routeVerified, true);
+      assert.equal(sha256(join(folder, 'isolated-not-configured.toml')), configBefore);
+    }
     await host.close();
     assert.deepEqual({ exe: sha256(runtime.executable), asar: sha256(runtime.archivePath) }, before);
     results.push({ version, passed: true, checks: ['same-tarball', 'authenticated-log-rpc', 'source-only-result',
       'reported-credits', live ? 'live-custom-endpoint-quota-rpc' : 'real-loopback-quota-rpc',
-      ...(!live ? ['all-failed-no-official'] : []), 'clear-and-close', 'official-files-unchanged'],
+       ...(!live ? ['all-failed-no-official'] : []), 'clear-and-close', 'official-files-unchanged',
+       ...(storage ? ['official-electron-worker-checkpoint', 'latest-fifty-active-revisions',
+         'search-after-checkpoint', 'explicit-stop-after-checkpoint', 'shared-config-unchanged'] : [])],
       officialSearchCount: 0, counterScope: 'isolated-original-provider-fixture', privateQueriesRecordedInArtifacts: false });
   }
 } catch (error) { fatal = sanitize(error.stack || error); }

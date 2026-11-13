@@ -1,0 +1,77 @@
+name: Offline Gates
+
+on:
+  push:
+    branches: [main, "feat/**", "test/**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      desktop_candidate:
+        description: Run the isolated macOS candidate gates with the exact frozen package; does not publish.
+        type: boolean
+        default: false
+      expected_tarball_sha256:
+        description: Required frozen tarball SHA-256 when desktop_candidate is true.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  desktop-candidate:
+    if: github.event_name == 'workflow_dispatch' && inputs.desktop_candidate
+    uses: ./.github/workflows/macos-beta-gate.yml
+    with:
+      confirm_public_standard_runner: true
+      expected_tarball_sha256: ${{ inputs.expected_tarball_sha256 }}
+      search_log_only: true
+  offline:
+    name: Offline gates on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Build the browser client
+        run: npm run build:client
+      - name: Reject a stale generated client
+        run: git diff --exit-code -- src/client.js
+      - name: Run offline gates
+        run: npm run test:all
+  browser:
+    name: Chromium UI smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install locked development dependencies
+        run: npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Install only the test browser
+        run: node node_modules/playwright/cli.js install chromium --with-deps --only-shell
+      - name: Verify generated client and run UI smoke
+        id: ui-smoke
+        run: npm run check:client && npm run test:ui:smoke
+      - name: Verify required browser receipt
+        run: node scripts/check-evidence.mjs ui "${{ steps.ui-smoke.outputs.run-id }}"
+      - name: Preserve offline browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chromium-ui-smoke
+          path: artifacts/ui-gates/**/summary.json
+          if-no-files-found: error
+          retention-days: 7

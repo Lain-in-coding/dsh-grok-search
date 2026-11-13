@@ -1,37 +1,44 @@
 {
   "name": "dsh-grok-search",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "填写任一可用搜索来源的 API Key，开启插件即可接管网页搜索；支持共享配置、补充来源静默回退和即时恢复官方搜索。",
   "engines": {
     "node": ">=22.0.0",
-    "dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1"
+    "dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2"
   },
   "scripts": {
     "check": "node scripts/check.mjs",
-    "test": "node --test test/provider-core.test.mjs test/commit-message.test.mjs",
+    "test": "node --test test/provider-core.test.mjs test/commit-message.test.mjs test/settings-codec.test.mjs test/tool-budget.test.mjs test/source-chain.test.mjs test/search-log-view.test.mjs test/route-controller-lifecycle.test.mjs",
     "test:provider": "node --test test/provider-core.test.mjs test/commit-message.test.mjs",
-    "test:control": "node --test test/control-intent-store.test.mjs test/startup-recovery.test.mjs test/control-intent-migration.test.mjs",
+    "test:control": "node --test test/control-intent-store.test.mjs test/startup-recovery.test.mjs test/control-intent-migration.test.mjs test/control-storage-governance.test.mjs test/storage-maintenance.test.mjs test/storage-worker.test.mjs test/owned-lock.test.mjs",
     "test:migration": "node --test test/control-intent-migration.test.mjs",
     "test:release": "node --test test/release-transaction.test.mjs test/pack-release.test.mjs test/host-compatibility.test.mjs",
     "test:wiring": "node --test test/product-wiring.test.mjs",
-    "test:client": "node --test test/client.test.mjs test/search-log-view.test.mjs",
+    "test:client": "node --test test/client-build.test.mjs test/client.test.mjs test/search-log-view.test.mjs test/route-controller-lifecycle.test.mjs",
     "test:session": "node --test test/session-owner.test.mjs",
     "test:mcp": "node scripts/mcp-session-probe.mjs --runtime-root . && node --test test/provider-mcp.test.mjs",
     "test:acceptance": "node --test test/acceptance-redaction.test.mjs test/deferred-release.test.mjs test/deferred-desktop.test.mjs",
-    "test:config": "node --test test/shared-config.test.mjs",
+    "test:config": "node --test test/shared-config.test.mjs test/settings-codec.test.mjs",
     "test:security": "node --test test/connection-security.test.mjs",
-    "test:source": "node --test test/source-adapters.test.mjs test/source-chain.test.mjs test/private-preferences.test.mjs test/routed-search.test.mjs test/search-log.test.mjs test/tool-route-context.test.mjs test/account-quota.test.mjs",
+    "test:source": "node --test test/source-adapters.test.mjs test/source-chain.test.mjs test/private-preferences.test.mjs test/routed-search.test.mjs test/search-log.test.mjs test/tool-route-context.test.mjs test/account-quota.test.mjs test/tool-budget.test.mjs",
+    "test:github": "node --test test/github-read.test.mjs",
+    "test:ui": "node scripts/run-ui.mjs",
+    "test:ui:smoke": "node scripts/run-ui.mjs --smoke",
+    "test:closeout": "node --test test/search-query.test.mjs test/control-retry.test.mjs test/quota-view-safety.test.mjs test/browser-gates.test.mjs test/shared-styles.test.mjs",
     "test:settings": "node --test test/settings-gateway.test.mjs test/config-opener.test.mjs test/config-opener-windows.test.mjs",
     "build:client": "node scripts/build-client.mjs",
     "test:program": "node --test test/program-discovery.test.mjs test/program-install.test.mjs test/program-controller.test.mjs",
     "verify:product-install": "node scripts/b2-product-install.mjs",
+    "storage:inspect": "node src/core/storage-maintenance.mjs --mode inspect",
     "check:commit": "node scripts/check-commit-message.mjs",
     "verify:internal": "node scripts/internal-candidate.mjs",
-    "test:all": "npm run check && npm test && npm run test:control && npm run test:release && npm run test:wiring && npm run test:client && npm run test:session && npm run test:mcp && npm run test:acceptance && npm run test:config && npm run test:program && npm run test:security && npm run test:source && npm run test:settings",
+    "check:client": "node scripts/build-client.mjs --check",
+    "test:all": "npm run check && npm run check:client && npm run test:provider && npm run test:control && npm run test:release && npm run test:wiring && npm run test:client && npm run test:session && npm run test:mcp && npm run test:acceptance && npm run test:config && npm run test:program && npm run test:security && npm run test:source && npm run test:settings && npm run test:github && npm run test:closeout",
     "prepack": "npm run build:client && npm run test:all",
     "prepublishOnly": "npm run test:all",
     "pack:beta": "node scripts/pack-internal.mjs --beta",
+    "pack:alpha": "node scripts/pack-internal.mjs --alpha",
     "pack:release": "node scripts/pack-internal.mjs --release"
   },
   "files": [
@@ -72,11 +79,11 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1",
-    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1",
-    "@deepseek-ai/dsh-web": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1",
     "@deepseek-ai/cordis": "~4.0.5 || ~4.1.0",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1",
+    "@deepseek-ai/dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
+    "@deepseek-ai/dsh-web": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
     "@deepseek-ai/schemastery": "~3.18.5 || ~3.19.0"
   },
   "dependencies": {
@@ -120,5 +127,11 @@
   "publishConfig": {
     "tag": "latest",
     "access": "public"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "playwright": "1.64.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   }
 }

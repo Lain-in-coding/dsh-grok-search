@@ -53,7 +53,8 @@ export async function queryAccountQuota({ provider, keyIndex = 0, config, signal
   const fields = config?.fields ?? config ?? {};
   const get = key => fields[key] && typeof fields[key] === 'object' ? fields[key].value : fields[key];
   const spec = sourceSpec[provider];
-  const keys = String(get(spec.key) ?? '').split(provider === 'tavily' ? ',' : '\0').map(v => v.trim()).filter(Boolean);
+  const rawKey = String(get(spec.key) ?? '');
+  const keys = (provider === 'tavily' ? rawKey.split(',') : [rawKey]).map(v => v.trim()).filter(Boolean);
   if (!Number.isSafeInteger(keyIndex) || keyIndex < 0 || keyIndex >= keys.length) throw failed('CONFIG');
   let base;
   try { base = new URL(String(get(spec.url) || spec.fallbackUrl)); } catch { throw failed('CONFIG'); }
@@ -61,13 +62,16 @@ export async function queryAccountQuota({ provider, keyIndex = 0, config, signal
   const raw = base.href.replace(/\/+$/, '');
   const url = provider === 'tavily' ? `${raw}/usage`
     : provider === 'firecrawl' ? `${/\/v[12]$/.test(raw) ? raw : `${raw}/v2`}/team/credit-usage`
-      : raw === spec.fallbackUrl ? 'https://agent.tinyfish.ai/v1/wallet' : `${raw}/v1/wallet`;
+      : raw === spec.fallbackUrl ? 'https://agent.tinyfish.ai/v1/wallet'
+        : `${/\/v1$/.test(raw) ? raw : `${raw}/v1`}/wallet`;
   const timeout = AbortSignal.timeout(15_000);
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  let response;
   try {
     combined.throwIfAborted();
-    const response = await fetchImpl(url, { method: 'GET', redirect: 'manual', signal: combined,
+    response = await fetchImpl(url, { method: 'GET', redirect: 'manual', signal: combined,
       headers: provider === 'tinyfish' ? { 'X-API-Key': keys[keyIndex] } : { authorization: `Bearer ${keys[keyIndex]}` } });
+    combined.throwIfAborted();
     if (!response.ok) {
       await response.body?.cancel?.().catch(() => {});
       const status = response.status;
@@ -80,12 +84,23 @@ export async function queryAccountQuota({ provider, keyIndex = 0, config, signal
     if (!reader) throw failed();
     const chunks = [];
     let size = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > 128 * 1024) { await reader.cancel().catch(() => {}); throw failed(); }
-      chunks.push(value);
+    const abort = () => { void reader.cancel(combined.reason).catch(() => {}); };
+    combined.addEventListener('abort', abort, { once: true });
+    try {
+      combined.throwIfAborted();
+      for (;;) {
+        combined.throwIfAborted();
+        const { done, value } = await reader.read();
+        combined.throwIfAborted();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 128 * 1024) throw failed();
+        chunks.push(value);
+      }
+    } finally {
+      combined.removeEventListener('abort', abort);
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
     combined.throwIfAborted();
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -123,5 +138,7 @@ export async function queryAccountQuota({ provider, keyIndex = 0, config, signal
       'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT',
       'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'];
     throw failed('NETWORK', allowedCodes.includes(networkCode) ? { networkCode } : {});
+  } finally {
+    if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
   }
 }

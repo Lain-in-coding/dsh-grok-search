@@ -343,19 +343,56 @@ export function createConfigLocationOpener({ platform = process.platform, env = 
     open({ path, kind = 'folder', signal } = {}) {
       if (disposed) return Promise.reject(error('CONFIG_OPEN_CANCELLED', '插件已停用，打开请求已取消。'));
       if (signal?.aborted) return Promise.reject(signal.reason);
-      if (active) return active.path === path && active.kind === kind ? active.promise
-        : Promise.reject(error('CONFIG_OPEN_BUSY', '正在打开配置位置，请稍候再试。'));
-      const controller = new AbortController();
-      const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-      const request = { path, kind, controller };
-      active = request;
-      request.promise = (async () => {
-        const plan = openPlan(path, kind, { platform, env: typeof env === 'function' ? env() : env, stat });
-        if (plan.missing) return { exists: plan.exists, opened: false };
-        const result = await runOpen(plan, { spawnImpl, signal: combined, timeoutMs });
-        return { exists: plan.exists, opened: true, ...result };
-      })().finally(() => { if (active === request) active = null; });
-      return request.promise;
+      let request = active;
+      if (request && (request.path !== path || request.kind !== kind)) {
+        return Promise.reject(error('CONFIG_OPEN_BUSY', '正在打开配置位置，请稍候再试。'));
+      }
+      if (!request) {
+        const controller = new AbortController();
+        request = { path, kind, controller, waiters: new Set(), settled: false };
+        active = request;
+        request.promise = (async () => {
+          const plan = openPlan(path, kind, { platform, env: typeof env === 'function' ? env() : env, stat });
+          if (plan.missing) return { exists: plan.exists, opened: false };
+          const result = await runOpen(plan, { spawnImpl, signal: controller.signal, timeoutMs });
+          return { exists: plan.exists, opened: true, ...result };
+        })().finally(() => {
+          request.settled = true;
+          if (active === request) active = null;
+        });
+        // The shared operation may outlive its last caller after cancellation.
+        // Keep its rejection observed; each caller attaches its own handler.
+        request.promise.catch(() => {});
+      }
+      const waiter = { signal, settled: false, reject: null };
+      const cancel = () => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        request.waiters.delete(waiter);
+        signal?.removeEventListener('abort', cancel);
+        waiter.reject?.(signal.reason ?? error('CONFIG_OPEN_CANCELLED', '打开请求已取消。'));
+        if (!request.waiters.size && !request.settled) {
+          request.controller.abort(signal.reason ?? error('CONFIG_OPEN_CANCELLED', '打开请求已取消。'));
+        }
+      };
+      request.waiters.add(waiter);
+      if (signal) {
+        waiter.signal = signal;
+        signal.addEventListener('abort', cancel, { once: true });
+        if (signal.aborted) cancel();
+      }
+      return new Promise((resolve, reject) => {
+        waiter.reject = reject;
+        const finish = () => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          request.waiters.delete(waiter);
+          signal?.removeEventListener('abort', cancel);
+        };
+        if (waiter.settled) { reject(signal?.reason ?? error('CONFIG_OPEN_CANCELLED', '打开请求已取消。')); return; }
+        request.promise.then(value => { finish(); resolve(value); },
+          failure => { finish(); reject(failure); });
+      });
     },
     dispose() {
       disposed = true;

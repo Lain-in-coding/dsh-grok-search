@@ -4,6 +4,7 @@ import { SEARCH_EXECUTION, SEARCH_SNAPSHOT, SEARCH_DIAGNOSTIC, capturedExecution
 import { createSearchExecutor } from './search-executor.mjs';
 import { assertSearchReferences, mapSearchResult, searchSourceProvenance } from './result-map.mjs';
 import { createSearchLog } from './search-log.mjs';
+import { validateSearchQuery } from './search-query.mjs';
 
 const CODE = /^[\w.-]{1,64}$/;
 const SOURCES = new Set(['grok', 'tavily', 'exa', 'tinyfish', 'firecrawl']);
@@ -84,14 +85,18 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
 
   async function dispatch(request, signal, origin, maxChars, config, grokEnabled, remainingMs, identity) {
       const token = request.logToken;
+      token.trace?.dispatched?.();
       const record = (origin, route) => {
         lastRoute = { at: now(), origin, ...route };
         lastRouteIdentity = identity;
         if (token) token.route = { ...route, callsComplete: route.grokCode === 'DISABLED' };
       };
-      const onCall = call => searchLog.call(token, call);
-      const sourceInput = { ...request, signal, onCall, configuration: config, remainingMs };
-      const available = config.fallback_sources !== 0 && sourceRouter.snapshot?.(config)?.available === true;
+      const onCall = call => { searchLog.call(token, call); token.trace?.record?.(call); };
+      const onProgress = call => token.trace?.record?.({ ...call, result: 'running' });
+      const sourceInput = { ...request, signal, onCall, onProgress, configuration: config, remainingMs };
+      const sourceState = config.fallback_sources !== 0 ? sourceRouter.snapshot?.(config) : null;
+      const available = sourceState?.available === true;
+      token.trace?.planned?.([...(grokEnabled ? ['grok'] : []), ...(available && Array.isArray(sourceState.enabled) ? sourceState.enabled : [])]);
       if (!grokEnabled) {
         try {
           const result = await sourceRouter.search({ ...sourceInput, reason: 'grok-disabled' });
@@ -113,6 +118,7 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
         'GROK_STAGE_TIMEOUT', '主搜索未在当前阶段返回，已转交备用来源。')), Math.max(1, workMs - reserve)) : null;
       const primarySignal = reserve > 0 ? AbortSignal.any([signal, stage.signal]) : signal;
       try {
+        onProgress({ provider: 'grok' });
         const result = await grok.search(request, primarySignal);
         primarySignal?.throwIfAborted();
         signal?.throwIfAborted();
@@ -120,7 +126,8 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
         assertSearchReferences(result, output, request.maxResults);
         const route = fromGrok(output);
         onCall({ provider: 'grok', result: route.fallbackUsed ? 'failed' : 'ok',
-          code: route.fallbackUsed ? route.grokCode : '' });
+          code: route.fallbackUsed ? route.grokCode : '',
+          ...(route.fallbackUsed ? { evidence: 'kernel-summary' } : {}) });
         for (const provider of route.resultProviders || []) {
           if (provider !== 'grok') onCall({ provider, operation: 'supplement', result: 'ok', evidence: 'source-label' });
         }
@@ -180,7 +187,9 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
   // One queue/time budget covers Grok and every fallback attempt, including
   // sources-only requests. The nested Grok executor retains process ownership.
   const executor = createSearchExecutor({
-    budgetMs, cleanupMs, maxRunning: 1, maxQueued: 8, snapshot: configuration,
+    // A host batch may contain ten queries. Leave bounded room for a batch
+    // alongside existing work without increasing upstream concurrency.
+    budgetMs, cleanupMs, maxRunning: 1, maxQueued: 16, snapshot: configuration,
     runQuery: ({ request, signal, maxChars, config, execution, grokEnabled, remainingMs, identity }) => {
       if (request[SEARCH_DIAGNOSTIC]) return request[SEARCH_DIAGNOSTIC](signal, remainingMs);
       const captured = { ...request, ...(execution ? { [SEARCH_EXECUTION]: execution } : {}) };
@@ -194,10 +203,16 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
     },
   });
   const search = async (request, signal, origin = 'search', attribution = null) => {
+    try { validateSearchQuery(request?.query); }
+    catch (error) {
+      attribution?.finish({ outcome: 'failed', served: null, code: codeOf(error), calls: [] });
+      throw error;
+    }
     const logToken = origin === 'search' && !attribution?.suppressed ? searchLog.begin(request?.query, attribution) : null;
     // Route evidence belongs to this invocation even when its history was
     // cleared/evicted. Never fall back to the mutable lastRoute snapshot.
     const routeToken = logToken ?? {};
+    routeToken.trace = attribution;
     try {
       const result = await tracked(() => executor.search({ ...request, origin, logToken: routeToken }, signal));
       searchLog.finish(logToken, routeToken.route);
@@ -222,10 +237,12 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
   }, signal));
 
   return { search, testGrok, scheduleDiagnosis, searchLog, dispose: async () => { if (!suppliedLog) searchLog.dispose(); return executor.dispose(); }, snapshot: executor.snapshot,
-    routeSnapshot: () => {
+    routeSnapshot: captured => {
       if (!lastRoute) return null;
       try {
-        if (configuration().identity === lastRouteIdentity) return structuredClone(lastRoute);
+        // The settings gateway has already captured this same trusted local
+        // configuration. Reuse it only for display; dispatch still rereads.
+        if (configuration(captured ? { [SEARCH_SNAPSHOT]: captured } : undefined).identity === lastRouteIdentity) return structuredClone(lastRoute);
       } catch { /* Unreadable current config cannot inherit an older success. */ }
       // The historical call/log remains intact; only current health expires.
       lastRoute = null;

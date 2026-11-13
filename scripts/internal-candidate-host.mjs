@@ -61,6 +61,18 @@ process.on('message', async message => {
     else if (op === 'direct-search') {
       try { value = { ok: true, result: await boot.ctx.web.search({ query: '独立 seam 查询', maxResults: 5 }) }; }
       catch (error) { value = { ok: false, error: safeError(error) }; }
+    } else if (op === 'seed-control-history') {
+      // Explicit isolated storage probe only; never part of the product API.
+      if (!productWiring || !Number.isSafeInteger(args.count) || args.count < 1 || args.count > 100) {
+        throw new Error('Storage history seeding requires an isolated product probe and bounded count.');
+      }
+      const { createProductStore } = await import(pathToFileURL(join(profile, 'node_modules/dsh-grok-search/src/core/product-control.mjs')).href);
+      const store = createProductStore(boot.ctx);
+      for (let index = 0; index < args.count; index++) {
+        const current = store.read();
+        await store.compareAndSwapAsync({ expectedRevision: current.revision, intent: { ...current.intent } });
+      }
+      value = { added: args.count, revision: store.read().revision };
     } else if (op === 'cancel-start') {
       writeFileSync(controlPath, JSON.stringify({ mode: 'hang' }));
       const controller = new AbortController();

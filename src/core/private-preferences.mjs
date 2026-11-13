@@ -2,12 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, lstatSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { GrokSearchError } from './errors.mjs';
+import { acquireOwnedLock, DEFAULT_STALE_LOCK_MS } from './owned-lock.mjs';
 
 const SOURCES = Object.freeze(['tavily', 'exa', 'tinyfish', 'firecrawl']);
 const DEFAULTS = Object.freeze({
   schemaVersion: 1,
   grokEnabled: true,
   githubEnabled: true,
+  githubReadEnabled: false,
   sourceOrder: SOURCES,
   sourceEnabled: Object.freeze({ tavily: true, exa: true, tinyfish: true, firecrawl: true }),
 });
@@ -19,6 +21,7 @@ function validate(value) {
   if (value.schemaVersion !== 1) fail('PREFERENCES_INVALID', '插件偏好版本不受支持。');
   if (typeof value.grokEnabled !== 'boolean') fail('PREFERENCES_INVALID', 'Grok 开关值无效。');
   if (value.githubEnabled !== undefined && typeof value.githubEnabled !== 'boolean') fail('PREFERENCES_INVALID', 'GitHub 开关值无效。');
+  if (value.githubReadEnabled !== undefined && typeof value.githubReadEnabled !== 'boolean') fail('PREFERENCES_INVALID', 'GitHub 读取开关值无效。');
   if (!Array.isArray(value.sourceOrder) || value.sourceOrder.length !== SOURCES.length
     || new Set(value.sourceOrder).size !== SOURCES.length
     || value.sourceOrder.some(source => !SOURCES.includes(source))) {
@@ -32,6 +35,7 @@ function validate(value) {
     schemaVersion: 1,
     grokEnabled: value.grokEnabled,
     githubEnabled: value.githubEnabled ?? true,
+    githubReadEnabled: value.githubReadEnabled ?? false,
     sourceOrder: [...value.sourceOrder],
     sourceEnabled: Object.fromEntries(SOURCES.map(source => [source, value.sourceEnabled[source]])),
   };
@@ -64,18 +68,21 @@ export function createPrivatePreferences({ path, fault }) {
       if (expectedRevision !== 'missing' && !/^[a-f0-9]{64}$/.test(expectedRevision ?? '')) {
         fail('PREFERENCES_REVISION_REQUIRED', '保存偏好前必须读取当前修订。');
       }
-      const next = validate(value);
+      validate(value);
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      const lock = path + '.dsh-grok-search.lock';
-      let lockFd, stage, published = false;
+      const lockPath = path + '.dsh-grok-search.lock';
+      let lock, stage, published = false;
       try {
-        try { lockFd = openSync(lock, 'wx', 0o600); }
+        try { lock = acquireOwnedLock(lockPath, { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS }); }
         catch (error) {
           if (error.code === 'EEXIST') fail('PREFERENCES_BUSY', '插件偏好正在保存或上次保存被中断，请稍后检查。');
           throw error;
         }
         const before = read();
         if (before.revision !== expectedRevision) fail('PREFERENCES_CONFLICT', '插件偏好已被其他窗口修改，请重新读取。');
+        // Older clients must not silently revoke or grant the new permission.
+        const next = validate({ ...value, githubReadEnabled: Object.hasOwn(value, 'githubReadEnabled')
+          ? value.githubReadEnabled : before.value.githubReadEnabled });
         const text = JSON.stringify(next, null, 2) + '\n';
         if (before.revision === digest(text)) return { value: structuredClone(next), revision: before.revision };
         stage = `${path}.${randomUUID()}.tmp`;
@@ -93,7 +100,7 @@ export function createPrivatePreferences({ path, fault }) {
         fail('PREFERENCES_WRITE_FAILED', '无法保存插件偏好；原文件未由本次操作替换。');
       } finally {
         if (stage && !published) { try { unlinkSync(stage); } catch {} }
-        if (lockFd !== undefined) { closeSync(lockFd); unlinkSync(lock); }
+        if (lock) lock.release();
       }
     },
   });

@@ -1,6 +1,7 @@
 async page => {
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
   const results = [], errors = [];
+  let fatal = null;
   page.on('pageerror', error => errors.push(String(error)));
   const check = (name, actual, expected = true) => {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
@@ -42,14 +43,14 @@ async page => {
     }), [24, 24, 16, 16]);
     await projectLink.hover();
     await projectTip.waitFor({ state: 'visible' });
-    check('project hover tooltip', await projectTip.textContent(), '用着还行？给个star');
+    check('project hover tooltip', await projectTip.textContent(), '用着还行？给个 star');
     await page.keyboard.press('Escape');
     await projectTip.waitFor({ state: 'hidden' });
     await page.locator('#outside').focus();
     await page.keyboard.press('Shift+Tab');
     check('project link reachable by keyboard', await projectLink.evaluate(link => link.matches(':focus-visible')));
     await projectTip.waitFor({ state: 'visible' });
-    check('project focus tooltip', await projectTip.textContent(), '用着还行？给个star');
+    check('project focus tooltip', await projectTip.textContent(), '用着还行？给个 star');
     const linkBefore = await projectLink.getAttribute('href'), originalPage = page.url();
     await page.context().route('https://github.com/Lain-in-coding/dsh-grok-search', route =>
       route.fulfill({ status: 200, contentType: 'text/html', body: '<title>Project navigation test</title>' }));
@@ -296,12 +297,22 @@ async page => {
     await page.locator('[data-a=adv]').click();
     check('plugin budget read only', (await page.locator('input[data-k=budget]').getAttribute('readonly')) !== null);
     check('plugin executable read only', (await page.locator('input[data-k=exeOverride]').getAttribute('readonly')) !== null);
+    await page.locator('input[data-k=fallback]').fill('0');
+    await page.locator('input[data-k=maxChars]').fill('100');
+    await save();
+    check('hub accepts runtime fallback zero and minimum character budget', await read(() => [
+      window.harness.state.content.fallback_sources, window.harness.state.content.response_max_chars,
+    ]), [0, 100]);
+    await page.locator('#nodeHub').click();
+    check('fallback zero readback disables only further decrement',
+      await page.locator('[data-a=step][data-k=fallback][data-d="-1"]').isDisabled());
     await close();
 
     await state('returning');
     await page.locator('.row[data-id=github] .switch').click();
     check('GitHub toggle never clears token', await read(() => window.harness.state.content.github_token === 'ghp_synthetic'));
-    check('GitHub toggle private preference', await read(() => window.harness.state.prefs.value.githubEnabled), false);
+    check('GitHub toggle private read preference', await read(() => window.harness.state.prefs.value.githubReadEnabled), false);
+    check('GitHub read toggle preserves legacy diagnosis preference', await read(() => window.harness.state.prefs.value.githubEnabled), true);
     await page.evaluate(() => window.harness.configure({ nextPreferenceError: 'PREFERENCES_BUSY' }));
     await page.locator('.row[data-id=grok] .switch').click();
     await page.locator('.toast:has-text("PREFERENCES_BUSY")').waitFor();
@@ -362,7 +373,7 @@ async page => {
     check('partial Tavily key error not whole-source failure', await page.locator('.row[data-id=tavily] .row-fault').getAttribute('data-tone'), 'partial');
     check('real grok code shown without fake HTTP', await page.locator('.row[data-id=grok] .row-fault').textContent().then(text => text.includes('认证')));
     check('individual diagnosis does not claim actual fallback', await page.locator('.s-end').textContent().then(text =>
-      text.includes('Grok 未通过') && text.includes('4/6 项可用') && !text.includes('已静默回退')));
+      text.includes('Grok 未通过') && text.includes('3/5 项可用') && text.includes('GitHub 可用') && !text.includes('已静默回退')));
     check('availability status is distinct from observed fallback', await page.locator('#statusText').textContent(), '补充来源可用');
     check('diagnostic banner names all successful supplementary providers', await page.locator('.banner').textContent().then(text =>
       text.includes('Tavily、Exa、Firecrawl 可用') && !text.includes('已静默回退到')));
@@ -420,7 +431,7 @@ async page => {
       if (onlyGrok) await page.locator('.row[data-id=tavily] .switch[aria-checked=false]').waitFor();
       await page.locator('#testBtn').click();
       await page.locator('[data-pop=go]').click();
-      await page.locator('.s-end:has-text("测试未通过")').waitFor();
+      await page.locator('.s-end:has-text("搜索未通过")').waitFor();
       await page.waitForFunction(() => !document.querySelector('[data-dsg-route]').shadowRoot.querySelector('#testBtn').disabled);
       check(`${onlyGrok ? 'Grok-only' : 'all-source'} diagnosis failure is not a chat-search failure`,
         await page.locator('#statusText').textContent(), '最近检查未通过');
@@ -667,7 +678,8 @@ async page => {
     check('fresh single-source target list excludes never-configured GitHub',
       await read(() => window.harness.state.calls.filter(call => call.method === 'diagnoseProvider').map(call => call.request.provider)), ['tavily']);
     check('unconfigured GitHub has no verification icon', await page.locator('#strip .s-node[data-id=github]').count(), 0);
-    await page.evaluate(() => { window.harness.inject({ github_token: 'ghp_synthetic' }); window.harness.refresh(); });
+    await page.evaluate(() => { window.harness.inject({ github_token: 'ghp_synthetic' });
+      window.harness.configure({ preferences: { githubReadEnabled: true } }); window.harness.refresh(); });
     await page.locator('.row[data-id=github] .switch[aria-checked=true]').waitFor();
     await page.locator('.row[data-id=github] .switch').click();
     await page.locator('.row[data-id=github] .switch[aria-checked=false]').waitFor();
@@ -677,11 +689,12 @@ async page => {
     check('previously configured but closed GitHub is never requested',
       await read(() => window.harness.state.calls.filter(call => call.method === 'diagnoseProvider' && call.request.provider === 'github').length), 0);
     await page.locator('.row[data-id=github] .switch').click();
+    await save();
     await page.locator('.row[data-id=github] .switch[aria-checked=true]').waitFor();
     await page.evaluate(() => window.harness.configure({ diagnostics: { tavily: ['OK'], github: ['HTTP_403'] } }));
     await page.locator('#testBtn').click();
     await page.locator('[data-pop=go]').click();
-    await page.locator('.s-end:has-text("1/2")').waitFor();
+    await page.locator('.s-end:has-text("1/1"):has-text("GitHub 未通过")').waitFor();
     check('GitHub failure remains separate from successful search source',
       await page.locator('#strip .s-node[data-id=github]').getAttribute('data-health'), 'err');
     check('GitHub displays its actual failure code',
@@ -775,6 +788,54 @@ async page => {
     await page.locator('[data-a=eye][data-k=key]').click();
     check('fresh reveal remains functional after permission recovery', await secretInput.inputValue(), 'exa-synthetic');
     await close();
+
+    await state('returning');
+    await page.evaluate(() => {
+      window.harness.inject({ openai_compatible_api_url: 'https://gateway.example.test/v1',
+        openai_compatible_api_key: 'gateway-synthetic-key' });
+      window.harness.configure({ revealDelay: 1200 });
+      window.harness.refresh();
+    });
+    await card('grok');
+    await page.locator('[data-a=eye][data-k=key]').click();
+    await page.locator('[data-a=mode][data-v=compat]').click();
+    await page.locator('[data-a=eye][data-k=gwKey]').click();
+    check('concurrent protocol fields issue independent reveal requests', await read(() =>
+      window.harness.state.calls.filter(call => call.method === 'reveal').map(call => call.request.key)),
+    ['grok_api_key', 'openai_compatible_api_key']);
+    await page.waitForFunction(() => document.querySelector('[data-dsg-layer]').shadowRoot
+      .querySelector('input[data-k=gwKey]')?.value === 'gateway-synthetic-key');
+    check('gateway reveal populates only its own credential', await page.locator('input[data-k=gwKey]').inputValue(), 'gateway-synthetic-key');
+    await page.locator('[data-a=mode][data-v=responses]').click();
+    check('concurrent native reveal keeps the native credential', await page.locator('input[data-k=key]').inputValue(), 'xai-synthetic-key');
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    check('close immediately scrubs secrets while retaining the exit animation', await read(() => {
+      const root = document.querySelector('[data-dsg-layer]').shadowRoot;
+      const input = root.querySelector('input[data-k=key]'), overlay = root.querySelector('#overlay');
+      root.querySelector('[data-a=cancel]').click();
+      return { value: input.value, attribute: input.getAttribute('value'), type: input.type, disabled: input.disabled,
+        actionsDisabled: [...root.querySelectorAll('[data-a=eye], [data-a=copy]')].every(button => button.disabled),
+        closing: overlay.classList.contains('is-closing'), hidden: overlay.hidden };
+    }), { value: '', attribute: null, type: 'password', disabled: true, actionsDisabled: true, closing: true, hidden: false });
+    await page.locator('#overlay').waitFor({ state: 'hidden' });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+
+    await state('returning');
+    await card('exa');
+    await page.locator('input[data-k=url]').fill('https://discarded.example.test');
+    await page.evaluate(() => window.harness.configure({ revealDelay: 1200 }));
+    await page.locator('[data-a=eye][data-k=key]').click();
+    await page.locator('[data-a=save]').click();
+    await close();
+    await card('grok');
+    await page.locator('input[data-k=model]').fill('next-unsaved-model');
+    await page.waitForTimeout(1350);
+    check('old pending save leaves the replacement dialog open', await page.locator('#dlgTitle').textContent(), 'Grok');
+    check('old pending save cannot write either dialog', await read(() =>
+      window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+    check('replacement draft stays unsaved after the old reveal settles', await page.locator('input[data-k=model]').inputValue(), 'next-unsaved-model');
+    await close();
+
     await state('returning');
     await page.evaluate(() => window.harness.configure({ delay: 800,
       openError: { code: 'CONFIG_OPEN_UNAVAILABLE', message: 'Windows 系统打开工具不存在，请复制路径后手动打开。' } }));
@@ -854,18 +915,20 @@ async page => {
     check('unmount removes route DOM', await page.locator('#routeCard').count(), 0);
     check('no page errors', errors.length, 0);
   } catch (error) {
-    results.push({ name: 'browser-run', passed: false, error: String(error) });
+    fatal = String(error);
+    if (!results.some(row => row.passed === false)) results.push({ name: 'browser-run', passed: false, error: fatal });
     await page.screenshot({ path: run.directory + '/failure.png' });
   }
   const summary = { runId: run.runId, scope: 'generated production client + offline synthetic host shim; not Desktop or paid-provider evidence',
     command: 'playwright-cli run-code --filename=test/ui-route-browser.js',
     passed: results.filter(result => result.passed).length, failed: results.filter(result => !result.passed).length,
-    pageErrors: errors, results };
+    pageErrors: errors, fatal, results };
   const evidence = await page.evaluate(async summary => {
     const response = await fetch('/evidence', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(summary) });
     return { ok: response.ok, text: await response.text() };
   }, summary);
   if (!evidence.ok) throw new Error('Evidence write failed: ' + evidence.text);
+  if (summary.failed) throw new Error(`Browser regression failed (${summary.failed}); evidence: ${run.runId}`);
   return { runId: run.runId, passed: summary.passed, failed: summary.failed, directory: run.directory,
     ...(summary.failed ? { failure: results.filter(result => !result.passed) } : {}) };
 }

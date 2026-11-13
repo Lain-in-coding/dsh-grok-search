@@ -3,6 +3,47 @@ import test from 'node:test';
 import { queryAccountQuota, quotaDraftConfiguration } from '../src/core/account-quota.mjs';
 
 const json = body => new Response(JSON.stringify(body));
+test('quota response readers release their lock on success, malformed data and oversize failures', async () => {
+  for (const body of [
+    JSON.stringify({ account: { plan_usage: 1, plan_limit: 100 } }), 'invalid JSON', 'x'.repeat(128 * 1024 + 1),
+  ]) {
+    const response = new Response(body);
+    try {
+      await queryAccountQuota({ provider: 'tavily', config: { tavily_api_key: 'synthetic' },
+        fetchImpl: async () => response });
+    } catch (error) { assert.equal(error.code, 'QUOTA_QUERY_FAILED'); }
+    assert.equal(response.body.locked, false);
+  }
+});
+
+test('quota caller cancellation also releases a body that does not propagate the fetch signal', async () => {
+  const controller = new AbortController(), reason = new Error('synthetic quota cancellation');
+  let stream, response, cancelled = 0, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const pending = queryAccountQuota({ provider: 'tavily', config: { tavily_api_key: 'synthetic' },
+    signal: controller.signal, fetchImpl: async () => {
+      response = new Response(new ReadableStream({
+        start(value) { stream = value; started(); },
+        cancel() { cancelled++; },
+      }));
+      return response;
+    } });
+  let timer;
+  try {
+    await ready;
+    controller.abort(reason);
+    await assert.rejects(Promise.race([pending, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Quota body remained pending after cancellation.')), 500);
+    })]), error => error === reason);
+    assert.equal(cancelled, 1);
+    assert.equal(response.body.locked, false);
+  } finally {
+    clearTimeout(timer);
+    if (!cancelled) stream.close();
+    await pending.catch(() => {});
+  }
+});
+
 test('Tavily custom endpoints query the configured origin and separate account/key scopes', async () => {
   const result = await queryAccountQuota({ provider: 'tavily', keyIndex: 1,
     config: { tavily_api_url: 'https://custom.test/api', tavily_api_key: 'first,second' },
@@ -27,7 +68,10 @@ test('Firecrawl never derives mixed-scope usage from plan and remaining', async 
 });
 test('TinyFish supports real negative wallet balance and keeps custom credentials on custom origin', async () => {
   for (const [base, expected] of [[undefined, 'https://agent.tinyfish.ai/v1/wallet'],
-    ['https://custom.test/search', 'https://custom.test/search/v1/wallet']]) {
+    ['https://custom.test/search', 'https://custom.test/search/v1/wallet'],
+    ['https://custom.test/', 'https://custom.test/v1/wallet'],
+    ['https://custom.test/v1', 'https://custom.test/v1/wallet'],
+    ['https://custom.test/prefix/v1/', 'https://custom.test/prefix/v1/wallet']]) {
     const result = await queryAccountQuota({ provider: 'tinyfish',
       config: { tinyfish_api_key: 'synthetic', tinyfish_search_api_url: base },
       fetchImpl: async (url, init) => {
@@ -79,6 +123,44 @@ test('real HTTP redirects are refused instead of forwarding custom credentials',
     } }), { code: 'QUOTA_QUERY_FAILED' });
     assert.equal(downstream, 0);
   } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('real HTTP quota cancellation closes a stalled response and preserves the caller reason', async () => {
+  const { createServer } = await import('node:http');
+  const controller = new AbortController(), reason = new Error('real loopback quota cancellation');
+  let sent, closed, requests = 0;
+  const received = new Promise(resolve => { sent = resolve; });
+  const disconnected = new Promise(resolve => { closed = resolve; });
+  const server = createServer((request, response) => {
+    requests++;
+    assert.equal(request.url, '/usage');
+    assert.equal(request.headers.authorization, 'Bearer synthetic-loopback-key');
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.write('{"account":');
+    response.once('close', closed);
+    sent();
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const pending = queryAccountQuota({ provider: 'tavily', config: {
+    tavily_api_url: `http://127.0.0.1:${server.address().port}`, tavily_api_key: 'synthetic-loopback-key',
+  }, signal: controller.signal });
+  const rejection = assert.rejects(pending, failure => failure === reason);
+  let timer;
+  try {
+    await received;
+    controller.abort(reason);
+    await rejection;
+    await Promise.race([disconnected, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Quota connection remained open after cancellation.')), 1000);
+    })]);
+    assert.equal(requests, 1);
+  } finally {
+    clearTimeout(timer);
+    controller.abort(reason);
+    await rejection;
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   }

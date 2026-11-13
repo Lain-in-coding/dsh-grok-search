@@ -177,13 +177,32 @@ test('concurrent clicks reuse one request and a different action reports busy', 
   const h = harness({ behavior(value) { child = value; } });
   const first = h.opener.open({ path: FILE, kind: 'file' });
   const second = h.opener.open({ path: FILE, kind: 'file' });
-  assert.equal(first, second);
+  assert.notEqual(first, second, 'callers own their wait even though the helper is shared');
   await assert.rejects(h.opener.open({ path: FILE, kind: 'folder' }), { code: 'CONFIG_OPEN_BUSY' });
   await new Promise(done => setImmediate(done));
   child.stdout.write('DSH_GROK_OPEN_OK'); child.emit('close', 0, null);
   await first;
   assert.equal(h.calls.length, 1);
 });
+
+for (const cancelledIndex of [0, 1]) {
+  test(`cancelling concurrent opener caller ${cancelledIndex + 1} leaves the other caller and helper intact`, async () => {
+    let child;
+    const h = harness({ behavior(value) { child = value; } });
+    const controllers = [new AbortController(), new AbortController()];
+    const tasks = controllers.map(controller => h.opener.open({ path: FILE, kind: 'file', signal: controller.signal }));
+    const reason = new Error('cancel only this caller');
+    const rejection = assert.rejects(tasks[cancelledIndex], error => error === reason);
+    await new Promise(done => setImmediate(done));
+    controllers[cancelledIndex].abort(reason);
+    await rejection;
+    assert.equal(child.killCalls, 0);
+    child.stdout.write('DSH_GROK_OPEN_OK'); child.emit('close', 0, null);
+    assert.equal((await tasks[1 - cancelledIndex]).opened, true);
+    assert.equal(h.calls.length, 1);
+    h.opener.dispose();
+  });
+}
 
 test('timeout reaps only the helper and leaves the operation retryable', async () => {
   const h = harness({ timeoutMs: 20, behavior() {} });

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPrivateProgramInstaller, resolveGrokProgram, unpackPlatformArchive, verifyArchiveIntegrity } from '../src/core/program-install.mjs';
@@ -33,7 +33,7 @@ const validRows = () => [
 const integrity = data => 'sha512-' + createHash('sha512').update(data).digest('base64');
 function fixture({ latest = VERSION, archive = tar(validRows()), mutateMetadata, failOfficial = false,
   redirect = null, failOfficialArchive = false, handshakeFailure = false, failAll = false, handshake } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'dsh-installer-test-'));
+  const directory = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-test-'));
   const urls = [], versions = [];
   const fetchImpl = async url => {
     urls.push(url);
@@ -73,6 +73,42 @@ test('integrity failure rejects the archive before any installation', () => {
   assert.throws(() => verifyArchiveIntegrity(Buffer.concat([archive, Buffer.from('changed')]), integrity(archive)), error => error.code === 'GROK_DOWNLOAD_INTEGRITY');
   assert.throws(() => verifyArchiveIntegrity(archive, 'sha1-wrong'), error => error.code === 'GROK_DOWNLOAD_INTEGRITY');
 });
+
+test('download cancellation closes a stalled metadata body without mirror retries or publication', async () => {
+  const directory = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-cancel-body-'));
+  const controller = new AbortController(), reason = new Error('synthetic download cancellation');
+  let stream, responseBody, started, cancelled = 0, requests = 0;
+  const ready = new Promise(resolve => { started = resolve; });
+  const installer = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64',
+    fetchImpl: async () => {
+      requests++;
+      responseBody = new Response(new ReadableStream({
+        start(value) { stream = value; started(); },
+        cancel() { cancelled++; },
+      }));
+      return responseBody;
+    }, inspect: async () => assert.fail('Cancelled download must not inspect a program.'),
+    handshake: async () => assert.fail('Cancelled download must not start MCP.') });
+  const pending = installer.install({ signal: controller.signal });
+  let timer;
+  try {
+    await ready;
+    controller.abort(reason);
+    await assert.rejects(Promise.race([pending, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Download body remained pending after cancellation.')), 500);
+    })]), failure => failure === reason);
+    assert.equal(cancelled, 1);
+    assert.equal(requests, 1);
+    assert.equal(responseBody.body.locked, false);
+    assert.equal(existsSync(join(directory, '.install.lock')), false);
+    assert.equal(existsSync(join(directory, 'active.json')), false);
+  } finally {
+    clearTimeout(timer);
+    if (!cancelled) stream.close();
+    await pending.catch(() => {});
+  }
+});
+
 test('path traversal, links, unknown payloads and duplicate binaries are rejected', () => {
   for (const row of [
     { name: 'package/../escape' }, { name: '/absolute' }, { name: 'package/C:\\escape' },
@@ -94,7 +130,7 @@ test('missing program is installed privately and cached, with a receipt', async 
   assert.ok(result.path.startsWith(directory));
   assert.equal(result.source, 'private-cache');
   assert.equal(result.version, VERSION);
-  assert.equal(urls.length, 3);
+  assert.equal(urls.length, 2);
   assert.equal((await installer.active()).sha256, result.sha256);
   assert.equal(existsSync(join(directory, '.install.lock')), false);
   assert.equal(JSON.parse(readFileSync(join(directory, 'active.json'), 'utf8')).schemaVersion, 1);
@@ -154,16 +190,26 @@ test('failed handshake never promotes the prepared binary', async () => {
   const { installer, directory } = fixture({ handshakeFailure: true });
   await assert.rejects(installer.install(), error => error.code === 'GROK_PROTOCOL_UNVERIFIED');
   assert.equal(existsSync(join(directory, 'active.json')), false);
+  assert.deepEqual(readdirSync(directory), [], 'exited, uncommitted candidate is cleaned');
+});
+test('an uncertain validation process retains its candidate files', async () => {
+  const { installer, directory } = fixture({ handshake: async () => {
+    throw Object.assign(new Error('not reaped'), { code: 'GROK_PROCESS_REAP_FAILED', diagnostic: { exited: false } });
+  } });
+  await assert.rejects(installer.install(), { code: 'GROK_PROCESS_REAP_FAILED' });
+  assert.equal(existsSync(join(directory, 'active.json')), false);
+  assert.equal(readdirSync(directory).filter(name => name.startsWith(VERSION + '-')).length, 1);
 });
 test('progress observer errors cannot invalidate a completed installation', async () => {
   const { installer } = fixture();
   assert.equal((await installer.install({ onProgress: () => { throw new Error('observer-only'); } })).version, VERSION);
   assert.equal((await installer.active()).version, VERSION);
 });
-test('unverified upstream latest is reported rather than silently pinning or installing it', async () => {
-  const { installer, directory } = fixture({ latest: '0.2.0' });
-  await assert.rejects(installer.install(), error => error.code === 'GROK_VERSION_UNVERIFIED');
-  assert.equal(existsSync(join(directory, 'active.json')), false);
+test('a newer upstream latest cannot block first installation of the highest verified version', async () => {
+  const { installer, directory, urls } = fixture({ latest: '0.2.0' });
+  assert.equal((await installer.install()).version, VERSION);
+  assert.equal(urls.some(url => url.endsWith('/latest')), false);
+  assert.equal(JSON.parse(readFileSync(join(directory, 'active.json'), 'utf8')).version, VERSION);
 });
 test('untrusted distribution URL is never fetched', async () => {
   const { installer, urls } = fixture({ mutateMetadata: data => { data.dist.tarball = 'https://example.invalid/evil'; } });
@@ -307,4 +353,20 @@ test('discovery reuses an existing program without consulting the installer', as
   const result = await resolveGrokProgram({ override: binary, inspect: async path => ({ path, version: VERSION }),
     installer: { active: () => { throw new Error('must not inspect cache'); }, install: () => { throw new Error('must not download'); } } });
   assert.equal(result.source, 'manual');
+});
+
+test('unsupported automatic program discovery does not block a verified private cache or explicit repair', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-discovery-fallback-'));
+  writeFileSync(join(directory, 'grok-search-rs.exe'), 'automatic-candidate');
+  const options = { env: { PATH: directory, HOME: directory }, platform: 'win32', arch: 'x64',
+    inspect: async () => { throw Object.assign(new Error('unsupported'), { code: 'GROK_VERSION_UNVERIFIED' }); } };
+  const cached = { found: true, path: 'verified-private-cache' };
+  assert.deepEqual(await resolveGrokProgram({ ...options, installer: { active: async () => cached } }), cached);
+  await assert.rejects(resolveGrokProgram({ ...options, installer: { active: async () => null,
+    install() { assert.fail('an unverified existing program does not authorize silent replacement'); } } }),
+  { code: 'GROK_VERSION_UNVERIFIED' });
+  assert.deepEqual(await resolveGrokProgram({ ...options, repair: true, installer: { repair: async () => cached } }), cached);
+  await assert.rejects(resolveGrokProgram({ ...options, repair: true,
+    configured: join(directory, 'grok-search-rs.exe'), installer: { repair() { assert.fail('explicit paths remain authoritative'); } } }),
+  { code: 'GROK_VERSION_UNVERIFIED' });
 });

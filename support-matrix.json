@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "0.2.1",
-  "channel": "正式版；npm latest 与 GitHub Release 使用同一个安装包。next 可能指向旧版",
-  "verificationBaseline": "targets 保留对应平台的既有宿主证据。0.2.1 已补验 Windows rc.5 和 0.2.2-rc.1 的配置、搜索、日志、额度、安装和旧版升级保留，并完成人工验收；未变路径按输入哈希复用，不把旧包安装或源码审查冒充本版全部平台实测",
-  "supportPolicy": "targets 列出本版本的兼容支持组合，verificationLevel 单独说明验证依据。支持声明不要求逐个官方 Desktop 发行包实测：rc.4 Desktop 经关键源码一致性审查并结合已有宿主证据纳入支持，但不宣称原包实测通过。后续版本仍须完成受影响验证并审核后发布。Linux 证据限 WSL Ubuntu 22.04，原生 Linux 完整安装路径属于验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
+  "packageVersion": "0.3.0",
+  "channel": "0.3.0 正式发行通道（latest）；实际公开状态以 npm 和 GitHub Release 为准",
+  "verificationBaseline": "0.3.0最终运行代码已在Windows x64 DSH 0.2.1-rc.5/0.2.2-rc.2 Desktop及WSL Ubuntu 22.04 DSH 0.2.2-rc.2 CLI/Web隔离验证。macOS arm64官方Desktop为正文取消修复前候选的托管证据，未冒称最终包完整复验；Linux证据仅限WSL。真实付费上游、签名安装器启动及所有平台故障组合不因此通过",
+  "supportPolicy": "targets列出本版本兼容支持组合，verificationLevel逐行说明累计证据与适用对象。支持声明不要求每个官方Desktop发行包均实测：0.2.1-rc.4 Desktop仍按源码审查及相邻宿主证据纳入支持，不宣称实测。Windows/WSL最终运行代码已有复验，macOS保留较早候选证据及最终修复未完整复验边界。后续版本仍须完成受影响验证并审核后发布。Linux运行证据限WSL Ubuntu 22.04，原生Linux完整安装路径仍属验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
   "verificationLevels": {
     "host-tested": "有对应系统、架构、入口和版本的宿主自动化测试记录；具体场景见 verification。运行时未变时可按源码哈希复用原范围证据，不把旧包安装写成新包安装，也不表示真实付费接口通过。",
-    "source-reviewed": "基于明确的接口与源码审查及相邻版本/同版其他入口证据声明兼容；未单独实测该官方 Desktop 原包。此等级属于支持范围，不属于宿主实测通过。"
+    "source-reviewed": "基于明确的接口与源码审查及相邻版本/同版其他入口证据声明兼容；未单独完成对应系统、版本及入口的宿主实测。此等级属于支持范围，不属于宿主实测通过。"
   },
   "platforms": [
     { "platform": "win32", "arch": "x64", "host": "Desktop" },
@@ -125,10 +125,31 @@
       "dsh": "0.2.2-rc.1",
       "verificationLevel": "host-tested",
       "verification": "WSL Ubuntu 22.04、隔离 Node 24.14.1：完整182项和首次使用199项通过，包括安装、共享配置、安全RPC、日志/额度/回放、原生启停、配置重载后工具恢复、自动下载与缓存复用；合成上游"
+    },
+    {
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.2-rc.2",
+      "verificationLevel": "host-tested",
+      "verification": "0.3.0最终运行代码在官方Windows x64 DSH 0.2.2-rc.2原始ASAR/Electron隔离Desktop完成配置/日志/额度/GitHub 164项、搜索11类与GitHub25类专项、新包干净安装及0.2.1原生UI更新/重启/配置缓存保持验证。首次下载、真实grok-search-rs 0.1.26对回环Responses、HMR及两种搜索API恢复按未变模块保留既有证据。供应商使用合成回环响应，不代表真实付费接口或签名安装器启动"
+    },
+    {
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "dsh": "0.2.2-rc.2",
+      "verificationLevel": "host-tested",
+      "verification": "正文取消修复前的0.3.0候选（762835e5…de0777）在GitHub托管macOS 15 Apple Silicon与官方DSH 0.2.2-rc.2原始Desktop完成安装、控制、首次下载/诊断、日志/回放/额度、Session搜索、GitHub续读、生命周期与本地Grok Responses验证。最终来源/额度/GitHub/下载四模块取消修复未在macOS完整复验，旧证据仅按未变模块复用。合成上游，不代表真实付费接口或用户签名安装器启动"
+    },
+    {
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "dsh": "0.2.2-rc.2",
+      "verificationLevel": "host-tested",
+      "verification": "0.3.0最终运行代码在WSL Ubuntu 22.04、隔离Node 24.14.1及官方DSH 0.2.2-rc.2 Linux x64 CLI/Web完成196项首次下载门禁；179项常规按未变模块复用较早候选证据。engine-strict安装、空配置引导、程序自动下载/握手及缓存复用、共享配置、搜索来源、接管/停用/移除/重启通过；合成上游，无真实Key或付费请求。不是原生Linux发行版或Linux Desktop实测"
     }
   ],
   "realKeyVerification": {
-    "win32-x64": "0.2.1 的真实 Tavily、Firecrawl、TinyFish 搜索与额度查询通过；Windows rc.5 和 0.2.2-rc.1 的真实 Tavily Session、来源与日志一致，聊天模型为合成测试模型。Exa 现有测试 Key 返回401，Grok 指定测试网关未取得真实主搜成功证据。用户已确认本版人工验收通过，但未逐项报告上游与模型，不据此补写未取得的服务证据；历史成功、当前凭据与隔离合成测试分别记录。",
+    "win32-x64": "0.2.1 的真实 Tavily、Firecrawl、TinyFish 搜索与额度查询通过；Windows rc.5 和 0.2.2-rc.1 的真实 Tavily Session、来源与日志一致，聊天模型为合成测试模型。0.3.0更名前阶段的限定Exa两次搜索通过，早期Key返回401的记录不代表所有Exa不可用；Grok指定测试网关未取得本开发线真实主搜成功证据。用户于2026-11-13确认0.3.0人工验收通过，但未逐项报告上游与模型，不据此补写未取得的服务证据；历史成功、当前凭据与隔离合成测试分别记录。",
     "darwin-arm64": "尚未做真实付费接口验收",
     "linux-x64": "尚未做真实付费接口验收"
   },
@@ -138,9 +159,11 @@
     "Windows ARM（win32-arm64）",
     "官方 Linux Desktop（官方未提供）",
     "Windows 与 macOS 上的 DSH CLI/Web（可能可以安装，但未验证）",
-    "DSH 0.2.2-alpha.2（不在 engines.dsh 范围内，安装会被拒绝）"
+    "DSH 0.2.2-alpha.2（不在 engines.dsh 范围内，安装会被拒绝）",
+    "DSH 0.2.2-rc.3 及更高未来版本（不在 engines.dsh 范围内，安装会被拒绝）"
   ],
   "notTested": [
+    "0.3.0最终正文取消修复后的macOS完整实机复验；较早候选宿主证据按未变模块保留",
     "Windows 10 桌面配置文件打开：已有经典记事本分支回归，不等同 Windows 10 实机验证",
     "原生 Linux 桌面的配置文件打开：无桌面 CLI/Web 行为单独验证",
     "DSH 0.2.1-rc.4 Desktop 官方原包实测：已纳入兼容支持，但仅有关键源码审查与关联宿主证据，不把该版本 CLI/Web 测试写成 Desktop 实测",

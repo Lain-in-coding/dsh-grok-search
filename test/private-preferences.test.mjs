@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -25,6 +25,19 @@ test('invalid source order is rejected instead of silently normalized', () => {
   const initial = store.snapshot();
   assert.throws(() => store.save(initial.revision, { ...initial.value, sourceOrder: ['exa'] }),
     error => error.code === 'PREFERENCES_INVALID');
+});
+
+test('new GitHub read consent defaults off and older clients cannot overwrite it', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
+  const store = createPrivatePreferences({ path });
+  const initial = store.snapshot();
+  assert.equal(initial.value.githubEnabled, true);
+  assert.equal(initial.value.githubReadEnabled, false);
+  const enabled = store.save(initial.revision, { ...initial.value, githubReadEnabled: true });
+  const { githubReadEnabled, ...oldClient } = enabled.value;
+  const saved = store.save(enabled.revision, { ...oldClient, grokEnabled: false });
+  assert.equal(saved.value.githubReadEnabled, true);
+  assert.throws(() => store.save(saved.revision, { ...saved.value, githubReadEnabled: 'yes' }), { code: 'PREFERENCES_INVALID' });
 });
 
 test('preference writers cooperate through an exclusive lock and never steal an abandoned one', () => {
@@ -71,6 +84,21 @@ test('preference failures distinguish unpublished writes from uncertain committe
   }
 });
 
+test('preference publication survives a vanished lock and never removes a replacement owner', () => {
+  for (const replacement of [null, 'next-owner']) {
+    const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
+    const lock = path + '.dsh-grok-search.lock';
+    const store = createPrivatePreferences({ path, fault: stage => {
+      if (stage !== 'after-publish') return;
+      unlinkSync(lock);
+      if (replacement) writeFileSync(lock, replacement, { flag: 'wx' });
+    } });
+    const saved = store.save('missing', { ...store.snapshot().value, grokEnabled: false });
+    assert.equal(saved.value.grokEnabled, false);
+    assert.equal(existsSync(lock), replacement !== null);
+    if (replacement) assert.equal(readFileSync(lock, 'utf8'), replacement);
+  }
+});
 test('idempotent preference saves do not republish and oversized or invalid UTF-8 files fail closed', () => {
   const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
   const initial = createPrivatePreferences({ path });

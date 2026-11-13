@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -32,7 +32,7 @@ function requiredIntent(overrides = {}) {
 }
 
 function fixture(t) {
-  const directory = join(mkdtempSync(join(tmpdir(), 'dsh-release-transaction-test-')), 'control');
+  const directory = join(mkdtempSync(join(realpathSync(tmpdir()), 'dsh-release-transaction-test-')), 'control');
   t.diagnostic(`Retained fixture: ${directory}`);
   const store = createControlIntentStore({ directory });
   const before = store.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });

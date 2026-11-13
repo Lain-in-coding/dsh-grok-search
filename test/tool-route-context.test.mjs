@@ -6,9 +6,119 @@ import { createRoutedSearch } from '../src/core/routed-search.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
 import { createReleaseBarrier } from '../src/core/release-transaction.mjs';
 import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSourceRouter } from '../src/core/source-adapters.mjs';
 
 const exec = (sessionId, callId, name = 'web_search') => ({ name, callId, agent: { session: { id: sessionId } } });
 const route = served => ({ served, outcome: 'ok', fallbackUsed: false, grokCode: null });
+
+test('trace keeps actual queued/dispatch/attempt timing while the legacy RPC shape stays exact', async () => {
+  let clock = 1000;
+  const context = createToolRouteContext({ now: () => clock }), session = randomUUID();
+  await context.run(exec(session, 'trace'), async () => {
+    const capture = context.capture();
+    assert.equal(context.readTrace(session, 'trace').routes[0].phase, 'queued');
+    clock += 50; capture.dispatched();
+    capture.record({ provider: 'tavily', result: 'running', keyIndex: 0, query: 'private-query', key: 'private-key' });
+    clock += 120;
+    capture.record({ provider: 'tavily', result: 'failed', keyIndex: 0, code: 'HTTP_401' });
+    capture.record({ provider: 'tavily', result: 'running', keyIndex: 1, operation: 'retry' });
+    clock += 80; capture.record({ provider: 'tavily', result: 'ok', keyIndex: 1 });
+    capture.finish({ ...route('tavily'), callsComplete: true });
+  });
+  const value = context.readTrace(session, 'trace'), calls = value.routes[0].calls;
+  assert.equal(value.elapsedMs, 250);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(call => [call.result, call.elapsedMs, call.keyIndex]), [['failed',120,0],['ok',80,1]]);
+  assert.equal(value.routes[0].callsComplete, true);
+  assert.doesNotMatch(JSON.stringify(value), /private-query|private-key/);
+  calls[0].code = 'MUTATED';
+  assert.equal(context.readTrace(session, 'trace').routes[0].calls[0].code, 'HTTP_401');
+  assert.deepEqual(SETTINGS_DESCRIPTORS.find(row => row.method === 'toolCallTrace').result.create().parse(value), value);
+  assert.deepEqual(context.read(session, 'trace'), { known: true, state: 'done',
+    routes: [{ served: 'tavily', outcome: 'ok', fallbackUsed: false, code: '' }] });
+  context.dispose();
+});
+
+test('trace records are bounded and cannot resurrect cleared, cancelled or ambiguous identities', async () => {
+  const context = createToolRouteContext(), session = randomUUID(), controller = new AbortController();
+  await context.run({ ...exec(session, 'bounded'), signal: controller.signal }, () => {
+    const capture = context.capture();
+    for (let i = 0; i < 20; i++) {
+      capture.record({ provider: 'tavily', result: 'running', keyIndex: i });
+      capture.record({ provider: 'tavily', result: 'failed', keyIndex: i, code: 'HTTP_429' });
+    }
+    capture.finish({ ...route('exa'), callsComplete: true });
+  });
+  const bounded = context.readTrace(session, 'bounded');
+  assert.equal(bounded.routes[0].calls.length, 16);
+  assert.equal(bounded.routes[0].callsTruncated, true);
+  assert.equal(bounded.routes[0].callsComplete, false);
+  await context.run({ ...exec(session, 'cancel'), signal: controller.signal }, () => {
+    context.capture().record({ provider: 'grok', result: 'running' });
+    controller.abort();
+  });
+  assert.equal(context.readTrace(session, 'cancel').routes[0].calls[0].result, 'cancelled');
+  await context.run(exec(session, 'clear'), () => {
+    const capture = context.capture();
+    context.clear();
+    capture.record({ provider: 'grok', result: 'running' });
+    capture.finish(route('grok'));
+  });
+  assert.equal(context.readTrace(session, 'clear').known, false);
+  await context.run(exec(session, 'duplicate'), () => context.capture().finish(route('grok')));
+  await context.run(exec(session, 'duplicate'), () => {});
+  assert.equal(context.readTrace(session, 'duplicate').known, false);
+  context.dispose();
+});
+
+test('an inner kernel fallback reports supplier evidence without inventing individual Grok latency', async () => {
+  let clock = 100;
+  const context = createToolRouteContext({ now: () => clock }), session = randomUUID();
+  await context.run(exec(session, 'inner'), () => {
+    const capture = context.capture();
+    capture.record({ provider: 'grok', result: 'running' });
+    clock = 9000;
+    capture.record({ provider: 'grok', result: 'failed', code: 'grok_timeout', evidence: 'kernel-summary' });
+    capture.record({ provider: 'exa', result: 'ok', evidence: 'source-label' });
+    capture.finish({ ...route('exa'), fallbackUsed: true, grokCode: 'grok_timeout' });
+  });
+  const value = context.readTrace(session, 'inner');
+  assert.equal(value.elapsedMs, 8900);
+  assert.equal(value.routes[0].calls[0].elapsedMs, null);
+  assert.equal(value.routes[0].calls[1].elapsedMs, null);
+  assert.equal(value.routes[0].callsComplete, false);
+  context.dispose();
+});
+
+test('real routing callbacks expose each active retry without extra requests or duplicate history rows', async () => {
+  const history=createSearchLog(),context=createToolRouteContext({searchLog:history}),session=randomUUID();
+  const configuration={source_providers:['tavily','exa','tinyfish','firecrawl'],
+    tavily_api_key:'fixture-a,fixture-b',tavily_api_url:'https://tavily.test',tavily_enabled:true,
+    exa_api_key:'fixture-exa',exa_api_url:'https://exa.test',exa_enabled:true,
+    tinyfish_api_key:'fixture-tiny',tinyfish_search_api_url:'https://tinyfish.test',tinyfish_enabled:true,
+    firecrawl_api_key:'fixture-fire',firecrawl_api_url:'https://firecrawl.test',firecrawl_enabled:true};
+  let sent=0;
+  const sourceRouter=createSourceRouter({getConfig:()=>configuration,fetchImpl:async url=>{
+    sent++;
+    const trace=context.readTrace(session,'real-route');
+    assert.equal(trace.routes[0].calls.at(-1).result,'running');
+    const success=String(url).includes('firecrawl');
+    return new Response(JSON.stringify(success?{data:{web:[{url:'https://example.test/real'}]}}:{}),
+      {status:success?200:401,headers:{'content-type':'application/json'}});
+  }});
+  const routed=createRoutedSearch({grok:{search:async()=>{throw Object.assign(new Error('fixture'),{code:'HTTP_401'});}},
+    sourceRouter,getConfig:()=>configuration,searchLog:history,releaseBarrier:createReleaseBarrier()});
+  await context.run(exec(session,'real-route'),()=>routed.search({query:'private-query'},undefined,'search',context.capture()));
+  const result=context.readTrace(session,'real-route');
+  assert.equal(sent,5,'Tavily two keys plus three suppliers, with no observation requests');
+  assert.equal(result.routes[0].calls.length,6,'one primary and five supplementary attempts');
+  assert.deepEqual(result.routes[0].planned,['grok','tavily','exa','tinyfish','firecrawl']);
+  assert.equal(result.routes[0].calls.at(-1).provider,'firecrawl');
+  assert.equal(result.routes[0].calls.at(-1).result,'ok');
+  assert.equal(history.snapshot(randomUUID()).records[0].queries[0].calls.length,6);
+  assert.doesNotMatch(JSON.stringify(result),/private-query|fixture-|https:/);
+  await routed.dispose();context.dispose();history.dispose();
+});
 
 test('tool route context tracks exact call and session, never query text or current route', async () => {
   const context = createToolRouteContext(), session = randomUUID();
@@ -302,9 +412,10 @@ test('same words in different tool calls or sessions never merge, and capacity c
 
 test('clearing in the middle of a tool batch suppresses late and newly dispatched child history', async () => {
   const history = createSearchLog(), context = createToolRouteContext({ searchLog: history }), session = randomUUID();
+  history.snapshot(session);
   await context.run(exec(session, 'cleared-batch'), async () => {
     const attribution = context.capture(), pending = history.begin('first', attribution);
-    history.clear(randomUUID()); context.clear();
+    history.clear(session); context.clear();
     history.finish(pending, { outcome: 'ok', served: 'grok' });
     const late = context.capture();
     assert.equal(late.suppressed, true);
@@ -400,4 +511,103 @@ test('host ABORTED error envelopes remain cancelled, while timeout envelopes rem
     assert.equal(context.read(session, reason).state, reason === 'ABORTED' ? 'cancelled' : 'failed');
     context.dispose();
   }
+});
+
+test('GitHub one-call history is finalized by the whole host outcome and late post-policy failure', async () => {
+  const history = createSearchLog(), context = createToolRouteContext({ searchLog: history }), session = randomUUID();
+  const call = exec(session, 'github-call', 'github_read');
+  await context.run(call, () => {
+    const attribution = context.capture('github_read');
+    const token = history.beginRead('https://github.com/a/b/issues/1', attribution);
+    history.finishRead(token, { segment: 1, hasMore: true, acquiredComplete: true, apiRequests: 3 });
+    attribution.finish({ served: 'github', outcome: 'ok' });
+    return { isError: false };
+  });
+  let row = history.snapshot(randomUUID()).records[0];
+  assert.equal(row.recordType, 'github');
+  assert.equal(row.kind, 'ok');
+  assert.equal(row.callFinished, true);
+  assert.equal(row.queries, undefined);
+  assert.equal(row.apiRequests, 3);
+  context.finalizeRead(call, { isError: true, error: { info: { code: 'PERMISSION_DENIED' } } });
+  row = history.snapshot(randomUUID()).records[0];
+  assert.equal(row.kind, 'failed');
+  assert.equal(row.reason, 'PERMISSION_DENIED');
+  assert.equal(context.read(session, 'github-call').state, 'failed');
+  context.dispose(); history.dispose();
+});
+
+test('final host policy outcome overrides only the tool summary and keeps real supplier usage', async () => {
+  for (const finalCode of ['PERMISSION_DENIED', 'ABORTED', 'TOOL_TIMEOUT']) {
+    const history = createSearchLog(), context = createToolRouteContext({ searchLog: history });
+    const session = randomUUID(), call = exec(session, 'final-' + finalCode);
+    await context.run(call, () => {
+      const attribution = context.capture(), token = history.begin('supplier already completed', attribution);
+      history.call(token, { provider: 'tavily', result: 'ok', charge: { amount: 1, unit: 'credits', basis: 'reported' } });
+      history.finish(token, { outcome: 'ok', served: 'tavily', callsComplete: true });
+      attribution.finish(route('tavily'));
+      return { isError: false };
+    });
+    context.finalizeRead(call, { isError: true, error: { info: { name: 'PolicyError', code: finalCode } } });
+    const row = history.snapshot(randomUUID()).records[0];
+    const kind = finalCode === 'ABORTED' ? 'cancelled' : 'failed';
+    assert.equal(row.kind, kind);
+    assert.equal(row.reason, finalCode);
+    assert.equal(context.read(session, call.callId).state, kind);
+    assert.equal(row.queries[0].kind, 'ok');
+    assert.deepEqual(row.queries[0].calls[0].charge, { amount: 1, unit: 'credits', basis: 'reported' });
+    context.finalizeRead(call, { isError: false });
+    assert.equal(history.snapshot(randomUUID()).records[0].kind, kind, 'final settlement is idempotent');
+    context.dispose(); history.dispose();
+  }
+});
+
+test('late final outcomes cannot change another execution with reused or cleared identities', async () => {
+  const history = createSearchLog(), context = createToolRouteContext({ searchLog: history });
+  const session = randomUUID(), call = exec(session, 'reused-final');
+  const run = execution => context.run(execution, () => {
+    const attribution = context.capture(), token = history.begin('successful', attribution);
+    history.finish(token, { outcome: 'ok', served: 'grok' }); attribution?.finish(route('grok'));
+  });
+  await run(call);
+  const unrelated = { ...call, agent: { session: { id: session } } };
+  context.finalizeRead(unrelated, { isError: true, error: { info: { code: 'PERMISSION_DENIED' } } });
+  assert.equal(history.snapshot(randomUUID()).records[0].kind, 'ok', 'matching text ids alone are insufficient');
+  history.snapshot(session);
+  history.clear(session); context.clear();
+  await run(exec(session, call.callId));
+  context.finalizeRead(call, { isError: true, error: { info: { code: 'PERMISSION_DENIED' } } });
+  assert.equal(history.snapshot(randomUUID()).records[0].kind, 'ok');
+  context.dispose(); history.dispose();
+});
+
+test('a duplicate completed identity prevents late host finalization from claiming its previous record', async () => {
+  const history = createSearchLog(), context = createToolRouteContext({ searchLog: history });
+  const session = randomUUID(), original = exec(session, 'duplicate-completed');
+  await context.run(original, () => {
+    const attribution = context.capture(), token = history.begin('original', attribution);
+    history.finish(token, { outcome: 'ok', served: 'grok' }); attribution.finish(route('grok'));
+  });
+  for (let index = 0; index < 2; index++) await context.run(exec(session, original.callId), () => {
+    assert.equal(context.capture(), null);
+  });
+  context.finalize(original, { isError: true, error: { info: { code: 'PERMISSION_DENIED' } } });
+  assert.equal(context.read(session, original.callId).known, false);
+  assert.equal(history.snapshot(randomUUID()).records[0].kind, 'ok', 'ambiguous identities cannot rewrite historical attribution');
+  context.dispose(); history.dispose();
+});
+
+test('clearing during GitHub tool execution suppresses new and late records', async () => {
+  const history = createSearchLog(), context = createToolRouteContext({ searchLog: history }), session = randomUUID();
+  history.snapshot(session);
+  await context.run(exec(session, 'github-clear', 'github_read'), () => {
+    const first = context.capture('github_read'), token = history.beginRead('https://github.com/a/b/issues/1', first);
+    context.clear(); history.clear(session);
+    const late = context.capture('github_read');
+    assert.equal(history.beginRead('https://github.com/a/b/issues/1', late), null);
+    history.finishRead(token, { segment: 1 });
+    first.finish({ served: 'github', outcome: 'ok' });
+  });
+  assert.equal(history.snapshot(randomUUID()).records.length, 0);
+  context.dispose(); history.dispose();
 });

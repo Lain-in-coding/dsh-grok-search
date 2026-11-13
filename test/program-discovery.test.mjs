@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discoverGrokCandidates, findExistingGrok, grokPlatformPackage, inspectGrokProgram } from '../src/core/program-discovery.mjs';
 import { resolveGrokProgram } from '../src/core/program-install.mjs';
-const setup = () => mkdtempSync(join(tmpdir(), 'dsh-discovery-test-'));
+const setup = () => mkdtempSync(join(realpathSync(tmpdir()), 'dsh-discovery-test-'));
 const makeFile = path => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'offline-fixture'); return path; };
 const nativeBinary = process.platform === 'win32' ? 'grok-search-rs.exe' : 'grok-search-rs';
 const nativePackage = grokPlatformPackage(process.platform, process.arch);

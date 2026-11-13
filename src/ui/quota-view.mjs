@@ -4,7 +4,7 @@
  */
 export function createQuotaView(host) {
 const { $, S, getDialog, dlg, active, DEF, SUPP, svg, EXT, esc, reduced, dialogBusy,
-  remote, uuid, hideTip, hidden = () => false } = host;
+  remote, uuid, hideTip, hidden = value => typeof value === 'string' && value.startsWith('\u2063dsg-configured-secret:') } = host;
 let D = null, disposed = false;
 const QUOTA_PROVIDERS = new Set(SUPP);
 const QUOTA_CONSOLE = {
@@ -72,7 +72,19 @@ function quotaContext(id, p, keyIndex = 0) {
     scope: JSON.stringify([id, base, S.config?.quotaRevision || S.configRevision, index,
       draftSame ? 'saved' : D.quotaDraftId]) };
 }
-const quotaNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const quotaNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1e12;
+function quotaValue(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const note = typeof value.note === 'string' ? value.note.slice(0, 2048) : '';
+  if (value.kind === 'credits') return { kind: 'credits', note,
+    ...Object.fromEntries(['used', 'plan', 'remaining', 'keyUsed', 'keyLimit', 'keyRemaining']
+      .map(key => [key, quotaNumber(value[key]) ? value[key] : null])) };
+  if (value.kind === 'wallet' && typeof value.balance === 'number'
+    && Number.isFinite(value.balance) && Math.abs(value.balance) <= 1e12) {
+    return { kind: 'wallet', balance: value.balance, note };
+  }
+  return null;
+}
 const quotaFormat = value => quotaNumber(value) ? value.toLocaleString('zh-CN', { maximumFractionDigits: 6 }) : '未报告';
 function quotaView() {
   if (!D || D.kind !== 'card' || !QUOTA_PROVIDERS.has(D.id)) return null;
@@ -110,7 +122,7 @@ function quotaHtml() {
     <span class="qp-label">${label}</span><div class="qp-amount"><strong class="qp-value${quotaNumber(amount) ? '' : ' is-unknown'}">${quotaFormat(amount)}</strong>${quotaNumber(amount) ? '<span class="qp-unit">credits</span>' : ''}</div></div>`;
   const metrics = credits ? `<div class="qp-stats">${stat('已用', value.used, 'used')}${stat('剩余', value.remaining, 'remaining', true)}</div>`
     : value?.kind === 'wallet' ? `<div class="qp-wallet"><span class="qp-label">钱包余额</span><div class="qp-amount"><span class="qp-currency">$</span><strong class="qp-value">${esc(value.balance)}</strong><span class="qp-unit">USD</span></div></div>` : '';
-  const progress = credits && quotaNumber(value.used) && value.plan > 0
+  const progress = credits && quotaNumber(value.used) && quotaNumber(value.plan) && value.plan > 0
     ? `<div class="qp-meter" role="meter" aria-label="账户已用额度" aria-valuemin="0" aria-valuemax="${value.plan}" aria-valuenow="${Math.min(value.plan, value.used)}" aria-valuetext="已用 ${quotaFormat(value.used)} credits，总额度 ${quotaFormat(value.plan)} credits"><i style="transform:scaleX(${Math.min(1, value.used / value.plan)})"></i></div>`
     : credits ? '<div class="qp-meter is-unreported" aria-hidden="true"></div>' : '';
   const hasKey = credits && context.id === 'tavily'
@@ -138,7 +150,7 @@ function quotaHtml() {
   const consoleLink = `<a class="dlg-link qp-console" href="${QUOTA_CONSOLE[context.id]}" target="_blank" rel="noopener noreferrer" data-quota-kind="console" data-quota-tip="${consoleHelp}" aria-label="服务控制台（官方）">${EXT('服务控制台')}</a>`;
   const total = credits ? `<span class="qp-total">${quotaNumber(value.plan) ? `总额度 <b>${quotaFormat(value.plan)}</b> credits` : '总额度未报告'}</span>` : '';
   const updated = value ? `<span class="qp-updated" data-state="${status}">${status === 'error' ? info('error', '额度查询失败原因', `${errorHelp}\n上次更新：${cached.updatedAt}`) : ''}<span>${stateText}</span></span>` : '';
-  return `<section class="quota-panel" id="quotaPanel" data-provider="${context.id}" data-state="${status}" data-kind="${value?.kind || ''}" aria-labelledby="quotaTitle" aria-busy="${status === 'loading'}">
+  return `<section class="quota-panel" id="quotaPanel" data-provider="${context.id}" data-state="${status}" data-kind="${esc(value?.kind || '')}" aria-labelledby="quotaTitle" aria-busy="${status === 'loading'}">
     <header class="qp-head"><div class="qp-heading"><h3 id="quotaTitle">账户额度</h3>${consoleLink}</div>${tools}</header>
     <div class="qp-content"><div class="qp-main" aria-live="polite" aria-atomic="true">
       ${value ? `${metrics}${progress}<div class="qp-summary"><span class="qp-account-meta">${total}${accountInfo}</span>${updated}</div>`
@@ -235,8 +247,9 @@ async function refresh({ automatic = false } = {}) {
     D = mine; mine.quotaRequest = null;
     const current = quotaView();
     if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
-    quotaCache.set(request.scope, { value: result.value, updatedAt: quotaTime(),
-      completedAt: Date.now(), error: result.value ? null : 'UNREPORTED' });
+    const value = quotaValue(result?.value);
+    quotaCache.set(request.scope, { value, updatedAt: quotaTime(),
+      completedAt: Date.now(), error: value ? null : 'UNREPORTED' });
   } catch (error) {
     if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
     D = mine; mine.quotaRequest = null;

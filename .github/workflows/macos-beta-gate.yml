@@ -1,10 +1,27 @@
 name: macOS Apple Silicon Release Candidate Gate
 
 on:
+  workflow_call:
+    inputs:
+      confirm_public_standard_runner:
+        type: boolean
+        default: false
+      expected_tarball_sha256:
+        type: string
+        required: true
+      first_use_only:
+        type: boolean
+        default: false
+      search_log_only:
+        type: boolean
+        default: false
+      config_open_only:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       confirm_public_standard_runner:
-        description: Confirm that the public-repository standard Windows and macOS Apple Silicon runners may run; this workflow does not select a paid larger runner.
+        description: Confirm that standard Windows and macOS Apple Silicon runners may run in this repository; this workflow does not publish or select a larger runner.
         required: true
         type: boolean
         default: false
@@ -93,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        desktop_baseline: ["rc2", "rc3", "022-rc1"]
+        desktop_baseline: ["rc2", "rc3", "022-rc1", "022-rc2"]
     if: inputs.confirm_public_standard_runner && !inputs.config_open_only
     runs-on: macos-15
     timeout-minutes: 60
@@ -123,7 +140,7 @@ jobs:
           defaults write -g AppleLocale zh_CN
           test "$(defaults read -g AppleLanguages | sed -n 2p | tr -d ' ,"')" = "zh-Hans"
       - name: Prepare isolated Grok MCP and local Responses stub
-        if: ${{ !inputs.first_use_only }}
+        if: ${{ !inputs.first_use_only || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -227,11 +244,81 @@ jobs:
             mkdir -p "$RUNNER_TEMP/dsh-rc3"
             ditto -x -k "$RUNNER_TEMP/022-rc1.zip" "$RUNNER_TEMP/dsh-rc3"
             echo "DSH_B2_TARGET_VERSIONS=0.2.2-rc.1,0.2.1-rc.5" >> "$GITHUB_ENV"
+          elif test "$DSH_DESKTOP_BASELINE" = "022-rc2"; then
+            curl --fail --location --retry 5 --retry-delay 5 \
+              --output "$RUNNER_TEMP/022-rc2.zip" \
+              "https://download.deepseek.com/dsh-desk/bin/mac-arm64/deepseek-harness-0.2.2-rc.2-mac-arm64.zip"
+            test "$(openssl dgst -sha512 -binary "$RUNNER_TEMP/022-rc2.zip" | openssl base64 -A)" = "SAKrGOp6y3vla/r7QG6hP+y3LfHeRKS3xQ+lxFBuiF7ezSt+dqkCedm9znqKqr7akCkLgag0GnC+yZhkAWL/+Q=="
+            mv "$RUNNER_TEMP/dsh-rc3" "$RUNNER_TEMP/dsh-rc3-unused"
+            mkdir -p "$RUNNER_TEMP/dsh-rc3"
+            ditto -x -k "$RUNNER_TEMP/022-rc2.zip" "$RUNNER_TEMP/dsh-rc3"
+            echo "DSH_B2_TARGET_VERSIONS=0.2.2-rc.2,0.2.1-rc.5" >> "$GITHUB_ENV"
           fi
           test -x "$RUNNER_TEMP/dsh-rc3/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"
           test -x "$RUNNER_TEMP/dsh-rc5/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"
+      - name: Verify search execution and GitHub contracts in the official Electron runtime
+        if: ${{ !inputs.first_use_only || matrix.desktop_baseline == '022-rc2' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$(find "$RUNNER_TEMP/release" -name 'dsh-grok-search-*.tgz' -print -quit)"
+          test -n "$TARBALL"
+          mkdir "$RUNNER_TEMP/host-contract-package"
+          tar -xzf "$TARBALL" -C "$RUNNER_TEMP/host-contract-package"
+          # The extracted package is outside the checkout, so Node cannot find
+          # the already locked test dependencies through its normal ancestors.
+          # Use those same dependencies without changing the frozen package.
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$RUNNER_TEMP/host-contract-package/package/node_modules"
+          node --input-type=module - "$TARBALL" <<'NODE'
+          import { readFileSync } from 'node:fs';
+          import { dirname, join } from 'node:path';
+          import { createHash } from 'node:crypto';
+          const receipt = JSON.parse(readFileSync(join(dirname(process.argv[2]), 'package-receipt.json'), 'utf8'));
+          if (receipt.sha256 !== process.env.EXPECTED_TARBALL_SHA256) throw new Error('Contract package identity mismatch');
+          for (const row of receipt.sourceHashes) {
+            const installed = join(process.env.RUNNER_TEMP, 'host-contract-package/package', row.file);
+            const hash = createHash('sha256').update(readFileSync(installed)).digest('hex');
+            if (hash !== row.sha256) throw new Error(`Contract input differs: ${row.file}`);
+          }
+          NODE
+          CONTRACT_ROOT="artifacts/host-execution-contracts"
+          mkdir -p "$CONTRACT_ROOT"
+          for HOST in "$RUNNER_TEMP/dsh-rc3" "$RUNNER_TEMP/dsh-rc5"; do
+            APP="$HOST/DeepSeek Harness.app/Contents"
+            VERSION="$(ELECTRON_RUN_AS_NODE=1 "$APP/MacOS/DeepSeek Harness" -p "JSON.parse(require('node:fs').readFileSync(process.argv[1],'utf8')).version" "$APP/Resources/app.asar/package.json")"
+            CONTRACT_DIR="$CONTRACT_ROOT/$VERSION"
+            mkdir "$CONTRACT_DIR"
+            ELECTRON_RUN_AS_NODE=1 "$APP/MacOS/DeepSeek Harness" --expose-internals scripts/verify-search-execution-host.mjs \
+              "$APP/Resources/app.asar" "$RUNNER_TEMP/host-contract-package/package" > "$CONTRACT_DIR/search.json"
+            ELECTRON_RUN_AS_NODE=1 "$APP/MacOS/DeepSeek Harness" --expose-internals scripts/verify-github-read-host.mjs \
+              "$APP/Resources/app.asar" "$RUNNER_TEMP/host-contract-package/package" > "$CONTRACT_DIR/github.json"
+            node --input-type=module - "$CONTRACT_DIR" "$TARBALL" "$VERSION" <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { dirname, join } from 'node:path';
+          const [directory, tarball, version] = process.argv.slice(2);
+          const packageReceipt = JSON.parse(readFileSync(join(dirname(tarball), 'package-receipt.json'), 'utf8'));
+          const results = ['search', 'github'].map(name => {
+            const result = JSON.parse(readFileSync(join(directory, name + '.json'), 'utf8'));
+            assert.equal(result.passed, true);
+            assert.equal(result.version, version);
+            assert.equal(result.candidate, packageReceipt.version);
+            assert.equal(result.syntheticOnly, true);
+            assert.equal(result.cases.length, name === 'search' ? 11 : 25);
+            for (const row of result.sourceHashes) {
+              assert.equal(row.sha256, packageReceipt.sourceHashes.find(source => source.file === row.file)?.sha256);
+            }
+            return result;
+          });
+          writeFileSync(join(directory, 'receipt.json'), JSON.stringify({
+            passed: true, version, packageSha256: packageReceipt.sha256, results,
+            exitCode: 0, officialElectronNodeRuntime: true, realCredentialsUsed: false,
+          }, null, 2) + '\n', { flag: 'wx' });
+          console.log(JSON.stringify({ version, searchCases: 11, githubCases: 25, packageSha256: packageReceipt.sha256 }));
+          NODE
+          done
       - name: Run isolated product install gate
-        if: ${{ !inputs.search_log_only }}
+        if: ${{ !inputs.search_log_only || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -242,7 +329,7 @@ jobs:
             --desktop-rc21 "$RUNNER_TEMP/dsh-rc5/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
             --product-package "$TARBALL"
       - name: Run product Desktop control gate
-        if: ${{ !inputs.first_use_only && !inputs.search_log_only }}
+        if: ${{ (!inputs.first_use_only && !inputs.search_log_only) || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -251,7 +338,7 @@ jobs:
             --desktop-rc21 "$RUNNER_TEMP/dsh-rc5/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
             --case product
       - name: Run M0-04 Desktop gate
-        if: ${{ !inputs.first_use_only && !inputs.search_log_only }}
+        if: ${{ (!inputs.first_use_only && !inputs.search_log_only) || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -261,7 +348,7 @@ jobs:
             --case m0-04 \
             --grok-program "$RUNNER_TEMP/grok/grok-search-rs"
       - name: Run native hot-toggle and sources-only Desktop gates
-        if: ${{ !inputs.first_use_only && !inputs.search_log_only }}
+        if: ${{ (!inputs.first_use_only && !inputs.search_log_only) || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -270,7 +357,7 @@ jobs:
             --desktop-rc21 "$RUNNER_TEMP/dsh-rc5/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
             --case ux
       - name: Run isolated internal candidate gate
-        if: ${{ !inputs.first_use_only && !inputs.search_log_only }}
+        if: ${{ (!inputs.first_use_only && !inputs.search_log_only) || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -282,7 +369,7 @@ jobs:
             --real-grok-executable "$RUNNER_TEMP/grok/grok-search-rs" \
             --real-grok-config "$RUNNER_TEMP/grok/config.toml"
       - name: Run original Desktop PluginManager gate
-        if: ${{ !inputs.search_log_only }}
+        if: ${{ !inputs.search_log_only || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -292,7 +379,7 @@ jobs:
             --desktop-rc21 "$RUNNER_TEMP/dsh-rc5/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
             --product-package "$TARBALL"
       - name: Run new-user automatic program and configuration gates
-        if: ${{ !inputs.search_log_only }}
+        if: ${{ !inputs.search_log_only || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -304,15 +391,17 @@ jobs:
             --first-use download \
             --diagnostics loopback
       - name: Run search history, replay and quota Desktop gate
-        if: ${{ !inputs.first_use_only }}
+        if: ${{ !inputs.first_use_only || matrix.desktop_baseline == '022-rc2' }}
         shell: bash
         run: |
           set -euo pipefail
           TARBALL="$(find "$RUNNER_TEMP/release" -name 'dsh-grok-search-*.tgz' -print -quit)"
           DSH_LOG_GROK_PROGRAM="$RUNNER_TEMP/grok/grok-search-rs" \
-            node scripts/verify-search-log-desktop.mjs --editable-config "$TARBALL" \
+            node scripts/verify-search-log-desktop.mjs --editable-config --github-read "$TARBALL" \
             "$RUNNER_TEMP/dsh-rc3/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
             "$RUNNER_TEMP/dsh-rc5/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"
+      - name: Require evidence for every selected Desktop gate
+        run: node scripts/check-evidence.mjs macos "${{ matrix.desktop_baseline != '022-rc2' && inputs.first_use_only }}" "${{ matrix.desktop_baseline != '022-rc2' && inputs.search_log_only }}"
       - name: Preserve macOS evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -331,15 +420,18 @@ jobs:
             artifacts/diagnostics-desktop/**/*diagnostics-failure.json
             artifacts/diagnostics-desktop/**/*diagnostics*-ui.png
             artifacts/macos-grok-protocol/receipt.json
+            artifacts/host-execution-contracts/**/*.json
             artifacts/search-log-desktop/**/summary.json
             artifacts/search-log-desktop/**/*-checks.json
             artifacts/search-log-desktop/**/*.png
             artifacts/search-log-desktop/**/failed-state.json
-          if-no-files-found: ignore
+            artifacts/search-log-desktop/**/*-chat-stream-performance.json
+            artifacts/search-log-desktop/**/*-chat-cpu-summary.json
+          if-no-files-found: error
           retention-days: 7
 
       - name: Stop local Grok Responses stub
-        if: ${{ always() && !inputs.first_use_only }}
+        if: ${{ always() && (!inputs.first_use_only || matrix.desktop_baseline == '022-rc2') }}
         shell: bash
         run: |
           # Always attempt every fallback, even when the graceful shutdown request fails.
@@ -402,8 +494,9 @@ jobs:
             artifacts/diagnostics-desktop/**/*diagnostics-failure.json
             artifacts/diagnostics-desktop/**/*diagnostics*-ui.png
             artifacts/macos-grok-protocol/receipt.json
+            artifacts/host-execution-contracts/**/*.json
             ${{ runner.temp }}/grok/stub-receipt.json
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   configuration-opener:

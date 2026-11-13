@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { CONFIG_FIELDS, createSharedConfigStore, patchSharedToml, resolveSharedConfigPath } from '../src/core/shared-config.mjs';
@@ -107,6 +109,40 @@ test('default location follows upstream HOME / USERPROFILE and explicit preceden
   assert.throws(() => resolveSharedConfigPath({ override: 'relative.toml' }), code('CONFIG_PATH_INVALID'));
 });
 
+test('Windows MSYS home is normalized without replacing an explicit isolated HOME', () => {
+  for (const home of ['/c/Users/review', '/mnt/c/Users/review', '/cygdrive/c/Users/review']) {
+    assert.equal(resolveSharedConfigPath({ env: { HOME: home, USERPROFILE: 'C:\\other' }, platform: 'win32' }),
+      'C:\\Users\\review\\.config\\grok-search-rs\\config.toml');
+  }
+  assert.equal(resolveSharedConfigPath({ env: { HOME: 'D:\\isolated', USERPROFILE: 'C:\\real' }, platform: 'win32' }),
+    'D:\\isolated\\.config\\grok-search-rs\\config.toml');
+  assert.equal(resolveSharedConfigPath({ env: { HOME: '/tmp/isolated' }, platform: 'linux' }),
+    '/tmp/isolated/.config/grok-search-rs/config.toml');
+});
+
+test('prototype property names cannot bypass the shared configuration allowlist', () => {
+  for (const key of ['toString', 'hasOwnProperty', 'valueOf', 'constructor', '__proto__']) {
+    for (const value of ['synthetic', null]) {
+      assert.throws(() => patchSharedToml('', { [key]: value }), code('CONFIG_FIELD_READ_ONLY'));
+    }
+  }
+  const { store } = setup('toString = "preserved"\nhasOwnProperty = "retained"\n');
+  assert.deepEqual(store.snapshot().unknownFields, ['toString', 'hasOwnProperty']);
+});
+
+test('editable fallback and response limits match their runtime boundaries', () => {
+  const { store } = setup();
+  for (const updates of [{ fallback_sources: 0, response_max_chars: 100 },
+    { fallback_sources: 10, response_max_chars: 500000 }]) {
+    const saved = store.save({ expectedRevision: store.snapshot().revision, updates });
+    for (const [key, value] of Object.entries(updates)) assert.equal(saved.fields[key].value, value);
+  }
+  for (const updates of [{ fallback_sources: -1 }, { fallback_sources: 11 },
+    { response_max_chars: 99 }, { response_max_chars: 500001 }]) {
+    assert.throws(() => store.save({ expectedRevision: store.snapshot().revision, updates }), code('CONFIG_VALUE_INVALID'));
+  }
+});
+
 test('localized edit preserves comments, blank lines, CRLF, unknown keys and tables', () => {
   const original = '# heading\r\n\r\ngrok_model  = "old"   # model comment\r\nunknown = 9007199254740993\r\n[future]\r\nx = 42\r\n';
   const changed = patchSharedToml(original, { grok_model: 'new', tavily_api_key: 'synthetic' });
@@ -177,6 +213,22 @@ test('postpublish interruption is uncertain rather than falsely claiming rollbac
   assert.equal(store.snapshot().fields.grok_model.value, 'new');
 });
 
+test('missing or replaced config lock does not undo a saved result or delete another owner', () => {
+  for (const replacement of [null, 'next-owner']) {
+    let lockPath;
+    const { store, path } = setup('grok_model = "old"\n', { fault: stage => {
+      if (stage !== 'after-publish') return;
+      unlinkSync(lockPath);
+      if (replacement) writeFileSync(lockPath, replacement, { flag: 'wx' });
+    } });
+    lockPath = path + '.dsh-grok-search.lock';
+    const saved = store.save({ expectedRevision: store.snapshot().revision, updates: { grok_model: 'new' } });
+    assert.equal(saved.fields.grok_model.value, 'new');
+    assert.equal(existsSync(lockPath), replacement !== null);
+    if (replacement) assert.equal(readFileSync(lockPath, 'utf8'), replacement);
+  }
+});
+
 test('history restore requires current revision and original bytes match exactly', () => {
   const original = '# private\n\ngrok_api_key  = "old-synthetic" # keep\n';
   const { store, path } = setup(original);
@@ -208,7 +260,7 @@ test('unsupported values cannot silently change upstream semantics', () => {
   const { store, path } = setup();
   for (const updates of [
     { grok_auth_mode: 'oauth' }, { bogus: true }, { source_providers: ['github'] },
-    { source_providers: ['tavily', 'tavily'] }, { fallback_sources: 0 },
+    { source_providers: ['tavily', 'tavily'] }, { fallback_sources: -1 },
     { cache_size: 1.5 }, { tavily_api_url: 'http://remote.example' },
     { grok_api_url: 'https://user:secret@example.com' }, { grok_api_key: 'a\nb' },
     { timeout_seconds: 9999 },
@@ -231,6 +283,128 @@ test('no-op save is idempotent and creates no redundant history', () => {
   const revision = store.snapshot().revision;
   assert.equal(store.save({ expectedRevision: revision, updates: { grok_model: 'existing' } }).revision, revision);
   assert.deepEqual(store.history(), []);
+});
+
+test('configuration history keeps at most twenty verified revisions', () => {
+  const { store } = setup('grok_model = "v0"\n');
+  const revisions = [store.snapshot().revision];
+  for (let index = 1; index <= 25; index++) {
+    const before = store.snapshot();
+    revisions.push(before.revision);
+    store.save({ expectedRevision: before.revision, updates: { grok_model: `v${index}` } });
+  }
+  const retained = store.history().map(row => row.revision);
+  assert.equal(retained.length, 20);
+  assert.equal(retained.includes(revisions[0]), false);
+  assert.equal(retained.includes(revisions[1]), false);
+  assert.equal(retained.includes(revisions.at(-1)), true);
+  assert.equal(store.snapshot().fields.grok_model.value, 'v25');
+});
+
+test('age retention uses recorded creation time and leaves unknown-age legacy history untouched', () => {
+  let clock = Date.parse('2026-01-01T00:00:00.000Z');
+  const { store, path, historyDirectory } = setup('grok_model = "v0"\n', {
+    now: () => new Date(clock),
+  });
+  const first = store.snapshot();
+  store.save({ expectedRevision: first.revision, updates: { grok_model: 'v1' } });
+  assert.ok(store.history().some(row => row.revision === first.revision));
+  clock += 31 * 24 * 60 * 60 * 1000;
+  store.save({ expectedRevision: store.snapshot().revision, updates: { grok_model: 'v2' } });
+  assert.equal(store.history().some(row => row.revision === first.revision), false);
+
+  // A history file created before the index existed has no trustworthy age.
+  // It may be removed by the count cap, but not by the age rule.
+  const legacyText = 'grok_model = "legacy"\n';
+  const legacyRevision = createHash('sha256').update(legacyText).digest('hex');
+  mkdirSync(historyDirectory, { recursive: true });
+  const legacyPath = join(historyDirectory, legacyRevision + '.toml');
+  writeFileSync(legacyPath, legacyText);
+  const old = new Date('2020-01-01T00:00:00.000Z');
+  utimesSync(legacyPath, old, old);
+  store.retainHistory();
+  assert.equal(existsSync(legacyPath), true);
+  assert.equal(readFileSync(path, 'utf8'), 'grok_model = "v2"\n');
+});
+
+test('retention never removes a history file whose bytes do not match its revision name', () => {
+  const { store, historyDirectory } = setup('grok_model = "base"\n');
+  mkdirSync(historyDirectory, { recursive: true });
+  const misleading = 'a'.repeat(64) + '.toml';
+  writeFileSync(join(historyDirectory, misleading), 'grok_model = "not-the-hash"\n');
+  store.retainHistory();
+  assert.equal(existsSync(join(historyDirectory, misleading)), true);
+});
+
+test('reused configuration hashes refresh undo retention and older restores fit the twenty-entry cap', () => {
+  let clock = Date.parse('2026-01-01T00:00:00.000Z');
+  const { store } = setup('grok_model = "base"\n', { now: () => new Date(clock) });
+  const original = store.snapshot().revision;
+  for (let index = 1; index <= 20; index++) {
+    clock += 1000;
+    store.save({ expectedRevision: store.snapshot().revision, updates: { grok_model: `version-${index}` } });
+  }
+  assert.equal(store.history().length, 20);
+  store.restore({ expectedRevision: store.snapshot().revision, revision: original });
+  assert.equal(store.snapshot().revision, original);
+  assert.equal(store.history().length, 20);
+  clock += 31 * 24 * 60 * 60 * 1000;
+  const saved = store.save({ expectedRevision: original, updates: { grok_model: 'later' } });
+  store.restore({ expectedRevision: saved.revision, revision: original });
+  assert.equal(store.snapshot().fields.grok_model.value, 'base');
+  assert.ok(store.history().length <= 20);
+});
+
+test('a corrupt retention index reports maintenance failure without masking a successful save', () => {
+  const reports = [];
+  const { store, historyDirectory } = setup('grok_model = "before"\n', { onMaintenance: value => reports.push(value) });
+  mkdirSync(historyDirectory, { recursive: true });
+  writeFileSync(join(historyDirectory, 'index.json'), '{ corrupt');
+  const original = store.snapshot().revision;
+  const saved = store.save({ expectedRevision: original, updates: { grok_model: 'after' } });
+  assert.equal(saved.fields.grok_model.value, 'after');
+  assert.equal(store.maintenanceStatus().status, 'error');
+  assert.equal(reports.at(-1).code, 'CONFIG_HISTORY_INVALID');
+  assert.equal(readFileSync(join(historyDirectory, 'index.json'), 'utf8'), '{ corrupt');
+  assert.equal(existsSync(join(historyDirectory, original + '.toml')), true);
+  store.restore({ expectedRevision: saved.revision, revision: original });
+  assert.equal(store.snapshot().fields.grok_model.value, 'before');
+});
+
+test('a partial history write cannot publish a corrupt backup or permanently block later saves', () => {
+  const raw = 'grok_model = "original-before-write-failure"\n';
+  const { store, historyDirectory } = setup(raw);
+  const before = store.snapshot(), originalWrite = fs.writeFileSync;
+  let injected = false;
+  fs.writeFileSync = (file, data, ...options) => {
+    if (!injected && String(data) === raw) {
+      injected = true;
+      originalWrite(file, raw.slice(0, 10), ...options);
+      throw Object.assign(new Error('synthetic short history write'), { code: 'ENOSPC' });
+    }
+    return originalWrite(file, data, ...options);
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => store.save({ expectedRevision: before.revision, updates: { grok_model: 'next' } }),
+      { code: 'CONFIG_WRITE_FAILED' });
+  } finally { fs.writeFileSync = originalWrite; syncBuiltinESMExports(); }
+  assert.equal(injected, true);
+  assert.equal(store.snapshot().revision, before.revision);
+  assert.equal(existsSync(join(historyDirectory, before.revision + '.toml')), false,
+    'partial bytes must never occupy the content-addressed backup filename');
+  assert.equal(store.save({ expectedRevision: before.revision, updates: { grok_model: 'next' } }).fields.grok_model.value, 'next');
+  assert.equal(readFileSync(join(historyDirectory, before.revision + '.toml'), 'utf8'), raw);
+});
+
+test('history maintenance and restore use the same config lock and cannot race a save', () => {
+  let other;
+  const { store, path, historyDirectory } = setup('grok_model = "before"\n', { fault(stage) {
+    if (stage !== 'before-publish') return;
+    assert.throws(() => other.retainHistory(), { code: 'EEXIST' });
+  } });
+  other = createSharedConfigStore({ path, historyDirectory });
+  store.save({ expectedRevision: store.snapshot().revision, updates: { grok_model: 'after' } });
 });
 
 test('directory targets are rejected', () => {

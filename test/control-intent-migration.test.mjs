@@ -38,7 +38,7 @@ const sourceMarker = (raw, operationId) => ({ format: LEGACY_FORMAT, schemaVersi
   routeChanged: false, historicReleasePreserved: true });
 
 function fixture(t, { raw = encode(legacyIntent()), source = true } = {}) {
-  const root = mkdtempSync(join(tmpdir(), 'dsh-control-migration-test-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-control-migration-test-'));
   const directory = join(root, 'control');
   const legacyPath = join(root, 'legacy-control.json');
   if (source) writeFileSync(legacyPath, raw, { flag: 'wx' });

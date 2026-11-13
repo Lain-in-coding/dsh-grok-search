@@ -1,3 +1,13 @@
+// Browser ESM entry; the historical filename is used by preview fingerprints.
+import { createSettingsCodec as codec } from './core/settings-codec.mjs';
+import { createSourceChain } from './core/source-chain.mjs';
+import { createRouteController as ROUTE_CONTROLLER } from './ui/route-controller.mjs';
+import { createSearchLogView as SEARCH_LOG } from './ui/search-log-view.mjs';
+import { createQuotaView as QUOTA_VIEW } from './ui/quota-view.mjs';
+import { createToolRouteView as TOOL_ROUTE_VIEW } from './ui/tool-route-view.mjs';
+import { attachSharedStyles } from './ui/shared-styles.mjs';
+import { LOGOS, TOOL_ROUTE_CSS, ROUTE_CSS, ROUTE_CARD, ROUTE_LAYER, SETTINGS_DESCRIPTORS } from 'dsh:client-data';
+
 window.__ModuleLoader__.load({
   id: 'dsh-grok-search',
   factory: require => {
@@ -6,17 +16,8 @@ window.__ModuleLoader__.load({
     const { useEffect, useRef } = React;
     const NS = 'plugins.dshGrokSearch';
     const inject = ['slots', 'locale', 'remote'];
-    const LOGOS = __LOGOS__;
-    const SOURCE_CHAIN = (__SOURCE_CHAIN_FACTORY__)();
-    const ROUTE_CONTROLLER = (__ROUTE_CONTROLLER_FACTORY__);
-    const SEARCH_LOG = (__SEARCH_LOG_FACTORY__);
-    const QUOTA_VIEW = (__QUOTA_FACTORY__);
-    const TOOL_ROUTE_VIEW = (__TOOL_ROUTE_FACTORY__);
-    const ROUTE_CSS = __ROUTE_CSS__;
-    const ROUTE_CARD = __ROUTE_CARD__;
-    const ROUTE_LAYER = __ROUTE_LAYER__;
-    const codec = __CODEC_FACTORY__;
-    const descriptors = __SETTINGS_DESCRIPTORS__.map(descriptor => ({
+    const SOURCE_CHAIN = createSourceChain();
+    const descriptors = SETTINGS_DESCRIPTORS.map(descriptor => ({
       ...descriptor,
       parameters: descriptor.parameters.map(parameter => ({
         ...parameter, codec: codec(parameter.codec.typeSymbol, parameter.codec.jsonSchema),
@@ -45,7 +46,7 @@ window.__ModuleLoader__.load({
           [role=tooltip]::before{content:"";position:absolute;bottom:100%;left:0;right:0;height:8px}
           .project:not([data-dismissed]):is(:hover,:focus-within) [role=tooltip]{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,0)}
           @media(prefers-reduced-motion:reduce){img,[role=tooltip]{transition:none}}
-        </style><span class="project"><a href="https://github.com/Lain-in-coding/dsh-grok-search" target="_blank" rel="noopener noreferrer" aria-label="打开 dsh-grok-search 的 GitHub 项目首页（新窗口）" aria-describedby="project-tip"><img alt="" aria-hidden="true" width="16" height="16" draggable="false"></a><span id="project-tip" role="tooltip">用着还行？给个star</span></span>`;
+        </style><span class="project"><a href="https://github.com/Lain-in-coding/dsh-grok-search" target="_blank" rel="noopener noreferrer" aria-label="打开 dsh-grok-search 的 GitHub 项目首页（新窗口）" aria-describedby="project-tip"><img alt="" aria-hidden="true" width="16" height="16" draggable="false"></a><span id="project-tip" role="tooltip">用着还行？给个 star</span></span>`;
         const root = shadow.querySelector('.project');
         const image = shadow.querySelector('img');
         const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
@@ -110,7 +111,8 @@ window.__ModuleLoader__.load({
         // StrictMode can set up the same element twice. Reuse its ShadowRoot
         // and remove every contribution made by the previous mount.
         const shadow = element.current.shadowRoot || element.current.attachShadow({ mode: 'open' });
-        shadow.innerHTML = `<style>${ROUTE_CSS}</style><div class="dsg-surface dsg-root"><div class="route-scroll">${ROUTE_CARD}</div></div>`;
+        shadow.innerHTML = `<div class="dsg-surface dsg-root"><div class="route-scroll">${ROUTE_CARD}</div></div>`;
+        const detachMainStyle = attachSharedStyles(shadow, ROUTE_CSS);
         const root = shadow.querySelector('.dsg-root');
         const layerHost = document.createElement('div');
         layerHost.dataset.dsgLayer = '1';
@@ -119,7 +121,8 @@ window.__ModuleLoader__.load({
           zIndex: '2147483000', pointerEvents: 'none',
         });
         const layerShadow = layerHost.attachShadow({ mode: 'open' });
-        layerShadow.innerHTML = `<style>${ROUTE_CSS}</style><div class="dsg-surface dsg-layer">${ROUTE_LAYER}</div>`;
+        layerShadow.innerHTML = `<div class="dsg-surface dsg-layer">${ROUTE_LAYER}</div>`;
+        const detachLayerStyle = attachSharedStyles(layerShadow, ROUTE_CSS);
         document.body.appendChild(layerHost);
         const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
         const currentTheme = () => theme?.current === null || theme?.current === undefined ? systemTheme.matches : theme.current;
@@ -138,6 +141,8 @@ window.__ModuleLoader__.load({
           theme?.listeners.delete(updateTheme);
           systemTheme.removeEventListener('change', updateTheme);
           controller.dispose();
+          detachMainStyle();
+          detachLayerStyle();
           layerHost.remove();
           shadow.replaceChildren();
         };
@@ -156,6 +161,14 @@ window.__ModuleLoader__.load({
 
     async function apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, { zh: text, en: text }), 'dsh-grok-search: locale');
+      ctx.effect(() => {
+        if (typeof document === 'undefined') return () => {};
+        const style = document.createElement('style');
+        style.dataset.dsgChatStyle = '1';
+        style.textContent = TOOL_ROUTE_CSS;
+        document.head.appendChild(style);
+        return () => style.remove();
+      }, 'dsh-grok-search: chat card styles');
       const unmountRemote = await ctx.remote.$mount({ package: 'dsh-grok-search', descriptors });
       const theme = { current: null, listeners: new Set() };
       const themeView = ctx.inject(['theme'], themeCtx => {
@@ -199,7 +212,7 @@ window.__ModuleLoader__.load({
             // extension's injected props, stores or child-slot authority.
             if (!entry || entry.inject || entry.store || entry.children || entry.select) return;
             wrapper = TOOL_ROUTE_VIEW({ React, jsx, remote: remoteAdapter(settingsCtx.remote),
-              Original: entry.component }).Component;
+              Original: entry.component, logos: LOGOS, theme }).Component;
             remove = settingsCtx.slots.register({
               name: 'tool.call.toolview', key: 'web_search', locale: entry.locale,
               priority: (entry.options.priority ?? 0) - 1,
@@ -225,6 +238,10 @@ window.__ModuleLoader__.load({
         await unmountRemote();
       };
     }
-    return { NS, inject, apply, __test: Object.freeze({ descriptors, remoteAdapter, sourceChain: SOURCE_CHAIN, toolRouteView: TOOL_ROUTE_VIEW }) };
+    return { NS, inject, apply, __test: Object.freeze({
+      descriptors, remoteAdapter, sourceChain: SOURCE_CHAIN, toolRouteView: TOOL_ROUTE_VIEW,
+      routeController: ROUTE_CONTROLLER, searchLogView: SEARCH_LOG, quotaView: QUOTA_VIEW,
+      LOGOS, TOOL_ROUTE_CSS, ROUTE_CSS, ROUTE_CARD, ROUTE_LAYER,
+    }) };
   },
 });

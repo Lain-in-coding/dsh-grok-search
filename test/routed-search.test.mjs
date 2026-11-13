@@ -41,6 +41,23 @@ test('Grok success is recorded as served by grok', async () => {
   assert.deepEqual(barrier.snapshot().activeOperationIds, []);
 });
 
+test('a trusted settings snapshot reuses one configuration observation without caching dispatch data', async () => {
+  let reads = 0;
+  const captured = { snapshot: { path: '/example/config.toml' }, effective: { grok_model: { value: 'first' } } };
+  const { routed } = harness({ getConfig: () => { reads++; return captured; },
+    grok: async () => ({ sources: [{ url: 'https://result.test' }] }) });
+  try {
+    await routed.search({ query: 'first' });
+    const before = reads;
+    assert.equal(routed.routeSnapshot(captured).served, 'grok');
+    assert.equal(reads, before, 'display reuses the local capture');
+    const newer = { ...captured, effective: { grok_model: { value: 'second' } } };
+    assert.equal(routed.routeSnapshot(newer), null, 'a changed captured configuration expires old success');
+    await routed.search({ query: 'second' });
+    assert.equal(reads, before + 1, 'actual dispatch still makes a fresh observation');
+  } finally { await routed.dispose(); }
+});
+
 test('primary references lost to the output budget use the configured fallback and record its actual route', async () => {
   const { routed, calls } = harness({
     getConfig: () => ({ response_max_chars: 100 }),
@@ -163,19 +180,49 @@ test('bounded tool output retains non-enumerable source routing metadata for the
   await routed.dispose();
 });
 
-test('sources-only uses the same one-running eight-queued limit', async () => {
+test('sources-only keeps one running and sixteen waiting requests with explicit overload', async () => {
   let resolve, running = 0, peak = 0, count = 0;
   const gate = new Promise(done => { resolve = done; });
   const { routed } = harness({ prefs: { grokEnabled: false },
     sources: { search: async () => { running++; peak = Math.max(peak, running); count++; await gate; running--; return sourceResult('exa'); } } });
-  const tasks = Array.from({ length: 9 }, (_, i) => routed.search({ query: String(i) }));
-  await new Promise(done => setImmediate(done));
-  assert.equal(count, 1);
-  assert.equal(routed.snapshot().queued, 8);
-  await assert.rejects(routed.search({ query: 'overflow' }), { code: 'GROK_QUEUE_FULL' });
-  resolve(); await Promise.all(tasks);
+  const tasks = Array.from({ length: 17 }, (_, i) => routed.search({ query: String(i) }));
+  const settled = Promise.allSettled(tasks);
+  try {
+    await new Promise(done => setImmediate(done));
+    assert.equal(count, 1);
+    assert.equal(routed.snapshot().queued, 16);
+    await assert.rejects(routed.search({ query: 'overflow' }), { code: 'GROK_QUEUE_FULL' });
+  } finally { resolve(); await settled; await routed.dispose(); }
+  assert.equal((await settled).every(row => row.status === 'fulfilled'), true);
   assert.equal(peak, 1);
-  await routed.dispose();
+});
+
+test('ten host queries fit beside an in-flight request without parallel provider dispatch', async () => {
+  let release, running = 0, peak = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const seen = [];
+  const { routed } = harness({ prefs: { grokEnabled: false }, sources: {
+    search: async ({ query, maxResults }) => {
+      seen.push({ query, maxResults }); peak = Math.max(peak, ++running);
+      try { await gate; return sourceResult('tavily'); }
+      finally { running--; }
+    },
+  } });
+  const pending = [routed.search({ query: 'existing', maxResults: 10 }),
+    ...Array.from({ length: 10 }, (_, index) => routed.search({ query: `batch-${index}`, maxResults: 10 }))];
+  const settled = Promise.allSettled(pending);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(routed.snapshot().running, 1);
+    assert.equal(routed.snapshot().queued, 10);
+  } finally { release(); }
+  const results = await settled;
+  try {
+    assert.equal(results.every(row => row.status === 'fulfilled'), true);
+    assert.equal(peak, 1);
+    assert.equal(seen.length, 11);
+    assert.equal(seen.every(row => row.maxResults === 10), true);
+  } finally { await routed.dispose(); }
 });
 
 test('stop aborts in-flight sources and rejects queued requests before barrier drain', async () => {

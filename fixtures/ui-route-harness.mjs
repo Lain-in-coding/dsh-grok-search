@@ -17,13 +17,13 @@ const mapping = {
 };
 const secrets = ['grok_api_key', 'openai_compatible_api_key', 'tavily_api_key', 'exa_api_key', 'tinyfish_api_key', 'firecrawl_api_key', 'github_token'];
 let content = {}, environment = {}, history = {}, currentRevision = 'missing', revisionNumber = 0, environmentRevision = 0, exists = false;
-let prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true, sourceOrder: [...sourceNames],
+let prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true, githubReadEnabled: false, sourceOrder: [...sourceNames],
   sourceEnabled: Object.fromEntries(sourceNames.map(id => [id, true])) }, revision: 'missing' };
 let control, program, capabilities, route = null, configError = null, delay = 0, nextSaveError = null, nextPreferenceError = null;
 let diagnostics = {}, calls = [], themeListener = null, theme = 'light', fiberErrors = [], revealDelay = 0, openError = null, openResult = null;
 let logRecords = [], logError = null, quotaReplies = {}, quotaError = false, quotaDelay = 0, quotaIgnoreCancellation = false;
 let snapshotError = null, snapshotDelay = 0, logDelay = 0;
-let nextRepairError = null;
+let nextRepairError = null, nextGithubError = null, pendingRelease = false, releaseError = null;
 const cancelledOperations = new Set(), activeDiagnostics = new Map();
 let counters = { added: 0, removed: 0 };
 const failure = (code, message) => ({ ok: false, error: { code, message, details: {} } });
@@ -49,6 +49,16 @@ function snapshot() {
 }
 const settings = new Proxy({}, { get: (_, method) => async request => {
   calls.push({ method, request: clone(request) });
+  if (method === 'retryControlRelease') {
+    if (delay) await new Promise(done => setTimeout(done, delay));
+    if (pendingRelease && releaseError) return failure(releaseError, 'Synthetic release retry failed.');
+    if (pendingRelease) {
+      pendingRelease = false;
+      control = { ...control, phase: 'released', policy: 'released', routeVerified: true,
+        completionCommitted: true, error: null };
+    }
+    return { ok: true, value: snapshot() };
+  }
   if (method === 'snapshot' && (snapshotError || snapshotDelay)) {
     const reply = snapshotError ? failure(snapshotError, 'Synthetic snapshot rejection') : { ok: true, value: snapshot() };
     if (snapshotDelay) await new Promise(done => setTimeout(done, snapshotDelay));
@@ -84,7 +94,7 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
         details: typeof error === 'object' ? error : {} } }
       : { ok: true, value: { value: value ?? null, supported: request.provider !== 'exa' } };
   }
-  if (method === 'diagnoseProvider') {
+  if (method === 'diagnoseProvider' || method === 'previewGithubConnection') {
     const operationId = request.operationId;
     if (cancelledOperations.has(operationId)) return failure('SETTINGS_DIAGNOSIS_CANCELLED', '测试已取消。');
     if (delay) await new Promise(done => {
@@ -96,6 +106,7 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
   }
   else if (delay) await new Promise(done => setTimeout(done, delay));
   if (method === 'snapshot') return { ok: true, value: snapshot() };
+  if (method === 'openSearchLog') return { ok: true, value: { sessionId: 'view:' + crypto.randomUUID() } };
   if (method === 'readSearchLog') return logError ? failure(logError, 'Synthetic log read failure')
     : { ok: true, value: { records: clone(logRecords) } };
   if (method === 'clearSearchLog') { logRecords = []; return { ok: true, value: { records: [] } }; }
@@ -134,7 +145,7 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
       return failure(error, '开关保存失败。');
     }
     if (request.expectedRevision !== prefs.revision) return failure('PREFERENCES_CONFLICT', '其他窗口已修改。');
-    prefs = { value: clone(request.value), revision: revision() };
+    prefs = { value: { ...clone(request.value), githubReadEnabled: request.value.githubReadEnabled ?? prefs.value.githubReadEnabled }, revision: revision() };
     if (nextPreferenceError) {
       nextPreferenceError = null;
       return failure('PREFERENCES_COMMIT_UNCERTAIN', '开关已保存，但回读未完成。');
@@ -157,8 +168,14 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
     program.program ||= { path: '/isolated/cache/grok-search-rs', version: '0.1.26', source: 'private-cache' };
     return { ok: true, value: clone(program) };
   }
-  if (method === 'diagnoseProvider') {
-    const id = request.provider, key = id === 'github' ? 'github_token' : id + '_api_key';
+  if (method === 'diagnoseProvider' || method === 'previewGithubConnection') {
+    const id = method === 'previewGithubConnection' ? 'github' : request.provider, key = id === 'github' ? 'github_token' : id + '_api_key';
+    if (method === 'previewGithubConnection' && nextGithubError) {
+      const code = nextGithubError; nextGithubError = null;
+      return failure(code, 'Synthetic GitHub preview rejection');
+    }
+    if (id === 'github' && method !== 'previewGithubConnection' && !prefs.value.githubReadEnabled) return { ok: true,
+      value: { provider: id, status: 'disabled', code: 'DISABLED', message: '未启用读取', keys: [] } };
     const count = configSnapshot().fields[key]?.keyCount || 1;
     const configured = id === 'github' || configSnapshot().fields[key]?.configured;
     const codes = diagnostics[id] || Array(count).fill('OK');
@@ -253,8 +270,8 @@ function reset(state = 'returning') {
   exists = state !== 'fresh'; route = null; configError = null; diagnostics = {}; calls = []; delay = 0; nextSaveError = null; nextPreferenceError = null;
   quotaDelay = 0; quotaIgnoreCancellation = false; quotaError = false; quotaReplies = {}; logError = null; revealDelay = 0; openError = null; openResult = null;
   snapshotError = null; snapshotDelay = 0; logDelay = 0;
-  nextRepairError = null;
-  prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true,
+  nextRepairError = null; nextGithubError = null; pendingRelease = false; releaseError = null;
+  prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true, githubReadEnabled: state !== 'fresh',
     sourceOrder: [...sourceNames], sourceEnabled: Object.fromEntries(sourceNames.map(id => [id, true])) }, revision: 'missing' };
   control = { available: true, phase: 'required', policy: 'required', routeVerified: true, completionCommitted: false };
   program = { phase: 'ready', program: { path: '/isolated/bin/grok-search-rs', version: '0.1.26', source: 'npm' },
@@ -262,6 +279,10 @@ function reset(state = 'returning') {
   capabilities = { secretsAllowed: true, transport: 'loopback', reason: null };
   if (state === 'backup') { delete content.grok_api_key; }
   if (state === 'off') { control = { ...control, phase: 'released', policy: 'released', completionCommitted: true }; }
+  if (state === 'stop-failed' || state === 'control-failed') {
+    pendingRelease = state === 'stop-failed';
+    control = { ...control, phase: 'incomplete', error: { code: 'CONTROL_ROUTE_COUNTER_REQUIRED', message: 'Synthetic failure.' } };
+  }
   if (state === 'fallback' || state === 'allfail') {
     route = { at: Date.now(), origin: 'search', outcome: state === 'allfail' ? 'failed' : 'ok',
       served: state === 'allfail' ? null : 'exa', grokCode: 'grok_auth_error', fallbackUsed: state !== 'allfail',
@@ -282,12 +303,15 @@ window.harness = {
     environment = clone(updates);
   },
   configure(options) {
+    if (options.preferences) { Object.assign(prefs.value, options.preferences); prefs.revision = revision(); }
     if (options.logs) logRecords = clone(options.logs);
     if (options.logError !== undefined) logError = options.logError;
     if (options.snapshotError !== undefined) snapshotError = options.snapshotError;
     if (options.snapshotDelay !== undefined) snapshotDelay = options.snapshotDelay;
     if (options.logDelay !== undefined) logDelay = options.logDelay;
     if (options.nextRepairError !== undefined) nextRepairError = options.nextRepairError;
+    if (options.nextGithubError !== undefined) nextGithubError = options.nextGithubError;
+    if (options.releaseError !== undefined) releaseError = options.releaseError;
     if (options.quotas) quotaReplies = clone(options.quotas);
     if (options.quotaError !== undefined) quotaError = options.quotaError;
     if (options.quotaDelay !== undefined) quotaDelay = options.quotaDelay;

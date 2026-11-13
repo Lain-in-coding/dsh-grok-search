@@ -12,22 +12,30 @@ import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson }
 import { createSharedConfigStore, resolveSharedConfigPath, CONFIG_FIELDS } from '../src/core/shared-config.mjs';
 import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { findExistingGrok } from '../src/core/program-discovery.mjs';
+import { followStreamingSearchCard } from './lib/browser-gates.mjs';
 
 // Opt-in live services, no live key ever enters arguments, screenshots or files.
 const live = process.argv.includes('--allow-live');
 const liveSmoke = process.argv.includes('--live-smoke');
 const editable = process.argv.includes('--editable-config');
-const args = process.argv.slice(2).filter(value => !['--allow-live', '--editable-config', '--live-smoke'].includes(value));
+const githubRead = process.argv.includes('--github-read');
+const clientBaseline = process.argv.includes('--frozen-client-baseline');
+const args = process.argv.slice(2).filter(value => !['--allow-live', '--editable-config', '--live-smoke', '--github-read','--frozen-client-baseline'].includes(value));
+if(clientBaseline&&live)throw new Error('A client performance baseline may only use synthetic services.');
 if (args.length < 2 || live && editable || liveSmoke && !live) throw new Error('Usage: node scripts/verify-search-log-desktop.mjs [--allow-live [--live-smoke] | --editable-config] <tgz> <official-executables...>');
 const tarball = resolve(args[0]), runtimes = args.slice(1).map(candidateRuntime);
 const packageReceipt = JSON.parse(readFileSync(join(dirname(tarball), 'package-receipt.json'), 'utf8'));
 assert.equal(sha256(tarball), packageReceipt.sha256);
-for (const row of packageReceipt.sourceHashes) assert.equal(sha256(join(project, row.file)), row.sha256);
+for (const row of packageReceipt.sourceHashes) {
+  if(clientBaseline&&['src/client.js','README.md'].includes(row.file))continue;
+  assert.equal(sha256(join(project, row.file)), row.sha256);
+}
 const run = freshRun(live ? 'search-log-desktop-live' : 'search-log-desktop');
 const temporary = join(realpathSync(tmpdir()), 'dsh-deferred-desktop-search-log-' + run.runId);
 const sourceFiles = [...packageReceipt.sourceHashes.map(row => row.file),
   'scripts/verify-search-log-desktop.mjs', 'scripts/deferred-release-desktop-prepare.mjs',
-  'fixtures/deferred-release/desktop-fixture.mjs', 'scripts/lib/renderer-cdp.mjs'];
+  'fixtures/deferred-release/desktop-fixture.mjs', 'fixtures/deferred-release/github-api-fixture.mjs',
+  'fixtures/internal-candidate/host-fixture.mjs', 'scripts/lib/renderer-cdp.mjs', 'scripts/lib/browser-gates.mjs'];
 const sourceHashes = sourceFiles.map(file => ({ file, sha256: sha256(join(project, file)) }));
 const secrets = new Set(), results = [], exits = [];
 const safeCode = error => /^[\w.-]{1,80}$/.test(error?.code ?? '') ? error.code : 'DESKTOP_VALIDATION_FAILED';
@@ -82,7 +90,10 @@ const q = selector => `(() => [document.querySelector('[data-dsg-route]')?.shado
 const dom = (renderer, expression) => renderer.evaluate(expression);
 const click = (renderer, selector) => dom(renderer, `(() => { const element=${q(selector)};
   if(!element || element.disabled) return false; element.click(); return true; })()`);
-const until = (renderer, expression, timeoutMs = 30_000) => waitForRenderer(renderer, current => current.evaluate(expression), { timeoutMs });
+const until = async (renderer, expression, timeoutMs = 30_000) => {
+  try { return await waitForRenderer(renderer, current => current.evaluate(expression), { timeoutMs }); }
+  catch (failure) { throw new Error(failure.message + ' Predicate: ' + expression, { cause: failure }); }
+};
 const inside = path => {
   const rel = relative(temporary, resolve(path));
   assert.ok(rel && !rel.startsWith('..') && !isAbsolute(rel), 'new run path only');
@@ -138,7 +149,7 @@ async function modelTurn(host, mode) {
     const after = await probe(host, 'snapshot');
     const events = after.sessionEvents.slice(before.sessionEvents.length).filter(row => row.sessionId === host.modelSession);
     const final = events.findLast(row => row.type === 'assistant/message'
-      && row.data.message.content.some(block => block.type === 'text' && block.text === '内部候选轮次完成'));
+      && row.data.message.content.some(block => block.type === 'text' && block.text.endsWith('内部候选轮次完成')));
     const ended = final && events.find(row => row.type === 'turn/end'
       && row.data.turn === final.data.turn && row.data.reason?.kind === 'completed');
     const tool = final && events.findLast(row => row.type === 'tool/result' && row.data.turn === final.data.turn);
@@ -147,6 +158,8 @@ async function modelTurn(host, mode) {
       sessionId: host.modelSession, callId: tool?.data.message.toolCallId ?? null,
       originalDelta: after.calls.original - before.calls.original,
       fetchDelta: after.calls.fetch - before.calls.fetch,
+      ...(mode.startsWith('github') ? { githubDelta: (after.calls.github ?? 0) - (before.calls.github ?? 0),
+        text: tool?.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') } : {}),
     };
     await new Promise(done => setTimeout(done, 150));
   }
@@ -195,7 +208,7 @@ try {
     assert.equal(extract.exitCode, 0, 'isolated candidate extraction must succeed');
     const product = inside(join(control.profile, 'node_modules/dsh-grok-search'));
     renameSync(inside(join(extraction, 'package')), product);
-    for (const row of packageReceipt.files) assert.equal(sha256(join(product, row.path)), sha256(join(project, row.path)));
+    for (const row of packageReceipt.sourceHashes) assert.equal(sha256(join(product, row.file)), row.sha256);
     mkdirSync(join(product, 'node_modules'));
     for (const name of readdirSync(join(project, 'node_modules'))) {
       if (name.startsWith('.') || name === '@deepseek-ai') continue;
@@ -244,6 +257,7 @@ try {
       DSH_DESKTOP_FIXTURE_TOKEN: control.token, DSH_DESKTOP_FIXTURE_ADDRESS_FILE: addressPath,
       DSH_DESKTOP_OPEN_DEVTOOLS: '0', DSH_B2_CONTROL_RECORD: '1', DSH_B2_PRODUCT_COUNTER: '1',
       DSH_DESKTOP_OFFLINE_SENTINEL: 'offline-test-sentinel-not-a-real-key',
+      ...(githubRead ? { DSH_GITHUB_READ_FIXTURE: '1' } : {}),
       DSH_PRODUCT_ANALYTICS_OTLP_URL: 'http://127.0.0.1:9', GROK_SEARCH_CONFIG: configPath, ...envFields,
     });
     const child = spawn(control.electron, [...(process.platform === 'win32' ? [runtime.archivePath] : []), '--user-data-dir=' + control.userData,
@@ -290,7 +304,7 @@ try {
     await until(renderer, `${q('#routeCard')} && ${q('#routeCard')}.dataset.s!=='load'`);
     check('official plugin detail mounts production Shadow DOM', await dom(renderer,
       `Boolean(document.querySelector('[data-plugin-detail="dsh-grok-search"]') && ${q('#logCard')} && !document.querySelector('#logCard'))`));
-    check('same packaged client', sha256(join(product, 'src/client.js')), sha256(join(project, 'src/client.js')));
+    check('same packaged client', sha256(join(product, 'src/client.js')), packageReceipt.sourceHashes.find(row=>row.file==='src/client.js').sha256);
     const projectLink = `document.querySelector('[data-dsg-project]')?.shadowRoot?.querySelector('a')`;
     await until(renderer, `Boolean(${projectLink}?.querySelector('img')?.complete)`);
     check('project GitHub badge is in the native title row', await dom(renderer, `(() => {
@@ -303,7 +317,7 @@ try {
       return link.href==='https://github.com/Lain-in-coding/dsh-grok-search'
         && link.target==='_blank' && link.rel==='noopener noreferrer'
         && link.getAttribute('aria-label')==='打开 dsh-grok-search 的 GitHub 项目首页（新窗口）'
-        && link.getRootNode().querySelector('[role=tooltip]').textContent==='用着还行？给个star';
+        && link.getRootNode().querySelector('[role=tooltip]').textContent==='用着还行？给个 star';
     })()`));
     check('project badge is 16px with a 24px target', await dom(renderer, `(() => {
       const link=${projectLink}, icon=link.querySelector('img');
@@ -435,34 +449,160 @@ try {
     await dom(renderer, `${chatRow}.click()`);
     await until(renderer, `!document.querySelector('[data-dsg-route]')`);
     const attributedCard = `document.querySelector('[data-dsg-search-card="${sessionSearch.callId}"]')`;
-    await until(renderer, `${attributedCard}?.querySelector('.dsg-tool-attribution')?.textContent.includes('Tavily')`);
-    check('chat shows plugin and actual provider', await dom(renderer,
-      `${attributedCard}.querySelector('.dsg-tool-attribution').textContent`), '由 dsh-grok-search 执行 · Tavily');
-    check('original host search result still rendered', await dom(renderer,
-      `!!${attributedCard}.querySelector('[data-tool="web_search"]')`));
+    await until(renderer, `!!${attributedCard}`);
     await dom(renderer, `(() => {
-      for (const button of document.querySelectorAll('button')) {
+      for (const button of document.querySelectorAll('button,[role=button]')) {
         if (/已完成.*用时/.test(button.textContent || '') && button.getAttribute('aria-expanded') !== 'true') button.click();
       }
     })()`);
     await dom(renderer, `(() => {
+      for(const button of document.querySelectorAll('button[data-process-activity][aria-expanded=false]'))button.click();
+    })()`);
+    await until(renderer, `${attributedCard}.getBoundingClientRect().height>0`);
+    await dom(renderer, `${attributedCard}.scrollIntoView({ block: 'center' })`);
+    await until(renderer, `${attributedCard}?.querySelector('.card-name')?.textContent==='dsh-grok-search'`);
+    check('chat shows plugin title and actual provider', await dom(renderer,
+      `${attributedCard}.querySelector('.card-name').textContent==='dsh-grok-search'
+        && ${attributedCard}.querySelector('.provider-steps').textContent.includes('Tavily')`));
+    check('host search references retained in the enhanced card', await dom(renderer,
+      `${attributedCard}.querySelectorAll('.source-row[href^="https://example.test/"]').length>0`));
+    await dom(renderer, `(() => {
       for (const button of document.querySelectorAll('button,[role=button]')) {
-        if ((button.textContent || '').trim() === '已搜索网页' && button.getAttribute('aria-expanded') !== 'true') button.click();
+        if (button.matches('.dsg-chat .card-toggle') && button.getAttribute('aria-expanded') !== 'true') button.click();
       }
     })()`);
     await until(renderer, `(() => {
-      const element = ${attributedCard}?.querySelector('.dsg-tool-attribution');
+      const element = ${attributedCard}?.querySelector('.provider-steps');
       return element && element.getBoundingClientRect().height > 0 && element.innerText.includes('Tavily');
     })()`);
-    check('chat attribution is visibly displayed, not hidden in a collapsed tree', await dom(renderer,
-      `${attributedCard}.querySelector('.dsg-tool-attribution').getBoundingClientRect().height>0`));
+    check('chat route is visibly displayed, not hidden in a collapsed tree', await dom(renderer,
+      `${attributedCard}.querySelector('.provider-steps').getBoundingClientRect().height>0`));
+    const detailedTrace = await rpc(renderer,'grokSearchSettings','toolCallTrace',{
+      request:{sessionId:sessionSearch.sessionId,callId:sessionSearch.callId},
+    });
+    check('chat details RPC agrees with the exact provider attempt',detailedTrace.known
+      && detailedTrace.routes[0].calls[0].provider==='tavily'
+      && detailedTrace.routes[0].calls[0].result==='ok'
+      && typeof detailedTrace.routes[0].calls[0].elapsedMs==='number');
+    check('chat preserves native parameter inspector',await dom(renderer,
+      `!!${attributedCard}.querySelector('button.inspect-btn')`));
     await dom(renderer, `${attributedCard}.scrollIntoView({ block: 'center' })`);
     const cardImage = await renderer.send('Page.captureScreenshot', { format: 'png' });
     writeFileSync(join(run.directory, version + '-chat-route.png'), Buffer.from(cardImage.data, 'base64'), { flag: 'wx' });
+    if (!live) {
+      // Measure the actual official chat while the fixture model streams, not
+      // just a static card rendered in a browser. No real credentials/upstreams.
+      await renderer.send('Page.bringToFront');
+      await renderer.send('Performance.enable');
+      await renderer.send('Profiler.enable');
+      await renderer.send('Profiler.start');
+      const metricsBefore=(await renderer.send('Performance.getMetrics')).metrics;
+      await dom(renderer, `(() => {
+        const data=window.__dsgHostPerf={measurements:0,heightAnimations:0,longTasks:[],frames:[],streamFrames:0,mutations:0,visibility:[document.visibilityState]};
+        const onVisibility=()=>data.visibility.push(document.visibilityState);
+        document.addEventListener('visibilitychange',onVisibility);
+        const measure=Element.prototype.getBoundingClientRect,animate=Element.prototype.animate;
+        const taskObserver=new PerformanceObserver(list=>{for(const task of list.getEntries())data.longTasks.push(Math.round(task.duration));});
+        taskObserver.observe({type:'longtask'});
+        const changes=new MutationObserver(list=>{data.mutations+=list.length;});
+        changes.observe(document.body,{subtree:true,childList:true,characterData:true});
+        Element.prototype.getBoundingClientRect=function(...args){
+          if(this.classList?.contains('card-body')&&this.closest('.dsg-chat'))data.measurements++;
+          return Reflect.apply(measure,this,args);
+        };
+        Element.prototype.animate=function(...args){
+          if((this.classList?.contains('card-body')||this.classList?.contains('fold-inner'))&&this.closest('.dsg-chat'))data.heightAnimations++;
+          return Reflect.apply(animate,this,args);
+        };
+        const streaming={initialCallIds:new Set([...document.querySelectorAll('.dsg-chat')]
+          .map(card=>card.dataset.dsgSearchCard)),card:null,open:false};
+        data.streaming=streaming;
+        const follow=${followStreamingSearchCard.toString()};
+        let previous=null,frame;
+        // Keep tracking through pending->result DOM replacement and host scroll
+        // changes. Visibility of the initial placeholder is not proof that the
+        // final enhanced card is open, so cleanup belongs to data.stop below.
+        const openTimer=setInterval(()=>follow(document,streaming),100);
+        const tick=time=>{if(previous!==null)data.frames.push(time-previous);previous=time;
+          if(streaming.open&&streaming.card?.isConnected&&streaming.card.dataset.visible==='true')data.streamFrames++;
+          frame=requestAnimationFrame(tick);
+        };frame=requestAnimationFrame(tick);
+        data.stop=()=>{cancelAnimationFrame(frame);clearInterval(openTimer);taskObserver.disconnect();changes.disconnect();
+          document.removeEventListener('visibilitychange',onVisibility);
+          Element.prototype.getBoundingClientRect=measure;Element.prototype.animate=animate;};
+      })()`);
+      let streamed, streamFailure;
+      try { streamed=await modelTurn(host,'search stream'); }
+      catch (error) { streamFailure=error; throw error; }
+      finally {
+        try {
+        const profile=(await renderer.send('Profiler.stop')).profile;
+        writeJson(join(run.directory,version+'-chat-cpu-profile.json'),profile);
+        const metricsAfter=(await renderer.send('Performance.getMetrics')).metrics;
+        const durations=Object.fromEntries(['TaskDuration','ScriptDuration','LayoutDuration','RecalcStyleDuration','LayoutCount','RecalcStyleCount']
+          .map(name=>[name,(metricsAfter.find(row=>row.name===name)?.value??0)-(metricsBefore.find(row=>row.name===name)?.value??0)]));
+        const nodes=new Map(profile.nodes.map(node=>[node.id,node.callFrame]));
+        const totals=new Map();
+        for(let index=0;index<(profile.samples?.length??0);index++){
+          const call=nodes.get(profile.samples[index]);
+          const label=`${call?.functionName??''} ${call?.url??''}:${call?.lineNumber??0}`;
+          totals.set(label,(totals.get(label)??0)+(profile.timeDeltas?.[index]??0));
+        }
+        writeJson(join(run.directory,version+'-chat-cpu-summary.json'),{durations,
+          top:[...totals].sort((a,b)=>b[1]-a[1]).slice(0,25).map(([frame,us])=>({frame,ms:Math.round(us/1000)}))});
+        const metrics=await dom(renderer, `(() => {
+          const data=window.__dsgHostPerf;data.stop();
+          const sorted=data.frames.toSorted((a,b)=>a-b);
+          const result={measurements:data.measurements,heightAnimations:data.heightAnimations,longTasks:data.longTasks,
+            frameCount:data.frames.length,frameP95Ms:Math.round((sorted[Math.floor(sorted.length*.95)]??0)*100)/100,
+            maxFrameMs:Math.round((sorted.at(-1)??0)*100)/100,visibleCardFrames:data.streamFrames,domMutations:data.mutations,visibility:data.visibility,
+            observedCallId:data.streaming.card?.dataset.dsgSearchCard??null,observedConnected:data.streaming.card?.isConnected===true,
+            observedVisible:data.streaming.card?.dataset.visible??null,observedOpen:data.streaming.open,
+            observedTitle:data.streaming.card?.querySelector('.card-name')?.textContent??null};
+          delete window.__dsgHostPerf;return result;
+        })()`);
+        writeJson(join(run.directory,version+'-chat-stream-performance.json'),{
+          ...metrics, modelTurnCompleted:streamed?.completed===true,
+          modelFailure:streamFailure?safeError(streamFailure):null,
+        });
+        // A failed RPC never exercised the full streaming case. Keep its real
+        // cause instead of masking it with an assertion about a partial frame.
+        if(!streamFailure){
+          check('streaming official chat renders visible search cards',metrics.visibleCardFrames>30);
+          if(!clientBaseline){
+            check('streaming card performs no synchronous body height reads',metrics.measurements,0);
+            check('content size animation does not restart per model token',metrics.heightAnimations<20);
+          }
+        }
+        } catch (error) {
+          if(!streamFailure)throw error;
+          host.streamDiagnosticFailure=safeError(error);
+        }
+      }
+      check('streamed model turn succeeds without bypassing search',streamed.isError===false&&streamed.originalDelta===0);
+      for(const width of [1366,1000]){
+        await renderer.send('Emulation.setDeviceMetricsOverride',{width,height:925,deviceScaleFactor:1,mobile:false});
+        check('native chat horizontal chain at '+width,await dom(renderer,`[...document.querySelectorAll('.dsg-chat .flow')].every(flow=>{
+          const nodes=[...flow.querySelectorAll('.route-node')].map(node=>node.getBoundingClientRect());
+          return nodes.every(node=>Math.abs(node.top-nodes[0].top)<1);
+        })`));
+      }
+      await renderer.send('Emulation.clearDeviceMetricsOverride');
+    }
     const whileAway = await modelTurn(host, 'search');
     check('search while settings unmounted succeeds', whileAway.isError, false);
-    await until(renderer, `document.querySelector('[data-dsg-search-card="${whileAway.callId}"] .dsg-tool-attribution')
-      ?.textContent.includes('Tavily')`);
+    const awayCard=`document.querySelector('[data-dsg-search-card="${whileAway.callId}"]')`;
+    await until(renderer,`!!${awayCard}`);
+    await dom(renderer,`(()=>{
+      for(const button of document.querySelectorAll('button,[role=button]')){
+        if(/已完成.*用时/.test(button.textContent||'')&&button.getAttribute('aria-expanded')==='false')button.click();
+      }
+    })()`);
+    await dom(renderer,`(()=>{
+      for(const button of document.querySelectorAll('button[data-process-activity][aria-expanded=false]'))button.click();
+    })()`);
+    await dom(renderer,`${awayCard}.scrollIntoView({block:'center'})`);
+    await until(renderer, `${awayCard}?.querySelector('.provider-steps')?.textContent.includes('Tavily')`);
     await dom(renderer, `[...document.querySelectorAll('button')].find(e=>e.getAttribute('aria-label')==='插件').click()`);
     await until(renderer, `!!document.querySelector('button[aria-label="查看 dsh-grok-search"]')`);
     await dom(renderer, `document.querySelector('button[aria-label="查看 dsh-grok-search"]').click()`);
@@ -572,6 +712,10 @@ try {
       await renderer.send('Emulation.setEmulatedMedia', {
         features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
       });
+      // MediaQueryList change is asynchronous and cancels retained playback.
+      // Let that listener settle before starting the first static replay.
+      await until(renderer, `matchMedia('(prefers-reduced-motion: reduce)').matches
+        && ${q('#historyBar')}.hidden && ${q('#historyStage')}.hidden`);
       for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
         mode = 'mcp-' + provider;
         const call = await modelTurn(host, 'search');
@@ -587,7 +731,7 @@ try {
         check(provider + ' supplier attribution is not a fabricated bill', row?.calls.find(item => item.provider === provider)?.charge?.basis, 'unknown');
         await until(renderer, `${q('.log-entry')}?.dataset.parentId === ${JSON.stringify(history.records[0].id)}`);
         check(provider + ' log has official supplier logo', await dom(renderer, `!!${q('.log-entry .lnode[data-node=' + provider + '] img')}`));
-        await click(renderer, '.log-entry [data-log-replay]');
+        check(provider + ' internal fallback replay starts', await click(renderer, '.log-entry [data-log-replay]'));
         await until(renderer, `${q('#historyStage [data-history-node=' + provider + ']')}?.dataset.hs === 'back'`);
         check(provider + ' desktop replay has no anonymous fallback node', await dom(renderer, `!${q('#historyStage [data-history-node=unknown]')}`));
         if (provider === 'tavily' || provider === 'firecrawl') {
@@ -694,6 +838,35 @@ try {
       check('search after restart remains functional without original fallback', !afterRestart.isError && afterRestart.originalDelta === 0);
       check('restarted renderer has no exception', nextRenderer.exceptions.length, 0);
     }
+    if (githubRead) {
+      const activeHost = owned, activeRenderer = activeHost.renderer;
+      const initial = await rpc(activeRenderer, 'grokSearchSettings', 'preferences');
+      check('GitHub read is off after upgrading old preferences', initial.value.githubReadEnabled, false);
+      const saved = await rpc(activeRenderer, 'grokSearchSettings', 'savePreferences', { request: {
+        expectedRevision: initial.revision, value: { ...initial.value, githubReadEnabled: true },
+      } });
+      const url = 'https://github.com/dsh-fixture/discussion/issues/7';
+      const first = await modelTurn(activeHost, 'github ' + JSON.stringify({ url }));
+      check('actual Session discovers and invokes GitHub tool', !first.isError && first.githubDelta >= 3 && first.fetchDelta === 0);
+      const cursor = /cursor="([^"]+)"/.exec(first.text)?.[1];
+      check('actual Session receives a continuation cursor', !!cursor);
+      const second = await modelTurn(activeHost, 'github ' + JSON.stringify({ url, cursor }));
+      check('same real Agent can continue across turns', !second.isError && second.githubDelta === 1 && /分段 2/.test(second.text));
+      const log = await rpc(activeRenderer, 'grokSearchSettings', 'readSearchLog', { request: { sessionId: randomUUID() } });
+      const rows = log.records.filter(row => row.recordType === 'github');
+      check('two tool calls produce exactly two GitHub records', rows.length, 2);
+      check('continuation record identifies its cached segment', rows[0].segment === 2 && rows[0].cacheHit);
+      check('GitHub logs contain no original discussion text', !JSON.stringify(rows).includes('fixture-answer-'));
+      const fetched = await modelTurn(activeHost, 'github-fetch ' + JSON.stringify({ url }));
+      check('actual Session official fetch is diverted without original fetch', !fetched.isError && fetched.githubDelta >= 3 && fetched.fetchDelta === 0);
+      await rpc(activeRenderer, 'grokSearchSettings', 'savePreferences', { request: {
+        expectedRevision: saved.revision, value: { ...saved.value, githubReadEnabled: false },
+      } });
+      const disabled = await modelTurn(activeHost, 'github ' + JSON.stringify({ url, cursor }));
+      check('disabled GitHub tool cannot continue', disabled.isError && disabled.githubDelta === 0);
+      const restored = await modelTurn(activeHost, 'github-fetch ' + JSON.stringify({ url }));
+      check('disabled GitHub restores author fetch', !restored.isError && restored.githubDelta === 0 && restored.fetchDelta === 1);
+    }
     check('no renderer exception', renderer.exceptions.length, 0);
     results.push({ version, passed: true, checks, live, editableConfig: editable, officialCounterScope: 'isolated-provider-fixture-not-production',
       desktopRenderer: true, packagedStartup: process.platform === 'darwin', dependenciesInstalled: false });
@@ -713,13 +886,22 @@ try {
         motionReduced:matchMedia('(prefers-reduced-motion: reduce)').matches,
         visibility:document.visibilityState,
         historyPhase:${q('#historyPhase')}?.textContent,
+        historyBarPhase:${q('#historyBar')}?.dataset.phase,
+        logAnnouncer:${q('#logAnnouncer')}?.textContent,
+        lastCheck: ${JSON.stringify(owned.checks?.at(-1)?.name ?? null)},
         historyStageHidden:${q('#historyStage')}?.hidden,
         historyPackets:${q('#historyStage')}?.querySelectorAll('.packet').length,
         sidebarRows:[...document.querySelectorAll('[data-row-key]')].map(e=>({key:e.dataset.rowKey,expanded:e.getAttribute('aria-expanded')})),
         attributionRows:[...document.querySelectorAll('.dsg-tool-attribution')].map(e=>e.textContent),
         chatCardMarkup:document.querySelector('[data-dsg-search-card]')?.outerHTML.slice(0,5000),
+        chatAncestors:(()=>{const rows=[];let e=document.querySelector('[data-dsg-search-card]');
+          while(e&&rows.length<8){const r=e.getBoundingClientRect();rows.push({tag:e.tagName,class:e.className,
+            height:r.height,display:getComputedStyle(e).display,visibility:getComputedStyle(e).visibility});e=e.parentElement;}return rows;})(),
+        buttons:[...document.querySelectorAll('button,[role=button]')].filter(e=>e.hasAttribute('aria-expanded'))
+          .map(e=>({text:e.textContent.slice(0,100),expanded:e.getAttribute('aria-expanded'),html:e.outerHTML.slice(0,500)})),
         nativeSwitches:[...document.querySelectorAll('[role=switch]')].map(e=>({aria:e.getAttribute('aria-label'),checked:e.getAttribute('aria-checked')}))})`);
-      writeJson(join(run.directory, 'failed-state.json'), { ...state, checks: owned.checks });
+      writeJson(join(run.directory, 'failed-state.json'), { ...state, checks: owned.checks, exceptions:owned.renderer.exceptions,
+        streamDiagnosticFailure:owned.streamDiagnosticFailure??null });
     } catch { /* Original failure remains authoritative. */ }
   }
 } finally {

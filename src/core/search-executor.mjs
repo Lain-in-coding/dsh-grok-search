@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { GrokSearchError, isRecord, timeoutError } from './errors.mjs';
 import { runMcpSearch } from './mcp-search.mjs';
+import { validateSearchQuery } from './search-query.mjs';
 
 const stoppedError = () => new GrokSearchError('GROK_SEARCH_STOPPING', '插件正在停止查询，请等待回收完成。');
 const reapError = () => new GrokSearchError('GROK_PROCESS_REAP_FAILED', '本次查询进程尚未回收，新查询已暂停。');
@@ -10,7 +11,7 @@ export function createSearchExecutor({ snapshot, runQuery = runMcpSearch, budget
   for (const [name, value] of Object.entries({ budgetMs, cleanupMs, maxRunning, maxQueued })) {
     if (!Number.isSafeInteger(value) || value < (name === 'maxQueued' ? 0 : 1)) throw new TypeError(name + ' 必须是有效整数。');
   }
-  if (budgetMs <= cleanupMs || budgetMs > 120_000 || cleanupMs > 2_000 || maxRunning > 4 || maxQueued > 8) throw new TypeError('查询预算或容量超出内部候选范围。');
+  if (budgetMs <= cleanupMs || budgetMs > 120_000 || cleanupMs > 2_000 || maxRunning > 4 || maxQueued > 16) throw new TypeError('查询预算或容量超出内部候选范围。');
   const queue = [];
   const active = new Map();
   const faulted = new Map();
@@ -69,7 +70,8 @@ export function createSearchExecutor({ snapshot, runQuery = runMcpSearch, budget
 
   return {
     search(request, signal) {
-      if (!isRecord(request) || typeof request.query !== 'string' || !request.query.trim()) return Promise.reject(new GrokSearchError('GROK_QUERY_INVALID', '搜索查询不能为空。'));
+      try { validateSearchQuery(isRecord(request) ? request.query : undefined); }
+      catch (error) { return Promise.reject(error); }
       if (request.maxResults !== undefined && (!Number.isSafeInteger(request.maxResults) || request.maxResults < 0)) return Promise.reject(new GrokSearchError('GROK_QUERY_INVALID', '搜索来源上限无效。'));
       if (signal?.aborted) return Promise.reject(signal.reason);
       if (stopping) return Promise.reject(stoppedError());

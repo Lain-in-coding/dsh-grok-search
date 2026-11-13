@@ -26,6 +26,136 @@ function router({ config = baseConfig(), prefs = prefsOf(), fetchImpl }) {
   return { instance, calls };
 }
 
+test('source response readers release their lock after successful or rejected payloads', async () => {
+  for (const body of [
+    JSON.stringify({ results: [{ url: 'https://result.test' }] }), 'invalid JSON', 'x'.repeat(2 * 1024 * 1024 + 1),
+  ]) {
+    const response = new Response(body);
+    const { instance } = router({ config: without(baseConfig(), 'exa', 'firecrawl', 'tinyfish'),
+      fetchImpl: async () => response });
+    try { await instance.search({ query: 'reader cleanup' }); }
+    catch (error) { assert.equal(error.code, 'SOURCE_ALL_FAILED'); }
+    assert.equal(response.body.locked, false);
+  }
+});
+
+test('caller cancellation at response EOF cannot become a successful source result', async () => {
+  const controller = new AbortController(), reason = new Error('synthetic caller cancellation');
+  let response, sent = false;
+  const { instance } = router({ config: without(baseConfig(), 'exa', 'firecrawl', 'tinyfish'),
+    fetchImpl: async () => {
+      response = new Response(new ReadableStream({
+        pull(stream) {
+          if (!sent) {
+            sent = true;
+            stream.enqueue(new TextEncoder().encode(JSON.stringify({ results: [{ url: 'https://result.test' }] })));
+          } else {
+            controller.abort(reason);
+            stream.close();
+          }
+        },
+      }));
+      return response;
+    } });
+  await assert.rejects(instance.search({ query: 'cancel at EOF', signal: controller.signal }),
+    error => error === reason);
+  assert.equal(response.body.locked, false);
+});
+
+test('a stalled source body is cancelled before caller cancellation settles', async () => {
+  const controller = new AbortController(), reason = new Error('synthetic body cancellation');
+  let stream, response, cancelled = 0, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const { instance } = router({ config: without(baseConfig(), 'exa', 'firecrawl', 'tinyfish'),
+    fetchImpl: async () => {
+      response = new Response(new ReadableStream({
+        start(value) { stream = value; started(); },
+        cancel() { cancelled++; },
+      }));
+      return response;
+    } });
+  const pending = instance.search({ query: 'stalled caller cancellation', signal: controller.signal });
+  let timer;
+  try {
+    await ready;
+    controller.abort(reason);
+    await assert.rejects(Promise.race([pending, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Body remained pending after cancellation.')), 500);
+    })]), error => error === reason);
+    assert.equal(cancelled, 1);
+    assert.equal(response.body.locked, false);
+  } finally {
+    clearTimeout(timer);
+    if (!cancelled) stream.close();
+    await pending.catch(() => {});
+  }
+});
+
+test('source-stage timeout cancels a stalled body and continues to the next enabled source', async () => {
+  let stream, response, cancelled = 0;
+  const calls = [];
+  const { instance } = router({ config: { ...baseConfig(), source_providers: ['tavily', 'exa'] },
+    fetchImpl: async url => {
+      if (url.includes('exa')) return json({ results: [{ url: 'https://exa.test/after-timeout' }] });
+      response = new Response(new ReadableStream({
+        start(value) { stream = value; },
+        cancel() { cancelled++; },
+      }));
+      return response;
+    } });
+  const pending = instance.search({ query: 'stalled stage', remainingMs: () => 150,
+    onCall: call => calls.push(call) });
+  let timer;
+  try {
+    const result = await Promise.race([pending, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Timed-out body prevented fallback.')), 800);
+    })]);
+    assert.equal(result.search_provider, 'exa');
+    assert.equal(cancelled, 1);
+    assert.equal(response.body.locked, false);
+    assert.deepEqual(calls.map(call => [call.provider, call.result, call.code ?? '']),
+      [['tavily', 'failed', 'TIMEOUT'], ['exa', 'ok', '']]);
+  } finally {
+    clearTimeout(timer);
+    if (!cancelled) stream.close();
+    await pending.catch(() => {});
+  }
+});
+
+test('real HTTP source timeout closes its stalled connection before a later source supplies results', async () => {
+  const { createServer } = await import('node:http');
+  let tavilyClosed = false;
+  const paths = [], calls = [];
+  const server = createServer((request, response) => {
+    paths.push(request.url);
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    if (request.url === '/tavily/search') {
+      response.once('close', () => { tavilyClosed = true; });
+      response.write('{"results":');
+    } else response.end(JSON.stringify({ results: [{ url: 'https://example.test/loopback-fallback' }] }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const instance = createSourceRouter({ getConfig: () => ({
+    tavily_api_url: origin + '/tavily', tavily_api_key: 'synthetic-loopback-key',
+    exa_api_url: origin + '/exa', exa_api_key: 'synthetic-loopback-key',
+    source_providers: ['tavily', 'exa'], timeout_seconds: 60,
+  }) });
+  try {
+    const result = await instance.search({ query: 'loopback fallback', remainingMs: () => 500,
+      onCall: value => calls.push(value) });
+    assert.equal(result.search_provider, 'exa');
+    assert.deepEqual(paths, ['/tavily/search', '/exa/search']);
+    assert.equal(tavilyClosed, true);
+    assert.deepEqual(calls.map(value => [value.provider, value.result, value.code ?? '']),
+      [['tavily', 'failed', 'TIMEOUT'], ['exa', 'ok', '']]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('request contracts follow grok-search-rs v0.1.26 for every source', async () => {
   const config = { ...baseConfig(), tinyfish_api_key: 'tf-key' };
   const { instance, calls } = router({ config, fetchImpl: async () => json({}, 503) });

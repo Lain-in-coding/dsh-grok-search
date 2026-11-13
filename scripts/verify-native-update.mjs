@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { gunzipSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
 import { prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
@@ -14,43 +14,149 @@ import { cleanEnvironment, commandResult, freshRun, project, redact, sha256, wri
 import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { discoverGrokCandidates, inspectGrokProgram } from '../src/core/program-discovery.mjs';
 import { probeMcpHandshake } from '../src/core/mcp-search.mjs';
+import { closeUpgradeHost, readUpgradePackage } from './verify-search-log-upgrade.mjs';
+
+export function nativeUpdateMetadata(packages, origin, targetData = packages[1]?.data) {
+  assert.equal(packages.length, 2, 'Native update needs two verified packages.');
+  const versions = packages.map(pkg => pkg.manifest.version);
+  assert.notEqual(versions[0], versions[1], 'Native update needs distinct package versions.');
+  return {
+    name: 'dsh-grok-search', 'dist-tags': { latest: versions[1] },
+    versions: Object.fromEntries(packages.map((pkg, index) => {
+      const bytes = index === 1 ? targetData : pkg.data;
+      return [pkg.manifest.version, { ...pkg.manifest, dist: {
+        tarball: `${origin}/tar/dsh-grok-search/${pkg.manifest.version}`,
+        integrity: 'sha512-' + createHash('sha512').update(bytes).digest('base64'),
+        shasum: createHash('sha1').update(bytes).digest('hex'),
+      } }];
+    })),
+    // Fixture-only release ages do not change public registry metadata.
+    time: { created: '2026-01-01T00:00:00Z', modified: '2026-01-02T00:00:00Z',
+      [versions[0]]: '2026-01-01T00:00:00Z', [versions[1]]: '2026-01-02T00:00:00Z' },
+  };
+}
+
+export async function finishNativeUpdate({ process, checkpoint }) {
+  if (!process || process.ended()) return;
+  try { return await checkpoint?.(); }
+  finally { await closeUpgradeHost(process, 30_000); }
+}
+
+export function validateNativeUpdateOutcome({
+  scenario, oldVersion, targetVersion, hostVersion, checkpoints, operations, requests,
+}) {
+  assert.ok(['success', 'disabled', 'download-failed', 'activation-failed', 'cancel-download'].includes(scenario));
+  assert.notEqual(oldVersion, targetVersion);
+  const baseline = checkpoints.find(row => row.label === 'old-installed');
+  const final = checkpoints.findLast(row => row.label === 'final');
+  assert.ok(baseline && final, 'The original installation and final state must both be observed.');
+  assert.equal(baseline.installedVersion, oldVersion);
+  assert.equal(final.hostVersion, hostVersion);
+  assert.equal(final.configAndCacheUnchanged, true, 'Configuration and runtime cache must remain unchanged.');
+  assert.deepEqual(final.mismatched, [], 'The final installed files must match the supplied receipt.');
+  assert.ok(requests.some(row => row.kind === 'tarball' && row.version === targetVersion),
+    'A completed fixture must actually request the target distribution.');
+  assert.equal(final.enabled, baseline.enabled, 'The installed plugin must retain its enabled state.');
+  assert.equal(final.fetchProvider, baseline.fetchProvider, 'Updating search must not change the fetch provider.');
+  assert.equal(final.originalSearches, baseline.originalSearches, 'The update verification must not call official search.');
+  const updated = ['success', 'disabled'].includes(scenario);
+  assert.equal(final.installedVersion, updated ? targetVersion : oldVersion,
+    updated ? 'The target version must remain installed.' : 'A failed or cancelled update must restore the original plugin.');
+  assert.equal(final.searchProvider, baseline.searchProvider);
+  if (updated) {
+    const restarted = checkpoints.findLast(row => row.label === 'after-restart');
+    assert.ok(restarted && operations.some(row => row.method === 'desktop-restart'),
+      'A successful update must be verified after a real host restart.');
+    assert.equal(restarted.installedVersion, targetVersion);
+    assert.equal(restarted.enabled, baseline.enabled);
+    assert.equal(restarted.configAndCacheUnchanged, true);
+    assert.deepEqual(restarted.mismatched, []);
+  } else {
+    assert.ok(requests.some(row => row.kind === 'tarball' && row.version === targetVersion && row.fault === scenario),
+      'A failure result must follow the deliberately injected fault.');
+  }
+  if (scenario === 'disabled') {
+    assert.equal(final.enabled, false);
+    assert.equal(final.programPhase, null, 'A disabled plugin must not start its program.');
+    assert.ok(!requests.some(row => row.kind === 'search'), 'A disabled update must not send a search request.');
+  } else {
+    assert.equal(final.enabled, true);
+    assert.equal(final.searchProvider, 'grok-search');
+    assert.equal(final.programPhase, 'ready');
+    assert.equal(final.programSource, 'private-cache', 'The existing verified program cache must actually be reused.');
+    const searches = operations.filter(row => row.method === 'session-search');
+    assert.ok(searches.length >= (updated ? 2 : 1), 'Real Session searches must validate the final running plugin.');
+    for (const search of searches) {
+      assert.equal(search.sessionCompleted, true);
+      assert.equal(search.toolResultSucceeded, true);
+      assert.equal(search.logRecords, 1);
+      assert.deepEqual(search.actualSources, ['tavily']);
+      assert.equal(search.originalSearchDelta, 0);
+    }
+  }
+  if (scenario === 'cancel-download') {
+    const cancellation = operations.findLast(row => row.method === 'pluginManager/updateBundle');
+    assert.equal(cancellation?.pending, false, 'The cancelled update must finish before the fixture is closed.');
+    assert.equal(cancellation.result?.result?.application, 'cancelled', 'The host must acknowledge cancellation.');
+    assert.equal(cancellation.result?.restore?.application, 'applied', 'The host must confirm restoration after cancellation.');
+  }
+  return { passed: true, outcome: updated ? 'updated' : 'restored', installedVersion: final.installedVersion,
+    enabledPreserved: true, configAndCacheUnchanged: true, officialSearchesUnchanged: true };
+}
+
+export function nativeUpdateHostStages(targetVersion, baselineVersion = targetVersion) {
+  assert.ok(['0.2.2-rc.1', '0.2.2-rc.2'].includes(targetVersion));
+  if (targetVersion === baselineVersion) return [targetVersion];
+  assert.equal(baselineVersion, '0.2.2-rc.1', 'Only a forward rc.1 to rc.2 baseline is supported.');
+  assert.equal(targetVersion, '0.2.2-rc.2', 'Never hand new-host data back to an older host.');
+  return [baselineVersion, targetVersion];
+}
 
 // The fixture serves the exact old release and frozen candidate through an
 // isolated loopback npm registry. It never changes a public tag or user profile.
 // UI interactions are performed separately through the reported CDP endpoint.
-const [desktop, oldArgument, nextArgument, grokArgument, scenario = 'success'] = process.argv.slice(2);
+async function main() {
+const [desktop, oldArgument, nextArgument, grokArgument, scenario = 'success', baselineDesktop] = process.argv.slice(2);
 assert.ok(desktop && oldArgument && nextArgument && grokArgument,
   'Provide Desktop, old/new tarballs, verified Grok executable and optional scenario.');
 assert.equal(process.platform, 'win32', 'This native update fixture is verified on Windows only.');
 assert.ok(['success', 'disabled', 'download-failed', 'activation-failed', 'cancel-download'].includes(scenario));
 const runtime = candidateRuntime(desktop);
-assert.equal(runtime.app.version, '0.2.2-rc.1');
-const packages = [oldArgument, nextArgument].map(value => {
-  const path = resolve(value), data = readFileSync(path);
-  const receipt = JSON.parse(readFileSync(join(dirname(path), 'package-receipt.json'), 'utf8'));
-  assert.equal(sha256(path), receipt.sha256);
-  const bytes = gunzipSync(data, { maxOutputLength: 64 * 1024 * 1024 });
-  let manifest;
-  for (let offset = 0; offset + 512 <= bytes.length;) {
-    const name = bytes.toString('utf8', offset, offset + 100).replace(/\0.*$/, '');
-    const size = Number.parseInt(bytes.toString('ascii', offset + 124, offset + 136).replace(/\0/g, '').trim(), 8) || 0;
-    assert.ok(Number.isSafeInteger(size) && size >= 0 && offset + 512 + size <= bytes.length);
-    if (name === 'package/package.json') manifest = JSON.parse(bytes.toString('utf8', offset + 512, offset + 512 + size));
-    offset += 512 + Math.ceil(size / 512) * 512;
-  }
-  assert.equal(manifest?.name, 'dsh-grok-search');
-  assert.equal(manifest.version, receipt.version);
-  return { path, data, receipt, manifest };
-});
-assert.equal(packages[0].manifest.version, '0.2.0');
-assert.equal(packages[1].manifest.version, '0.2.1');
+const baselineRuntime = baselineDesktop ? candidateRuntime(baselineDesktop) : runtime;
+const hostStages = nativeUpdateHostStages(runtime.app.version, baselineRuntime.app.version);
+const packages = [oldArgument, nextArgument].map(readUpgradePackage);
+const oldVersion = packages[0].manifest.version, targetVersion = packages[1].manifest.version;
+assert.notEqual(oldVersion, targetVersion, 'Native update needs distinct package versions.');
+assert.ok(packages[0].manifest.engines?.dsh?.split(' || ').includes(baselineRuntime.app.version),
+  'Install the unchanged historical package on a compatible baseline host; no exemptions are granted.');
+assert.ok(packages[1].manifest.engines?.dsh?.split(' || ').includes(runtime.app.version),
+  'The actual candidate must support the target host.');
 for (const row of packages[1].receipt.sourceHashes) assert.equal(sha256(join(project, row.file)), row.sha256);
-const run = freshRun('native-update-021');
+const verificationHashes = ['scripts/verify-native-update.mjs', 'scripts/verify-search-log-upgrade.mjs']
+  .map(file => ({ file, sha256: sha256(join(project, file)) }));
+const run = freshRun('native-update');
 const folder = join(tmpdir(), 'dsh-deferred-desktop-native-update-' + run.runId);
 prepareDesktopFixture(runtime.executable, folder, { pluginManagerEntries: true, liveHmr: true, versionedControlRecord: true });
 const control = JSON.parse(readFileSync(join(folder, 'local-control.json'), 'utf8'));
 writeFileSync(join(control.profile, 'cordis.patch.yml'), JSON.stringify([desktopWorkspacePatch(folder)], null, 2) + '\n');
-const originalHashes = [runtime.executable, runtime.archivePath, control.pnpmEntry].map(sha256);
+let baselineControl = control;
+if (hostStages.length > 1) {
+  // Assembly only: both lifetimes use the SAME target profile, userData and
+  // cache. No historical package or compatibility exemption is modified.
+  const baselineFolder = folder + '-baseline-runtime';
+  prepareDesktopFixture(baselineRuntime.executable, baselineFolder,
+    { pluginManagerEntries: true, liveHmr: true, versionedControlRecord: true });
+  baselineControl = JSON.parse(readFileSync(join(baselineFolder, 'local-control.json'), 'utf8'));
+  for (const path of [join(control.profile, 'node_modules/candidate-offline-fixture/package.json'),
+    join(folder, 'fixture-package/package.json')]) {
+    const manifest = JSON.parse(readFileSync(path, 'utf8'));
+    manifest.engines.dsh = hostStages.join(' || ');
+    writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
+  }
+}
+const originalFiles = [...new Set([runtime.executable, runtime.archivePath, control.pnpmEntry,
+  baselineRuntime.executable, baselineRuntime.archivePath, baselineControl.pnpmEntry])];
+const originalHashes = originalFiles.map(sha256);
 const productPath = join(control.profile, 'node_modules/dsh-grok-search');
 const configPath = join(folder, 'synthetic-shared-config.toml');
 const preferencesPath = join(control.profile, 'grok-search/preferences.json');
@@ -60,8 +166,8 @@ const requests = [], checkpoints = [], operations = [];
 const metadataCache = new Map();
 const heldDownloads = new Set();
 let origin, renderer, child, closed, childEnded = false, finishing = false;
-let baseline, launchEnvironment, exitCode, forced = false, failed = null, ready = false;
-const sha512 = bytes => 'sha512-' + createHash('sha512').update(bytes).digest('base64');
+let baseline, launchEnvironment, exitCode, forced = false, failed = null, ready = false, outcome = null;
+let activeRuntime = baselineRuntime, activeElectron = baselineControl.electron;
 let activationTar;
 if (scenario === 'activation-failed') {
   const extracted = join(folder, 'fault-package');
@@ -79,11 +185,6 @@ const safe = value => JSON.parse(redact(JSON.stringify(value), [[folder, '<ISOLA
 const json = (response, code, body) => {
   response.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   response.end(JSON.stringify(body));
-};
-const latestManifest = pkg => {
-  const bytes = pkg === packages[1] && activationTar ? activationTar : pkg.data;
-  return { ...pkg.manifest, dist: { tarball: `${origin}/tar/dsh-grok-search/${pkg.manifest.version}`,
-    integrity: sha512(bytes), shasum: createHash('sha1').update(bytes).digest('hex') } };
 };
 async function rpc(service, method, args = {}) {
   return renderer.evaluate(`(async () => {
@@ -110,10 +211,11 @@ async function launchDesktop() {
   const addressPath = join(folder, 'probe-address.json');
   const previousInstance = existsSync(addressPath) ? JSON.parse(readFileSync(addressPath, 'utf8')).instanceId : null;
   childEnded = false;
-  child = spawn(control.electron, [runtime.archivePath, '--user-data-dir=' + control.userData,
+  child = spawn(activeElectron, [activeRuntime.archivePath, '--user-data-dir=' + control.userData,
     '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + control.port, '--lang=zh-CN'],
   { cwd: folder, env: launchEnvironment, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout.resume(); child.stderr.resume();
+  child.once('error', error => { failed ??= safe({ message: error.message }); });
   closed = new Promise(done => child.once('close', code => { childEnded = true; exitCode = code; done(code); }));
   renderer = await connectRenderer(control.port, { timeoutMs: 60_000, requestTimeoutMs: 200_000 });
   await waitForRenderer(renderer, current => current.evaluate('document.readyState === "complete" && !!document.querySelector(\'button[aria-label="插件"]\')'), { timeoutMs: 60_000 });
@@ -167,7 +269,8 @@ async function checkpoint(label) {
   const current = await probe('snapshot');
   const bundles = await rpc('pluginManager', 'listBundles');
   const bundle = bundles.find(row => row.name === 'dsh-grok-search');
-  const record = { label, installedVersion: manifest?.version ?? null, enabled: bundle?.enabled ?? null,
+  const record = { label, hostVersion: activeRuntime.app.version,
+    installedVersion: manifest?.version ?? null, enabled: bundle?.enabled ?? null,
     mismatched, configAndCacheUnchanged: JSON.stringify(preservedFiles()) === JSON.stringify(baseline),
     searchProvider: current.runtimeWeb?.searchProviderId, fetchProvider: current.runtimeWeb?.fetchProviderId,
     programPhase: current.productProgram?.phase ?? null, programSource: current.productProgram?.program?.source ?? null,
@@ -188,20 +291,30 @@ async function finish() {
   if (finishing) return;
   finishing = true;
   try {
-    if (renderer && !childEnded) {
-      await checkpoint('final');
-      await requestDesktopShutdown(control.port, closed, { timeoutMs: 25_000 });
-    }
+    await finishNativeUpdate({
+      process: child ? { request: () => requestDesktopShutdown(control.port, closed, { timeoutMs: 25_000 }),
+        closed, ended: () => childEnded, exitCode: () => exitCode,
+        kill: () => { forced = true; child.kill(); } } : null,
+      checkpoint: renderer && ready ? () => checkpoint('final') : null,
+    });
+    if (ready) outcome = validateNativeUpdateOutcome({
+      scenario, oldVersion, targetVersion, hostVersion: runtime.app.version, checkpoints, operations, requests,
+    });
   } catch (error) {
     failed ??= safe({ message: error.message });
-    if (child && !childEnded) { forced = true; child.kill(); await closed; }
   } finally {
     renderer?.close();
     for (const response of heldDownloads) response.destroy();
     heldDownloads.clear();
-    const unchanged = [runtime.executable, runtime.archivePath, control.pnpmEntry].every((path, i) => sha256(path) === originalHashes[i]);
+    const unchanged = originalFiles.every((path, i) => sha256(path) === originalHashes[i]);
+    const sourceUnchanged = verificationHashes.every(row => sha256(join(project, row.file)) === row.sha256);
+    if (!sourceUnchanged) failed ??= { message: 'Upgrade verifier source changed during the run.' };
+    if (!unchanged) failed ??= { message: 'Official runtime files changed during the run.' };
+    if (failed || forced || exitCode !== 0) process.exitCode = 1;
     writeJson(join(run.directory, 'summary.json'), { runId: run.runId, scenario, ready, failed,
-      hostVersion: runtime.app.version, officialProgramUnchanged: unchanged,
+      passed: !failed && !forced && exitCode === 0 && outcome?.passed === true, outcome,
+      hostVersion: runtime.app.version, hostStages, hostDowngradeTested: false,
+      officialProgramUnchanged: unchanged, sourceUnchanged, verificationHashes,
       packages: packages.map(pkg => ({ version: pkg.manifest.version, sha256: pkg.receipt.sha256 })),
       faultDistribution: scenario === 'activation-failed', checkpoints, operations, requests,
       exitCode, forced, realCredentialsUsed: false, paidSearchRequests: 0, published: false });
@@ -219,7 +332,7 @@ const server = createServer(async (request, response) => {
       for await (const part of request) { body += part; assert.ok(body.length <= 8192); }
       const args = body ? JSON.parse(body) : {};
       if (url.pathname === '/control/state') {
-        return json(response, 200, { ready, scenario, requests, checkpoints, operations });
+        return json(response, 200, { ready, scenario, oldVersion, targetVersion, requests, checkpoints, operations });
       }
       if (url.pathname === '/control/checkpoint') return json(response, 200, await checkpoint(args.label ?? 'manual'));
       if (url.pathname === '/control/search') {
@@ -230,7 +343,7 @@ const server = createServer(async (request, response) => {
       if (url.pathname === '/control/restart') {
         assert.ok(['success', 'disabled'].includes(scenario), 'Restart is limited to successful upgrade scenarios.');
         const before = await checkpoint('before-restart');
-        assert.equal(before.installedVersion, '0.2.1', 'Restart verification follows the actual update.');
+        assert.equal(before.installedVersion, targetVersion, 'Restart verification follows the actual update.');
         await requestDesktopShutdown(control.port, closed, { timeoutMs: 25_000 });
         assert.equal(exitCode, 0, 'The old instance must exit normally before restart.');
         renderer.close();
@@ -242,6 +355,7 @@ const server = createServer(async (request, response) => {
             : state.productProgram === null && state.runtimeWeb?.searchProviderId === before.searchProvider;
         }, { timeoutMs: 60_000 });
         const after = await checkpoint('after-restart');
+        assert.equal(after.installedVersion, targetVersion, 'Restart must retain the verified target package.');
         assert.equal(after.enabled, before.enabled);
         assert.equal(after.searchProvider, before.searchProvider);
         if (before.enabled) assert.equal(after.programSource, 'private-cache', 'The retained cache must actually be reused.');
@@ -253,7 +367,7 @@ const server = createServer(async (request, response) => {
         assert.ok(!operations.some(row => row.pending), 'Only one test update may run.');
         const operation = { method: 'pluginManager/updateBundle', requestId: randomUUID(), pending: true };
         operations.push(operation);
-        void rpc('pluginManager', 'updateBundle', { name: 'dsh-grok-search', version: '0.2.1',
+        void rpc('pluginManager', 'updateBundle', { name: 'dsh-grok-search', version: targetVersion,
           options: { registry: origin + '/', requestId: operation.requestId } })
           .then(result => { operation.result = safe(result); })
           .catch(error => { operation.error = String(error.message).slice(0, 500); })
@@ -296,14 +410,9 @@ const server = createServer(async (request, response) => {
     if (!path || path === '-/ping') return json(response, 200, { ok: true });
     if (path === 'dsh-grok-search' || path.startsWith('dsh-grok-search/')) {
       requests.push({ kind: 'metadata', name: 'dsh-grok-search', path });
-      const doc = { name: 'dsh-grok-search', 'dist-tags': { latest: '0.2.1' },
-        versions: Object.fromEntries(packages.map(pkg => [pkg.manifest.version, latestManifest(pkg)])),
-        // Synthetic old timestamps are local fixture metadata only. The public
-        // registry and its release-age policies remain untouched.
-        time: { created: '2026-01-01T00:00:00Z', modified: '2026-01-02T00:00:00Z',
-          '0.2.0': '2026-01-01T00:00:00Z', '0.2.1': '2026-01-02T00:00:00Z' } };
+      const doc = nativeUpdateMetadata(packages, origin, activationTar ?? packages[1].data);
       const version = path.split('/')[1];
-      return json(response, 200, !version ? doc : doc.versions[version === 'latest' ? '0.2.1' : version] ?? {});
+      return json(response, 200, !version ? doc : doc.versions[version === 'latest' ? targetVersion : version] ?? {});
     }
     if (request.method !== 'GET' || path.includes('..') || path.startsWith('-')) return json(response, 404, {});
     if (!metadataCache.has(path)) metadataCache.set(path, (async () => {
@@ -346,8 +455,9 @@ try {
   await new Promise(done => reservation.listen(0, '127.0.0.1', done));
   control.port = reservation.address().port;
   await new Promise(done => reservation.close(done));
-  launchEnvironment = prepareDesktopAcceptanceEnvironment(folder, { DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
-    DSH_DESKTOP_PRIMARY_RUNTIME_DIR: control.primaryRuntime, DSH_DESKTOP_PNPM_ENTRY: control.pnpmEntry,
+  launchEnvironment = prepareDesktopAcceptanceEnvironment(folder, { DSH_HOME: control.dshHome,
+    DSH_DESKTOP_DSH_DIR: baselineControl.runtime,
+    DSH_DESKTOP_PRIMARY_RUNTIME_DIR: baselineControl.primaryRuntime, DSH_DESKTOP_PNPM_ENTRY: baselineControl.pnpmEntry,
     DSH_DESKTOP_FIXTURE_TOKEN: control.token, DSH_DESKTOP_FIXTURE_ADDRESS_FILE: join(folder, 'probe-address.json'),
     DSH_DESKTOP_OPEN_DEVTOOLS: '0', DSH_B2_CONTROL_RECORD: '1', DSH_B2_PRODUCT_COUNTER: '1',
     DSH_DESKTOP_OFFLINE_SENTINEL: 'isolated-not-a-real-key', GROK_SEARCH_CONFIG: configPath,
@@ -359,15 +469,32 @@ try {
   launchEnvironment.PATH = [join(system, 'System32'), system, join(system, 'System32', 'WindowsPowerShell', 'v1.0')].join(';');
   assert.deepEqual(discoverGrokCandidates({ env: launchEnvironment }), [], 'No global program enters this upgrade fixture.');
   await launchDesktop();
-  const installed = await rpc('pluginManager', 'installBundle', { spec: 'dsh-grok-search@0.2.0',
+  const installed = await rpc('pluginManager', 'installBundle', { spec: 'dsh-grok-search@' + oldVersion,
     options: { registry: origin + '/', requestId: randomUUID(), enabled: scenario !== 'disabled', saveExact: true } });
   assert.equal(installed.application, 'applied', JSON.stringify(installed.error));
   for (const row of packages[0].receipt.sourceHashes) assert.equal(sha256(join(productPath, row.file)), row.sha256);
   baseline = preservedFiles();
   assert.ok(Object.values(baseline).every(Boolean));
   ready = true;
-  await checkpoint('old-installed');
-  writeJson(join(run.directory, 'local-control.json'), { scenario, port: control.port, origin, token: control.token,
+  const oldInstalled = await checkpoint('old-installed');
+  assert.equal(oldInstalled.installedVersion, oldVersion, 'The baseline must be the supplied public package.');
+  if (hostStages.length > 1) {
+    await requestDesktopShutdown(control.port, closed, { timeoutMs: 25_000 });
+    assert.equal(exitCode, 0, 'The baseline host must exit normally before a forward upgrade.');
+    renderer.close();
+    operations.push({ method: 'forward-host-upgrade', from: baselineRuntime.app.version,
+      to: runtime.app.version, sameProfile: true, sameUserData: true, previousExitCode: exitCode });
+    activeRuntime = runtime; activeElectron = control.electron;
+    launchEnvironment.DSH_DESKTOP_DSH_DIR = control.runtime;
+    launchEnvironment.DSH_DESKTOP_PRIMARY_RUNTIME_DIR = control.primaryRuntime;
+    launchEnvironment.DSH_DESKTOP_PNPM_ENTRY = control.pnpmEntry;
+    await launchDesktop();
+    const retained = await checkpoint('old-package-retained-on-new-host');
+    assert.equal(retained.installedVersion, oldVersion);
+    assert.equal(retained.originalSearches, oldInstalled.originalSearches,
+      'Do not invoke the official search while the incompatible old plugin is skipped.');
+  }
+  writeJson(join(run.directory, 'local-control.json'), { scenario, oldVersion, targetVersion, port: control.port, origin, token: control.token,
     folder, profile: control.profile, configPath, programPath, artifacts: run.directory });
   console.log(JSON.stringify({ phase: 'ready', scenario, port: control.port, registry: origin,
     controlFile: join(run.directory, 'local-control.json'), directory: run.directory }));
@@ -376,3 +503,6 @@ try {
   process.exitCode = 1;
   await finish();
 }
+}
+
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) await main();

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ControlRecordError } from './control-intent-store.mjs';
+import { ControlRecordError, writeControlIntent } from './control-intent-store.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -175,7 +175,7 @@ async function finishExplicitRelease({ store, record, owner, controller, reason,
   };
   const intent = { ...record.intent, releaseCompletion: completion };
   try {
-    const envelope = store.compareAndSwap({ expectedRevision: record.revision, intent,
+    const envelope = await writeControlIntent(store, { expectedRevision: record.revision, intent,
       operationId: completionOperationId });
     return Object.freeze({ kind: 'released', recordCommitted: true, completionCommitted: true,
       inFlightInvalidated: true, drainSettled: true, routeChanged: restore.routeChanged,
@@ -297,7 +297,7 @@ export async function commitExplicitRelease({ store, owner, controller, reason =
   };
   let committed;
   try {
-    committed = store.compareAndSwap({ expectedRevision: before.revision, intent, operationId });
+    committed = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId });
   } catch (error) {
     if (error instanceof ControlRecordError) {
       error.releaseOutcome = Object.freeze(releaseOutcome({ operationId,

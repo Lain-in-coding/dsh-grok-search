@@ -42,20 +42,22 @@ const VERSIONS = Object.freeze({
   rc4: '0.2.1-rc.4',
   rc5: '0.2.1-rc.5',
   '022-rc1': '0.2.2-rc.1',
+  '022-rc2': '0.2.2-rc.2',
 });
+const MODERN_VERSIONS = new Set(['022-rc1', '022-rc2']);
 const CASES = new Set(['smoke', 'stop', 'full']);
 
 export function cliNodeVersionSupported(version, dshVersion) {
   const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
-  if (!match) return false;
+  if (!match || !Object.hasOwn(VERSIONS, dshVersion)) return false;
   const major = Number(match[1]), minor = Number(match[2]);
-  return dshVersion === '022-rc1' ? major > 24 || major === 24 && minor >= 9 : major >= 22;
+  return MODERN_VERSIONS.has(dshVersion) ? major > 24 || major === 24 && minor >= 9 : major >= 22;
 }
 
 function usage() {
   return [
     'Usage:',
-    '  node scripts/b3-cli-web.mjs --dsh-cli <bin.js> --dsh-version <rc2|rc3|rc4|rc5|022-rc1>',
+    '  node scripts/b3-cli-web.mjs --dsh-cli <bin.js> --dsh-version <rc2|rc3|rc4|rc5|022-rc1|022-rc2>',
     '    --product-package <tgz> --grok-linux-archive <tar.gz> --case <smoke|stop|full>',
     '    --browser-executable <linux-browser-path>',
     '    --pnpm-entry <pnpm.cjs> --pnpm-store <path> --pnpm-cache <path>',
@@ -723,7 +725,7 @@ async function windowsBootstrap(options) {
     const environment = preflight.stdout.trim().split(/\r?\n/);
     if (environment[0] !== 'x86_64') throw new Error(`Expected WSL x86_64, got ${environment[0]}.`);
     if (!cliNodeVersionSupported(environment[1], options.dshVersion)) {
-      throw new Error(`Expected WSL Node >= ${options.dshVersion === '022-rc1' ? '24.9' : '22'}, got ${environment[1]}.`);
+      throw new Error(`Expected WSL Node >= ${MODERN_VERSIONS.has(options.dshVersion) ? '24.9' : '22'}, got ${environment[1]}.`);
     }
 
     stage = 'create-temporary-root';
@@ -1157,7 +1159,7 @@ async function linuxWorker(options) {
       throw new Error(`Linux x64 is required, got ${platform()} ${arch()}.`);
     }
     check('linux-node-supported', cliNodeVersionSupported(process.versions.node, options.dshVersion),
-      { node: process.versions.node, minimum: options.dshVersion === '022-rc1' ? '24.9.0' : '22.0.0' });
+      { node: process.versions.node, minimum: MODERN_VERSIONS.has(options.dshVersion) ? '24.9.0' : '22.0.0' });
     packageReceipt = JSON.parse(readFileSync(packageReceiptPath, 'utf8'));
     if (options.bootstrapFile && existsSync(options.bootstrapFile)) {
       bootstrap = JSON.parse(readFileSync(options.bootstrapFile, 'utf8'));
@@ -1263,71 +1265,80 @@ async function linuxWorker(options) {
       CI: '1',
       NO_COLOR: '1',
     };
-    const overlay = join(runRoot, 'linux-overlay');
-    mkdirSync(overlay, { recursive: true });
-    const nativeInstall = await runCaptured('install-linux-native', 'npm', [
-      'install',
-      '--prefix', overlay,
-      '--ignore-scripts',
-      '--no-audit',
-      '--no-fund',
-      '--no-package-lock',
-      '--prefer-offline',
-      '--registry', REGISTRY,
-      `${LINUX_NATIVE}@${LINUX_NATIVE_VERSION}`,
-    ], {
-      cwd: runRoot,
-      env: npmEnv,
-      timeoutMs: 180_000,
-    }, evidence);
-    check('install-linux-native', nativeInstall.exitCode === 0 && !nativeInstall.timedOut, {
-      exitCode: nativeInstall.exitCode,
-      package: `${LINUX_NATIVE}@${LINUX_NATIVE_VERSION}`,
-    });
-    const nativeSource = join(overlay, 'node_modules', LINUX_NATIVE);
     const nativeDestination = join(runtimeRoot, 'node_modules', LINUX_NATIVE);
-    check('linux-native-package-present', existsSync(nativeSource), { package: LINUX_NATIVE });
-    cpSync(nativeSource, nativeDestination, { recursive: true, errorOnExist: true, force: false });
+    if (!existsSync(nativeDestination)) {
+      const overlay = join(runRoot, 'linux-overlay');
+      mkdirSync(overlay, { recursive: true });
+      const nativeInstall = await runCaptured('install-linux-native', 'npm', [
+        'install',
+        '--prefix', overlay,
+        '--ignore-scripts',
+        '--no-audit',
+        '--no-fund',
+        '--no-package-lock',
+        '--prefer-offline',
+        '--registry', REGISTRY,
+        `${LINUX_NATIVE}@${LINUX_NATIVE_VERSION}`,
+      ], {
+        cwd: runRoot,
+        env: npmEnv,
+        timeoutMs: 180_000,
+      }, evidence);
+      check('install-linux-native', nativeInstall.exitCode === 0 && !nativeInstall.timedOut, {
+        exitCode: nativeInstall.exitCode,
+        package: `${LINUX_NATIVE}@${LINUX_NATIVE_VERSION}`,
+      });
+      const nativeSource = join(overlay, 'node_modules', LINUX_NATIVE);
+      check('linux-native-overlay-present', existsSync(nativeSource), { package: LINUX_NATIVE });
+      cpSync(nativeSource, nativeDestination, { recursive: true, errorOnExist: true, force: false });
+    } else {
+      step('reuse-installed-linux-native', { package: LINUX_NATIVE, source: 'official-cli-install' });
+    }
+    check('linux-native-package-present', existsSync(join(nativeDestination, 'package.json')), { package: LINUX_NATIVE });
     const nativeManifest = JSON.parse(readFileSync(join(nativeDestination, 'package.json'), 'utf8'));
     check('linux-native-version', nativeManifest.version === LINUX_NATIVE_VERSION, { version: nativeManifest.version });
 
-    const systemNativePackDir = join(runRoot, 'system-native-pack');
-    mkdirSync(systemNativePackDir, { recursive: true });
-    const systemNativePack = await runCaptured('pack-linux-system-native', 'npm', [
-      'pack',
-      `${SYSTEM_NATIVE}@${SYSTEM_NATIVE_VERSION}`,
-      '--pack-destination', systemNativePackDir,
-      '--prefer-offline',
-      '--registry', REGISTRY,
-    ], {
-      cwd: runRoot,
-      env: npmEnv,
-      timeoutMs: 180_000,
-    }, evidence);
-    check('pack-linux-system-native', systemNativePack.exitCode === 0
-      && !systemNativePack.timedOut, {
-      exitCode: systemNativePack.exitCode,
-      package: `${SYSTEM_NATIVE}@${SYSTEM_NATIVE_VERSION}`,
-    });
-    const systemNativeTarballName = systemNativePack.stdout.trim().split(/\r?\n/).at(-1);
-    const systemNativeTarball = join(systemNativePackDir, systemNativeTarballName);
-    check('system-native-tarball', Boolean(systemNativeTarballName)
-      && existsSync(systemNativeTarball), {
-      name: systemNativeTarballName ?? null,
-      sha256: existsSync(systemNativeTarball) ? sha256(systemNativeTarball) : null,
-    });
     const systemNativeDestination = join(runtimeRoot, 'node_modules', '@deepseek-ai',
       'node-addon-system-linux-x64');
-    mkdirSync(systemNativeDestination, { recursive: true });
-    const systemNativeExtract = await runCaptured('extract-linux-system-native', 'tar', [
-      '-xzf', systemNativeTarball, '-C', systemNativeDestination, '--strip-components=1',
-    ], {
-      cwd: runRoot,
-      env: process.env,
-      timeoutMs: 30_000,
-    }, evidence);
-    check('extract-linux-system-native', systemNativeExtract.exitCode === 0
-      && !systemNativeExtract.timedOut, { exitCode: systemNativeExtract.exitCode });
+    if (!existsSync(systemNativeDestination)) {
+      const systemNativePackDir = join(runRoot, 'system-native-pack');
+      mkdirSync(systemNativePackDir, { recursive: true });
+      const systemNativePack = await runCaptured('pack-linux-system-native', 'npm', [
+        'pack',
+        `${SYSTEM_NATIVE}@${SYSTEM_NATIVE_VERSION}`,
+        '--pack-destination', systemNativePackDir,
+        '--prefer-offline',
+        '--registry', REGISTRY,
+      ], {
+        cwd: runRoot,
+        env: npmEnv,
+        timeoutMs: 180_000,
+      }, evidence);
+      check('pack-linux-system-native', systemNativePack.exitCode === 0
+        && !systemNativePack.timedOut, {
+        exitCode: systemNativePack.exitCode,
+        package: `${SYSTEM_NATIVE}@${SYSTEM_NATIVE_VERSION}`,
+      });
+      const systemNativeTarballName = systemNativePack.stdout.trim().split(/\r?\n/).at(-1);
+      const systemNativeTarball = join(systemNativePackDir, systemNativeTarballName);
+      check('system-native-tarball', Boolean(systemNativeTarballName)
+        && existsSync(systemNativeTarball), {
+        name: systemNativeTarballName ?? null,
+        sha256: existsSync(systemNativeTarball) ? sha256(systemNativeTarball) : null,
+      });
+      mkdirSync(systemNativeDestination, { recursive: true });
+      const systemNativeExtract = await runCaptured('extract-linux-system-native', 'tar', [
+        '-xzf', systemNativeTarball, '-C', systemNativeDestination, '--strip-components=1',
+      ], {
+        cwd: runRoot,
+        env: process.env,
+        timeoutMs: 30_000,
+      }, evidence);
+      check('extract-linux-system-native', systemNativeExtract.exitCode === 0
+        && !systemNativeExtract.timedOut, { exitCode: systemNativeExtract.exitCode });
+    } else {
+      step('reuse-installed-linux-system-native', { package: SYSTEM_NATIVE, source: 'official-cli-install' });
+    }
     const systemNativeManifest = JSON.parse(readFileSync(
       join(systemNativeDestination, 'package.json'), 'utf8'));
     check('linux-system-native-version', systemNativeManifest.name === SYSTEM_NATIVE
@@ -2655,7 +2666,7 @@ async function linuxWorker(options) {
           reloadProbe: reloadState.reloadProbe,
         });
       if (reloadState.reloadProbe?.toolResult?.isError) {
-        const revokedAdmission = options.dshVersion === '022-rc1'
+        const revokedAdmission = MODERN_VERSIONS.has(options.dshVersion)
           && reloadState.reloadProbe.toolErrorCode === 'UNKNOWN_TOOL'
           && /unknown tool.*web_search/i.test(JSON.stringify(reloadState.reloadProbe.toolResult));
         check('config-reload-error-explicit', revokedAdmission || /CONTROL_|WEB_PROVIDER_|GROK_/i

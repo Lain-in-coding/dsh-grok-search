@@ -50,6 +50,11 @@ export async function waitForDesktopRecovery(ctx) {
 }
 
 export async function apply(ctx) {
+  if (process.env.DSH_GITHUB_READ_FIXTURE === '1') {
+    const { installGithubApiFixture } = await import('./github-api-fixture.mjs');
+    const restore = installGithubApiFixture(trace);
+    ctx.effect(() => restore);
+  }
   const { applyModel, applyProviders, applyExisting } = await import('./host-fixture.mjs');
   applyExisting(ctx);
   ctx.inject(['llm', 'tools'], applyModel);

@@ -133,6 +133,7 @@ async function start(runtime,folder,phase,fault=null,versioned=true,productCount
     DSH_DESKTOP_OPEN_DEVTOOLS:'0',DSH_DESKTOP_HOST_INSPECT_PORT:String(hostInspectPort),
     DSH_DESKTOP_FIXTURE_TOKEN:control.token,DSH_DESKTOP_FIXTURE_ADDRESS_FILE:addressPath,
     DSH_B2_CONTROL_RECORD:versioned?'1':'0',DSH_B2_PRODUCT_COUNTER:productCounter?'1':'0',...(verificationCase==='m0-04'?{DSH_TOOLS_MODE:runtime.app.version==='0.2.0-rc.2'?'both':'ptc'}:{}),...(fault?{DSH_B2_RECORD_FAULT:fault}:{}),DSH_DESKTOP_OFFLINE_SENTINEL:'offline-test-sentinel-not-a-real-key',
+    ...(verificationCase==='ux'?{DEEPSEEK_API_KEY:'isolated-search-api-key'}:{}),
     DSH_PRODUCT_ANALYTICS_OTLP_URL:'http://127.0.0.1:9',NODE_OPTIONS:'--dns-result-order=ipv4first'});
   const prefix=runtime.app.version+'-'+phase+'-'+serial;
   const stdoutPath=join(directory,prefix+'-stdout.log'),stderrPath=join(directory,prefix+'-stderr.log');
@@ -592,7 +593,7 @@ try{
           restored, requestCount: stub.requests.length, exit };
       } finally { await stub.close(); }
     });
-    if (runtime.app.version === '0.2.2-rc.1') {
+    if (['0.2.2-rc.1', '0.2.2-rc.2'].includes(runtime.app.version)) {
       await scenario(runtime, 'deepseek-search-api-takeover-and-native-restore', async folder => {
         let requests = 0;
         const server = createServer((request, response) => {
@@ -609,8 +610,8 @@ try{
         try {
           await prepare(runtime, folder);
           writeFileSync(join(folder, 'dsh-home/profiles/desktop/cordis.patch.yml'), JSON.stringify([
-            { id: 'web-deepseek-api', config: { apiKey: 'isolated-search-api-key',
-              baseURL: `http://127.0.0.1:${server.address().port}/v1/tools` } },
+            { id: 'web-deepseek-api', config: { searchApiKeyEnv: 'DEEPSEEK_API_KEY',
+              searchBaseURL: `http://127.0.0.1:${server.address().port}/v1/tools` } },
             { id: 'web', config: { searchProvider: 'deepseek-search-api', fetchProvider: 'candidate-fetch' } },
           ]) + '\n');
           const host = await start(runtime, folder, 'ux-search-api', null, true, false);
@@ -676,7 +677,8 @@ try{
         assert.equal(state.reloadProbe.overlappedReload, true, 'Search tool call did not overlap the web reload.');
         assert.ok(state.reloadProbe.toolResult);
         if (state.reloadProbe.toolResult.isError) {
-          if (runtime.app.version === '0.2.2-rc.1' && state.reloadProbe.toolErrorCode === 'UNKNOWN_TOOL') {
+          if (['0.2.2-rc.1', '0.2.2-rc.2'].includes(runtime.app.version)
+            && state.reloadProbe.toolErrorCode === 'UNKNOWN_TOOL') {
             // Per-step admission cannot retain the tool definition after its
             // owning WebRuntime unloads. The new host refuses this in-flight
             // call; it must not substitute the newly registered definition.

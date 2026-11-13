@@ -2,14 +2,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
+import { buildClient } from '../scripts/build-client.mjs';
 import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
-import { createSearchLogView } from '../src/ui/search-log-view.mjs';
 import { createQuotaView } from '../src/ui/quota-view.mjs';
 import { createSourceChain } from '../src/core/source-chain.mjs';
-import { createRouteController } from '../src/ui/route-controller.mjs';
 import { createToolRouteView } from '../src/ui/tool-route-view.mjs';
 
-function loadClient() {
+const { code: clientSource } = await buildClient();
+
+function loadClient(globals = {}) {
   let factory;
   const document = {
     querySelector: () => null,
@@ -17,9 +18,12 @@ function loadClient() {
     head: { appendChild() {} },
   };
   const window = { __ModuleLoader__: { load(definition) { factory = definition.factory; } } };
-  const context = { window, document, structuredClone, console, setTimeout, clearTimeout };
+  const context = { window, document, URL, console, setTimeout, clearTimeout, ...globals };
   vm.createContext(context);
-  vm.runInContext(readFileSync(new URL('../src/client.js', import.meta.url), 'utf8'), context,
+  // Node's injected structuredClone would create foreign-realm objects. These
+  // UI fixtures clone JSON only, matching the browser's local object realm.
+  vm.runInContext('globalThis.structuredClone = value => JSON.parse(JSON.stringify(value));', context);
+  vm.runInContext(clientSource, context,
     { filename: 'src/client.js' });
   assert.equal(typeof factory, 'function');
   const react = {
@@ -46,6 +50,28 @@ test('client declares the owners of its remote and keyed detail slot', () => {
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-api-remotes'));
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-plugin-manager'));
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-tool'));
+});
+
+test('chat and settings whale assets are compact variants and preserve the source artwork', () => {
+  const logos = loadClient().__test.LOGOS;
+  const original = readFileSync(new URL('../src/assets/logos/deepseek-harness.png', import.meta.url));
+  assert.equal(original.readUInt32BE(16), 1024);
+  const settings = readFileSync(new URL('../src/assets/logos/deepseek-harness-settings.png', import.meta.url));
+  assert.equal(logos.harness, `data:image/png;base64,${settings.toString('base64')}`);
+  assert.equal(settings.readUInt32BE(16), 256);
+  assert.ok(settings.length < original.length / 3);
+  for (const [key, theme] of [['harnessChat', 'light'], ['harnessChatDark', 'dark']]) {
+    assert.match(logos[key] ?? '', /^data:image\/png;base64,/);
+    const image = Buffer.from(logos[key].split(',')[1], 'base64');
+    assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    assert.equal(image.readUInt32BE(16), 64);
+    assert.equal(image.readUInt32BE(20), 64);
+    assert.ok(image.length < 10_000, 'a small decorative icon must not decode a full-size app artwork');
+    assert.deepEqual(image, readFileSync(new URL(`../src/assets/logos/deepseek-harness-chat-${theme}.png`, import.meta.url)));
+  }
+  assert.notEqual(logos.harnessChat, logos.harnessChatDark);
+  const css = readFileSync(new URL('../src/ui/tool-route.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(css, /mix-blend-mode\s*:/, 'chat cards must not blend a logo against the scrolling host');
 });
 
 test('GitHub project badge uses the public title slot and is limited to this bundle', async () => {
@@ -78,9 +104,9 @@ test('GitHub project badge uses the public title slot and is limited to this bun
     ...badge.options.inject() });
   assert.equal(typeof own.type, 'function');
   assert.ok(own.props.theme.listeners instanceof Set || typeof own.props.theme.listeners.add === 'function');
-  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  const source = clientSource;
   assert.match(source, /href="https:\/\/github\.com\/Lain-in-coding\/dsh-grok-search" target="_blank" rel="noopener noreferrer"/);
-  assert.match(source, /role="tooltip">用着还行？给个star/);
+  assert.match(source, /role="tooltip">用着还行？给个 star/);
   for (const cleanup of disposers.reverse()) cleanup?.();
   assert.equal(entries.length, 0);
   await dispose();
@@ -176,7 +202,7 @@ test('chat source ribbon wraps only a plain host web_search row and follows slot
 });
 
 test('production view embeds v74 inputs without mock actions or global presentation changes', () => {
-  const code = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  const code = clientSource;
   assert.match(code, /attachShadow/);
   assert.match(code, /restoreConfig/);
   assert.match(code, /diagnoseProvider/);
@@ -185,17 +211,16 @@ test('production view embeds v74 inputs without mock actions or global presentat
   assert.doesNotMatch(code, /document\.body\.(?:style|dataset|classList)|document\.documentElement\.dataset/);
 });
 
-test('production embeds exact approved log/quota factories, not scene controls or synthesized balances', () => {
-  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes(createSearchLogView.toString()));
-  assert.ok(source.includes(createQuotaView.toString()));
-  for (const id of ['logCard', 'historyStage', 'historyRoute', 'logPrivacy']) assert.ok(source.includes(id));
-  assert.doesNotMatch(source, /quotaFixture|LOG_SCENES|LOG_DEMO_QUERIES|mockbar|演示数据/);
-  assert.match(source, /scope: JSON\.stringify\(\[id, base, S\.config\?\.quotaRevision/);
+test('bundled client exposes the production log and quota modules without demo controls', () => {
+  const client = loadClient();
+  assert.equal(typeof client.__test.searchLogView, 'function');
+  assert.equal(typeof client.__test.quotaView, 'function');
+  for (const id of ['logCard', 'historyStage', 'historyRoute', 'logPrivacy']) assert.ok(clientSource.includes(id));
+  assert.doesNotMatch(clientSource, /quotaFixture|LOG_SCENES|LOG_DEMO_QUERIES|mockbar|演示数据/);
 });
 
 test('approved compact quota removes detail panels without discarding query safeguards', () => {
-  const quota = createQuotaView.toString();
+  const quota = readFileSync(new URL('../src/ui/quota-view.mjs', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../src/ui/search-log.css', import.meta.url), 'utf8');
   assert.doesNotMatch(quota, /quota-details|quotaDetailsOpen|qp-key-hint|qp-disclosure|qp-details/);
   assert.match(quota, /data-quota-kind/);
@@ -213,8 +238,8 @@ test('approved compact quota removes detail panels without discarding query safe
 });
 
 test('capability revocation invalidates pending log reads before polling can defer it', () => {
-  const controller = createRouteController.toString();
-  const log = createSearchLogView.toString();
+  const controller = readFileSync(new URL('../src/ui/route-controller.mjs', import.meta.url), 'utf8');
+  const log = readFileSync(new URL('../src/ui/search-log-view.mjs', import.meta.url), 'utf8');
   assert.match(controller, /S\.capabilities = snapshot\.capabilities;[\s\S]*?if \(S\.capabilities && !S\.capabilities\.secretsAllowed\) void logView\?\.read\(\);/);
   const read = log.slice(log.indexOf('async function read()'), log.indexOf('async function clearRemoteLog()'));
   assert.ok(read.indexOf('if (!S.capabilities?.secretsAllowed)') < read.indexOf('if (readTask) return;'));
@@ -232,7 +257,7 @@ test('client embeds the exact host source-chain rules', () => {
 });
 
 test('Grok form names protocols and credentials without implying a provider or key-prefix restriction', () => {
-  const code = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
+  const code = readFileSync(new URL('../src/ui/route-controller.mjs', import.meta.url), 'utf8');
   assert.match(code, />xAI Responses<\/button>/);
   assert.match(code, />OpenAI 兼容网关<\/button>/);
   assert.match(code, /title="Responses 接口；支持兼容此协议的自定义服务"/);
@@ -252,9 +277,7 @@ test('quota auto-load deduplicates, expires per account and keeps refresh indepe
     return { id, kind: 'card', base, draft: structuredClone(base),
       configBaseline: { revision: S.configRevision, quotaRevision: S.config.quotaRevision } };
   };
-  const factory = vm.runInNewContext('(' + createQuotaView.toString() + ')', {
-    URL, Date: class extends Date { static now() { return now; } },
-  });
+  const factory = loadClient({ Date: class extends Date { static now() { return now; } } }).__test.quotaView;
   let failNext = false;
   const view = factory({
     $: () => null, S, getDialog: () => dialog, dlg: {}, active: () => null,
@@ -347,21 +370,17 @@ test('quota draft changes, closed dialogs and disposal reject late replies even 
   assert.equal(pending.length, 3, 'disposed UI starts no new query');
 });
 
-test('generated client carries the current route controller and separates search errors from credential feedback', () => {
-  const code = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
-  assert.ok(code.includes(createRouteController.toString()), 'rebuild client after changing the route controller');
+test('bundled route controller separates search errors from credential feedback', () => {
+  assert.equal(typeof loadClient().__test.routeController, 'function');
+  const code = readFileSync(new URL('../src/ui/route-controller.mjs', import.meta.url), 'utf8');
   assert.match(code, /class="note search-result"/);
   assert.match(code, /GROK_SOURCES_EMPTY: \['来源', '未返回引用链接'\]/);
   assert.doesNotMatch(code, /没有可核验来源|没有可核验回答/);
 });
 
 test('chat route presentation preserves the host view and never infers unknown history', () => {
-  const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes(createToolRouteView.toString()));
-  assert.match(source, /key: 'web_search', locale: entry\.locale/);
-  assert.match(source, /Original: entry\.component/);
-  assert.doesNotMatch(source, /toolName\s*=\s*['"]dsh-grok-search|lastRoute.*toolCallRoute/);
-  const view = createToolRouteView({ React: {}, jsx() {}, remote: {}, Original() {} });
+  assert.doesNotMatch(clientSource, /toolName\s*=\s*['"]dsh-grok-search|lastRoute.*toolCallRoute/);
+  const view = loadClient().__test.toolRouteView({ React: {}, jsx() {}, remote: {}, Original() {} });
   const unknown = view.describe({ known: false, routes: [] }, 'result', false);
   assert.equal(unknown.text, '本次来源未记录');
   assert.equal(unknown.known, false);
@@ -403,30 +422,34 @@ test('chat route presentation marks capped calls as incomplete instead of presen
   assert.equal(view.describe({ known: true, state: 'done', routes }, 'result', false).text, '由 dsh-grok-search 执行 · Tavily');
 });
 
-// A one-component React stand-in: state survives renders and the effect reruns
-// only when its dependencies change, which is enough to drive the route poll.
+// Drive the production subscription directly; real React/DOM is covered by the
+// isolated browser and Desktop checks, not emulated with a partial hook engine.
 function routeHarness() {
-  let answer = null, dependencies, pendingEffect, cleanup;
+  let answer = null, identity, callIdentity, subscription;
   const requests = [];
   const view = createToolRouteView({
-    React: {
-      useState: () => [answer, value => { answer = value; }],
-      useEffect(effect, next) {
-        if (!dependencies || next.some((value, index) => value !== dependencies[index])) {
-          cleanup?.(); dependencies = next; pendingEffect = effect;
-        }
-      },
-    },
+    React: {},
     jsx: (type, props) => ({ type, props }), Original() {},
     remote: { toolCallRoute: request => new Promise((resolve, reject) => requests.push({ request, resolve, reject })) },
   });
   const render = (phase, callId = 'same-call', sessionId = 'session') => {
-    const tree = view.Component({ sessionId, callId, phase });
-    if (pendingEffect) { const effect = pendingEffect; pendingEffect = null; cleanup = effect(); }
-    return tree.props.children.find(child => child.type === 'span').props;
+    const nextCall = JSON.stringify([sessionId, callId]), nextIdentity = JSON.stringify([sessionId, callId, phase]);
+    if (nextCall !== callIdentity) {
+      subscription?.dispose(); callIdentity = nextCall;
+      subscription = view.watch({ sessionId, callId, phase, onChange: value => { answer = value; } });
+    }
+    if (nextIdentity !== identity) {
+      identity = nextIdentity; answer = null;
+      subscription.update({ phase, visible: true });
+    }
+    const readable = typeof sessionId === 'string' && typeof callId === 'string' && phase !== 'preparing';
+    const label = readable && (!answer || answer.reading) ? { text: '正在读取本次来源…', tone: 'unknown' }
+      : answer?.unreadable ? { text: `本次来源暂不可读 · ${answer.code}`, tone: 'unknown' }
+        : view.describe(answer?.result, phase, false);
+    return { children: label.text, 'data-tone': label.tone };
   };
   const reply = async result => { requests.shift().resolve(result); await Promise.resolve(); };
-  return { view, requests, render, reply, unmount: () => cleanup?.() };
+  return { view, requests, render, reply, unmount: () => subscription?.dispose() };
 }
 
 test('tool route mount and phase changes stay neutral while reading, until the final unknown reply', async t => {
@@ -483,4 +506,187 @@ test('cancelled tool routes stay cancelled even when the host marks the result a
     routes: [{ served: 'tavily', outcome: 'cancelled' }] }, 'result', true);
   assert.equal(label.text, '由 dsh-grok-search 执行 · Tavily · 已取消');
   assert.equal(label.tone, 'cancelled');
+});
+
+test('chat model keeps pending suppliers separate from actual attempts and never reconstructs missing latency', () => {
+  const view = createToolRouteView({ React: {}, jsx() {}, remote: {}, Original() {} });
+  const props = {phase:'start',block:{argsRaw:JSON.stringify({queries:['same query','same query','second query']})}};
+  const trace={known:true,state:'running',elapsedMs:null,routes:[{outcome:'running',phase:'search',
+    planned:['grok','tavily','exa','tinyfish','firecrawl'],calls:[
+      {provider:'grok',result:'failed',code:'grok_timeout',elapsedMs:null,evidence:'kernel-summary'},
+      {provider:'tavily',result:'running',keyIndex:0,elapsedMs:null,evidence:'dispatch'},
+    ]}]};
+  const running=view.model(trace,props);
+  assert.equal(running.query,'2 个查询');
+  assert.equal(Object.hasOwn(running.routes[0],'stacked'),false);
+  assert.equal(running.routes[0].calls.filter(row=>row.result==='pending').length,3);
+  assert.equal(running.routes[0].calls[0].elapsedMs,null);
+  assert.equal(running.routes[0].partial,true);
+  const done=view.model({...trace,state:'done',routes:[{...trace.routes[0],outcome:'ok',served:'tavily',
+    calls:[{provider:'tavily',result:'ok',keyIndex:0,elapsedMs:100,evidence:'dispatch'}]}]},
+    {phase:'result',block:{call:{argsRaw:props.block.argsRaw},meta:{sources:[],truncated:false}}});
+  assert.equal(done.routes[0].calls.length,1,'unattempted suppliers are not labelled as failed');
+  assert.equal(done.state,'done');
+  assert.equal(Object.hasOwn(done.routes[0],'stacked'),false,'source planning cannot select a vertical layout');
+});
+
+test('chat results use host data, escape via React, and reject executable or credential-bearing URLs', () => {
+  const view=createToolRouteView({React:{},jsx(){},remote:{},Original(){}});
+  const trace={known:true,state:'done',routes:[{outcome:'ok',served:'exa',resultProviders:['exa'],calls:[]}]};
+  const value=view.model(trace,{phase:'result',block:{call:{argsRaw:'{"queries":["<script>query</script>"]}'},
+    meta:{answer:'Original summary',truncated:true,sources:[
+      {url:'javascript:alert(1)',title:'bad'},
+      {url:'https://secret:token@example.test/'},
+      {url:'https://example.test/a',title:'<img src=x onerror=alert(1)>',snippet:'Source excerpt',publishedAt:'2026-11-10'},
+    ]}}});
+  assert.equal(value.sources.length,1);
+  assert.equal(value.sources[0].title,'<img src=x onerror=alert(1)>');
+  assert.equal(value.sources[0].snippet,'Source excerpt');
+  assert.equal(value.answer,'Original summary');
+  assert.equal(value.truncated,true);
+  assert.equal(value.routes[0].calls[0].evidence,'source-label');
+  assert.equal(value.routes[0].calls[0].elapsedMs,null);
+});
+
+test('a host result cannot turn an unsettled route snapshot into a successful card', () => {
+  const view=createToolRouteView({React:{},jsx(){},remote:{},Original(){}});
+  const props={phase:'result',block:{call:{argsRaw:'{"queries":["weather"]}'},meta:{sources:[]}}};
+  const trace={known:true,state:'running',routes:[{outcome:'running',phase:'search',
+    planned:['tavily'],calls:[{provider:'tavily',result:'running',elapsedMs:null}]}]};
+  const waiting=view.model(trace,props);
+  assert.equal(waiting.state,'running');
+  assert.equal(waiting.label,'正在确认结果');
+  assert.equal(waiting.routes[0].calls[0].result,'running');
+  for(const state of ['failed','cancelled']){
+    const settled=view.model({...trace,state,routes:[{...trace.routes[0],outcome:state,
+      calls:[{provider:'tavily',result:state,code:'HTTP_401'}]}]},props);
+    assert.equal(settled.state,state);
+    assert.notEqual(settled.label,'已完成');
+  }
+});
+
+test('a finished card revalidates once when visible again and discards cleared attribution', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const requests=[],updates=[];
+  const view=createToolRouteView({React:{},jsx(){},Original(){},remote:{
+    toolCallTrace:()=>new Promise(resolve=>requests.push(resolve)),
+  }});
+  const watch=view.watch({sessionId:'s',callId:'c',phase:'result',onChange:value=>updates.push(value)});
+  const flush=async()=>{await Promise.resolve();await Promise.resolve();};
+  try{
+    watch.update({phase:'result',visible:true});
+    requests.shift()({known:true,state:'done',routes:[{outcome:'ok',served:'tavily'}]});await flush();
+    t.mock.timers.tick(5000);assert.equal(requests.length,0,'terminal cards do not continuously poll');
+    watch.update({phase:'result',visible:false});
+    watch.update({phase:'result',visible:true});
+    assert.equal(requests.length,1,'visibility resumes a bounded validity check');
+    for(let index=0;index<3;index++){
+      requests.shift()({known:false,state:'unknown',routes:[]});await flush();
+      if(index<2)t.mock.timers.tick(750);
+    }
+    assert.equal(updates.at(-1).result.known,false);
+    t.mock.timers.tick(5000);assert.equal(requests.length,0,'unknown results stop after the bounded retry window');
+  }finally{watch.dispose();t.mock.timers.reset();}
+});
+
+test('unsettled terminal attribution times out neutrally instead of spinning or claiming success', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const requests=[],updates=[];
+  const view=createToolRouteView({React:{},jsx(){},Original(){},remote:{
+    toolCallTrace:()=>new Promise(resolve=>requests.push(resolve)),
+  }});
+  const watch=view.watch({sessionId:'s',callId:'c',phase:'result',onChange:value=>updates.push(value)});
+  try{
+    watch.update({phase:'result',visible:true});
+    for(let index=0;index<3;index++){
+      requests.shift()({known:true,state:'running',routes:[{outcome:'running',calls:[]}]});
+      await Promise.resolve();await Promise.resolve();
+      if(index<2)t.mock.timers.tick(750);
+    }
+    assert.equal(updates.at(-1).unreadable,true);
+    assert.equal(updates.at(-1).code,'TOOL_ROUTE_PENDING');
+    assert.equal(updates.at(-1).result,null);
+    t.mock.timers.tick(5000);assert.equal(requests.length,0);
+  }finally{watch.dispose();t.mock.timers.reset();}
+});
+
+test('route watcher pauses offscreen, deduplicates identical snapshots, and drops late replies on disposal', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const requests=[],updates=[];
+  const view=createToolRouteView({React:{},jsx(){},Original(){},remote:{
+    toolCallTrace:()=>new Promise(resolve=>requests.push(resolve)),
+  }});
+  const watch=view.watch({sessionId:'s',callId:'c',phase:'start',onChange:value=>updates.push(value)});
+  const running={known:true,state:'running',routes:[{served:null,outcome:'running'}]};
+  try {
+    watch.update({phase:'start',visible:false});t.mock.timers.tick(2000);
+    assert.equal(requests.length,0);
+    watch.update({phase:'start',visible:true});watch.update({phase:'start',visible:true});
+    assert.equal(requests.length,1,'only one RPC may be in flight');
+    requests.shift()(running);await Promise.resolve();await Promise.resolve();
+    t.mock.timers.tick(750);requests.shift()(running);await Promise.resolve();await Promise.resolve();
+    assert.equal(updates.length,1,'unchanged wire state does not update React');
+    watch.update({phase:'start',visible:false});t.mock.timers.tick(5000);
+    assert.equal(requests.length,0);
+    watch.update({phase:'result',visible:true});
+    watch.dispose();requests.shift()({...running,state:'done'});
+    await Promise.resolve();await Promise.resolve();
+    assert.equal(updates.length,1);
+  }finally{watch.dispose();t.mock.timers.reset();}
+});
+
+test('terminal publication races retry boundedly without converting cancelled calls to success', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const updates=[],requests=[];
+  const view=createToolRouteView({React:{},jsx(){},Original(){},remote:{
+    toolCallTrace:()=>new Promise(resolve=>requests.push(resolve)),
+  }});
+  const watch=view.watch({sessionId:'s',callId:'c',phase:'start',onChange:value=>updates.push(value)});
+  try {
+    watch.update({phase:'start',visible:true});
+    watch.update({phase:'result',visible:true});
+    requests.shift()({known:true,state:'running',routes:[{outcome:'running',calls:[]}]});
+    await Promise.resolve();await Promise.resolve();
+    t.mock.timers.tick(750);
+    assert.equal(requests.length,1,'a result phase must not settle a stale running snapshot');
+    requests.shift()({known:true,state:'cancelled',routes:[{outcome:'cancelled',calls:[]}]});
+    await Promise.resolve();await Promise.resolve();t.mock.timers.tick(2000);
+    assert.equal(requests.length,0);
+    assert.equal(updates.at(-1).result.state,'cancelled');
+  }finally{watch.dispose();t.mock.timers.reset();}
+});
+
+test('a hung trace read becomes a bounded error without stacking requests or repainting hidden cards', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  let reads=0,resolve;const updates=[];
+  const view=createToolRouteView({React:{},jsx(){},Original(){},remote:{
+    toolCallTrace:()=>{reads++;return new Promise(done=>{resolve=done;});},
+  }});
+  const watch=view.watch({sessionId:'s',callId:'c',phase:'start',onChange:value=>updates.push(value)});
+  try {
+    watch.update({phase:'start',visible:true});
+    watch.update({phase:'start',visible:false});
+    t.mock.timers.tick(4000);
+    assert.equal(updates.length,0,'offscreen reads cannot trigger React updates');
+    watch.update({phase:'start',visible:true});
+    assert.equal(updates[0].code,'SETTINGS_READ_TIMEOUT');
+    watch.update({phase:'result',visible:true});t.mock.timers.tick(6000);
+    assert.equal(reads,1);
+    watch.dispose();resolve({known:true,state:'done',routes:[]});
+    await Promise.resolve();await Promise.resolve();
+    assert.equal(updates.length,1);
+  }finally{watch.dispose();t.mock.timers.reset();}
+});
+
+test('empty or malformed identities never schedule a trace read', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  let reads=0;
+  const view=createToolRouteView({React:{},jsx(){},Original(){},remote:{toolCallTrace:async()=>{reads++;return {known:false,routes:[]};}}});
+  try{
+    for(const [sessionId,callId]of [['','c'],['s',''],['s','bad id'],['s','x'.repeat(513)]]){
+      const watch=view.watch({sessionId,callId,phase:'result',onChange:()=>assert.fail('invalid identity cannot publish')});
+      watch.update({phase:'result',visible:true});t.mock.timers.tick(5000);watch.dispose();
+    }
+    assert.equal(reads,0);
+  }finally{t.mock.timers.reset();}
 });

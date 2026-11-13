@@ -7,7 +7,7 @@ import { SEARCH_EXECUTION } from './core/search-config.mjs';
 
 export const PROVIDER_ID = 'grok-search';
 
-// 本轮只实现查询核心；自动接管、临时字段所有权及持久恢复由控制层验收。
+// 查询核心；自动接管、临时字段所有权与持久恢复由独立控制层负责。
 export function createGrokProvider({ configuration, sdkFactory, runQuery, executionConfiguration = () => configuration } = {}) {
   if (!configuration || typeof configuration !== 'object') throw new TypeError('需要查询配置。');
   const budgetMs = configuration.budgetMs ?? 120_000;

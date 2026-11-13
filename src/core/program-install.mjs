@@ -1,11 +1,12 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
-  renameSync, unlinkSync, writeFileSync } from 'node:fs';
+  renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { GrokSearchError } from './errors.mjs';
 import { findExistingGrok, grokPlatformPackage, inspectGrokProgram, VERIFIED_GROK_VERSIONS } from './program-discovery.mjs';
 import { probeMcpHandshake } from './mcp-search.mjs';
+import { acquireOwnedLock } from './owned-lock.mjs';
 
 const fail = (code, message) => { throw new GrokSearchError(code, message); };
 const REGISTRIES = Object.freeze(['https://registry.npmjs.org', 'https://registry.npmmirror.com']);
@@ -73,21 +74,26 @@ async function readResponse(response, limit, signal) {
   let reader;
   const chunks = [];
   let size = 0;
+  const abort = () => { void reader?.cancel(signal.reason).catch(() => {}); };
   try {
+    signal?.throwIfAborted();
     if (!response.ok) fail('GROK_DOWNLOAD_HTTP', `程序下载服务返回 HTTP ${response.status}。`);
     if (Number(response.headers.get('content-length')) > limit) fail('GROK_DOWNLOAD_SIZE', '下载文件超过限制。');
     reader = response.body?.getReader();
     if (!reader) fail('GROK_DOWNLOAD_EMPTY', '下载服务未返回文件内容。');
+    signal?.addEventListener('abort', abort, { once: true });
     for (;;) {
       signal?.throwIfAborted();
       const { value, done } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       size += value.length;
       if (size > limit) fail('GROK_DOWNLOAD_SIZE', '下载文件超过限制。');
       chunks.push(value);
     }
   } finally {
-    if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    signal?.removeEventListener('abort', abort);
+    if (reader) { void reader.cancel().catch(() => {}); reader.releaseLock(); }
     // A rejected status/header still owns an unread body. Release it before
     // retrying the mirror instead of waiting for nondeterministic GC.
     else await response.body?.cancel?.().catch(() => {});
@@ -105,6 +111,27 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     try { stat = lstatSync(directory); }
     catch (error) { if (error.code === 'ENOENT') return; throw error; }
     if (!stat.isDirectory() || stat.isSymbolicLink()) fail('GROK_CACHE_PATH_INVALID', '程序缓存必须是插件自管的实际目录。');
+  };
+  const removeIncompleteVersion = ({ id, folder, files }) => {
+    checkCacheRoot();
+    if (!lstatSync(folder).isDirectory() || lstatSync(folder).isSymbolicLink()) return;
+    const root = realpathSync(directory), target = realpathSync(folder);
+    if (relative(root, target) !== id) return;
+    try {
+      const activeRecord = JSON.parse(readFileSync(join(directory, 'active.json'), 'utf8'));
+      if (!safePath(activeRecord.executable)) return;
+      if (resolve(directory, activeRecord.executable).startsWith(folder + sep)) return;
+    } catch (error) {
+      if (error.code !== 'ENOENT') return;
+    }
+    // Remove only the files we created, after the validation process is known
+    // to have exited. Unknown files, active versions and linked paths survive.
+    for (const file of files) {
+      if (relative(target, resolve(file)).includes(sep) || !lstatSync(file).isFile()
+        || lstatSync(file).isSymbolicLink()) return;
+      unlinkSync(file);
+    }
+    rmdirSync(target);
   };
   const fetchBytes = async (url, limit, signal) => {
     for (let redirects = 0; redirects < 4; redirects++) {
@@ -187,17 +214,19 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       checkCacheRoot();
       const lock = join(directory, '.install.lock');
-      let fd;
+      let ownedLock;
+      let incomplete = null, staged = null, published = false, validationExited = true;
       try {
-        try { fd = openSync(lock, 'wx', 0o600); }
+        try { ownedLock = acquireOwnedLock(lock, { reclaimStaleAfterMs: 30 * 60 * 1000 }); }
         catch (error) {
           if (error.code === 'EEXIST') fail('GROK_INSTALL_BUSY', '另一个实例正在准备程序，或上次准备被中断。');
           if (['EACCES', 'EPERM'].includes(error.code)) fail('GROK_CACHE_ACCESS_DENIED', '没有写入程序缓存的权限，请检查目录权限。');
           throw error;
         }
         notify({ phase: 'checking-version' });
-        const version = requestedVersion ?? (await metadata('grok-search-rs', 'latest', combined)).data.version;
-        if (!VERIFIED_GROK_VERSIONS.includes(version)) fail('GROK_VERSION_UNVERIFIED', `上游最新版本 ${version} 尚未通过兼容验证，未自动安装。`);
+        const selectedVersion = VERIFIED_GROK_VERSIONS.at(-1);
+        const version = requestedVersion ?? selectedVersion;
+        if (!VERIFIED_GROK_VERSIONS.includes(version)) fail('GROK_VERSION_UNVERIFIED', `程序版本 ${version} 尚未通过兼容验证，未自动安装。`);
         const resolved = await metadata(packageName, version, combined);
         const { data } = resolved;
         if (data.version !== version || !data.dist?.tarball || !data.dist?.integrity) fail('GROK_DOWNLOAD_METADATA', '平台包版本或下载信息不完整。');
@@ -224,11 +253,15 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         const id = `${version}-${platform}-${arch}-${randomUUID()}`;
         const folder = join(directory, id);
         mkdirSync(folder, { mode: 0o700 });
+        incomplete = { id, folder, files: [] };
         const path = join(folder, unpacked.filename);
         const binary = openSync(path, 'wx', 0o700);
+        incomplete.files.push(path);
         try { writeFileSync(binary, unpacked.executable); fsyncSync(binary); } finally { closeSync(binary); }
         if (platform !== 'win32') chmodSync(path, 0o700);
+        validationExited = false;
         const checked = await inspect(path, { signal: combined, platform });
+        validationExited = true;
         if (checked.version !== version) fail('GROK_PROGRAM_IDENTITY_INVALID', '下载程序实际版本与元数据不一致。');
         if (checked.sha256 !== sha256(unpacked.executable)) fail('GROK_PROGRAM_CHANGED', '程序在验证期间发生变化，未启用。');
         const envOverrides = Object.fromEntries(Object.keys(process.env)
@@ -240,24 +273,37 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         Object.assign(envOverrides, { HOME: folder, USERPROFILE: folder, GROK_SEARCH_AUTH_MODE: 'api_key',
           GROK_SEARCH_API_KEY: 'dsh-handshake-only-sentinel-not-a-real-key',
           GROK_SEARCH_URL: 'http://127.0.0.1:9', GROK_SEARCH_MODEL: 'offline-handshake' });
+        validationExited = false;
         const protocol = await handshake({ executable: path, signal: combined,
           configPath: join(folder, 'handshake-config-not-created.toml'), envOverrides });
+        validationExited = protocol.exited === true;
         if (protocol.version !== version || protocol.toolsDeclared !== true || protocol.exited !== true) {
           fail('GROK_PROTOCOL_UNVERIFIED', '下载程序的 MCP 握手或回收验证未通过，未启用。');
         }
         const record = { schemaVersion: 1, version, executable: `${id}/${unpacked.filename}`,
           sha256: sha256(unpacked.executable), integrity: data.dist.integrity, registry: resolved.origin, downloadRegistry,
           mcpHandshakeValidated: true, handshakeUsesSyntheticConfig: true, credentialsValidated: false };
-        writeFileSync(join(folder, 'receipt.json'), JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-        const staged = join(directory, `active-${randomUUID()}.json`);
+        const receiptPath = join(folder, 'receipt.json');
+        writeFileSync(receiptPath, JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        incomplete.files.push(receiptPath);
+        staged = join(directory, `active-${randomUUID()}.json`);
         const stagedFd = openSync(staged, 'wx', 0o600);
         try { writeFileSync(stagedFd, JSON.stringify(record) + '\n'); fsyncSync(stagedFd); } finally { closeSync(stagedFd); }
         combined.throwIfAborted();
         renameSync(staged, join(directory, 'active.json'));
+        published = true;
         notify({ phase: 'ready', version });
         return { ...checked, source: 'private-cache', found: true };
+      } catch (error) {
+        if (error.diagnostic?.exited === true) validationExited = true;
+        throw error;
       } finally {
-        if (fd !== undefined) { closeSync(fd); unlinkSync(lock); }
+        if (!published && staged) { try { unlinkSync(staged); } catch { /* An uncertain stage is never activated. */ } }
+        if (!published && incomplete && validationExited) {
+          try { removeIncompleteVersion(incomplete); }
+          catch { /* Preserve uncertain leftovers; never change the original installation error. */ }
+        }
+        if (ownedLock) ownedLock.release();
       }
     })().finally(() => { clearTimeout(timer); pending = null; });
     return pending;
@@ -272,17 +318,26 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       // process ownership must retain their original errors.
       if (error.code !== 'GROK_CACHE_DAMAGED') throw error;
     }
-    // Explicit recovery uses a version verified by this plugin. Normal first
-    // installation keeps its existing latest/version compatibility policy.
+    // Both first installation and explicit repair use a verified version.
     return install({ signal, onProgress, version: VERIFIED_GROK_VERSIONS.at(-1) });
   };
   return { active, install, repair };
 }
 
 export async function resolveGrokProgram({ installer, signal, onProgress, repair = false, ...discovery } = {}) {
-  const existing = await findExistingGrok({ ...discovery, signal });
-  if (existing.found) return existing;
+  let discoveryError = null;
+  try {
+    const existing = await findExistingGrok({ ...discovery, signal });
+    if (existing.found) return existing;
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (discovery.override || discovery.configured
+      || ['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error.code)) throw error;
+    discoveryError = error;
+  }
   if (repair) return installer.repair({ signal, onProgress });
   const cached = await installer.active({ signal });
-  return cached ?? installer.install({ signal, onProgress });
+  if (cached) return cached;
+  if (discoveryError) throw discoveryError;
+  return installer.install({ signal, onProgress });
 }

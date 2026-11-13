@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data:; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/tool-route.css">
+  <title>聊天搜索卡片 · 生产客户端回归</title>
+</head>
+<body>
+<script src="/react.js"></script>
+<script src="/react-dom.js"></script>
+<script src="/jsx.js"></script>
+<script>
+  window.__ModuleLoader__={load(definition){
+    window.__dsgChatClient=definition.factory(name=>{
+      if(name==='react')return window.React;
+      if(name==='react/jsx-runtime')return window.__jsx;
+      throw new Error('Unexpected fixture import: '+name);
+    });
+  }};
+  window.__dsgTestRuntime={async import(name){
+    if(name==='react')return window.React;
+    if(name==='react/jsx-runtime')return window.__jsx;
+    if(name==='react-dom/client')return window.ReactDOM;
+    if(name==='dsh-grok-search')return window.__dsgChatClient;
+    throw new Error('Unexpected fixture module: '+name);
+  }};
+</script>
+<script src="/client.js"></script>
+<script type="module">
+  import {mountChatCardFixture} from '/fixture.mjs';
+  const response=await fetch('/logos');
+  window.__dsgChatReady=await mountChatCardFixture(await response.json());
+</script>
+</body>
+</html>

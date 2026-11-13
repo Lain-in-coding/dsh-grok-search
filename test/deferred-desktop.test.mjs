@@ -4,6 +4,7 @@ import { Buffer } from 'node:buffer';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, realpathSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   readElectronFuseWire, assertDevelopmentFuseCompatibility,
   resolveNewTemporaryRunRoot, inspectDesktopPreparation,
@@ -12,6 +13,12 @@ import { captureDesktopSearch, captureDesktopSeam, waitForDesktopRecovery } from
 import { requestDesktopShutdown } from '../scripts/lib/renderer-cdp.mjs';
 import { desktopAcceptancePaths, desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from '../scripts/lib/desktop-acceptance-environment.mjs';
 import { commandResult } from '../scripts/lib/internal-candidate-utils.mjs';
+import { build } from 'esbuild';
+import { gzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
+import { readUpgradePackage, retainUpgradeCache, searchLogUpgradeStages } from '../scripts/verify-search-log-upgrade.mjs';
+import * as upgradeVerifier from '../scripts/verify-search-log-upgrade.mjs';
+import { finishNativeUpdate, nativeUpdateMetadata, nativeUpdateHostStages, validateNativeUpdateOutcome } from '../scripts/verify-native-update.mjs';
 
 const fuseBinary = (wire = '101100011', version = 1, length = wire.length) => Buffer.concat([
   Buffer.from('fixture-prefix:dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX'),
@@ -21,6 +28,284 @@ const temporary = realpathSync(tmpdir());
 const sandbox = mkdtempSync(join(temporary, 'dsh-deferred-desktop-checks-'));
 const marker = join(sandbox, 'existing-marker.txt');
 writeFileSync(marker, '既有成果保持', { flag: 'wx' });
+
+function upgradePackage(version, receiptVersion = version) {
+  const folder = mkdtempSync(join(sandbox, 'upgrade-package-'));
+  const manifest = Buffer.from(JSON.stringify({ name: 'dsh-grok-search', version }));
+  const header = Buffer.alloc(512);
+  header.write('package/package.json');
+  header.write(manifest.length.toString(8).padStart(11, '0') + '\0', 124, 'ascii');
+  const data = gzipSync(Buffer.concat([header, manifest, Buffer.alloc((512 - manifest.length % 512) % 512), Buffer.alloc(1024)]));
+  const path = join(folder, 'package.tgz');
+  writeFileSync(path, data, { flag: 'wx' });
+  writeFileSync(join(folder, 'package-receipt.json'), JSON.stringify({
+    version: receiptVersion, sha256: createHash('sha256').update(data).digest('hex'),
+    sourceHashes: [{ file: 'package.json', sha256: createHash('sha256').update(manifest).digest('hex') }],
+  }), { flag: 'wx' });
+  return path;
+}
+
+test('upgrade inputs use the actual archive and receipt versions, rejecting relabelled distributions', () => {
+  for (const version of ['0.2.0', '0.2.1', '0.3.0']) {
+    const pkg = readUpgradePackage(upgradePackage(version));
+    assert.equal(pkg.manifest.version, version);
+    assert.equal(pkg.receipt.version, version);
+  }
+  assert.throws(() => readUpgradePackage(upgradePackage('0.2.1', '0.3.0')), /version/);
+  const changed = upgradePackage('0.3.0');
+  writeFileSync(changed, 'different package bytes');
+  assert.throws(() => readUpgradePackage(changed), /receipt/);
+});
+
+test('upgrade receipt hashes must describe actual archive files instead of an unchecked claimed source list', () => {
+  for (const hash of [{ file: 'package.json', sha256: '0'.repeat(64) },
+    { file: '../outside.json', sha256: '0'.repeat(64) }]) {
+    const path = upgradePackage('0.3.0'), receiptPath = join(path, '../package-receipt.json');
+    const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+    receipt.sourceHashes = [hash];
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    assert.throws(() => readUpgradePackage(path), /receipt|source|archive/i);
+  }
+});
+
+test('native update registry advertises exactly the supplied historical or current upgrade pair', () => {
+  for (const versions of [['0.2.0', '0.2.1'], ['0.2.1', '0.3.0']]) {
+    const packages = versions.map(version => readUpgradePackage(upgradePackage(version)));
+    const metadata = nativeUpdateMetadata(packages, 'http://127.0.0.1:12345');
+    assert.equal(metadata['dist-tags'].latest, versions[1]);
+    assert.deepEqual(Object.keys(metadata.versions), versions);
+    assert.deepEqual(Object.keys(metadata.time).filter(key => !['created', 'modified'].includes(key)), versions);
+    for (const pkg of packages) {
+      const distribution = metadata.versions[pkg.manifest.version];
+      assert.equal(distribution.dist.tarball, 'http://127.0.0.1:12345/tar/dsh-grok-search/' + pkg.manifest.version);
+      assert.equal(distribution.dist.integrity, 'sha512-' + createHash('sha512').update(pkg.data).digest('base64'));
+    }
+  }
+  const same = readUpgradePackage(upgradePackage('0.3.0'));
+  assert.throws(() => nativeUpdateMetadata([same, same], 'http://127.0.0.1:12345'), /distinct/);
+});
+
+test('native update may seed an unchanged old package on rc.1 but never downgrade its host data', () => {
+  assert.deepEqual(nativeUpdateHostStages('0.2.2-rc.1'), ['0.2.2-rc.1']);
+  assert.deepEqual(nativeUpdateHostStages('0.2.2-rc.2', '0.2.2-rc.1'),
+    ['0.2.2-rc.1', '0.2.2-rc.2']);
+  assert.throws(() => nativeUpdateHostStages('0.2.2-rc.1', '0.2.2-rc.2'), /forward/);
+  assert.throws(() => nativeUpdateHostStages('0.2.2-rc.3'));
+  const source = readFileSync(new URL('../scripts/verify-native-update.mjs', import.meta.url), 'utf8');
+  assert.match(source, /Install the unchanged historical package on a compatible baseline host/);
+  assert.match(source, /sameProfile: true, sameUserData: true/);
+});
+
+function nativeOutcomeFixture(scenario = 'success') {
+  const updated = ['success', 'disabled'].includes(scenario);
+  const disabled = scenario === 'disabled';
+  const baseline = { label: 'old-installed', installedVersion: '0.2.1', hostVersion: '0.2.2-rc.1',
+    enabled: !disabled, mismatched: [], configAndCacheUnchanged: true, originalSearches: 0,
+    fetchProvider: 'original-fetch', searchProvider: disabled ? 'original-search' : 'grok-search',
+    programPhase: disabled ? null : 'ready', programSource: disabled ? null : 'private-cache' };
+  const final = { ...baseline, label: 'final', installedVersion: updated ? '0.3.0' : '0.2.1' };
+  const search = { method: 'session-search', sessionCompleted: true, toolResultSucceeded: true,
+    logRecords: 1, actualSources: ['tavily'], originalSearchDelta: 0 };
+  return { scenario, oldVersion: '0.2.1', targetVersion: '0.3.0', hostVersion: '0.2.2-rc.1',
+    checkpoints: [baseline, ...(updated ? [{ ...final, label: 'after-restart' }] : []), final],
+    operations: [...(updated ? [{ method: 'desktop-restart' }] : []),
+      ...(disabled ? [] : [search, ...(updated ? [{ ...search }] : [])]),
+      ...(scenario === 'cancel-download' ? [{ method: 'pluginManager/updateBundle', pending: false,
+        result: { result: { application: 'cancelled' }, restore: { application: 'applied' } } }] : [])],
+    requests: [{ kind: 'tarball', version: '0.3.0', fault: scenario }],
+  };
+}
+
+test('native update acceptance requires the actual final version, restart and Session evidence', () => {
+  for (const scenario of ['success', 'disabled', 'download-failed', 'activation-failed', 'cancel-download']) {
+    const fixture = nativeOutcomeFixture(scenario);
+    assert.equal(validateNativeUpdateOutcome(fixture).outcome,
+      ['success', 'disabled'].includes(scenario) ? 'updated' : 'restored');
+  }
+  const incomplete = nativeOutcomeFixture();
+  incomplete.checkpoints.pop();
+  assert.throws(() => validateNativeUpdateOutcome(incomplete), /final state/);
+  const notUpdated = nativeOutcomeFixture();
+  notUpdated.checkpoints.at(-1).installedVersion = '0.2.1';
+  assert.throws(() => validateNativeUpdateOutcome(notUpdated), /target version/i);
+  const noRestart = nativeOutcomeFixture();
+  noRestart.operations = noRestart.operations.filter(row => row.method !== 'desktop-restart');
+  assert.throws(() => validateNativeUpdateOutcome(noRestart), /real host restart/);
+  const noSearch = nativeOutcomeFixture();
+  noSearch.operations = noSearch.operations.filter(row => row.method !== 'session-search');
+  assert.throws(() => validateNativeUpdateOutcome(noSearch), /Real Session searches/);
+});
+
+test('native update never labels a missing or incompatible rollback as passing', () => {
+  const missing = nativeOutcomeFixture('download-failed');
+  Object.assign(missing.checkpoints.at(-1), { installedVersion: null, enabled: null });
+  assert.throws(() => validateNativeUpdateOutcome(missing), /enabled state|original plugin/);
+  const mismatched = nativeOutcomeFixture('activation-failed');
+  mismatched.checkpoints.at(-1).mismatched = ['src/bundle.mjs'];
+  assert.throws(() => validateNativeUpdateOutcome(mismatched), /receipt/);
+  const unsent = nativeOutcomeFixture('download-failed');
+  unsent.requests = [];
+  assert.throws(() => validateNativeUpdateOutcome(unsent), /request the target distribution/);
+  const cancelled = nativeOutcomeFixture('cancel-download');
+  cancelled.operations.at(-1).pending = true;
+  assert.throws(() => validateNativeUpdateOutcome(cancelled), /finish before/);
+});
+
+test('disabled native update preserves the original route and never starts a search', () => {
+  const fixture = nativeOutcomeFixture('disabled');
+  fixture.requests.push({ kind: 'search' });
+  assert.throws(() => validateNativeUpdateOutcome(fixture), /must not send a search/);
+  fixture.requests.pop();
+  fixture.checkpoints.at(-1).programPhase = 'ready';
+  assert.throws(() => validateNativeUpdateOutcome(fixture), /must not start its program/);
+});
+
+test('retained upgrade cache preserves the prior receipt and rejects changed binary data', () => {
+  const source = mkdtempSync(join(sandbox, 'old-cache-'));
+  mkdirSync(join(source, 'verified'));
+  const binary = join(source, 'verified/grok-search-rs.exe');
+  writeFileSync(binary, 'unit-test cache bytes', { flag: 'wx' });
+  const record = { version: '0.1.26', executable: 'verified/grok-search-rs.exe',
+    sha256: createHash('sha256').update(readFileSync(binary)).digest('hex'), mcpHandshakeValidated: true };
+  writeFileSync(join(source, 'active.json'), JSON.stringify(record), { flag: 'wx' });
+  writeFileSync(join(source, 'verified/receipt.json'), JSON.stringify(record), { flag: 'wx' });
+  const target = join(sandbox, 'retained-profile-cache');
+  const retained = retainUpgradeCache(source, target);
+  assert.equal(retained.length, 3);
+  for (const row of retained) assert.deepEqual(readFileSync(row.to), readFileSync(row.from));
+  assert.throws(() => retainUpgradeCache(source, target), /EEXIST/);
+  writeFileSync(binary, 'changed prior cache');
+  const rejected = join(sandbox, 'rejected-profile-cache');
+  assert.throws(() => retainUpgradeCache(source, rejected), /differs from its receipt/);
+  assert.equal(existsSync(rejected), false);
+});
+
+test('retained upgrade cache rejects a linked version directory before copying its files', () => {
+  const source = mkdtempSync(join(sandbox, 'linked-cache-'));
+  const outside = mkdtempSync(join(sandbox, 'cache-outside-'));
+  const record = { version: '0.1.26', executable: 'verified/grok-search-rs.exe',
+    sha256: createHash('sha256').update('cache bytes').digest('hex'), mcpHandshakeValidated: true };
+  writeFileSync(join(outside, 'grok-search-rs.exe'), 'cache bytes');
+  writeFileSync(join(outside, 'receipt.json'), JSON.stringify(record));
+  symlinkSync(outside, join(source, 'verified'), process.platform === 'win32' ? 'junction' : 'dir');
+  writeFileSync(join(source, 'active.json'), JSON.stringify(record));
+  const target = join(sandbox, 'linked-cache-target');
+  assert.throws(() => retainUpgradeCache(source, target), /link/i);
+  assert.equal(existsSync(target), false);
+});
+
+test('upgrade cleanup still waits for the owned process after its close RPC rejects', async () => {
+  let ended = false, killed = false, complete;
+  const closed = new Promise(done => { complete = done; });
+  const failure = new Error('close RPC disconnected');
+  await assert.rejects(upgradeVerifier.closeUpgradeHost({
+    request: async () => { throw failure; }, closed, ended: () => ended, exitCode: () => null,
+    kill: () => { killed = true; queueMicrotask(() => { ended = true; complete(); }); },
+  }, 100), error => error === failure);
+  assert.equal(killed, true);
+  assert.equal(ended, true, 'cleanup must observe actual exit before returning the error');
+});
+
+test('native update closes its owned process even without a renderer or after a checkpoint failure', async () => {
+  for (const checkpointFails of [false, true]) {
+    let ended = false, requested = false, complete;
+    const closed = new Promise(done => { complete = done; });
+    const checkpointError = new Error('checkpoint failed');
+    const result = finishNativeUpdate({
+      process: {
+        request: async () => { requested = true; ended = true; complete(); }, closed,
+        ended: () => ended, exitCode: () => 0, kill: () => assert.fail('normal close must not kill'),
+      },
+      checkpoint: checkpointFails ? async () => { throw checkpointError; } : null,
+    });
+    if (checkpointFails) await assert.rejects(result, error => error === checkpointError);
+    else await result;
+    assert.equal(requested, true);
+    assert.equal(ended, true);
+  }
+});
+
+test('B2 settings snapshot pins the current idle test-button label', () => {
+  const source = readFileSync(new URL('../scripts/b2-plugin-manager-desktop.mjs', import.meta.url), 'utf8');
+  assert.match(source, /testButton:\s*root\.querySelector\('#testBtn'\)\?\.textContent\.trim\(\)\s*===\s*'测试连接'/);
+  assert.doesNotMatch(source, /testButton:[^\n]*includes\(['"]测试搜索['"]\)/);
+});
+
+test('B2 detail verifies the description from the actual candidate instead of an obsolete sentence', () => {
+  const source = readFileSync(new URL('../scripts/b2-plugin-manager-desktop.mjs', import.meta.url), 'utf8');
+  assert.match(source, /installedUi\.detail\.text\.includes\(expectedProduct\.manifest\.description\)/);
+  assert.doesNotMatch(source, /assert\.match\(installedUi\.detail\.text, \/用 Grok 接管/);
+});
+
+test('macOS contract gates execute frozen-package probes with official Electron instead of ordinary Node', () => {
+  const source = readFileSync(new URL('../.github/workflows/macos-beta-gate.yml', import.meta.url), 'utf8');
+  for (const name of ['verify-search-execution-host', 'verify-github-read-host']) {
+    assert.match(source, new RegExp('ELECTRON_RUN_AS_NODE=1 "\\$APP/MacOS/DeepSeek Harness" --expose-internals scripts/' + name + '\\.mjs'));
+  }
+  assert.match(source, /host-contract-package\/package/);
+  assert.match(source, /ln -s "\$GITHUB_WORKSPACE\/node_modules" "\$RUNNER_TEMP\/host-contract-package\/package\/node_modules"/);
+  assert.match(source, /assert\.equal\(result\.cases\.length, name === 'search' \? 11 : 25\)/);
+  assert.match(source, /artifacts\/host-execution-contracts\/\*\*\/\*\.json/);
+});
+
+test('Desktop replay waits for the reduced-motion change listener and measures visible chat cards', () => {
+  const source = readFileSync(new URL('../scripts/verify-search-log-desktop.mjs', import.meta.url), 'utf8');
+  const replay = source.slice(source.indexOf("mode = 'mcp-' + provider") - 600,
+    source.indexOf("mode = 'mcp-' + provider"));
+  assert.match(replay, /prefers-reduced-motion/);
+  assert.match(replay, /#historyBar/);
+  assert.match(replay, /#historyStage/);
+  assert.match(source, /followStreamingSearchCard\.toString\(\)/);
+  assert.match(source, /if\(streaming\.open&&streaming\.card\?\.isConnected&&streaming\.card\.dataset\.visible==='true'\)data\.streamFrames\+\+/);
+});
+
+test('B2 all-failed diagnostics require the exact search-failure summary and zero connected sources', () => {
+  const source = readFileSync(new URL('../scripts/b2-plugin-manager-desktop.mjs', import.meta.url), 'utf8');
+  assert.match(source, /failed\.status\s*===\s*'最近检查未通过'\s*&&\s*failed\.announcer\.includes\('搜索未通过'\)\s*&&\s*failed\.announcer\.includes\('0\/4 项连通'\)/);
+  assert.doesNotMatch(source, /failed\.announcer\.includes\(['"]测试未通过['"]\)/);
+});
+
+test('old Session verification pins its original inclusive cursor across host restart', async () => {
+  const retained = { sessionId: 'old-session', cursor: 3, records: [{ seq: 3, type: 'turn/end' }] };
+  const calls = [];
+  const host = { async rpc(method, request) {
+    calls.push({ method, request });
+    return { cursor: request.throughSeq ?? 4, records: request.throughSeq === 3
+      ? retained.records : [...retained.records, { seq: 4, type: 'session/title' }], hasMore: false };
+  } };
+  await upgradeVerifier.readRetainedSession(host, retained);
+  assert.deepEqual(calls, [{ method: 'session/page', request: {
+    address: { kind: 'session', sessionId: 'old-session' }, throughSeq: 3, maxMessages: 100,
+  } }]);
+});
+
+test('forward host upgrade retains the new plugin on rc.2 and never schedules an old-host rollback', () => {
+  const runtimes = ['0.2.2-rc.1', '0.2.2-rc.2'].map(version => ({ app: { version } }));
+  const forward = searchLogUpgradeStages({ forwardHostUpgrade: true, runtimes });
+  assert.deepEqual(forward, [
+    { packageIndex: 0, runtimeIndex: 0 },
+    { packageIndex: 1, runtimeIndex: 0 },
+    { packageIndex: 1, runtimeIndex: 1 },
+  ]);
+  assert.deepEqual(searchLogUpgradeStages({ runtimes: runtimes.slice(0, 1) }).map(row => row.packageIndex), [0, 1, 0]);
+  assert.deepEqual(searchLogUpgradeStages({ hostUpgrade: true, runtimes }).map(row => row.runtimeIndex), [0, 0, 1, 0, 0]);
+  assert.throws(() => searchLogUpgradeStages({ forwardHostUpgrade: true, hostUpgrade: true, runtimes }), /separate/);
+  assert.throws(() => searchLogUpgradeStages({ forwardHostUpgrade: true, checkpointDowngrade: true, runtimes }), /separate/);
+  assert.throws(() => searchLogUpgradeStages({ forwardHostUpgrade: true, runtimes: [...runtimes].reverse() }), /rc\.1.*rc\.2/);
+});
+
+test('the Desktop fixture copy includes the complete local core dependency closure', async () => {
+  const preparation = readFileSync(new URL('../scripts/deferred-release-desktop-prepare.mjs', import.meta.url), 'utf8');
+  const copy = /for \(const module of (\[[^\]]+\])\)/.exec(preparation);
+  assert.ok(copy, 'locate the explicit fixture-only copy list');
+  const modules = [...copy[1].matchAll(/'([^']+\.mjs)'/g)].map(match => match[1]);
+  const result = await build({ absWorkingDir: fileURLToPath(new URL('..', import.meta.url)),
+    entryPoints: modules.map(name => 'src/core/' + name), outdir: 'unused-fixture-closure',
+    bundle: true, platform: 'node', format: 'esm', packages: 'external', metafile: true, write: false, logLevel: 'silent' });
+  const missing = Object.keys(result.metafile.inputs).filter(path => path.startsWith('src/core/'))
+    .map(path => path.slice('src/core/'.length)).filter(name => !modules.includes(name));
+  assert.deepEqual(missing, [], 'new core imports must be copied before any Desktop fixture is launched');
+});
 
 test('官方格式 fuse 可读且兼容检查只接受可用的开发加载条件', () => {
   const fuses = readElectronFuseWire(fuseBinary());

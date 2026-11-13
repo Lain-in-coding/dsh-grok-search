@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ControlRecordError, createControlIntentStore } from './control-intent-store.mjs';
+import { createStorageMaintenanceWorker } from './storage-worker.mjs';
 
 export const PRODUCT_SEARCH_BUNDLE = 'dsh-grok-search';
 // Single-bundle build (D-28): recovery entries ship in the product bundle itself.
@@ -83,11 +84,31 @@ export function authorInjectSha256(ctx) {
 }
 
 export function createProductStore(ctx) {
-  return createControlIntentStore({
-    directory: join(ctx.profileContext.dir, 'control-intent.records'),
-    legacyPath: join(ctx.profileContext.dir, 'control-intent.fixture.json'),
+  const directory = join(ctx.profileContext.dir, 'control-intent.records');
+  const legacyPath = join(ctx.profileContext.dir, 'control-intent.fixture.json');
+  const maintenance = createStorageMaintenanceWorker({ directory, legacyPath, trustedRoot: ctx.profileContext.dir,
+    onResult: result => {
+      if (result.status === 'error') ctx.logger?.warn?.(`Control history maintenance failed: ${result.code ?? 'unknown'}`);
+    } });
+  const store = createControlIntentStore({
+    directory, legacyPath,
     trustedRoot: ctx.profileContext.dir,
+    governance: true,
+    autoMaintain: false, maintenanceScheduler: () => {
+      setImmediate(() => { void maintenance.schedule(); });
+    },
   });
+  // Layout maintenance never changes the user's control intent. Unknown or
+  // damaged records still fail in the authoritative read; maintenance failure
+  // is reported separately and is not permission to restore another provider.
+  let disposed = false;
+  ctx.effect?.(() => () => { disposed = true; maintenance.dispose(); });
+  setImmediate(() => {
+    if (disposed) return;
+    try { store.scheduleMaintenance(); }
+    catch (error) { ctx.logger?.warn?.(`Control history maintenance not scheduled: ${error.code ?? 'unknown'}`); }
+  });
+  return store;
 }
 
 export function createAcquisition(ctx, observedAt = new Date().toISOString()) {

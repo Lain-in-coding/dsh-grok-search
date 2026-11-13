@@ -43,18 +43,22 @@ const upstream = createServer(async (request, response) => {
 await new Promise(done => upstream.listen(0, '127.0.0.1', done));
 const upstreamOrigin = `http://127.0.0.1:${upstream.address().port}`;
 const results = [];
+const exits = [];
 let owned = null, fatal = null;
 const sleep = ms => new Promise(done => setTimeout(done, ms));
 async function stop() {
   if (!owned) return;
-  owned.renderer?.close();
-  if (!owned.ended) {
-    try { await requestDesktopShutdown(owned.port, owned.closed, { timeoutMs: 20_000 }); }
+  const current = owned;
+  current.renderer?.close();
+  if (!current.ended) {
+    try { await requestDesktopShutdown(current.port, current.closed, { timeoutMs: 20_000 }); }
     catch {
-      owned.forced = true;
-      if (!owned.ended) { owned.child.kill('SIGKILL'); await owned.closed; }
+      current.forced = true;
+      if (!current.ended) { current.child.kill('SIGKILL'); await current.closed; }
     }
   }
+  exits.push({ label: current.label, code: current.exitCode, forced: current.forced === true,
+    spawnError: current.spawnError ?? null });
   owned = null;
 }
 try {
@@ -109,8 +113,9 @@ try {
       '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + port, '--lang=zh-CN'],
     { cwd: folder, env, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.resume(); child.stderr.resume();
-    owned = { child, port, ended: false };
-    owned.closed = new Promise(done => child.once('close', code => { owned.ended = true; owned.exitCode = code; done(); }));
+    const current = owned = { child, port, label: entry.label, ended: false };
+    child.once('error', error => { current.spawnError = error.code ?? 'SPAWN_FAILED'; });
+    current.closed = new Promise(done => child.once('close', code => { current.ended = true; current.exitCode = code; done(); }));
     console.log(JSON.stringify({ label: entry.label, phase: 'starting-official-rc5-isolated' }));
     const deadline = Date.now() + 90_000;
     while (!existsSync(addressPath) && !owned.ended && Date.now() < deadline) await sleep(200);
@@ -163,7 +168,8 @@ try {
   await stop();
   await new Promise(done => upstream.close(done));
   const summary = { runId: run.runId, scope: 'official-windows-rc5-desktop-synthetic-only',
-    passed: !fatal && results.length === 2, fatal, results, sourceHashes,
+    passed: !fatal && results.length === 2 && exits.length === 2
+      && exits.every(row => row.code === 0 && !row.forced && !row.spawnError), fatal, results, exits, sourceHashes,
     officialFilesUnchanged: sha256(runtime.archivePath) === originalArchive && sha256(runtime.executable) === originalExecutable,
     profileAndKeys: 'new synthetic-only isolated profiles', realCredentialsRead: false, paidRequests: false };
   writeJson(join(run.directory, 'summary.json'), summary);

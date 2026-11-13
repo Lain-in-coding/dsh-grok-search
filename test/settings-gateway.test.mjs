@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -172,6 +172,45 @@ test('SRC dispatch keeps draft validation and owner-only protection without the 
     { code: 'CONFIG_VALUE_INVALID' });
 });
 
+test('direct dispatch validates missing requests while optional config opening keeps its empty default', async () => {
+  const { gateway, path } = viewGateway({ transport: 'restricted' });
+  let reads = 0;
+  gateway._store = () => { reads++; throw new Error('invalid requests must not read configuration'); };
+  for (const descriptor of SETTINGS_DESCRIPTORS) {
+    if (!descriptor.parameters.length || descriptor.method.startsWith('openConfigLocation')) continue;
+    await assert.rejects(gateway[descriptor.method](), { code: 'SETTINGS_REQUEST_INVALID' }, descriptor.method);
+    await assert.rejects(gateway[descriptor.method](undefined), { code: 'SETTINGS_REQUEST_INVALID' }, descriptor.method);
+  }
+  for (const method of ['openConfigLocation', 'openConfigLocationWithStatus']) {
+    for (const value of [undefined, {}]) {
+      const result = await gateway[method](value);
+      assert.equal(result.kind, 'folder');
+      assert.equal(result.path, path);
+      assert.equal(result.opened, false);
+    }
+    await assert.rejects(gateway[method](null), { code: 'SETTINGS_REQUEST_INVALID' });
+  }
+  assert.equal(reads, 0);
+});
+
+test('owner RPCs fail closed when connection security is absent', async () => {
+  const { gateway } = viewGateway();
+  gateway.security = null;
+  let effects = 0;
+  gateway._store = () => { effects++; throw new Error('must not read or save'); };
+  gateway.preferenceStore = { snapshot() { effects++; }, save() { effects++; } };
+  gateway.program = { prepare() { effects++; }, repair() { effects++; } };
+  gateway.control = { stop() { effects++; } };
+  for (const [method, request] of [
+    ['snapshot'], ['preferences'], ['prepareProgram'], ['repairProgram'], ['stop'],
+    ['save', { expectedRevision: 'missing', updates: { grok_model: 'new' } }],
+    ['savePreferences', { expectedRevision: 'missing', value: {} }],
+    ['toolCallRoute', { sessionId: randomUUID(), callId: 'call' }],
+    ['toolCallTrace', { sessionId: randomUUID(), callId: 'call' }],
+  ]) await assert.rejects(gateway[method](request), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' }, method);
+  assert.equal(effects, 0);
+});
+
 test('search history uses separate secure owner RPCs; ordinary snapshot stays redacted', async () => {
   const log = createSearchLog(), id = randomUUID();
   const { gateway } = viewGateway({ core: { searchLog: log } });
@@ -187,6 +226,27 @@ test('search history uses separate secure owner RPCs; ordinary snapshot stays re
   assert.deepEqual(await gateway.readSearchLog({ sessionId: id }), { records: [] });
   await gateway.closeSearchLog({ sessionId: id });
   log.dispose();
+});
+
+test('clearing private search history preserves independent chat routes and traces', async () => {
+  const log = createSearchLog(), routes = createToolRouteContext(), sessionId = randomUUID();
+  const { gateway } = viewGateway({ core: { searchLog: log } });
+  gateway.callRoutes = routes;
+  try {
+    await gateway.readSearchLog({ sessionId });
+    const token = log.begin('private-history');
+    log.finish(token, { outcome: 'ok', served: 'tavily' });
+    await routes.run({ name: 'web_search', callId: 'call', agent: { session: { id: sessionId } } }, async () => {
+      routes.capture().finish({ outcome: 'ok', served: 'tavily' });
+    });
+    const request = { sessionId, callId: 'call' };
+    const route = await gateway.toolCallRoute(request), trace = await gateway.toolCallTrace(request);
+    assert.equal(route.known, true);
+    assert.equal(trace.known, true);
+    assert.deepEqual(await gateway.clearSearchLog({ sessionId }), { records: [] });
+    assert.deepEqual(await gateway.toolCallRoute(request), route);
+    assert.deepEqual(await gateway.toolCallTrace(request), trace);
+  } finally { log.dispose(); routes.dispose(); }
 });
 
 test('chat route RPC requires owner and exact session/call identity without exposing search text', async () => {
@@ -307,7 +367,9 @@ test('authenticated draft quota query and cancellation never save a file or conf
       draft: { baseUrl: `http://127.0.0.1:${server.address().port}`, apiKey: 'unsaved-synthetic' } };
     const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'accountQuota');
     assert.equal(descriptor.parameters[0].codec.create().safeParse(request).success, true);
+    const reads = observeConfigReads(gateway);
     assert.equal((await gateway.accountQuota(request)).value.remaining, 7);
+    assert.deepEqual(reads, { paired: 2, snapshot: 0, effective: 0 });
     assert.equal(existsSync(path), false, 'query does not create shared config');
     assert.equal((await gateway.snapshot()).config.revision, snapshot.config.revision);
     const operationId = randomUUID();
@@ -322,12 +384,22 @@ test('strict RPC codec implements the actual gateway parse boundary', () => {
   const request = { expectedRevision: 'missing', updates: { grok_api_key: 'sentinel' } };
   assert.deepEqual(codec.parse(request), request);
   assert.equal(codec.safeParse(request).success, true);
+  let deeplyNested = 1;
+  for (let i = 0; i < 70; i++) deeplyNested = { next: deeplyNested };
   for (const invalid of [null, [], {}, { expectedRevision: 4, updates: {} },
     { expectedRevision: 'missing', updates: [], unexpected: true },
-    { expectedRevision: 'missing', updates: { unknown: Infinity } }]) {
+    { expectedRevision: 'missing', updates: { unknown: Infinity } },
+    { expectedRevision: 'missing', updates: { unknown: new Date() } },
+    { expectedRevision: 'missing', updates: { unknown: deeplyNested } }]) {
     assert.throws(() => codec.parse(invalid), /Invalid settings payload/);
     assert.equal(codec.safeParse(invalid).success, false);
   }
+});
+
+test('missing required RPC arguments are rejected before implementation dispatch', async () => {
+  const { gateway } = viewGateway();
+  await assert.rejects(gateway.testSearch(), { code: 'SETTINGS_REQUEST_INVALID' });
+  await assert.rejects(gateway.testSearch({}), { code: 'SETTINGS_REQUEST_INVALID' });
 });
 
 test('settings gateway declares the host Remote error protocol it imports', () => {
@@ -336,7 +408,7 @@ test('settings gateway declares the host Remote error protocol it imports', () =
     manifest.peerDependencies['@deepseek-ai/dsh']);
 });
 
-function diagnosticGateway({ core = {}, sourceRouter = {}, preferences } = {}) {
+function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github = null } = {}) {
   let Gateway;
   applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-diagnose-'));
@@ -348,11 +420,73 @@ function diagnosticGateway({ core = {}, sourceRouter = {}, preferences } = {}) {
     ['grokSearchProgram', { snapshot: () => ({ configPath: join(directory, 'config.toml') }) }],
     ['grokSearchCore', core],
     ['grokSearchSourceRouter', sourceRouter],
+    ['grokSearchGithub', github],
     ['grokSearchConnectionSecurity', { requireOwner() {}, requireSecret() {},
       capabilities: () => ({ secretsAllowed: true, transport: 'loopback', reason: null }) }],
   ]);
   return new Gateway({ profileContext: { dir: directory }, get: name => services.get(name), provide: () => {} });
 }
+
+function observeConfigReads(gateway) {
+  const reads = { paired: 0, snapshot: 0, effective: 0 }, original = gateway._store.bind(gateway);
+  gateway._store = path => {
+    const store = original(path);
+    return { ...store,
+      readSnapshot() { reads.paired++; return store.readSnapshot(); },
+      snapshot() { reads.snapshot++; return store.snapshot(); },
+      readEffective() { reads.effective++; return store.readEffective(); },
+    };
+  };
+  return reads;
+}
+
+test('settings snapshot passes its exact local configuration capture to the health view once', async () => {
+  let observed;
+  const gateway = diagnosticGateway({ core: { routeSnapshot(captured) { observed = captured; return null; } } });
+  const reads = observeConfigReads(gateway);
+  const result = await gateway.snapshot();
+  assert.deepEqual(reads, { paired: 1, snapshot: 0, effective: 0 });
+  assert.equal(observed.snapshot.revision, result.config.revision);
+  assert.equal(observed.snapshot.path, result.config.path);
+  assert.ok(observed.effective);
+});
+
+test('provider diagnosis pairs revision and effective identity in one read at each boundary', async () => {
+  const gateway = diagnosticGateway({ sourceRouter: {
+    diagnoseProvider: async provider => ({ provider, status: 'ok', code: 'OK', message: 'ok' }),
+  } });
+  const reads = observeConfigReads(gateway);
+  assert.equal((await gateway.diagnoseProvider({ provider: 'tavily' })).status, 'ok');
+  assert.deepEqual(reads, { paired: 2, snapshot: 0, effective: 0 });
+});
+
+test('diagnostic completion rejects a new configuration path even if both files have identical content', async () => {
+  const gateway = diagnosticGateway({ sourceRouter: {
+    diagnoseProvider: async provider => {
+      const next = join(gateway.profileContext.dir, 'other.toml');
+      gateway.program = { snapshot: () => ({ configPath: next }) };
+      return { provider, status: 'ok', code: 'OK', message: 'ok' };
+    },
+  } });
+  await assert.rejects(gateway.diagnoseProvider({ provider: 'tavily' }), { code: 'CONFIG_CONFLICT' });
+});
+
+test('diagnostic completion notices changed environment configuration without a file revision change', async () => {
+  const previous = process.env.TAVILY_API_KEY;
+  try {
+    process.env.TAVILY_API_KEY = 'first-synthetic-key';
+    const gateway = diagnosticGateway({ sourceRouter: {
+      diagnoseProvider: async provider => {
+        process.env.TAVILY_API_KEY = 'second-synthetic-key';
+        return { provider, status: 'ok', code: 'OK', message: 'ok' };
+      },
+    } });
+    await assert.rejects(gateway.diagnoseProvider({ provider: 'tavily' }), { code: 'CONFIG_CONFLICT' });
+  } finally {
+    if (previous === undefined) delete process.env.TAVILY_API_KEY;
+    else process.env.TAVILY_API_KEY = previous;
+  }
+});
 
 test('diagnostic results cannot validate a key replaced while the request is in flight', async () => {
   let complete, entered;
@@ -510,9 +644,9 @@ test('provider diagnosis routes sources and forwards JSON-safe error details', a
   const gateway = diagnosticGateway({ sourceRouter: {
     diagnoseProvider: async provider => { seen.push(provider); return { provider, status: 'ok', code: 'OK', message: '连接成功。' }; },
   } });
-  assert.equal((await gateway.diagnoseProvider({ provider: 'github' })).provider, 'github');
+  assert.equal((await gateway.diagnoseProvider({ provider: 'github' })).status, 'disabled');
   assert.equal((await gateway.diagnoseProvider({ provider: 'tinyfish' })).status, 'ok');
-  assert.deepEqual(seen, ['github', 'tinyfish']);
+  assert.deepEqual(seen, ['tinyfish']);
   await assert.rejects(() => gateway.diagnoseProvider({ provider: '../etc' }), error => error.code === 'SOURCE_UNKNOWN');
 
   const failing = diagnosticGateway({ core: { testSearch: async () => {
@@ -525,6 +659,40 @@ test('provider diagnosis routes sources and forwards JSON-safe error details', a
   assert.ok(descriptor);
   assert.deepEqual(descriptor.parameters[0].codec.create().parse({ provider: 'exa' }), { provider: 'exa' });
   assert.throws(() => descriptor.parameters[0].codec.create().parse({ provider: 'exa', extra: 1 }));
+});
+
+test('GitHub main test requires explicit read consent, including anonymous public reading', async () => {
+  let calls = 0, seenToken = null;
+  const gateway = diagnosticGateway({ github: { test: async ({ token }) => {
+    calls++; seenToken = token; return { provider: 'github', status: 'ok', code: 'OK', message: '公开读取成功', keys: [] };
+  }, sync() {} } });
+  assert.equal((await gateway.diagnoseProvider({ provider: 'github' })).status, 'disabled');
+  assert.equal(calls, 0);
+  const preferences = await gateway.preferences();
+  await gateway.savePreferences({ expectedRevision: preferences.revision, value: { ...preferences.value, githubReadEnabled: true } });
+  assert.equal((await gateway.diagnoseProvider({ provider: 'github' })).status, 'ok');
+  assert.equal(calls, 1);
+  assert.equal(seenToken, '');
+});
+
+test('GitHub draft connection tests do not save token or enable reading; cancellation blocks dispatch', async () => {
+  const tokens = [];
+  const gateway = diagnosticGateway({ github: { test: async ({ token }) => {
+    tokens.push(token); return { provider: 'github', status: 'ok', code: 'OK', message: '公开读取成功', keys: [] };
+  } } });
+  const snapshot = await gateway.snapshot(), prefs = await gateway.preferences();
+  const request = { token: 'transient-test-value', operationId: randomUUID(), expectedRevision: snapshot.config.revision,
+    configIdentity: snapshot.config.quotaRevision };
+  const reads = observeConfigReads(gateway);
+  assert.equal((await gateway.previewGithubConnection(request)).status, 'ok');
+  assert.deepEqual(reads, { paired: 2, snapshot: 0, effective: 0 });
+  assert.deepEqual(tokens, ['transient-test-value']);
+  assert.equal(existsSync(gateway._configPath()), false);
+  assert.deepEqual(await gateway.preferences(), prefs);
+  const cancelled = { ...request, operationId: randomUUID() };
+  await gateway.cancelDiagnosis({ operationId: cancelled.operationId });
+  await assert.rejects(gateway.previewGithubConnection(cancelled), { code: 'SETTINGS_DIAGNOSIS_CANCELLED' });
+  assert.equal(tokens.length, 1);
 });
 
 function viewGateway({ configPath, transport = 'loopback', core = {}, configuration, preferences, withProgram = true } = {}) {
@@ -615,6 +783,25 @@ test('a broken config file still yields a parseable snapshot with its path', asy
   assert.equal(typeof snapshot.config.displayPath, 'string');
   assert.deepEqual(snapshotCodec().parse(snapshot), snapshot);
 });
+
+test('invalid configured paths produce a safe snapshot without resolving a fallback path', async () => withoutConfigEnv(async () => {
+  try {
+    process.env.GROK_SEARCH_CONFIG = 'relative/config.toml';
+    for (const withProgram of [false, true]) {
+      const { gateway } = viewGateway({ withProgram, configPath: 'relative/config.toml' });
+      let resolutions = 0;
+      const original = gateway._configPath.bind(gateway);
+      gateway._configPath = () => { resolutions++; return original(); };
+      const result = await gateway.snapshot();
+      assert.equal(resolutions, 1);
+      assert.equal(result.config.path, '');
+      assert.equal(result.config.displayPath, '');
+      assert.equal(result.config.exists, false);
+      assert.equal(result.config.error.code, 'CONFIG_PATH_INVALID');
+      assert.deepEqual(snapshotCodec().parse(result), result);
+    }
+  } finally { delete process.env.GROK_SEARCH_CONFIG; }
+}));
 
 test('openConfigLocation validates the target and never opens anything it cannot see', async () => {
   const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'openConfigLocation');
@@ -724,7 +911,7 @@ test('preferences are only the plugin-private DSH switches', async () => {
   // The shared chain lives in config.toml; it no longer leaks into preferences.
   writeFileSync(path, 'source_providers = ["firecrawl"]\ntavily_enabled = false\n');
   const current = await gateway.preferences();
-  assert.deepEqual(current.value, stored);
+  assert.deepEqual(current.value, { ...stored, githubReadEnabled: false });
   const saved = await gateway.savePreferences({ expectedRevision: current.revision, value: { ...current.value, grokEnabled: true } });
   assert.equal(saved.value.grokEnabled, true);
   assert.equal(readFileSync(path, 'utf8'), 'source_providers = ["firecrawl"]\ntavily_enabled = false\n');

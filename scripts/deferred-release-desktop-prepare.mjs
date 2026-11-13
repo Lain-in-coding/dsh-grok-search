@@ -208,7 +208,7 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
   } }] }]);
   const copyCore = destination => {
     mkdirSync(destination, { recursive: true });
-    for (const module of ['control-intent-store.mjs', 'startup-recovery.mjs', 'release-transaction.mjs', 'product-control.mjs', 'original-search-counter.mjs', 'errors.mjs', 'mcp-search.mjs', 'session-owner.mjs', 'result-map.mjs', 'search-executor.mjs']) {
+    for (const module of ['control-intent-store.mjs', 'startup-recovery.mjs', 'release-transaction.mjs', 'product-control.mjs', 'original-search-counter.mjs', 'errors.mjs', 'mcp-search.mjs', 'session-owner.mjs', 'result-map.mjs', 'search-executor.mjs', 'owned-lock.mjs', 'storage-worker.mjs', 'search-query.mjs']) {
       copyFileSync(join(actualProject, 'src/core', module), join(destination, module), constants.COPYFILE_EXCL);
     }
   };
@@ -216,6 +216,7 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
   write(join(fixture, 'desktop-fixture.mjs'), readFileSync(join(actualProject, 'fixtures/deferred-release/desktop-fixture.mjs'), 'utf8')
     .replaceAll('../../src/core/', './'));
   copyFileSync(join(actualProject, 'fixtures/internal-candidate/host-fixture.mjs'), join(fixture, 'host-fixture.mjs'));
+  copyFileSync(join(actualProject, 'fixtures/deferred-release/github-api-fixture.mjs'), join(fixture, 'github-api-fixture.mjs'));
   let grokProgramValidation = null;
   if (uxEntries || productEntries) {
     // D-28/D-29: one aggregate bundle with the real package metadata and the

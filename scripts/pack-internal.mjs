@@ -3,12 +3,13 @@ import { join, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { project, freshRun, writeJson, commandResult, receipt, npmCli, sha256, redact } from './lib/internal-candidate-utils.mjs';
 
-export function validatePackChannel(manifest, matrix, { beta = false, release = false } = {}) {
-  if (beta && release) throw new Error('打包通道不能同时为 beta 和 release。');
-  const channel = release ? 'release' : beta ? 'beta' : 'internal';
+export function validatePackChannel(manifest, matrix, { alpha = false, beta = false, release = false } = {}) {
+  if ([alpha, beta, release].filter(Boolean).length > 1) throw new Error('打包通道不能同时选择多个。');
+  const channel = release ? 'release' : alpha ? 'alpha' : beta ? 'beta' : 'internal';
   const versionMatches = release
     ? /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(manifest.version)
-    : manifest.version === (beta ? '0.1.0-beta.1' : '0.0.0-internal.1');
+    : alpha ? /^0\.3\.0-alpha\.[1-9]\d*$/.test(manifest.version)
+      : manifest.version === (beta ? '0.1.0-beta.1' : '0.0.0-internal.1');
   if ((channel === 'internal' ? manifest.private !== true : manifest.private === true) || !versionMatches) {
     throw new Error('打包版本或 private 状态不符合通道要求。');
   }
@@ -18,6 +19,7 @@ export function validatePackChannel(manifest, matrix, { beta = false, release = 
   if (release && (manifest.publishConfig?.tag !== 'latest' || manifest.publishConfig?.access !== 'public')) {
     throw new Error('正式候选必须显式声明 latest 和 public；打包不构成发布授权。');
   }
+  if (alpha && manifest.publishConfig?.tag !== 'next') throw new Error('开发候选不能使用 latest 标签；打包不构成发布授权。');
   return channel;
 }
 
@@ -66,10 +68,11 @@ export async function packInternal(directory, options = {}) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  if (args.length > 1 || (args.length === 1 && !['--beta', '--release'].includes(args[0]))) throw new Error('打包仅接受 --beta、--release 或无参数的内部通道。');
+  if (args.length > 1 || (args.length === 1 && !['--alpha', '--beta', '--release'].includes(args[0]))) throw new Error('打包仅接受 --alpha、--beta、--release 或无参数的内部通道。');
+  const alpha = args[0] === '--alpha';
   const beta = args[0] === '--beta';
   const release = args[0] === '--release';
-  const { directory, runId } = freshRun(release ? 'release-package' : beta ? 'beta-package' : 'internal-package');
-  const { packageReceipt } = await packInternal(directory, { beta, release });
+  const { directory, runId } = freshRun(release ? 'release-package' : alpha ? 'alpha-package' : beta ? 'beta-package' : 'internal-package');
+  const { packageReceipt } = await packInternal(directory, { alpha, beta, release });
   console.log(JSON.stringify({ runId, directory: redact(directory), ...packageReceipt }, null, 2));
 }

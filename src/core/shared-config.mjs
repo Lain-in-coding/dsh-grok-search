@@ -1,15 +1,19 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
+import { closeSync, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync,
   readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parse, stringify } from 'smol-toml';
 import { GrokSearchError, isRecord } from './errors.mjs';
+import { acquireOwnedLock, DEFAULT_STALE_LOCK_MS } from './owned-lock.mjs';
 export { resolveSharedConfigPath } from './config-path.mjs';
 
 const fail = (code, message) => { throw new GrokSearchError(code, message); };
 const hash = text => createHash('sha256').update(text).digest('hex');
 const MAX_BYTES = 1_048_576;
+const MAX_HISTORY_INDEX_BYTES = 262_144;
+const DEFAULT_HISTORY_MAX_ENTRIES = 20;
+const DEFAULT_HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const field = (env, type, fallback, extra = {}) => Object.freeze({ env, type, fallback, ...extra });
 export const SOURCE_PROVIDERS = Object.freeze(['tavily', 'exa', 'tinyfish', 'firecrawl']);
 export const CONFIG_FIELDS = Object.freeze({
@@ -39,10 +43,10 @@ export const CONFIG_FIELDS = Object.freeze({
   github_token: field('GITHUB_TOKEN', 'secret', ''),
   source_providers: field('GROK_SEARCH_SOURCE_PROVIDERS', 'sources', SOURCE_PROVIDERS),
   default_extra_sources: field('GROK_SEARCH_EXTRA_SOURCES', 'integer', 3, { min: 0, max: 10 }),
-  fallback_sources: field('GROK_SEARCH_FALLBACK_SOURCES', 'integer', 5, { min: 1, max: 10 }),
+  fallback_sources: field('GROK_SEARCH_FALLBACK_SOURCES', 'integer', 5, { min: 0, max: 10 }),
   timeout_seconds: field('GROK_SEARCH_TIMEOUT_SECONDS', 'integer', 60, { min: 5, max: 300 }),
   cache_size: field('GROK_SEARCH_CACHE_SIZE', 'integer', 256, { min: 1, max: 4096 }),
-  response_max_chars: field('GROK_SEARCH_RESPONSE_MAX_CHARS', 'integer', 45000, { min: 5000, max: 500000 }),
+  response_max_chars: field('GROK_SEARCH_RESPONSE_MAX_CHARS', 'integer', 45000, { min: 100, max: 500000 }),
 });
 const knownReadOnly = new Set(['fetch_max_chars', 'source_max_answers', 'source_max_comments',
   'enrich_concurrency', 'enrich_max_chars', 'max_inline_sources']);
@@ -62,7 +66,7 @@ function parseDocument(text) {
   catch { fail('CONFIG_PARSE_FAILED', '配置文件不是有效 TOML，请先修正文件语法。'); }
 }
 function validateValue(key, value, { writing = false } = {}) {
-  const spec = CONFIG_FIELDS[key];
+  const spec = Object.hasOwn(CONFIG_FIELDS, key) ? CONFIG_FIELDS[key] : null;
   if (!spec || writing && spec.readOnly) fail('CONFIG_FIELD_READ_ONLY', '该配置项不允许从插件修改。');
   const invalid = () => fail('CONFIG_VALUE_INVALID', `${key} 的值无效。`);
   if (spec.type === 'integer') {
@@ -125,8 +129,13 @@ function statements(text) {
 
 export function patchSharedToml(text, updates) {
   if (!isRecord(updates)) fail('CONFIG_PATCH_INVALID', '保存内容必须是配置项对象。');
-  for (const [key, value] of Object.entries(updates)) if (value !== null) validateValue(key, value, { writing: true });
-  for (const key of Object.keys(updates)) if (!CONFIG_FIELDS[key] || CONFIG_FIELDS[key].readOnly) fail('CONFIG_FIELD_READ_ONLY', '该配置项不允许从插件修改。');
+  for (const [key, value] of Object.entries(updates)) {
+    if (!Object.hasOwn(CONFIG_FIELDS, key)) fail('CONFIG_FIELD_READ_ONLY', '该配置项不允许从插件修改。');
+    if (value !== null) validateValue(key, value, { writing: true });
+  }
+  for (const key of Object.keys(updates)) {
+    if (!Object.hasOwn(CONFIG_FIELDS, key) || CONFIG_FIELDS[key].readOnly) fail('CONFIG_FIELD_READ_ONLY', '该配置项不允许从插件修改。');
+  }
   const before = parseDocument(text);
   const expected = Object.assign(Object.create(Object.getPrototypeOf(before)), before);
   for (const [key, value] of Object.entries(updates)) { if (value === null) delete expected[key]; else expected[key] = value; }
@@ -159,9 +168,170 @@ export function patchSharedToml(text, updates) {
   return result;
 }
 
-export function createSharedConfigStore({ path, historyDirectory, env = () => process.env, fault } = {}) {
+export function createSharedConfigStore({
+  path, historyDirectory, env = () => process.env, fault,
+  now = () => new Date(),
+  retention = {}, onMaintenance = () => {}, trustedHistoryRoot = null,
+} = {}) {
   if (typeof path !== 'string' || !isAbsolute(path)) fail('CONFIG_PATH_INVALID', '配置文件必须使用绝对路径。');
   if (historyDirectory && !isAbsolute(historyDirectory)) fail('CONFIG_PATH_INVALID', '配置历史必须使用绝对路径。');
+  const historyMaxEntries = retention.maxEntries ?? DEFAULT_HISTORY_MAX_ENTRIES;
+  const historyMaxAgeMs = retention.maxAgeMs ?? DEFAULT_HISTORY_MAX_AGE_MS;
+  if (!Number.isSafeInteger(historyMaxEntries) || historyMaxEntries < 1
+    || !Number.isFinite(historyMaxAgeMs) || historyMaxAgeMs < 0) {
+    fail('CONFIG_HISTORY_INVALID', '配置历史保留策略无效。');
+  }
+  const clock = () => {
+    const value = now();
+    const date = value instanceof Date ? value : new Date(value);
+    if (!Number.isFinite(date.getTime())) fail('CONFIG_HISTORY_INVALID', '配置历史时钟返回值无效。');
+    return date;
+  };
+  const historyIndexPath = historyDirectory ? join(historyDirectory, 'index.json') : null;
+  const historyBoundary = historyDirectory ? resolve(trustedHistoryRoot ?? dirname(historyDirectory)) : null;
+  if (historyDirectory) {
+    const child = relative(historyBoundary, resolve(historyDirectory));
+    if (child === '' || child === '..' || child.startsWith('..' + sep) || isAbsolute(child)) {
+      fail('CONFIG_HISTORY_INVALID', '配置历史目录必须位于可信目录内部。');
+    }
+  }
+  let lastMaintenance = null;
+  const checkHistoryDirectory = () => {
+    for (let cursor = historyDirectory; cursor; cursor = dirname(cursor)) {
+      const entry = lstatSync(cursor, { throwIfNoEntry: false });
+      if (entry) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) fail('CONFIG_HISTORY_INVALID', '配置历史目录不是安全的本地目录。');
+      }
+      if (resolve(cursor) === historyBoundary) break;
+      if (dirname(cursor) === cursor) break;
+    }
+  };
+  const historyNames = () => {
+    if (!historyDirectory) return [];
+    checkHistoryDirectory();
+    if (!existsSync(historyDirectory)) return [];
+    return readdirSync(historyDirectory).filter(name => /^[a-f0-9]{64}\.toml$/.test(name));
+  };
+  const readHistoryIndex = () => {
+    if (!historyIndexPath || !existsSync(historyIndexPath)) return { entries: {} };
+    try {
+      const entry = lstatSync(historyIndexPath);
+      if (!entry.isFile() || entry.isSymbolicLink() || entry.size > MAX_HISTORY_INDEX_BYTES) fail('CONFIG_HISTORY_INVALID', '配置历史索引无效；已保留原文件。');
+      const parsed = JSON.parse(readFileSync(historyIndexPath, 'utf8'));
+      if (!isRecord(parsed) || parsed.schemaVersion !== 1 || !isRecord(parsed.entries)) fail('CONFIG_HISTORY_INVALID', '配置历史索引格式无效；已保留原文件。');
+      const entries = {};
+      for (const [revision, value] of Object.entries(parsed.entries)) {
+        if (!/^[a-f0-9]{64}$/.test(revision) || !isRecord(value)
+          || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt))) {
+          fail('CONFIG_HISTORY_INVALID', '配置历史索引条目无效；已保留原文件。');
+        }
+        entries[revision] = { createdAt: value.createdAt };
+      }
+      return { entries };
+    } catch (error) {
+      if (error instanceof GrokSearchError) throw error;
+      fail('CONFIG_HISTORY_INVALID', '无法读取配置历史索引；未清理历史。');
+    }
+  };
+  const writeHistoryIndex = entries => {
+    if (!historyDirectory) return;
+    checkHistoryDirectory();
+    mkdirSync(historyDirectory, { recursive: true, mode: 0o700 });
+    const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, entries }, null, 2) + '\n');
+    if (bytes.length > MAX_HISTORY_INDEX_BYTES) fail('CONFIG_HISTORY_INVALID', '配置历史索引超过支持大小，已保留原索引。');
+    const stage = join(historyDirectory, `.index-${randomUUID()}.tmp`);
+    let fd;
+    try {
+      fd = openSync(stage, 'wx', 0o600);
+      writeFileSync(fd, bytes);
+      fsyncSync(fd);
+      closeSync(fd); fd = undefined;
+      renameSync(stage, historyIndexPath);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+      if (existsSync(stage)) unlinkSync(stage);
+    }
+  };
+  const recordHistory = revision => {
+    if (!historyDirectory) return;
+    const entries = readHistoryIndex().entries;
+    // A reused revision is once again the undo target of a fresh save. Refresh
+    // its retention clock so an immediate undo cannot expire an old hash.
+    entries[revision] = { createdAt: clock().toISOString() };
+    writeHistoryIndex(entries);
+  };
+  const retainHistory = ({ keep = [] } = {}) => {
+    if (!historyDirectory) return { deleted: [], retained: 0 };
+    const names = historyNames();
+    const index = readHistoryIndex();
+    const keepSet = new Set(keep.filter(revision => typeof revision === 'string' && /^[a-f0-9]{64}$/.test(revision)));
+    const nowMs = clock().getTime(), rows = [];
+    for (const name of names) {
+      const revision = name.slice(0, -5);
+      const fullPath = join(historyDirectory, name);
+      let entry;
+      try { entry = lstatSync(fullPath); }
+      catch { continue; }
+      if (!entry.isFile() || entry.isSymbolicLink() || entry.size > MAX_BYTES) fail('CONFIG_HISTORY_INVALID', '配置历史包含非普通文件或超限文件，未继续清理。');
+      const createdAt = index.entries[revision]?.createdAt;
+      const createdMs = createdAt ? Date.parse(createdAt) : null;
+      rows.push({ revision, path: fullPath, createdMs, sortMs: createdMs ?? entry.mtimeMs, entry });
+    }
+    rows.sort((left, right) => Number(keepSet.has(right.revision)) - Number(keepSet.has(left.revision))
+      || right.sortMs - left.sortMs || left.revision.localeCompare(right.revision));
+    const deleted = [];
+    let retained = 0, keptByCount = 0, changed = false;
+    for (const row of rows) {
+      const tooOld = row.createdMs !== null && nowMs - row.createdMs > historyMaxAgeMs;
+      const future = row.createdMs !== null && nowMs < row.createdMs;
+      if (keepSet.has(row.revision)) {
+        if (keptByCount < historyMaxEntries) keptByCount++;
+        retained++;
+        continue;
+      }
+      if ((!tooOld || future) && keptByCount < historyMaxEntries) {
+        keptByCount++;
+        retained++;
+        continue;
+      }
+      // Never delete a file whose name no longer matches its exact bytes.
+      let bytes;
+      bytes = readFileSync(row.path);
+      const text = bytes.toString('utf8');
+      if (hash(text) !== row.revision || !Buffer.from(text).equals(bytes)) {
+        fail('CONFIG_HISTORY_INVALID', '配置历史校验失败，已保留异常文件。');
+      }
+      const current = lstatSync(row.path);
+      if (current.isSymbolicLink() || current.ino !== row.entry.ino || current.dev !== row.entry.dev
+        || current.size !== row.entry.size || current.mtimeMs !== row.entry.mtimeMs) {
+        fail('CONFIG_HISTORY_INVALID', '配置历史在维护期间发生变化，已停止清理。');
+      }
+      unlinkSync(row.path);
+      delete index.entries[row.revision];
+      deleted.push(row.revision);
+      changed = true;
+    }
+    const present = new Set(names);
+    for (const revision of Object.keys(index.entries)) {
+      if (!present.has(revision + '.toml')) {
+        delete index.entries[revision];
+        changed = true;
+      }
+    }
+    if (changed) writeHistoryIndex(index.entries);
+    return { deleted, retained };
+  };
+  const reportMaintenance = result => {
+    lastMaintenance = result;
+    try { onMaintenance(result); }
+    catch { lastMaintenance = { ...result, reportingFailed: true }; }
+    return result;
+  };
+  const maintainHistory = keep => {
+    try { return reportMaintenance({ status: 'ok', ...retainHistory({ keep }) }); }
+    catch (error) { return reportMaintenance({ status: 'error', code: error.code ?? 'CONFIG_HISTORY_FAILED',
+      message: '配置已保存，历史维护未完成；历史文件已保留供检查。' }); }
+  };
   const read = () => {
     try {
       const stat = lstatSync(path);
@@ -171,7 +341,7 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
       const text = bytes.toString('utf8');
       if (!Buffer.from(text).equals(bytes)) fail('CONFIG_ENCODING_INVALID', '配置文件必须使用 UTF-8 编码。');
       const values = parseDocument(text);
-      for (const [key, value] of Object.entries(values)) if (CONFIG_FIELDS[key]) validateValue(key, value);
+      for (const [key, value] of Object.entries(values)) if (Object.hasOwn(CONFIG_FIELDS, key)) validateValue(key, value);
       return { text, values, revision: hash(bytes), exists: true, mode: stat.mode & 0o777 };
     } catch (error) {
       if (error.code === 'ENOENT') return { text: '', values: {}, revision: 'missing', exists: false, mode: 0o600 };
@@ -206,16 +376,46 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
       fields[key] = { value: null, configured: count > 0, keyCount: count, source: item.source, readOnly: item.readOnly };
     }
     return { effective: resolved, snapshot: { path, exists: document.exists, revision: document.revision, fields,
-      unknownFields: Object.keys(document.values).filter(key => !CONFIG_FIELDS[key] && !knownReadOnly.has(key)) } };
+      unknownFields: Object.keys(document.values).filter(key => !Object.hasOwn(CONFIG_FIELDS, key) && !knownReadOnly.has(key)) } };
   };
   const snapshot = () => readSnapshot().snapshot;
-  const commit = (expectedRevision, transform) => {
+  const preserveHistory = before => {
+    checkHistoryDirectory();
+    mkdirSync(historyDirectory, { recursive: true, mode: 0o700 });
+    const history = join(historyDirectory, before.revision + '.toml');
+    const verify = target => {
+      const entry = lstatSync(target);
+      if (!entry.isFile() || entry.isSymbolicLink() || entry.size > MAX_BYTES
+        || hash(readFileSync(target)) !== before.revision) {
+        fail('CONFIG_HISTORY_INVALID', '保存前历史备份校验失败，原配置未更改。');
+      }
+    };
+    if (existsSync(history)) { verify(history); return; }
+    const stage = join(historyDirectory, `.history-${randomUUID()}.tmp`);
+    let fd;
+    try {
+      fd = openSync(stage, 'wx', 0o600);
+      writeFileSync(fd, before.text);
+      fsyncSync(fd);
+      closeSync(fd); fd = undefined;
+      verify(stage);
+      // A failed/partial write must not occupy the content-addressed name:
+      // future saves can retry without deleting or overwriting evidence.
+      try { linkSync(stage, history); }
+      catch (error) { if (error.code !== 'EEXIST') throw error; }
+      verify(history);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+      try { unlinkSync(stage); } catch { /* A private incomplete stage is never a restorable revision. */ }
+    }
+  };
+  const commit = (expectedRevision, transform, { keepHistory = [] } = {}) => {
     if (expectedRevision !== 'missing' && !/^[a-f0-9]{64}$/.test(expectedRevision ?? '')) fail('CONFIG_REVISION_REQUIRED', '保存前必须读取当前配置修订。');
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const lock = path + '.dsh-grok-search.lock';
-    let lockFd, stage, published = false;
+    let lock, stage, published = false;
     try {
-      try { lockFd = openSync(lock, 'wx', 0o600); }
+      const lockPath = path + '.dsh-grok-search.lock';
+      try { lock = acquireOwnedLock(lockPath, { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS }); }
       catch (error) { if (error.code === 'EEXIST') fail('CONFIG_BUSY', '配置正在保存或上次保存被中断，请稍后检查。'); throw error; }
       const before = read();
       if (before.revision !== expectedRevision) fail('CONFIG_CONFLICT', '配置已被其他程序修改；草稿已保留，请重新读取后合并。');
@@ -223,14 +423,7 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
       if (Buffer.byteLength(text) > MAX_BYTES) fail('CONFIG_SIZE_LIMIT', '保存内容超过 1 MiB。');
       parseDocument(text);
       if (text === before.text && before.exists) return snapshot();
-      if (before.exists && historyDirectory) {
-        mkdirSync(historyDirectory, { recursive: true, mode: 0o700 });
-        const history = join(historyDirectory, before.revision + '.toml');
-        if (!existsSync(history)) {
-          const fd = openSync(history, 'wx', 0o600);
-          try { writeFileSync(fd, before.text); fsyncSync(fd); } finally { closeSync(fd); }
-        }
-      }
+      if (before.exists && historyDirectory) preserveHistory(before);
       stage = join(dirname(path), '.dsh-grok-search-' + randomUUID() + '.tmp');
       const fd = openSync(stage, 'wx', before.mode);
       try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
@@ -239,16 +432,26 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
       renameSync(stage, path);
       published = true;
       fault?.('after-publish');
-      return snapshot();
+      const result = snapshot();
+      if (historyDirectory) {
+        try {
+          if (before.exists) recordHistory(before.revision);
+          maintainHistory([before.revision, ...keepHistory]);
+        } catch (error) {
+          reportMaintenance({ status: 'error', code: error.code ?? 'CONFIG_HISTORY_FAILED',
+            message: '配置已保存，历史索引维护未完成；请检查历史目录。' });
+        }
+      }
+      return result;
     } catch (error) {
       if (published) fail('CONFIG_COMMIT_UNCERTAIN', '配置已写入，但回读未完成；请重新读取后确认，不要重复保存。');
       if (error instanceof GrokSearchError) throw error;
       fail('CONFIG_WRITE_FAILED', '无法保存配置；原文件未由本次操作替换，请检查文件权限。');
     } finally {
-      // Only files created by this call are removed; never reclaim another
-      // writer's lock or clean historical revisions automatically.
+      // Staging cleanup and lock release stay separate from verified retention.
+      // Never remove another writer's live or replaced lock here.
       if (stage && !published) { try { unlinkSync(stage); } catch {} }
-      if (lockFd !== undefined) { closeSync(lockFd); unlinkSync(lock); }
+      if (lock) lock.release();
     }
   };
   return Object.freeze({
@@ -272,13 +475,12 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
       });
     },
     history() {
-      if (!historyDirectory || !existsSync(historyDirectory)) return [];
-      return readdirSync(historyDirectory).filter(name => /^[a-f0-9]{64}\.toml$/.test(name))
-        .map(name => ({ revision: name.slice(0, -5) }));
+      return historyNames().map(name => ({ revision: name.slice(0, -5) }));
     },
     restore({ expectedRevision, revision }) {
       if (!historyDirectory || !/^[a-f0-9]{64}$/.test(revision ?? '')) fail('CONFIG_HISTORY_INVALID', '配置历史修订无效。');
       return commit(expectedRevision, () => {
+        checkHistoryDirectory();
         const historical = join(historyDirectory, revision + '.toml');
         const fd = openSync(historical, 'r');
         try {
@@ -288,7 +490,13 @@ export function createSharedConfigStore({ path, historyDirectory, env = () => pr
           if (hash(text) !== revision) fail('CONFIG_HISTORY_INVALID', '配置历史校验失败。');
           return text;
         } finally { closeSync(fd); }
-      });
+      }, { keepHistory: [revision] });
     },
+    retainHistory(options) {
+      if (!historyDirectory || !existsSync(historyDirectory)) return { deleted: [], retained: 0 };
+      const lock = acquireOwnedLock(path + '.dsh-grok-search.lock', { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS });
+      try { return retainHistory(options); } finally { lock.release(); }
+    },
+    maintenanceStatus() { return lastMaintenance ? { ...lastMaintenance } : null; },
   });
 }

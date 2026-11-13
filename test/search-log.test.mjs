@@ -84,6 +84,40 @@ test('closed view revocations survive repeated navigation and cannot clear later
   assert.equal(log.viewOpen(old), false);
 });
 
+test('view revocation storage stays bounded and an evicted destructive token cannot clear history', () => {
+  const log = createSearchLog({ viewCapacity: 4 }), first = log.open();
+  log.snapshot(first);
+  for (let i = 0; i < 8; i++) log.open();
+  const token = log.begin('new history remains intact');
+  log.finish(token, { outcome: 'ok', served: 'grok' });
+  assert.throws(() => log.clear(first), { code: 'SEARCH_LOG_VIEW_EXPIRED' });
+  assert.throws(() => log.snapshot(first), { code: 'SEARCH_LOG_VIEW_EXPIRED' });
+  log.close(first);
+  assert.equal(log.snapshot(randomUUID()).records[0].q, 'new history remains intact');
+  log.dispose();
+});
+
+test('issued views expire after inactivity, never resurrect, and active reads renew them', () => {
+  let clock = 0;
+  const log = createSearchLog({ now: () => clock, viewTtlMs: 10, viewCapacity: 2 });
+  const closed = log.open(), active = log.open();
+  log.close(closed);
+  for (let i = 0; i < 4; i++) { clock += 9; log.snapshot(active); }
+  assert.equal(log.viewOpen(active), true);
+  assert.throws(() => log.snapshot(closed), { code: 'SEARCH_LOG_VIEW_EXPIRED' });
+  clock += 11;
+  assert.throws(() => log.snapshot(active), { code: 'SEARCH_LOG_VIEW_EXPIRED' });
+  log.dispose();
+});
+
+test('legacy UUID revocations cannot be evicted and capacity exhaustion fails explicitly', () => {
+  const log = createSearchLog({ viewCapacity: 2 }), old = randomUUID();
+  log.snapshot(old); log.close(old); log.snapshot(randomUUID());
+  assert.throws(() => log.snapshot(randomUUID()), { code: 'SEARCH_LOG_VIEW_EXPIRED' });
+  assert.deepEqual(log.snapshot(old), { records: [] });
+  log.dispose();
+});
+
 test('bounded call list never presents a truncated retry list as complete', () => {
   const log = createSearchLog(), id = randomUUID();
   log.snapshot(id);
@@ -183,6 +217,7 @@ const okRoute = { outcome: 'ok', served: 'grok', callsComplete: true };
 const sourcesRoute = { outcome: 'ok', served: 'tavily', grokCode: 'DISABLED', fallbackUsed: true, callsComplete: true };
 function cappedLog(route = okRoute) {
   const log = createSearchLog(), view = randomUUID();
+  log.snapshot(view);
   const scope = log.beginCall({ sessionId: randomUUID(), callId: 'capped-call' });
   const begin = () => log.begin('query', { logScope: scope });
   for (let i = 0; i < 16; i++) log.finish(begin(), route);

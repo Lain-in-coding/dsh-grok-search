@@ -15,6 +15,7 @@ import {
   restoreAuthorRoute, effectiveConfig, createSearchConfigHook,
 } from '../src/core/product-control.mjs';
 import { commitExplicitRelease, createReleaseBarrier } from '../src/core/release-transaction.mjs';
+import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
 
 const deferred = () => {
   let resolve;
@@ -265,12 +266,58 @@ test('a fresh enabled owner reacquires a completed release and preserves immutab
   ctx.dispose();
 });
 
+test('explicit stop cancels a reactivation still waiting for the control writer lock', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  await ctx.get('grokSearchControl').stop('before-reactivation');
+  const store = createProductStore(ctx), released = store.read();
+  ctx.dispose();
+  ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+  const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+  const starting = applyControl(ctx);
+  try {
+    const stopped = await ctx.get('grokSearchControl').stop('cancel-reactivation');
+    assert.equal(stopped.kind, 'already-released');
+    lock.release();
+    await starting;
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+    assert.deepEqual(store.read(), released);
+    assert.equal(ctx.get('grokSearchControl').publicSnapshot().phase, 'released');
+  } finally {
+    lock.release();
+    await starting.catch(() => {});
+    ctx.dispose();
+  }
+});
+
+test('disposing a reactivation waiting on storage leaves the completed release unchanged', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  await ctx.get('grokSearchControl').stop('before-disposal');
+  const store = createProductStore(ctx), released = store.read();
+  ctx.dispose();
+  ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+  const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+  const starting = applyControl(ctx);
+  try {
+    ctx.dispose();
+    lock.release();
+    await starting;
+    assert.deepEqual(store.read(), released);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+    assert.equal(ctx.get('grokSearchControl').publicSnapshot().phase, 'disposed');
+  } finally { lock.release(); await starting.catch(() => {}); ctx.dispose(); }
+});
+
 test('product control stop prelude failure is recorded and retryable', async () => {
   const ctx = makeContext();
   await applyControl(ctx);
   const service = ctx.get('grokSearchControl');
   await service.retry();
   const core = ctx.get('grokSearchCore');
+  const unchanged = service.publicSnapshot();
+  await service.retryRelease();
+  assert.deepEqual(service.publicSnapshot(), unchanged, 'retry without stop intent is read-only');
   let disposals = 0;
   core.dispose = async () => { disposals += 1; };
 
@@ -292,8 +339,8 @@ test('product control stop prelude failure is recorded and retryable', async () 
   assert.deepEqual(createProductStore(ctx).read(), beforeRetry);
 
   ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 0 }) });
-  const outcome = await service.stop('retry-with-counter');
-  assert.equal(outcome.kind, 'released');
+  const outcome = await service.retryRelease();
+  assert.equal(outcome.phase, 'released');
   assert.equal(service.publicSnapshot().completionCommitted, true);
   assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
   assert.equal(disposals, 1);
@@ -644,7 +691,12 @@ test('public snapshot keeps route verification separate from committed completio
 test('settings gateway unavailable snapshot includes completionCommitted', async () => withIsolatedHome(async home => {
   let Gateway;
   applySettingsUi({ plugin(Plugin) { Gateway = Plugin; } });
-  const gateway = new Gateway({ provide() {} });
+  // The owner check fails closed without connection security; this case covers
+  // the unavailable control projection, so supply a verified local owner.
+  const gateway = new Gateway({ get: key => key === 'grokSearchConnectionSecurity' ? {
+    requireOwner() {},
+    capabilities: () => ({ secretsAllowed: false, transport: 'restricted', reason: null }),
+  } : null, provide() {} });
   const snapshot = await gateway.snapshot();
   assert.equal(snapshot.available, false);
   assert.equal(snapshot.completionCommitted, false);
@@ -782,6 +834,69 @@ test('product recovery reports a completed explicit release without rewriting it
   assert.equal(state.phase, 'still-selected');
   assert.deepEqual(store.read(), completed);
   assert.equal(store.read().intent.releaseCompletion.kind, 'explicit-release-completion');
+  ctx.dispose();
+});
+
+test('public presentation polling sees an external recovery completion', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  const control = ctx.get('grokSearchControl');
+  const store = createProductStore(ctx);
+  const recorded = store.read();
+  assert.equal(control.publicSnapshot().completionCommitted, false);
+  assert.equal(control.publicSnapshot().revision, recorded.revision);
+  const completion = {
+    kind: 'explicit-release-completion', operationId: randomUUID(),
+    releaseOperationId: randomUUID(), completedAt: '2026-10-30T00:00:00.000Z',
+    routeChanged: false, routeVerified: true, routeEvidence: {}, recordCommit: {},
+  };
+  const released = store.compareAndSwap({ expectedRevision: recorded.revision, intent: {
+    ...recorded.intent, policy: 'released', release: {
+      explicit: true, committedAt: '2026-10-30T00:00:00.000Z',
+      operationId: completion.releaseOperationId, routeChanged: false, routeVerified: false,
+    },
+  } });
+  store.compareAndSwap({ expectedRevision: released.revision,
+    intent: { ...released.intent, releaseCompletion: completion } });
+  const presentation = control.publicSnapshot();
+  assert.equal(presentation.phase, 'released');
+  assert.equal(presentation.revision, recorded.revision + 2);
+  assert.equal(presentation.releaseOperationId, completion.releaseOperationId);
+  assert.equal(presentation.completionCommitted, true);
+  assert.equal(presentation.routeVerified, true);
+  assert.equal(presentation.canStop, false);
+  assert.equal(control.snapshot().revision, recorded.revision + 2);
+  ctx.dispose();
+});
+
+test('public display cache leaves control state and authoritative corruption checks intact', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  const control = ctx.get('grokSearchControl'), store = createProductStore(ctx);
+  const recorded = store.read();
+  const completion = {
+    kind: 'explicit-release-completion', operationId: randomUUID(),
+    releaseOperationId: randomUUID(), completedAt: '2026-10-30T00:00:00.000Z',
+    routeChanged: false, routeVerified: true, routeEvidence: {}, recordCommit: {},
+  };
+  const completed = store.compareAndSwap({ expectedRevision: recorded.revision, intent: {
+    ...recorded.intent, policy: 'released', release: {
+      explicit: true, committedAt: '2026-10-30T00:00:00.000Z', operationId: completion.releaseOperationId,
+    }, releaseCompletion: completion,
+  } });
+  assert.equal(control.publicSnapshot().completionCommitted, true);
+  writeFileSync(join(store.directory, 'v000000000001.json'), '{ damaged old revision\n');
+  // The lightweight display can retain a previous view, but never installs it
+  // into the control state or substitutes it for a full read during retry.
+  assert.equal(control.publicSnapshot().completionCommitted, true);
+  assert.equal(control.snapshot().phase, 'required');
+  assert.equal(control.snapshot().revision, recorded.revision);
+  await assert.rejects(control.retry(), error => error.code === 'CONTROL_RECORD_INVALID');
+  assert.throws(() => store.read(), error => error.code === 'CONTROL_RECORD_INVALID');
+  writeFileSync(join(store.directory, `v${String(completed.revision).padStart(12, '0')}.json`), '{ damaged latest\n');
+  assert.doesNotThrow(() => control.publicSnapshot());
+  assert.equal(control.publicSnapshot().error.code, 'CONTROL_RECORD_INVALID');
+  assert.equal(control.publicSnapshot().completionCommitted, false);
   ctx.dispose();
 });
 

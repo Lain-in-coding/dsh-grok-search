@@ -16,6 +16,7 @@ import { createSharedConfigStore } from '../src/core/shared-config.mjs';
 import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { createPrivateProgramInstaller } from '../src/core/program-install.mjs';
 import { probeMcpHandshake } from '../src/core/mcp-search.mjs';
+import { readUpgradePackage } from './verify-search-log-upgrade.mjs';
 
 const PRODUCT_BUNDLE = 'dsh-grok-search';
 const options = new Map();
@@ -88,12 +89,14 @@ const runtimeFiles = folder => readdirSync(join(project, folder), { withFileType
 const sourceHashesBefore = [...new Set([...runtimeFiles('src'), 'package.json', 'cordis.patch.yml',
   'fixtures/deferred-release/desktop-fixture.mjs', 'fixtures/internal-candidate/host-fixture.mjs',
   'scripts/deferred-release-desktop-prepare.mjs', 'scripts/lib/renderer-cdp.mjs',
-  'scripts/lib/internal-candidate-utils.mjs', 'scripts/b2-plugin-manager-desktop.mjs'])]
+  'scripts/lib/internal-candidate-utils.mjs', 'scripts/b2-plugin-manager-desktop.mjs',
+  'scripts/verify-search-log-upgrade.mjs'])]
   .map(file => ({ file, sha256: sha256(join(project, file)) }));
-const expectedProductReceipt = packageReceipt(productTarball);
+const expectedProduct = readUpgradePackage(productTarball);
+const expectedProductReceipt = expectedProduct.receipt;
 const oldProductReceipt = upgradeFrom ? packageReceipt(upgradeFrom) : null;
 if (oldProductReceipt) {
-  assert.equal(oldProductReceipt.version, '0.1.1', 'Upgrade baseline must be the released 0.1.1 package.');
+  assert.notEqual(oldProductReceipt.version, expectedProductReceipt.version, 'Upgrade needs distinct package versions.');
   assert.notEqual(oldProductReceipt.sha256, expectedProductReceipt.sha256);
   replacements.push([dirname(upgradeFrom), '<OLD_PACKAGE>'], [upgradeCache, '<RETAINED_TEST_CACHE>']);
 }
@@ -111,11 +114,7 @@ function protocolAssociation() {
 }
 
 function packageReceipt(tarball) {
-  const file = join(dirname(tarball), 'package-receipt.json');
-  if (!existsSync(file)) throw new Error('Package receipt is missing: ' + file);
-  const value = JSON.parse(readFileSync(file, 'utf8'));
-  if (value.sha256 !== sha256(tarball)) throw new Error('Package tarball hash does not match its receipt.');
-  return value;
+  return readUpgradePackage(tarball).receipt;
 }
 
 async function rendererSnapshot(host) {
@@ -332,7 +331,7 @@ async function settingsStopRendererFlow(host, phase) {
         text: root.innerText,
         route: Boolean(root.querySelector('#routeCard')),
         providers: root.querySelectorAll('.row[data-id]').length,
-        testButton: root.querySelector('#testBtn')?.textContent.includes('测试搜索') === true,
+        testButton: root.querySelector('#testBtn')?.textContent.trim() === '测试连接',
         configPath: root.querySelector('#cfgPath')?.textContent ?? null,
         state: root.querySelector('#routeCard')?.dataset.s,
         shadowIsolated: mount.shadowRoot !== null && document.querySelector('#routeCard') === null,
@@ -1262,7 +1261,8 @@ async function productionDiagnosticsFlow(host, stub) {
     await completed();
     const failed = await snapshotUi();
     check('all-failed-diagnosis-is-clear', failed.state === 'err'
-      && failed.status === '最近检查未通过' && failed.announcer.includes('测试未通过'));
+      && failed.status === '最近检查未通过' && failed.announcer.includes('搜索未通过')
+      && failed.announcer.includes('0/4 项连通') && !failed.announcer.includes('已静默回退'));
     check('disabled-Grok-is-not-tested', !stub.requests.slice(allFailedStart)
       .some(row => row.provider === 'grok'));
     check('failed-diagnosis-keeps-all-source-status-codes',
@@ -1705,7 +1705,9 @@ async function runVersion(runtime) {
   assert.match(installedUi.list.text, /dsh-grok-search/);
   assert.ok(installedUi.detail.text.includes(expectedProductReceipt.version),
     'PluginManager must display the frozen package version.');
-  assert.match(installedUi.detail.text, /用 Grok 接管 DSH 网页搜索/);
+  assert.equal(typeof expectedProduct.manifest.description, 'string');
+  assert.ok(installedUi.detail.text.includes(expectedProduct.manifest.description),
+    'PluginManager must display the frozen package description, not a historic label.');
 
   // D-29: native hot disable restores the route, and explicit re-enable reacquires.
   const settingsStop = await settingsStopRendererFlow(productHost, 'restart');

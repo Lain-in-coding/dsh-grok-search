@@ -142,7 +142,7 @@ try {
     packageSha256: packageReceipt.sha256, fixtureBundle: false, snapshot, ui,
     log: await rpc('readSearchLog', { sessionId }),
     route: await rpc('toolCallRoute', { sessionId, callId: 'unknown' }),
-    draftQuota: JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version !== '0.2.1' ? null : await rpc('previewAccountQuota', {
+    draftQuota: await rpc('previewAccountQuota', {
       provider: 'tavily', expectedRevision: snapshot.body.result.value.config.revision,
       quotaRevision: snapshot.body.result.value.config.quotaRevision, operationId: randomUUID(),
       draft: { baseUrl: `http://127.0.0.1:${quotaServer.address().port}`, apiKey: 'synthetic-unsaved-key' },

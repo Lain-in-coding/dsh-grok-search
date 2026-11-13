@@ -43,7 +43,10 @@ export function createProgramController({ configuration, directory, env = () => 
       if (!disposed) {
         state.phase = 'error';
         state.error = { code: failure.code, message: failure.message };
-        state.canRepair = failure.code === 'GROK_CACHE_DAMAGED' || repair && ![
+        state.canRepair = failure.code === 'GROK_CACHE_DAMAGED' || !configuration.executable && [
+          'GROK_VERSION_UNVERIFIED', 'GROK_PROGRAM_NOT_NATIVE', 'GROK_PROGRAM_MISSING',
+          'GROK_PROGRAM_IDENTITY_INVALID', 'GROK_PROGRAM_START_FAILED', 'GROK_PROGRAM_TIMEOUT',
+        ].includes(failure.code) || repair && ![
           'GROK_CACHE_PATH_INVALID', 'GROK_CACHE_ACCESS_DENIED', 'GROK_PROGRAM_REAP_FAILED',
           'GROK_PROCESS_REAP_FAILED', 'GROK_SEARCH_STOPPING',
         ].includes(failure.code);

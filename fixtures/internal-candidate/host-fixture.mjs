@@ -19,12 +19,21 @@ export function applyModel(ctx) {
         .filter(text => text && !text.startsWith('Current runtime context') && !text.startsWith('Generate the session title'));
       const manual = process.env.DSH_MANUAL_ACCEPTANCE === '1';
       const command = manual ? userTexts.at(-1) ?? ''
-        : userTexts.findLast(text => /^(?:search|fetch|echo|chat|ptc)(?:\s|$)/.test(text)) ?? userTexts.at(-1) ?? '';
+        : userTexts.findLast(text => /^(?:search|fetch|echo|chat|ptc|github|github-fetch)(?:\s|$)/.test(text)) ?? userTexts.at(-1) ?? '';
       (state.modelCommands ??= []).push(command);
       const mode = command.split(/\s+/)[0];
       const question = manual && command && !/^(?:search|fetch|echo|chat|ptc)$/.test(mode) ? command.slice(0, 200) : null;
       if (messages.length || mode === 'chat') {
         state.toolMessages.push(...structuredClone(messages)); state.completed++;
+        // Only the explicit automated performance case streams tokens. Ordinary
+        // gates and the user's manual acceptance adapter retain their behavior.
+        if (!manual && messages.length && command === 'search stream') {
+          for (let index = 0; index < 150; index++) {
+            if (options.signal?.aborted) return;
+            yield { type: 'text-delta', index: 0, text: '检索资料已返回，正在逐项核对来源。' };
+            await new Promise(done => setTimeout(done, 40));
+          }
+        }
         yield { type: 'text-delta', index: 0,
           text: manual ? (messages.length ? MANUAL_SEARCH_REPLY : MANUAL_CHAT_REPLY) : '内部候选轮次完成' };
         yield { type: 'finish', reason: { kind: 'stop' } }; return;
@@ -35,7 +44,9 @@ export function applyModel(ctx) {
         ? options.tools.map(tool => tool.name ?? tool.function?.name)
         : Object.keys(options.tools ?? {});
       const ptcTransport = toolNames.includes('run_code') && !toolNames.includes('web_search');
-      const tool = (mode === 'ptc' || (ptcTransport && mode === 'search')) ? { name: 'run_code', args: {
+      const tool = !manual && ['github', 'github-fetch'].includes(mode)
+        ? { name: mode === 'github' ? 'github_read' : 'web_fetch', args: JSON.parse(command.slice(mode.length).trim()) }
+        : (mode === 'ptc' || (ptcTransport && mode === 'search')) ? { name: 'run_code', args: {
         code: "return await tools.web_search({queries:['内部候选 PTC 离线查询']});",
         description: 'Run the controlled search through PTC',
       } }

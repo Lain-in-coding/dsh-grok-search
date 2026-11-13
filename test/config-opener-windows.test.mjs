@@ -12,7 +12,7 @@ import { createConfigLocationOpener } from '../src/core/config-opener.mjs';
 // creation and profile lookup are replaced; these tests never open an editor.
 async function productionPlan() {
   let plan;
-  const opener = createConfigLocationOpener({ platform: 'win32', env: { SystemRoot: process.env.SystemRoot },
+  const opener = createConfigLocationOpener({ platform: 'win32', env: process.env,
     stat: () => ({ isFile: () => true, isDirectory: () => false }),
     spawnImpl(command, args, options) {
       plan = { command, script: args.at(-1), options };
@@ -133,21 +133,31 @@ function Start-FolderProcess($start) {
 function New-TestWindow([string]$path, [bool]$visible, [string]$executable, [long]$handle) {
   [pscustomobject]@{ FullName=$executable; Visible=$visible; HWND=$handle; LocationURL=([Uri]$path).AbsoluteUri }
 }
-function New-FolderShell {
-  $shell = New-Object PSObject
-  $shell | Add-Member ScriptMethod Windows {
+class TestWindowCollection {
+  [object[]]$Rows
+  [int]$Count
+  TestWindowCollection([object[]]$rows) { $this.Rows=$rows; $this.Count=$rows.Count }
+  [object] Item([int]$index) { return $this.Rows[$index] }
+}
+class TestFolderShell {
+  [object] Windows() {
     $script:polls++
     $explorer = [IO.Path]::Combine($env:DSH_TEST_SYSTEM_ROOT, 'explorer.exe')
-    $rows = @(New-TestWindow $target $false $explorer 1
-      New-TestWindow ($target + '-other') $true $explorer 2
-      New-TestWindow $target $true 'C:\untrusted\explorer.exe' 3
-      New-TestWindow $target $true $explorer 0)
-    if (Show-TestTarget) { $rows += New-TestWindow $target $true $explorer 5 }
-    $collection = [pscustomobject]@{ Rows=$rows; Count=$rows.Count }
-    $collection | Add-Member ScriptMethod Item { param($index) return $this.Rows[$index] }
-    return $collection
+    $rows = @(New-TestWindow $script:target $false $explorer 1
+      New-TestWindow ($script:target + '-other') $true $explorer 2
+      New-TestWindow $script:target $true 'C:\untrusted\explorer.exe' 3
+      New-TestWindow $script:target $true $explorer 0)
+    if (Show-TestTarget) { $rows += New-TestWindow $script:target $true $explorer 5 }
+    return [TestWindowCollection]::new($rows)
   }
-  return $shell
+}
+function New-FolderShell {
+  return [TestFolderShell]::new()
+}
+function Start-Sleep([int]$Milliseconds) {
+  [Console]::Error.WriteLine('WAIT:begin')
+  Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds
+  [Console]::Error.WriteLine('WAIT:end')
 }
 `;
   const cases = [
@@ -173,21 +183,33 @@ function New-FolderShell {
       // prevents Windows PowerShell's CLR from resolving its own assemblies.
       const explorerLookup = "[IO.Path]::Combine($env:SystemRoot, 'explorer.exe')";
       assert.equal(plan.script.split(explorerLookup).length, 2);
+      // ProcessInfo construction is an OS boundary, just like the mocked
+      // Start-FolderProcess. Avoid New-Object reflection/module discovery in
+      // a hosted Windows Server runspace; still assert all launch properties.
+      assert.equal(plan.script.split('$start = New-Object System.Diagnostics.ProcessStartInfo').length, 2);
       const script = plan.script.replace(explorerLookup,
         "[IO.Path]::Combine($env:DSH_TEST_SYSTEM_ROOT, 'explorer.exe')")
+        .replace('$start = New-Object System.Diagnostics.ProcessStartInfo',
+          '$start = [System.Diagnostics.ProcessStartInfo]::new()')
         .replace(boundary, setup + '\n' + scenario + '\n' + boundary);
-      const child = spawn(plan.command, ['-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script],
+      // Long test injections use -File so Windows argument quoting cannot
+      // change the script. The production command itself remains unchanged.
+      const scriptPath = join(systemRoot, `scenario-${cases.findIndex(row => row[0] === name)}.ps1`);
+      writeFileSync(scriptPath, '\uFEFF' + script);
+      const child = spawn(plan.command, ['-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-File', scriptPath],
         { ...plan.options, env: { ...plan.options.env, DSH_TEST_SYSTEM_ROOT: systemRoot,
           DSH_GROK_OPEN_KIND: 'folder', DSH_GROK_OPEN_TARGET: target },
           stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '', stderr = '';
       child.stdout.on('data', data => { stdout += data; });
       child.stderr.on('data', data => { stderr += data; });
-      const timer = setTimeout(() => child.kill(), 15_000);
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; child.kill(); }, 15_000);
       try {
         const code = await new Promise((resolve, reject) => {
           child.once('error', reject); child.once('close', resolve);
         });
+        assert.equal(timedOut, false, `PowerShell fixture timeout; stdout=${stdout}; stderr=${stderr}`);
         assert.equal(stdout.trim(), receipt, stderr);
         assert.equal(code, exitCode);
         assert.equal((stderr.match(/ATTEMPT:/g) || []).length, 1);

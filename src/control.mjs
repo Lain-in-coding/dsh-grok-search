@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ControlRecordError } from './core/control-intent-store.mjs';
+import { ControlRecordError, writeControlIntent } from './core/control-intent-store.mjs';
 import { commitExplicitRelease } from './core/release-transaction.mjs';
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID,
@@ -38,6 +38,7 @@ export function projectPublicSnapshot(current, disposed = false) {
 export async function apply(ctx, { counterSnapshot = null } = {}) {
   const store = createProductStore(ctx);
   let disposed = false;
+  const acquisitionAbort = new AbortController();
   let routeVerifier = null;
   let task = null;
   let releaseTask = null;
@@ -60,6 +61,11 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     hostId: PRODUCT_HOST_ID,
     path: store.directory,
   };
+  ctx.effect(() => () => {
+    disposed = true;
+    acquisitionAbort.abort(new ControlRecordError('CONTROL_ACQUISITION_CANCELLED', 'The control owner was disposed.'));
+    state.phase = 'disposed';
+  });
   const snapshot = () => {
     if (!state.releaseOutcome) {
       try {
@@ -70,7 +76,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
             routeChanged: completion.routeChanged === true, routeVerified: completion.routeVerified === true,
             operationId: current.intent.release?.operationId ?? null };
           state.releaseOperationId = current.intent.release?.operationId ?? null;
-          state.phase = 'released';
+          if (!disposed) state.phase = 'released';
           state.recordEnvelope = current;
           state.record = current.intent;
           state.revision = current.revision;
@@ -144,8 +150,10 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       const currentAcquisition = createAcquisition(ctx);
       const reactivating = existing?.intent.policy === 'released' || existing?.intent.pause?.confirmed === true;
       if (reactivating) {
-        existing = store.compareAndSwap({ expectedRevision: existing.revision,
-          intent: requiredIntent(selection, currentAcquisition, currentLease, existing.intent) });
+        existing = await writeControlIntent(store, { expectedRevision: existing.revision,
+          intent: requiredIntent(selection, currentAcquisition, currentLease, existing.intent),
+          signal: acquisitionAbort.signal });
+        if (disposed || stopRequested) return snapshot();
         setRecord(existing);
         state.releaseOutcome = null;
         state.releaseOperationId = null;
@@ -163,12 +171,15 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
         }
         if (!sameLease(existing.intent.lease, currentLease) || acquisitionChanged(recorded, currentAcquisition)) {
           const intent = requiredIntent(selection, currentAcquisition, currentLease, existing.intent);
-          existing = store.compareAndSwap({ expectedRevision: existing.revision, intent });
+          existing = await writeControlIntent(store, { expectedRevision: existing.revision, intent,
+            signal: acquisitionAbort.signal });
+          if (disposed || stopRequested) return snapshot();
           setRecord(existing);
         }
       } else {
         const intent = requiredIntent(selection, currentAcquisition, currentLease);
-        existing = store.compareAndSwap({ expectedRevision: 0, intent });
+        existing = await writeControlIntent(store, { expectedRevision: 0, intent, signal: acquisitionAbort.signal });
+        if (disposed || stopRequested) return snapshot();
         setRecord(existing);
       }
       const core = ctx.get('grokSearchCore');
@@ -180,7 +191,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       try { takeover = await pending; }
       finally { takeovers.delete(pending); }
       // The release restores the author after this late host update settles.
-      if (stopRequested) return snapshot();
+      if (disposed || stopRequested) return snapshot();
       acquired = true;
       state.phase = 'required';
       state.error = null;
@@ -188,7 +199,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       return snapshot();
     })().catch(error => {
       // A superseded takeover failure must not overwrite the explicit stop state.
-      if (stopRequested) return snapshot();
+      if (disposed || stopRequested) return snapshot();
       state.phase = 'incomplete';
       state.error = { code: error.code ?? null, message: error.message };
       throw error;
@@ -199,6 +210,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     if (disposed) return Promise.reject(new ControlRecordError('CONTROL_OWNER_ABSENT', 'The product owner is absent.'));
     if (releaseTask) return releaseTask;
     stopRequested = true;
+    acquisitionAbort.abort(new ControlRecordError('CONTROL_ACQUISITION_CANCELLED', 'Explicit stop cancelled pending acquisition.'));
     const stopFailure = error => {
       state.phase = 'incomplete';
       state.error = { code: error?.code ?? null, message: error?.message ?? String(error) };
@@ -256,7 +268,22 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     return releaseTask;
   };
   const publicSnapshot = () => {
-    return projectPublicSnapshot(snapshot(), disposed);
+    // Keep display observations separate from state used by control operations.
+    // Store read()/CAS still validate the full history; display errors retain the
+    // prior local state, as snapshot() has historically done.
+    let presentation = state;
+    try {
+      const current = store.readView();
+      const completion = current?.intent?.releaseCompletion;
+      if (completion && current.intent.policy === 'released' && current.revision >= state.revision) {
+        presentation = { ...state, phase: disposed ? state.phase : 'released',
+          record: current.intent, revision: current.revision,
+          releaseOperationId: current.intent.release?.operationId ?? null,
+          releaseOutcome: { completionCommitted: true,
+            routeChanged: completion.routeChanged === true, routeVerified: completion.routeVerified === true } };
+      }
+    } catch {}
+    return projectPublicSnapshot(presentation, disposed);
   };
   ctx.on('loader/volatile-update', paths => {
     const searchRouteChanged = Array.isArray(paths) && paths.some(path =>
@@ -267,6 +294,13 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     snapshot,
     publicSnapshot,
     retry: () => refresh(),
+    // A settings retry must never create a new stop intent or undo one. The
+    // native switch remains the initiating control; this only resumes its
+    // incomplete release while this exact owner is still alive.
+    retryRelease: async () => {
+      if (!disposed && stopRequested) await stop('settings-ui-retry-release');
+      return publicSnapshot();
+    },
     stop,
     release: stop,
     path: store.directory,
@@ -277,8 +311,4 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
   // still active. The web route is volatile, so takeover updates its live config
   // without restarting this dependency fiber.
   await ctx.inject(['web'], async () => { await refresh(); });
-  ctx.effect(() => () => {
-    disposed = true;
-    state.phase = 'disposed';
-  });
 }

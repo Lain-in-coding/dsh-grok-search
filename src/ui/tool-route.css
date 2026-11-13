@@ -1,0 +1,139 @@
+.dsg-chat{--surface:#fff;--soft:#f6f7f9;--line:#e6e8ed;--line-strong:#d7dbe3;--text:#242831;--secondary:#626b79;--muted:#707987;--blue:#5267df;--blue-soft:#eef1ff;--green:#23734d;--red:#b74648;--amber:#97631b;--route-flow:#4d6bfe;--route-back:#b86e00;--route-dead:#e5484d;--shadow:0 1px 3px #16274306,0 5px 18px #16274303;--ease:cubic-bezier(.2,.75,.25,1);min-width:0;color:var(--text);font-family:inherit;container-type:inline-size}
+.dsg-chat[data-theme=dark]{--surface:#1e2026;--soft:#25282f;--line:#343841;--line-strong:#454b58;--text:#e7e9ee;--secondary:#b0b7c4;--muted:#9ca6b7;--blue:#a2b0ff;--blue-soft:#2c3452;--green:#7dd8a2;--red:#f39698;--amber:#edc17d;--route-flow:#7b93ff;--route-back:#f0b04a;--route-dead:#ff6b70;--shadow:0 1px 3px #0002,0 5px 18px #0001}
+.dsg-chat *{box-sizing:border-box}
+.dsg-chat button{font:inherit;color:inherit;cursor:pointer;border:0;background:none}
+.dsg-chat button:focus-visible,.dsg-chat a:focus-visible,.dsg-chat summary:focus-visible,.dsg-chat .flow-scroll:focus-visible{outline:2px solid var(--blue);outline-offset:1px;border-radius:4px}
+.dsg-chat .icon{width:14px;height:14px;flex:none;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.dsg-chat .logo{width:14px;height:14px;flex:none;object-fit:contain}
+.dsg-chat .search-card{border:1px solid var(--line);border-radius:11px;background:var(--surface);overflow:hidden;box-shadow:var(--shadow)}
+.dsg-chat .card-header{display:flex;align-items:center;min-height:50px;padding:0 11px 0 14px;gap:0}
+.dsg-chat .card-toggle{display:flex;align-items:center;gap:9px;min-width:0;flex:1;align-self:stretch;padding:12px 0;text-align:left}
+.dsg-chat .plugin-mark{display:grid;place-items:center;color:var(--blue);width:21px;height:24px;flex:none}
+.dsg-chat .plugin-mark .icon{width:18px;height:18px}
+.dsg-chat .card-name{font-size:13px;font-weight:650;white-space:nowrap;letter-spacing:-.15px}
+.dsg-chat .tool-type,.dsg-chat .title-dot{font-size:12px;white-space:nowrap;color:var(--secondary)}
+.dsg-chat .query-summary{min-width:0;flex:1;font-size:12px;color:var(--secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:5px}
+.dsg-chat .header-right{display:flex;align-items:center;gap:12px;flex:none;margin-left:auto;padding-left:8px}
+.dsg-chat .state{display:inline-flex;align-items:center;gap:5px;color:var(--green);font-size:12px;white-space:nowrap}
+.dsg-chat .state[data-state=running]{color:var(--blue)}
+.dsg-chat .state[data-state=failed]{color:var(--red)}
+.dsg-chat .state[data-state=cancelled],.dsg-chat .state[data-state=unknown]{color:var(--muted)}
+.dsg-chat .elapsed{font-size:12px;white-space:nowrap;color:var(--secondary);font-variant-numeric:tabular-nums;min-width:36px;text-align:right}
+.dsg-chat .chevron{width:14px;height:14px;color:var(--muted);transition:transform .18s var(--ease)}
+.dsg-chat .search-card[data-open=true] .chevron{transform:rotate(90deg)}
+.dsg-chat .inspect-btn{display:grid;place-items:center;width:28px;height:30px;border-radius:5px;margin-left:4px;flex:none;color:var(--muted)}
+.dsg-chat .inspect-btn:hover{background:var(--soft);color:var(--text)}
+.dsg-chat .fold{display:grid;grid-template-rows:0fr;transition:grid-template-rows .12s var(--ease)}
+.dsg-chat .search-card[data-open=true] .fold{grid-template-rows:1fr;transition-duration:.18s}
+.dsg-chat .fold-inner{min-width:0;min-height:0;overflow:hidden}
+.dsg-chat .card-body{border-top:1px solid var(--line);padding:14px 17px 15px}
+.dsg-chat .section-line{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0 0 9px}
+.dsg-chat .section-caption{font-size:12px;color:var(--secondary);font-weight:500}
+.dsg-chat .wire-name{display:flex;align-items:center;gap:5px;font:11px/1.5 ui-monospace,monospace;color:var(--muted)}
+.dsg-chat .wire-name .icon{width:12px;height:12px}
+.dsg-chat .flow-scroll{max-width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain;padding:3px 3px 7px;margin:-3px -3px 2px;scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent}
+.dsg-chat .flow{display:flex;align-items:flex-start;width:max-content;min-width:0}
+.dsg-chat .ingress{display:flex;align-items:flex-start;flex:none}
+.dsg-chat .route-node{--arrival-delay:0ms;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;min-width:0;min-height:44px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--soft);position:relative;transition:border-color .24s var(--ease),background-color .24s var(--ease),opacity .24s var(--ease)}
+.dsg-chat .route-node::before,.dsg-chat .route-node::after{content:"";position:absolute;inset:-1px;border:1px solid var(--blue);border-radius:inherit;pointer-events:none;opacity:0}
+.dsg-chat .route-node::before{box-shadow:0 0 0 2px color-mix(in srgb,var(--blue) 9%,transparent),0 0 10px color-mix(in srgb,var(--blue) 14%,transparent)}
+.dsg-chat .route-node[data-feedback=receive]::before{animation:dsg-arrival .6s var(--ease) var(--arrival-delay) both}
+.dsg-chat .route-node[data-recovery=true]{--arrival-delay:480ms}
+.dsg-chat .route-node[data-feedback=failed]{animation:dsg-jolt .32s ease-out}
+.dsg-chat .route-node[data-feedback=failed]::before{border-color:var(--route-dead);box-shadow:0 0 0 2px color-mix(in srgb,var(--route-dead) 8%,transparent),0 0 10px color-mix(in srgb,var(--route-dead) 12%,transparent);animation:dsg-fault .58s ease-out}
+.dsg-chat .route-node[data-feedback=success]::before{border-color:var(--green);box-shadow:0 0 0 2px color-mix(in srgb,var(--green) 7%,transparent);animation:dsg-settle .6s ease-out}
+.dsg-chat .route-node[data-feedback=success] .route-note .icon{animation:dsg-check .38s var(--ease)}
+.dsg-chat .ingress .route-node:first-child{min-width:62px}
+.dsg-chat .ingress .route-node:last-child{min-width:120px}
+.dsg-chat .route-name{display:flex;align-items:center;gap:6px;white-space:nowrap;font-size:12px;font-weight:500;line-height:16px}
+.dsg-chat .route-name .icon{color:var(--blue)}
+.dsg-chat .route-note{display:flex;align-items:center;gap:4px;margin-top:2px;font-size:11px;line-height:14px;color:var(--muted);min-height:14px;white-space:nowrap}
+.dsg-chat .route-note .icon{width:11px;height:11px}
+.dsg-chat .edge{--wire-color:var(--line-strong);--flight-time:380ms;--flight-delay:40ms;display:block;position:relative;width:26px;height:12px;min-width:26px;flex:0 0 26px;margin-top:16px;color:var(--wire-color)}
+.dsg-chat .wire-svg{display:block;width:100%;height:100%;overflow:visible;fill:none;stroke:currentColor;stroke-width:1;stroke-linecap:butt;stroke-linejoin:miter}
+.dsg-chat .wire-svg path{vector-effect:non-scaling-stroke}
+.dsg-chat .wire-flow{opacity:0;stroke-width:1.8;stroke:currentColor;stroke-linecap:round;stroke-dasharray:22 178;stroke-dashoffset:22}
+.dsg-chat .wire-halo{stroke-width:5;filter:blur(1px)}
+.dsg-chat .wire-tip{stroke-width:2.2;stroke-dasharray:3 197;stroke-dashoffset:3;filter:drop-shadow(0 0 1.6px currentColor)}
+/* Completed/pending edges keep their static track and head, but do not retain
+   invisible blur/drop-shadow surfaces. Active edge light effects stay intact. */
+.dsg-chat .edge:not(.active) .wire-flow{display:none}
+.dsg-chat .edge[data-wire=passed],.dsg-chat .edge.active{--wire-color:var(--route-flow)}
+.dsg-chat .edge[data-wire=recovered],.dsg-chat .edge.active[data-tone=back]{--wire-color:var(--route-back)}
+.dsg-chat .edge[data-wire=dead]{--wire-color:var(--route-dead)}
+.dsg-chat .edge:is([data-wire=dead],[data-wire=pending],[data-wire=idle]) .wire-track{stroke-dasharray:3 3}
+.dsg-chat .edge:is([data-wire=dead],[data-wire=pending],[data-wire=idle]) .wire-head{display:none}
+.dsg-chat .edge[data-wire=pending]{opacity:.45}
+.dsg-chat .edge.active .wire-flow{animation:dsg-travel var(--flight-time) cubic-bezier(.25,.1,.3,1) var(--flight-delay) both}
+.dsg-chat .edge.active .wire-halo{animation-name:dsg-halo}
+.dsg-chat .edge.active .wire-tip{animation-name:dsg-tip}
+.dsg-chat .edge[data-edge=dsh-hub]{--flight-time:560ms;--flight-delay:60ms}
+.dsg-chat .edge.active[data-tone=back]{--flight-delay:140ms}
+.dsg-chat .edge.source-link .wire-track{stroke-dasharray:3 3}
+.dsg-chat .ingress>.edge{flex:none}
+.dsg-chat .bridge{width:28px;min-width:28px;flex:0 0 28px}
+.dsg-chat .provider-steps{display:flex;align-items:flex-start;flex:none;min-width:0}
+.dsg-chat .provider-steps>.route-node{flex:none;min-width:112px}
+.dsg-chat .provider-steps>.edge{min-width:26px;flex:0 0 26px}
+.dsg-chat .route-node[data-result=ok] .route-note{color:var(--green)}
+.dsg-chat .route-node[data-result=failed] .route-note{color:var(--amber)}
+.dsg-chat .flow[data-terminal=failed] .route-node[data-result=failed] .route-note{color:var(--red)}
+.dsg-chat .route-node[data-result=running]{border-color:color-mix(in srgb,var(--blue) 58%,var(--line));background:var(--blue-soft)}
+.dsg-chat .route-node[data-result=running]::after{box-shadow:0 0 0 2px color-mix(in srgb,var(--blue) 6%,transparent);animation:dsg-breathe 1.8s ease-in-out calc(var(--arrival-delay) + 350ms) infinite}
+.dsg-chat .route-node[data-result=running] .route-note{color:var(--blue)}
+.dsg-chat .route-node[data-result=pending]{opacity:.55}
+.dsg-chat .ingress .route-node[data-result=ok] .route-note{color:var(--muted)}
+.dsg-chat .source-evidence{border-style:dashed}
+.dsg-chat .cause{display:flex;align-items:flex-start;gap:6px;margin:0;font-size:12px;line-height:1.7;color:var(--secondary)}
+.dsg-chat .cause>.icon{color:var(--amber);width:13px;height:13px;margin-top:4px}
+.dsg-chat .results{border-top:1px solid var(--line);margin-top:13px;padding-top:11px}
+.dsg-chat .results[data-feedback=success]{animation:dsg-results .26s var(--ease)}
+.dsg-chat .results-heading{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:12px;color:var(--secondary)}
+.dsg-chat .results-count{color:var(--muted);font-size:11px}
+.dsg-chat .source-list{display:grid;gap:8px}
+.dsg-chat .source-row{display:flex;align-items:flex-start;gap:9px;min-width:0;text-decoration:none;color:var(--text)}
+.dsg-chat .source-num{width:18px;height:18px;display:grid;place-items:center;border-radius:4px;background:var(--soft);border:1px solid var(--line);font:10px/1 ui-monospace,monospace;color:var(--secondary);margin-top:2px;flex:none}
+.dsg-chat .source-copy{min-width:0;flex:1;display:flex;align-items:baseline;justify-content:space-between;gap:14px}
+.dsg-chat .source-title{font-size:12.5px;line-height:1.6;overflow-wrap:anywhere}
+.dsg-chat .source-domain{font-size:11px;line-height:1.7;color:var(--muted);flex:none}
+.dsg-chat .source-copy .source-domain{white-space:nowrap}
+.dsg-chat .source-row>.icon{color:var(--muted);width:12px;height:12px;opacity:0;margin-top:4px}
+.dsg-chat .source-row:hover .source-title{text-decoration:underline;text-underline-offset:3px;color:var(--blue)}
+.dsg-chat .source-row:hover>.icon,.dsg-chat .source-row:focus-visible>.icon{opacity:1}
+.dsg-chat .source-extra,.dsg-chat .answer-summary{margin:4px 0 0 27px;color:var(--secondary);font-size:12px;line-height:1.75;overflow-wrap:anywhere;white-space:pre-wrap}
+.dsg-chat .answer-summary{margin:8px 0}
+.dsg-chat .outcome-note{font-size:12px;color:var(--secondary);margin:0;line-height:1.75;overflow-wrap:anywhere;white-space:pre-wrap}
+.dsg-chat .batch-list{display:grid;grid-template-columns:minmax(0,1fr);gap:14px}
+.dsg-chat .query-block{min-width:0}
+.dsg-chat .query-block+.query-block{padding-top:13px;border-top:1px solid var(--line)}
+.dsg-chat .query-head{display:flex;gap:8px;align-items:baseline;margin-bottom:11px;font-size:12px;line-height:1.65}
+.dsg-chat .query-number{color:var(--muted);font:11px ui-monospace,monospace;flex:none}
+.dsg-chat .query-text{font-weight:500;overflow-wrap:anywhere;min-width:0}
+.dsg-chat .query-head .state{margin-left:auto}
+.dsg-chat .spinner{animation:dsg-spin 1.3s linear infinite}
+.dsg-chat .dsg-tool-attribution{display:block;margin:2px 0 5px 20px;font-size:12px;line-height:1.6;color:var(--secondary);overflow-wrap:anywhere}
+.dsg-chat .search-card[data-open=false] .card-body *,.dsg-chat .search-card[data-open=false] .card-body *::before,.dsg-chat .search-card[data-open=false] .card-body *::after,
+.dsg-chat[data-visible=false] *,.dsg-chat[data-visible=false] *::before,.dsg-chat[data-visible=false] *::after{animation-play-state:paused!important}
+.dsg-chat[data-motion=reduce] *,.dsg-chat[data-motion=reduce] *::before,.dsg-chat[data-motion=reduce] *::after{animation:none!important;transition:none!important}
+@keyframes dsg-spin{to{transform:rotate(360deg)}}
+@keyframes dsg-travel{from{stroke-dashoffset:22;opacity:0}12%,76%{opacity:.8}to{stroke-dashoffset:-100;opacity:0}}
+@keyframes dsg-halo{from{stroke-dashoffset:22;opacity:0}12%,76%{opacity:.2}to{stroke-dashoffset:-100;opacity:0}}
+@keyframes dsg-tip{from{stroke-dashoffset:3;opacity:0}12%,76%{opacity:1}to{stroke-dashoffset:-119;opacity:0}}
+@keyframes dsg-arrival{0%{opacity:0;transform:scale(.995)}22%{opacity:.85}100%{opacity:0;transform:scale(1.025)}}
+@keyframes dsg-breathe{0%,100%{opacity:.12}50%{opacity:.46}}
+@keyframes dsg-jolt{0%,100%{transform:translateX(0)}18%{transform:translateX(-1.2px)}38%{transform:translateX(1px)}60%{transform:translateX(-.6px)}80%{transform:translateX(.25px)}}
+@keyframes dsg-fault{0%{opacity:0}18%,42%{opacity:.9}100%{opacity:0}}
+@keyframes dsg-settle{0%{opacity:.65;transform:scale(1)}100%{opacity:0;transform:scale(1.02)}}
+@keyframes dsg-check{0%{opacity:.4;transform:scale(.82)}65%{opacity:1;transform:scale(1.08)}100%{transform:scale(1)}}
+@keyframes dsg-results{from{opacity:.45;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
+@container(max-width:600px){
+ .dsg-chat .query-summary,.dsg-chat .tool-type,.dsg-chat .title-dot{display:none}
+ .dsg-chat .card-header{padding-inline:10px}.dsg-chat .card-toggle{gap:6px}.dsg-chat .header-right{gap:7px;padding-left:0}
+ .dsg-chat .source-copy{display:block}.dsg-chat .source-copy .source-domain{display:block;white-space:normal;overflow-wrap:anywhere}
+}
+@container(max-width:380px){
+ .dsg-chat .card-name{font-size:12px}.dsg-chat .state,.dsg-chat .elapsed{font-size:11px}.dsg-chat .header-right{gap:5px}
+ .dsg-chat .card-body{padding:13px}.dsg-chat .inspect-btn{width:24px;margin-left:0}.dsg-chat .query-head{flex-wrap:wrap}
+}
+@container(max-width:310px){.dsg-chat .elapsed{display:none}.dsg-chat .card-toggle{gap:4px}.dsg-chat .card-header{padding-inline:8px}}
+@media(prefers-reduced-motion:reduce){.dsg-chat *,.dsg-chat *::before,.dsg-chat *::after{animation:none!important;transition:none!important}}

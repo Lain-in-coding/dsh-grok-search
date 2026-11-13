@@ -3,6 +3,7 @@ import { mapSearchResult } from './result-map.mjs';
 import { createSourceChain } from './source-chain.mjs';
 import { searchConfigValues } from './search-config.mjs';
 import { isCancellation } from './errors.mjs';
+import { validateSearchQuery } from './search-query.mjs';
 
 const sourceChain = createSourceChain();
 
@@ -120,11 +121,11 @@ const sourceSpec = Object.freeze({
 });
 
 const HTTP_MESSAGES = Object.freeze({
-  400: '请求被拒绝（HTTP 400），请检查 BaseUrl 是否指向搜索接口。',
+  400: '请求被拒绝（HTTP 400），请检查 Base URL 是否指向搜索接口。',
   401: 'API Key 无效或已失效。',
   403: 'API Key 没有访问权限或已被停用。',
-  404: '接口地址不存在，请检查 BaseUrl。',
-  405: '接口不接受该请求方式，请检查 BaseUrl。',
+  404: '接口地址不存在，请检查 Base URL。',
+  405: '接口不接受该请求方式，请检查 Base URL。',
   408: '服务响应超时。',
   429: '请求过于频繁或额度已用尽。',
   432: '套餐额度已用尽或超出限制。',
@@ -138,20 +139,32 @@ export function httpMessage(status) {
 
 const sourceFailure = (code, message) => new GrokSearchError(code, message);
 
-async function readBoundedJson(response) {
+async function readBoundedJson(response, signal) {
   const reader = response.body?.getReader?.();
   if (!reader) throw sourceFailure('SOURCE_INVALID_RESPONSE', '服务返回了空响应。');
   const chunks = [];
   let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > MAX_RESPONSE_BYTES) {
-      await reader.cancel().catch(() => {});
-      throw sourceFailure('SOURCE_RESPONSE_TOO_LARGE', '服务响应超过 2 MiB，已停止读取。');
+  // A transport can finish its response while cancellation is arriving. Own
+  // the body too: releasing a reader lock alone does not cancel a stalled read.
+  const abort = () => { void reader.cancel(signal.reason).catch(() => {}); };
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    signal?.throwIfAborted();
+    for (;;) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) {
+        throw sourceFailure('SOURCE_RESPONSE_TOO_LARGE', '服务响应超过 2 MiB，已停止读取。');
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { throw sourceFailure('SOURCE_INVALID_RESPONSE', '服务返回的不是有效 JSON。'); }
@@ -168,7 +181,7 @@ function classify(error) {
     return { code: error.code === 'SOURCE_INVALID_RESPONSE' ? 'INVALID_RESPONSE' : 'RESPONSE_TOO_LARGE', message: error.message };
   }
   const cause = safeCauseCode(error);
-  return { code: 'NETWORK', message: '无法连接服务，请检查网络、代理或 BaseUrl。', ...(cause ? { cause } : {}) };
+  return { code: 'NETWORK', message: '无法连接服务，请检查网络、代理或 Base URL。', ...(cause ? { cause } : {}) };
 }
 
 export function createSourceRouter({ getConfig, getPreferences, fetchImpl = globalThis.fetch,
@@ -204,16 +217,19 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
+    let response;
     try {
       combined.throwIfAborted();
       const request = source.spec.request(source.base, key, query, limit);
-      const response = await fetchImpl(request.url, { ...request.init, redirect: 'error', signal: combined });
+      response = await fetchImpl(request.url, { ...request.init, redirect: 'error', signal: combined });
+      combined.throwIfAborted();
       if (!response.ok) {
         await response.body?.cancel?.().catch(() => {});
         return { status: 'failed', code: `HTTP_${response.status}`, httpStatus: response.status,
           message: httpMessage(response.status), keyScoped: KEY_SCOPED_STATUS.has(response.status), elapsedMs: elapsed() };
       }
-      const body = await readBoundedJson(response);
+      const body = await readBoundedJson(response, combined);
+      combined.throwIfAborted();
       const sources = source.spec.read(body, limit).filter(Boolean);
       const amount = source.id === 'tavily' ? body?.usage?.credits : source.id === 'firecrawl' ? body?.creditsUsed
         : source.id === 'exa' ? body?.costDollars?.total : null;
@@ -227,13 +243,14 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
         keyScoped: false, elapsedMs: elapsed() };
     } finally {
       clearTimeout(timer);
+      if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
     }
   };
 
   const notRunnable = source => source.state === 'disabled'
     ? { status: 'disabled', code: 'DISABLED', message: '已停用，测试时跳过。' }
     : source.state === 'not-configured' ? { status: 'not-configured', code: 'NOT_CONFIGURED', message: '尚未填写 API Key。' }
-      : { status: 'failed', code: 'URL_INVALID', message: 'BaseUrl 无效，只支持 http 或 https 地址。' };
+      : { status: 'failed', code: 'URL_INVALID', message: 'Base URL 无效，只支持 http 或 https 地址。' };
 
   const diagnoseSource = async (source, signal, config, schedule) => {
     if (source.state !== 'available') {
@@ -281,32 +298,36 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
-    const base = { provider: 'github', keyCount: token ? 1 : 0, keys: [] };
+    const base = { provider: 'github', keyCount: 1, keys: [] };
+    let response;
     try {
       combined.throwIfAborted();
-      const response = await fetchImpl(GITHUB_RATE_LIMIT, { method: 'GET', redirect: 'error', signal: combined,
+      response = await fetchImpl(GITHUB_RATE_LIMIT, { method: 'GET', redirect: 'error', signal: combined,
         headers: { accept: 'application/vnd.github+json', 'user-agent': 'dsh-grok-search',
-          'x-github-api-version': '2022-11-28', ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+          'x-github-api-version': '2022-11-28', authorization: `Bearer ${token}` } });
+      combined.throwIfAborted();
       if (!response.ok) {
         await response.body?.cancel?.().catch(() => {});
         return { ...base, status: 'failed', code: `HTTP_${response.status}`, httpStatus: response.status,
-          message: response.status === 401 && token ? 'GitHub Token 无效或已过期。' : httpMessage(response.status), elapsedMs: elapsed() };
+          message: response.status === 401 ? 'GitHub Token 无效或已过期。' : httpMessage(response.status), elapsedMs: elapsed() };
       }
-      const body = await readBoundedJson(response);
+      const body = await readBoundedJson(response, combined);
+      combined.throwIfAborted();
       const core = body?.resources?.core ?? body?.rate ?? {};
       const limit = Number.isSafeInteger(core.limit) ? core.limit : null;
       const remaining = Number.isSafeInteger(core.remaining) ? core.remaining : null;
-      return { ...base, status: 'ok', code: 'OK', authenticated: Boolean(token), limit, remaining, elapsedMs: elapsed(),
-        message: token ? `Token 有效${limit !== null ? `，每小时 ${limit} 次` : ''}。` : `未填 Token，按匿名额度使用${limit !== null ? `（每小时 ${limit} 次）` : ''}。` };
+      return { ...base, status: 'ok', code: 'OK', authenticated: true, limit, remaining, elapsedMs: elapsed(),
+        message: `Token 有效${limit !== null ? `，每小时 ${limit} 次` : ''}。` };
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
       return { ...base, status: 'failed', ...classify(controller.signal.aborted ? controller.signal.reason : error), elapsedMs: elapsed() };
     } finally {
       clearTimeout(timer);
+      if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
     }
   };
 
-  const searchSource = async (source, query, limit, { signal, deadline, onCall }) => {
+  const searchSource = async (source, query, limit, { signal, deadline, onCall, onProgress }) => {
     const count = source.keys.length;
     const start = source.spec.multiKey && count > 1 ? tavilyCursor++ % count : 0;
     let last = null;
@@ -314,6 +335,7 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       const remaining = deadline - performance.now();
       if (remaining <= 0) return { status: 'failed', code: 'TIMEOUT', message: '补充来源在本次搜索预算内没有返回。' };
       const keyIndex = (start + offset) % count;
+      onProgress?.({ provider: source.id, keyIndex, operation: offset ? 'retry' : 'search' });
       try { last = await attempt(source, source.keys[keyIndex], query, limit, { signal, timeoutMs: remaining }); }
       catch (error) {
         const cancelled = isCancellation(error, signal?.aborted === true);
@@ -358,8 +380,8 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       if (!source) throw new GrokSearchError('SOURCE_UNKNOWN', '未知补充来源。');
       return diagnoseSource(source, signal, config, schedule);
     },
-    async search({ query, maxResults = 5, signal, reason = 'grok-unavailable', onCall, configuration, remainingMs } = {}) {
-      if (typeof query !== 'string' || !query.trim()) throw new GrokSearchError('SOURCE_QUERY_INVALID', '搜索查询不能为空。');
+    async search({ query, maxResults = 5, signal, reason = 'grok-unavailable', onCall, onProgress, configuration, remainingMs } = {}) {
+      validateSearchQuery(query, 'SOURCE_QUERY_INVALID');
       signal?.throwIfAborted();
       const { config, sources } = current(configuration);
       if (config.response_max_chars !== undefined
@@ -388,7 +410,7 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
             { failures, unattempted: available.slice(index).map(item => item.id) });
         }
         const sourceDeadline = performance.now() + remaining / (available.length - index);
-        const outcome = await searchSource(source, query, limit, { signal, deadline: sourceDeadline, onCall });
+        const outcome = await searchSource(source, query, limit, { signal, deadline: sourceDeadline, onCall, onProgress });
         if (outcome.status === 'ok') {
           const maxChars = config.response_max_chars === undefined ? 45_000 : Math.min(500_000, config.response_max_chars);
           const mapped = mapSearchResult({ content: '', sources: outcome.sources }, { maxResults: limit, maxChars });

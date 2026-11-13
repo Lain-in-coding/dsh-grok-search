@@ -52,7 +52,14 @@ export function createToolBudgetController({ ctx, budgetMs, required, resolveCon
   ctx.on('internal/update', updateHook, { global: true, prepend: true });
   ctx.on('internal/plugin', fiber => { if (fiber.uid === null) leases.delete(fiber); }, { global: true });
   const controller = {
-    acquire() { serial = serial.then(acquire); return serial; },
+    acquire() {
+      // A failed refresh must not poison later attempts. Keep its rejected tail
+      // observable by release() and the caller; the next acquire recovers it.
+      const attempt = serial.then(acquire, acquire);
+      serial = attempt;
+      attempt.catch(() => {});
+      return attempt;
+    },
     async release() {
       releasing = true;
       await serial.catch(onError);

@@ -18,8 +18,8 @@
 - 升级验证支持实际 `0.2.1 → 0.3.0`，将前向 DSH 宿主升级与插件账本降级分开；
   不保证旧 DSH 能读取 rc.2 新格式会话，不删除或改写历史来规避不兼容。
 - DSH `0.2.2-rc.2` 的 Windows x64、macOS arm64 官方 Desktop 与 WSL Ubuntu 22.04
-  CLI/Web 均有合成上游宿主验证；最终正文取消修复已在 Windows/WSL 复验，
-  macOS 托管 Apple Silicon 证据对应较早候选。原生 Linux 完整安装及真实付费接口
+  CLI/Web 均有合成上游宿主验证；发布包已通过 Windows 双版 Desktop 与
+  macOS 托管 Apple Silicon 同包门禁，WSL 后端证据按未变模块复用。原生 Linux 完整安装及真实付费接口
   不在本轮自动化验证结论内。
 
 - 单条搜索查询限制8192个Unicode字符，在排队、记录正文和上游请求前拒绝超限输入，

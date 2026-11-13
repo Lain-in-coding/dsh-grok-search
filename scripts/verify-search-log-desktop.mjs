@@ -499,6 +499,26 @@ try {
       const metricsBefore=(await renderer.send('Performance.getMetrics')).metrics;
       await dom(renderer, `(() => {
         const data=window.__dsgHostPerf={measurements:0,heightAnimations:0,longTasks:[],frames:[],streamFrames:0,mutations:0,visibility:[document.visibilityState]};
+        const OriginalIntersectionObserver=window.IntersectionObserver;
+        data.intersections=[];
+        let observerId=0;
+        window.IntersectionObserver=class extends OriginalIntersectionObserver{
+          constructor(callback,options){
+            const id=++observerId;
+            super((entries,observer)=>{
+              const relevant=entries.filter(entry=>entry.target.matches?.('.dsg-chat'));
+              if(relevant.length&&data.intersections.length<120)data.intersections.push({
+                id,at:performance.now(),entries:relevant.map(entry=>({
+                  callId:entry.target.dataset.dsgSearchCard,connected:entry.target.isConnected,
+                  time:entry.time,intersecting:entry.isIntersecting,ratio:entry.intersectionRatio,
+                  top:entry.boundingClientRect.top,height:entry.boundingClientRect.height,
+                  root:entry.rootBounds&&{top:entry.rootBounds.top,bottom:entry.rootBounds.bottom},
+                })),
+              });
+              callback(entries,observer);
+            },options);
+          }
+        };
         const onVisibility=()=>data.visibility.push(document.visibilityState);
         document.addEventListener('visibilitychange',onVisibility);
         const measure=Element.prototype.getBoundingClientRect,animate=Element.prototype.animate;
@@ -529,6 +549,7 @@ try {
         };frame=requestAnimationFrame(tick);
         data.stop=()=>{cancelAnimationFrame(frame);clearInterval(openTimer);taskObserver.disconnect();changes.disconnect();
           document.removeEventListener('visibilitychange',onVisibility);
+          window.IntersectionObserver=OriginalIntersectionObserver;
           Element.prototype.getBoundingClientRect=measure;Element.prototype.animate=animate;};
       })()`);
       let streamed, streamFailure;
@@ -558,6 +579,7 @@ try {
             maxFrameMs:Math.round((sorted.at(-1)??0)*100)/100,visibleCardFrames:data.streamFrames,domMutations:data.mutations,visibility:data.visibility,
             observedCallId:data.streaming.card?.dataset.dsgSearchCard??null,observedConnected:data.streaming.card?.isConnected===true,
             observedVisible:data.streaming.card?.dataset.visible??null,observedOpen:data.streaming.open,
+            intersections:data.intersections,
             observedTitle:data.streaming.card?.querySelector('.card-name')?.textContent??null,
             observedAncestors:(()=>{
               const rows=[];
@@ -580,6 +602,19 @@ try {
         // cause instead of masking it with an assertion about a partial frame.
         if(!streamFailure){
           if(metrics.visibleCardFrames<=30){
+            metrics.freshIntersection=await dom(renderer,`new Promise(resolve=>{
+              const target=[...document.querySelectorAll('.dsg-chat')].find(card=>card.dataset.dsgSearchCard===${JSON.stringify(metrics.observedCallId)});
+              if(!target){resolve({missing:true});return;}
+              let timer;
+              const observer=new IntersectionObserver(entries=>{
+                clearTimeout(timer);observer.disconnect();
+                resolve(entries.map(entry=>({intersecting:entry.isIntersecting,ratio:entry.intersectionRatio,
+                  top:entry.boundingClientRect.top,height:entry.boundingClientRect.height})));
+              });
+              observer.observe(target);
+              timer=setTimeout(()=>{observer.disconnect();resolve({timeout:true});},1500);
+            })`);
+            host.streamVisibility=metrics.freshIntersection;
             const image=await renderer.send('Page.captureScreenshot',{format:'png'});
             writeFileSync(join(run.directory,version+'-chat-stream-failed.png'),Buffer.from(image.data,'base64'),{flag:'wx'});
           }
@@ -916,7 +951,7 @@ try {
           .map(e=>({text:e.textContent.slice(0,100),expanded:e.getAttribute('aria-expanded'),html:e.outerHTML.slice(0,500)})),
         nativeSwitches:[...document.querySelectorAll('[role=switch]')].map(e=>({aria:e.getAttribute('aria-label'),checked:e.getAttribute('aria-checked')}))})`);
       writeJson(join(run.directory, 'failed-state.json'), { ...state, checks: owned.checks, exceptions:owned.renderer.exceptions,
-        streamDiagnosticFailure:owned.streamDiagnosticFailure??null });
+        streamDiagnosticFailure:owned.streamDiagnosticFailure??null,streamVisibility:owned.streamVisibility??null });
     } catch { /* Original failure remains authoritative. */ }
   }
 } finally {

@@ -85,6 +85,14 @@ test('正式发布材料同步0.3.0入口与日期，不遗留候选公告或把
   assert.doesNotMatch(matrix.channel, /未公开发布|仍为0\.2\.1/);
 });
 
+test('默认安装示例固定当前发布版本，避免预览新版却按裸名解析旧版', () => {
+  const readme = read('README.md');
+  const install = readme.split('### 方式一：在 DSH 中按名称安装')[1]?.split('\n### ')[0];
+  const expected = `${manifest.name}@${manifest.version}`;
+  assert.equal(install?.match(/```text\s+([^\r\n]+)\s+```/)?.[1]?.trim(), expected);
+  assert.equal(readme.match(/^dsh plugin --profile web add (\S+)$/m)?.[1], expected);
+});
+
 test('正式候选拒绝 Beta、内部版本和不规范的版本号', () => {
   for (const version of ['0.1.0-beta.1', '0.0.0-internal.1', 'v0.1.0', '01.1.0', '0.1', '0.1.0+local']) {
     assert.throws(() => validatePackChannel({ ...manifest, version }, { ...matrix, packageVersion: version }, { release: true }));

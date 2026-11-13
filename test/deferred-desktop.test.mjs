@@ -225,6 +225,38 @@ test('native update closes its owned process even without a renderer or after a 
   }
 });
 
+test('原生首装验证仅在宿主正常退出后生成通过摘要', async () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const closing = source.slice(source.lastIndexOf('} finally {\n  renderer?.close();'));
+  assert.ok(closing.startsWith('} finally {'));
+  assert.ok(closing.indexOf('assert.equal(exit.code, 0') < closing.indexOf('result.passed = true'));
+  assert.ok(closing.indexOf('assert.equal(exit.signal, null') < closing.indexOf('result.passed = true'));
+  const execute = new Function('assert', 'renderer', 'requestDesktopShutdown', 'port', 'closed',
+    'writeJson', 'join', 'run', 'quotaServer', 'result',
+    `return (async () => { try { ${closing} })();`);
+  for (const [exit, shutdownFailure] of [
+    [{ code: 0, signal: null }, null],
+    [{ code: 1, signal: null }, null],
+    [{ code: null, signal: 'SIGTERM' }, null],
+    [{ code: 0, signal: null }, new Error('synthetic shutdown timeout')],
+  ]) {
+    const evidence = [];
+    let quotaClosed = false;
+    const result = {};
+    const verification = execute(assert, { close() {} },
+      async () => { if (shutdownFailure) throw shutdownFailure; }, 1234, Promise.resolve(exit),
+      (path, value) => evidence.push({ path, value }), join, { directory: '/isolated-fixture' },
+      { closeAllConnections() {}, close(done) { quotaClosed = true; done(); } }, result);
+    const successful = exit.code === 0 && exit.signal === null && !shutdownFailure;
+    if (successful) await verification;
+    else await assert.rejects(verification);
+    assert.equal(quotaClosed, true, 'the local quota fixture closes even after a shutdown failure');
+    assert.equal(evidence.some(row => row.path.endsWith('summary.json')), successful);
+    assert.equal(result.passed === true, successful);
+    if (!shutdownFailure) assert.deepEqual(evidence[0].value, exit, 'failed exit diagnostics are retained');
+  }
+});
+
 test('B2 settings snapshot pins the current idle test-button label', () => {
   const source = readFileSync(new URL('../scripts/b2-plugin-manager-desktop.mjs', import.meta.url), 'utf8');
   assert.match(source, /testButton:\s*root\.querySelector\('#testBtn'\)\?\.textContent\.trim\(\)\s*===\s*'测试连接'/);

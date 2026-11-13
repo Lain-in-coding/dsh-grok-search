@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -14,20 +14,29 @@ import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './li
 // Unlike the historical desktop suite, this starts without the fixture bundle,
 // replacement providers, pre-created preferences, control records or shared keys.
 const liveInstall = process.argv.includes('--live-install');
+const registryInstall = process.argv.includes('--registry-install');
 const openConfig = process.argv.includes('--open-config');
 const hiddenFolder = process.argv.includes('--hidden-folder');
 assert.ok(!hiddenFolder || openConfig, '--hidden-folder requires --open-config');
-const input = process.argv.slice(2).filter(value => !['--live-install', '--open-config', '--hidden-folder'].includes(value));
+assert.ok(!registryInstall || liveInstall, '--registry-install requires --live-install');
+const input = process.argv.slice(2).filter(value => !['--live-install', '--registry-install', '--open-config', '--hidden-folder'].includes(value));
 const upgradeIndex = input.indexOf('--upgrade-from');
 if (upgradeIndex >= 0) assert.ok(input[upgradeIndex + 1] && !input[upgradeIndex + 1].startsWith('--'), '--upgrade-from requires an old tarball');
 const upgradeFrom = upgradeIndex < 0 ? null : resolve(input.splice(upgradeIndex, 2)[1]);
-assert.equal(input.length, 2, 'Usage: [--live-install | --upgrade-from <old tgz>] [--open-config] <tgz> <official Desktop executable>');
+assert.equal(input.length, 2, 'Usage: [--live-install [--registry-install] | --upgrade-from <old tgz>] [--open-config] <tgz> <official Desktop executable>');
 const [tarball, executable] = input.map(value => resolve(value));
 assert.ok(tarball && executable, 'Usage: <tgz> <official Desktop executable>');
 assert.equal(liveInstall && Boolean(upgradeFrom), false, 'Choose fresh installation or upgrade, not both');
 const packageReceipt = JSON.parse(readFileSync(join(dirname(tarball), 'package-receipt.json'), 'utf8'));
 assert.equal(sha256(tarball), packageReceipt.sha256, 'test the frozen candidate');
-for (const row of packageReceipt.sourceHashes) assert.equal(sha256(join(project, row.file)), row.sha256);
+const repositoryReadmeDiffers = packageReceipt.sourceHashes.some(row =>
+  row.file === 'README.md' && sha256(join(project, row.file)) !== row.sha256);
+for (const row of packageReceipt.sourceHashes) {
+  // Post-publication installation guidance may change without replacing the
+  // published package. Still reject any runtime-file drift in registry mode.
+  if (registryInstall && row.file === 'README.md') continue;
+  assert.equal(sha256(join(project, row.file)), row.sha256);
+}
 const run = freshRun('rc5-user-path');
 const root = join(tmpdir(), 'dsh-deferred-desktop-user-path-' + run.runId + (openConfig ? " 中文 空格 ' & $" : ''));
 prepareDesktopFixture(executable, root, { pluginManagerEntries: true, liveHmr: true });
@@ -78,6 +87,8 @@ const child = spawn(control.electron, [control.archive, '--user-data-dir=' + con
 child.stdout.resume(); child.stderr.resume();
 const closed = new Promise(done => child.once('close', (code, signal) => done({ code, signal })));
 let renderer;
+let registryResolution;
+let result;
 try {
   renderer = await connectRenderer(port, { timeoutMs: 90_000, requestTimeoutMs: 200_000 });
   await waitForRenderer(renderer, client => client.evaluate('document.readyState === "complete" && !!document.querySelector(\'button[aria-label="插件"]\')'));
@@ -109,8 +120,61 @@ try {
   writeJson(join(run.directory, 'workspace-initialization.json'), workspace);
   if (liveInstall || upgradeFrom) {
     if (upgradeFrom) await waitForRenderer(renderer, async () => (await rpc('snapshot')).body?.result?.ok, { timeoutMs: 45_000 });
+    if (registryInstall) {
+      // Exercise the installed host's own registry preview and resolver. A fresh
+      // release can preview as latest while pnpm's age policy selects an older
+      // version. Never weaken that policy or change any user profile.
+      const registry = 'https://registry.npmjs.org/';
+      const dependencyNames = Object.keys(JSON.parse(readFileSync(join(control.profile, 'package.json'), 'utf8'))
+        .dependencies ?? {}).sort();
+      const profileState = () => {
+        const files = Object.fromEntries(['package.json', 'pnpm-lock.yaml', 'cordis.patch.yml']
+          .map(file => [file, existsSync(join(control.profile, file)) ? sha256(join(control.profile, file)) : null]));
+        const modules = {};
+        const visit = relativePath => {
+          const path = join(control.profile, relativePath);
+          const entry = lstatSync(path, { throwIfNoEntry: false });
+          if (!entry) { modules[relativePath] = null; return; }
+          if (entry.isSymbolicLink()) { modules[relativePath] = { link: readlinkSync(path) }; return; }
+          if (entry.isFile()) { modules[relativePath] = { sha256: sha256(path) }; return; }
+          assert.ok(entry.isDirectory(), 'the isolated dependency tree contains only files, directories and links');
+          modules[relativePath] = { directory: true };
+          for (const name of readdirSync(path).sort()) visit(join(relativePath, name));
+        };
+        // Rollback restores the declared dependency graph, not pnpm's generated
+        // metadata or unused fixture files that pnpm moves into .ignored.
+        for (const name of dependencyNames) visit(join('node_modules', name));
+        return { files, modules };
+      };
+      const before = profileState();
+      const inspection = await rpc('inspect', { spec: manifest.name, options: { registry } }, true);
+      assert.equal(inspection.body?.result?.ok, true, 'native registry inspection succeeds');
+      assert.equal(inspection.body.result.value.version, manifest.version, 'registry preview identifies the candidate');
+      const bare = await rpc('installBundle', {
+        spec: manifest.name, options: { enabled: false, requestId: randomUUID(), registry },
+      }, true);
+      registryResolution = { inspection, bare };
+      writeJson(join(run.directory, 'registry-resolution.json'), registryResolution);
+      const value = bare.body?.result?.value;
+      assert.equal(bare.body?.result?.ok, true, 'native bare-name installation returns structured diagnostics');
+      if (value?.application === 'failed') {
+        assert.equal(value.error?.code, 'incompatible-version', 'bare-name failure must identify the actual incompatible package');
+        const after = profileState();
+        writeJson(join(run.directory, 'registry-rollback.json'), { dependencyNames, before, after });
+        assert.deepEqual(after, before,
+          'rejected old version restores the manifest, lockfile, host patch and declared dependency paths');
+        assert.equal(existsSync(join(product, 'package.json')), false,
+          'rejected old version cannot remain installed');
+      } else {
+        assert.equal(value?.version, manifest.version, 'an accepted bare-name install must be the current candidate');
+        const removed = await rpc('removeBundle', { name: manifest.name }, true);
+        assert.equal(removed.body?.result?.ok, true, 'remove only this test-created package before exact-version verification');
+        assert.notEqual(removed.body.result.value.application, 'failed');
+      }
+    }
     const installation = await rpc('installBundle', {
-      spec: tarball, options: { enabled: true, requestId: randomUUID(), registry: 'https://registry.npmjs.org/' },
+      spec: registryInstall ? `${manifest.name}@${manifest.version}` : tarball,
+      options: { enabled: true, requestId: randomUUID(), registry: 'https://registry.npmjs.org/' },
     }, true);
     writeJson(join(run.directory, 'installation.json'), installation);
     console.log(JSON.stringify({ installation: installation.body?.result?.value
@@ -137,8 +201,9 @@ try {
     return note && !note.includes('载入') && text && text!=='读取配置…'
       ? {note, text, componentError: /共\\s*1\\s*个[·\\s]*1\\s*异常/.test(document.body.innerText)} : null;
   })()`), { timeoutMs: 30_000 });
-  const result = {
+  result = {
     root, port, version: JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version,
+    ...(registryResolution ? { registryResolution, repositoryReadmeDiffers } : {}),
     packageSha256: packageReceipt.sha256, fixtureBundle: false, snapshot, ui,
     log: await rpc('readSearchLog', { sessionId }),
     route: await rpc('toolCallRoute', { sessionId, callId: 'unknown' }),
@@ -321,12 +386,18 @@ ConvertTo-Json -InputObject @{ first=$first; last=$last; crashEvents=$crashes; i
     result.realFolderVisibilityValidated = true;
     result.configOpenUsesSyntheticFile = true;
   }
-  result.passed = true;
-  writeJson(join(run.directory, 'summary.json'), result);
 } finally {
   renderer?.close();
-  await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 });
-  writeJson(join(run.directory, 'exit.json'), await closed);
-  quotaServer.closeAllConnections();
-  await new Promise(done => quotaServer.close(done));
+  try {
+    await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 });
+    const exit = await closed;
+    writeJson(join(run.directory, 'exit.json'), exit);
+    assert.equal(exit.code, 0, 'the owned Desktop exits successfully');
+    assert.equal(exit.signal, null, 'the owned Desktop is not terminated by a signal');
+  } finally {
+    quotaServer.closeAllConnections();
+    await new Promise(done => quotaServer.close(done));
+  }
 }
+result.passed = true;
+writeJson(join(run.directory, 'summary.json'), result);

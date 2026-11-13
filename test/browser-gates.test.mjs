@@ -68,6 +68,34 @@ test('streaming observer waits for the real card and follows replacements with t
   assert.equal(state.open, false);
 });
 
+test('streaming observer renews reader intent when the host starts following the tail again', () => {
+  let following = true, gestures = 0, scrolls = 0;
+  const card = {
+    dataset: { dsgSearchCard: 'same-call', visible: 'false' }, isConnected: true,
+    dispatchEvent() { gestures++; following = false; },
+    scrollIntoView() { scrolls++; if (!following) this.dataset.visible = 'true'; },
+    querySelector: selector => selector === '.card-toggle[aria-expanded=true]' ? {} : null,
+  };
+  const document = {
+    defaultView: { WheelEvent: class {} },
+    querySelectorAll: selector => selector === '.dsg-chat' ? [card] : [],
+  };
+  const state = { initialCallIds: new Set(), card: null, open: false };
+  followStreamingSearchCard(document, state);
+  assert.equal(card.dataset.visible, 'true');
+  // A new streamed block or fold can restart the host follow animation after
+  // the first gesture. Merely scrolling again does not interrupt that owner.
+  following = true;
+  card.dataset.visible = 'false';
+  followStreamingSearchCard(document, state);
+  assert.equal(card.dataset.visible, 'true', 'Reacquire reader intent before recovering the view.');
+  assert.equal(gestures, 2);
+  assert.equal(scrolls, 2);
+  followStreamingSearchCard(document, state);
+  assert.equal(gestures, 2, 'A visible card must not receive repeated gestures or scrolling.');
+  assert.equal(scrolls, 2);
+});
+
 test('Desktop streaming diagnostics preserve the failed model call instead of replacing it with a visibility assertion', async () => {
   const source = readFileSync(new URL('../scripts/verify-search-log-desktop.mjs', import.meta.url), 'utf8');
   const start = source.indexOf('      let streamed');

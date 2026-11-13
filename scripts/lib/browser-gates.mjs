@@ -26,9 +26,10 @@ export function followStreamingSearchCard(document, state) {
   state.card = [...document.querySelectorAll('.dsg-chat')]
     .findLast(card => !state.initialCallIds.has(card.dataset.dsgSearchCard)) ?? null;
   if (!state.card) { state.open = false; return; }
-  if (state.readingCallId !== state.card.dataset.dsgSearchCard) {
+  if (state.readingCallId !== state.card.dataset.dsgSearchCard || state.card.dataset.visible !== 'true') {
     // Programmatic scrolling alone is not reader intent in the official host.
-    // A simulated wheel interaction hands off its follow-to-tail controller.
+    // New stream blocks can restart follow-to-tail for the same call. Renew
+    // reader intent when recovering its view, but leave a visible card alone.
     state.card.dispatchEvent(new document.defaultView.WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
     state.readingCallId = state.card.dataset.dsgSearchCard;
   }

@@ -6197,13 +6197,19 @@ ${dots.map((d) => d.tip).join("\n")}
       const latest = React.useRef({ phase });
       latest.current = { phase };
       React.useEffect(() => {
-        let inView = true;
-        const update = () => setVisible(inView && !document.hidden);
+        const target = element.current;
+        let inView = false, active = true;
+        const update = () => {
+          if (active) setVisible(inView && !document.hidden);
+        };
         const observer = new IntersectionObserver((entries) => {
-          inView = entries[0].isIntersecting;
+          if (!active) return;
+          const newest = entries.reduce((previous, entry) => entry.target === target && (!previous || entry.time >= previous.time) ? entry : previous, null);
+          if (!newest) return;
+          inView = newest.isIntersecting;
           update();
         });
-        observer.observe(element.current);
+        observer.observe(target);
         document.addEventListener("visibilitychange", update);
         const color = matchMedia("(prefers-color-scheme: dark)"), motion = matchMedia("(prefers-reduced-motion: reduce)");
         const updateTheme = () => setDark(theme?.current ?? color.matches), updateMotion = () => setReduce(motion.matches);
@@ -6213,6 +6219,7 @@ ${dots.map((d) => d.tip).join("\n")}
         updateTheme();
         updateMotion();
         return () => {
+          active = false;
           observer.disconnect();
           document.removeEventListener("visibilitychange", update);
           theme?.listeners.delete(updateTheme);

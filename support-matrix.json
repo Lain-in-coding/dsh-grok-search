@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "packageVersion": "0.3.0",
   "channel": "0.3.0 正式发行通道（latest）；实际公开状态以 npm 和 GitHub Release 为准",
-  "verificationBaseline": "0.3.0最终运行代码已在Windows x64 DSH 0.2.1-rc.5/0.2.2-rc.2 Desktop及WSL Ubuntu 22.04 DSH 0.2.2-rc.2 CLI/Web隔离验证。macOS arm64官方Desktop为正文取消修复前候选的托管证据，未冒称最终包完整复验；Linux证据仅限WSL。真实付费上游、签名安装器启动及所有平台故障组合不因此通过",
-  "supportPolicy": "targets列出本版本兼容支持组合，verificationLevel逐行说明累计证据与适用对象。支持声明不要求每个官方Desktop发行包均实测：0.2.1-rc.4 Desktop仍按源码审查及相邻宿主证据纳入支持，不宣称实测。Windows/WSL最终运行代码已有复验，macOS保留较早候选证据及最终修复未完整复验边界。后续版本仍须完成受影响验证并审核后发布。Linux运行证据限WSL Ubuntu 22.04，原生Linux完整安装路径仍属验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
+  "verificationBaseline": "0.3.0累计验证覆盖Windows x64和macOS arm64官方Desktop，以及WSL Ubuntu 22.04 CLI/Web。每份证据绑定对应代码或安装包，最终发布包及后续修复的实际复验结果见开发与验证文档，不把旧包安装计作新包安装。真实付费上游、签名安装器启动及所有平台故障组合不因此通过",
+  "supportPolicy": "targets列出本版本兼容支持组合，verificationLevel逐行说明累计证据与适用对象。支持声明不要求每个官方Desktop发行包均实测：0.2.1-rc.4 Desktop仍按源码审查及相邻宿主证据纳入支持，不宣称实测。后续修复须完成受影响验证后发布；具体同包门禁见开发与验证文档。Linux运行证据限WSL Ubuntu 22.04，原生Linux完整安装路径仍属验证有限；不承诺表外环境、真实付费接口或所有故障组合均通过。",
   "verificationLevels": {
     "host-tested": "有对应系统、架构、入口和版本的宿主自动化测试记录；具体场景见 verification。运行时未变时可按源码哈希复用原范围证据，不把旧包安装写成新包安装，也不表示真实付费接口通过。",
     "source-reviewed": "基于明确的接口与源码审查及相邻版本/同版其他入口证据声明兼容；未单独完成对应系统、版本及入口的宿主实测。此等级属于支持范围，不属于宿主实测通过。"
@@ -131,21 +131,21 @@
       "host": "Desktop",
       "dsh": "0.2.2-rc.2",
       "verificationLevel": "host-tested",
-      "verification": "0.3.0最终运行代码在官方Windows x64 DSH 0.2.2-rc.2原始ASAR/Electron隔离Desktop完成配置/日志/额度/GitHub 164项、搜索11类与GitHub25类专项、新包干净安装及0.2.1原生UI更新/重启/配置缓存保持验证。首次下载、真实grok-search-rs 0.1.26对回环Responses、HMR及两种搜索API恢复按未变模块保留既有证据。供应商使用合成回环响应，不代表真实付费接口或签名安装器启动"
+      "verification": "0.3.0开发线在官方Windows x64 DSH 0.2.2-rc.2原始ASAR/Electron隔离Desktop完成配置/日志/额度/GitHub 164项、搜索11类与GitHub25类专项、干净安装及0.2.1原生UI更新/重启/配置缓存保持验证。首次下载、真实grok-search-rs 0.1.26对回环Responses、HMR及两种搜索API恢复按未变模块保留既有证据；最终包受影响复验见开发与验证文档。供应商使用合成回环响应，不代表真实付费接口或签名安装器启动"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.2",
       "verificationLevel": "host-tested",
-      "verification": "正文取消修复前的0.3.0候选（762835e5…de0777）在GitHub托管macOS 15 Apple Silicon与官方DSH 0.2.2-rc.2原始Desktop完成安装、控制、首次下载/诊断、日志/回放/额度、Session搜索、GitHub续读、生命周期与本地Grok Responses验证。最终来源/额度/GitHub/下载四模块取消修复未在macOS完整复验，旧证据仅按未变模块复用。合成上游，不代表真实付费接口或用户签名安装器启动"
+      "verification": "0.3.0候选在GitHub托管macOS 15 Apple Silicon与官方DSH 0.2.2-rc.2原始Desktop完成安装、控制、首次下载/诊断、日志/回放/额度、Session搜索、GitHub续读、生命周期与本地Grok Responses验证。正文取消修复后的64343b09…cf890包已在公开CI 43369732174的022-rc2组完整通过；其后聊天可见性修复的同包复验另见开发与验证文档。合成上游，不代表真实付费接口或用户签名安装器启动"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.2-rc.2",
       "verificationLevel": "host-tested",
-      "verification": "0.3.0最终运行代码在WSL Ubuntu 22.04、隔离Node 24.14.1及官方DSH 0.2.2-rc.2 Linux x64 CLI/Web完成196项首次下载门禁；179项常规按未变模块复用较早候选证据。engine-strict安装、空配置引导、程序自动下载/握手及缓存复用、共享配置、搜索来源、接管/停用/移除/重启通过；合成上游，无真实Key或付费请求。不是原生Linux发行版或Linux Desktop实测"
+      "verification": "0.3.0后端在WSL Ubuntu 22.04、隔离Node 24.14.1及官方DSH 0.2.2-rc.2 Linux x64 CLI/Web完成196项首次下载门禁；179项常规按未变模块复用较早候选证据。engine-strict安装、空配置引导、程序自动下载/握手及缓存复用、共享配置、搜索来源、接管/停用/移除/重启通过；客户端后续修复的浏览器回归另列，不将旧客户端当成新版本实测。合成上游，无真实Key或付费请求。不是原生Linux发行版或Linux Desktop实测"
     }
   ],
   "realKeyVerification": {
@@ -163,7 +163,6 @@
     "DSH 0.2.2-rc.3 及更高未来版本（不在 engines.dsh 范围内，安装会被拒绝）"
   ],
   "notTested": [
-    "0.3.0最终正文取消修复后的macOS完整实机复验；较早候选宿主证据按未变模块保留",
     "Windows 10 桌面配置文件打开：已有经典记事本分支回归，不等同 Windows 10 实机验证",
     "原生 Linux 桌面的配置文件打开：无桌面 CLI/Web 行为单独验证",
     "DSH 0.2.1-rc.4 Desktop 官方原包实测：已纳入兼容支持，但仅有关键源码审查与关联宿主证据，不把该版本 CLI/Web 测试写成 Desktop 实测",

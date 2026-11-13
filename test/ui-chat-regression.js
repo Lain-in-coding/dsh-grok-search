@@ -7,6 +7,12 @@ async page => {
   page.on('console',message=>{if(message.type()==='error')errors.push(message.text());});
   page.on('request',request=>{if(/^https?:/.test(request.url())&&!request.url().startsWith(origin+'/'))external.push(request.url());});
   await page.addInitScript(()=>{
+    const BaseIntersectionObserver=window.IntersectionObserver;
+    window.__chatIntersectionCallbacks=new WeakMap();
+    window.IntersectionObserver=class extends BaseIntersectionObserver{
+      constructor(callback,options){super(callback,options);this.callback=callback;}
+      observe(target){window.__chatIntersectionCallbacks.set(target,entries=>this.callback(entries,this));super.observe(target);}
+    };
     window.__chatTaskObserver?.disconnect();
     window.__chatLongTasks=[];
     window.__chatTaskObserver=new PerformanceObserver(list=>{for(const task of list.getEntries())window.__chatLongTasks.push(Math.round(task.duration));});
@@ -201,6 +207,22 @@ async page => {
   check('live searching retains visible glow paths',await page.evaluate(()=>
     [...document.querySelectorAll('.edge.active .wire-flow')].length>0
     &&[...document.querySelectorAll('.edge.active .wire-flow')].every(path=>getComputedStyle(path).display!=='none')));
+  for(const visible of [false,true]){
+    const observed=await page.evaluate(async visible=>{
+      const target=document.querySelector('.dsg-chat');
+      const callback=window.__chatIntersectionCallbacks.get(target);
+      // The browser may queue both crossings before delivering one callback.
+      // Include an unrelated target and timestamps so only this card's latest
+      // observation controls whether its attribution watcher should run.
+      callback([{target,isIntersecting:!visible,time:10},
+        {target,isIntersecting:visible,time:30},
+        {target,isIntersecting:!visible,time:20},
+        {target:document.body,isIntersecting:!visible,time:40}]);
+      await new Promise(done=>requestAnimationFrame(()=>requestAnimationFrame(done)));
+      return target.dataset.visible===String(visible);
+    },visible);
+    check(`batched intersection entries keep the latest card visibility (${visible})`,observed);
+  }
   await page.emulateMedia({reducedMotion:'reduce'});
   await page.waitForFunction(()=>document.querySelector('.dsg-chat').dataset.motion==='reduce');
   check('reduced motion disables glow, not semantics',await page.locator('.provider-steps [data-result=running]')

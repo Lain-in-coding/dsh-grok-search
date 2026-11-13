@@ -386,16 +386,25 @@ export function createToolRouteView({ React, jsx, remote, Original, logos = {}, 
     const [dark,setDark]=React.useState(theme?.current ?? false), [reduce,setReduce]=React.useState(false);
     const latest=React.useRef({phase});latest.current={phase};
     React.useEffect(() => {
-      let inView=true;
-      const update=()=>setVisible(inView&&!document.hidden);
-      const observer=new IntersectionObserver(entries=>{inView=entries[0].isIntersecting;update();});
-      observer.observe(element.current);
+      const target=element.current;
+      let inView=false,active=true;
+      const update=()=>{if(active)setVisible(inView&&!document.hidden);};
+      const observer=new IntersectionObserver(entries=>{
+        if(!active)return;
+        // Several crossings can be delivered together. The latest record for
+        // this card owns visibility; an earlier exit must not pause it forever.
+        const newest=entries.reduce((previous,entry)=>entry.target===target
+          &&(!previous||entry.time>=previous.time)?entry:previous,null);
+        if(!newest)return;
+        inView=newest.isIntersecting;update();
+      });
+      observer.observe(target);
       document.addEventListener('visibilitychange',update);
       const color=matchMedia('(prefers-color-scheme: dark)'), motion=matchMedia('(prefers-reduced-motion: reduce)');
       const updateTheme=()=>setDark(theme?.current ?? color.matches),updateMotion=()=>setReduce(motion.matches);
       theme?.listeners.add(updateTheme);color.addEventListener('change',updateTheme);motion.addEventListener('change',updateMotion);
       updateTheme();updateMotion();
-      return ()=>{observer.disconnect();document.removeEventListener('visibilitychange',update);
+      return ()=>{active=false;observer.disconnect();document.removeEventListener('visibilitychange',update);
         theme?.listeners.delete(updateTheme);color.removeEventListener('change',updateTheme);motion.removeEventListener('change',updateMotion);};
     },[]);
     React.useEffect(()=>{

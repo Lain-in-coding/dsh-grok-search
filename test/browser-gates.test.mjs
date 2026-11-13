@@ -109,6 +109,7 @@ test('Desktop streaming diagnostics preserve the failed model call instead of re
     const run = vm.runInNewContext(`(async () => {${source.slice(start, end)}})`, {
       renderer: { async send(method) {
         if (diagnosticFailure) throw diagnosticFailure;
+        if (method === 'Page.captureScreenshot') return { data: '' };
         return method === 'Profiler.stop' ? { profile: { nodes: [], samples: [], timeDeltas: [] } } : { metrics: [] };
       } },
       metricsBefore: [], host, version: 'isolated-version', clientBaseline: false,
@@ -116,6 +117,7 @@ test('Desktop streaming diagnostics preserve the failed model call instead of re
       modelTurn: async () => { if (callFailure) throw callFailure; return { completed: true }; },
       dom: async () => ({ visibleCardFrames: 0, measurements: 0, heightAnimations: 0 }),
       writeJson: (path, value) => records.push({ path, value }),
+      writeFileSync: (path, value) => records.push({ path, imageBytes: value.length }), Buffer,
       safeError: error => ({ message: error.message }),
       check: (_name, actual, expected = true) => assert.equal(actual, expected),
     });

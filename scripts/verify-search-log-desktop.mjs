@@ -558,7 +558,18 @@ try {
             maxFrameMs:Math.round((sorted.at(-1)??0)*100)/100,visibleCardFrames:data.streamFrames,domMutations:data.mutations,visibility:data.visibility,
             observedCallId:data.streaming.card?.dataset.dsgSearchCard??null,observedConnected:data.streaming.card?.isConnected===true,
             observedVisible:data.streaming.card?.dataset.visible??null,observedOpen:data.streaming.open,
-            observedTitle:data.streaming.card?.querySelector('.card-name')?.textContent??null};
+            observedTitle:data.streaming.card?.querySelector('.card-name')?.textContent??null,
+            observedAncestors:(()=>{
+              const rows=[];
+              for(let node=data.streaming.card;node&&rows.length<20;node=node.parentElement){
+                const rect=node.getBoundingClientRect(),style=getComputedStyle(node);
+                rows.push({tag:node.tagName,class:node.className,hidden:node.getAttribute('hidden'),
+                  top:rect.top,bottom:rect.bottom,height:rect.height,width:rect.width,
+                  display:style.display,visibility:style.visibility,contentVisibility:style.contentVisibility,
+                  overflowY:style.overflowY,scrollTop:node.scrollTop,scrollHeight:node.scrollHeight,clientHeight:node.clientHeight});
+              }
+              return rows;
+            })()};
           delete window.__dsgHostPerf;return result;
         })()`);
         writeJson(join(run.directory,version+'-chat-stream-performance.json'),{
@@ -568,6 +579,10 @@ try {
         // A failed RPC never exercised the full streaming case. Keep its real
         // cause instead of masking it with an assertion about a partial frame.
         if(!streamFailure){
+          if(metrics.visibleCardFrames<=30){
+            const image=await renderer.send('Page.captureScreenshot',{format:'png'});
+            writeFileSync(join(run.directory,version+'-chat-stream-failed.png'),Buffer.from(image.data,'base64'),{flag:'wx'});
+          }
           check('streaming official chat renders visible search cards',metrics.visibleCardFrames>30);
           if(!clientBaseline){
             check('streaming card performs no synchronous body height reads',metrics.measurements,0);

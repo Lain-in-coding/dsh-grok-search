@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ControlRecordError, createControlIntentStore } from './control-intent-store.mjs';
 import { createStorageMaintenanceWorker } from './storage-worker.mjs';
+import { resolveRuntimeConfig } from './product-config.mjs';
 
 export const PRODUCT_SEARCH_BUNDLE = 'dsh-grok-search';
 // Single-bundle build (D-28): recovery entries ship in the product bundle itself.
@@ -21,7 +22,7 @@ export function effectiveConfig(fiber) {
 }
 
 /** Adapt the public config hook without mutating the user's raw configuration. */
-export function createSearchConfigHook({ required, resolveConfig }) {
+export function createSearchConfigHook({ required, resolveConfig = resolveRuntimeConfig, requireSchema = false }) {
   return function (input, next) {
     // 4.0: this = Fiber, first argument = raw config.
     // 4.1: first argument = Fiber; next() already includes schema validation.
@@ -31,9 +32,122 @@ export function createSearchConfigHook({ required, resolveConfig }) {
     if (fiber?.entry?.options.id !== 'web'
       || fiber.entry.options.name !== '@deepseek-ai/dsh-web'
       || fiber.parent?.fiber?.entry === fiber.entry || !required()) return value;
+    if (requireSchema && (!fiber.runtime?.Config?.['~standard']
+      || typeof fiber.runtime.Config['~standard'].validate !== 'function')) {
+      throw new ControlRecordError('COMPATIBILITY_ABI_UNSUPPORTED', 'The web config schema is unavailable.');
+    }
     const candidate = { ...rawConfig(value), searchProvider: PRODUCT_PROVIDER_ID };
     return modern ? resolveConfig(fiber.runtime, candidate) : candidate;
   };
+}
+
+/** Bounded, provider-free checks of the known config/event/lifetime adapter contracts. */
+export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, selection = () => readSelection(ctx) } = {}) {
+  const entry = webEntry(ctx), fiber = entry.fiber.ctx?.fiber ?? entry.fiber;
+  const modern = 'effectiveConfig' in fiber;
+  const current = effectiveConfig(fiber), raw = rawConfig(current);
+  const rawBefore = fiber.config, optionsBefore = entry.options.config;
+  const checks = {};
+  const schema = fiber.runtime?.Config?.['~standard'];
+  if (!schema || schema.version !== 1 || typeof schema.validate !== 'function') {
+    throw new ControlRecordError('COMPATIBILITY_ABI_UNSUPPORTED', 'The web config schema is unavailable.');
+  }
+  const candidate = { ...raw, searchProvider: PRODUCT_PROVIDER_ID };
+  const normalized = resolveRuntimeConfig(fiber.runtime, candidate);
+  let rejectsInvalid = false;
+  try { resolveRuntimeConfig(fiber.runtime, { ...candidate, searchProvider: {} }); }
+  catch (error) { rejectsInvalid = error.code === 'COMPAT_CONFIG_INVALID'; }
+  checks.configCandidate = selectedId(normalized?.searchProvider) === PRODUCT_PROVIDER_ID
+    && isDeepStrictEqual(selectedId(normalized?.fetchProvider), raw.fetchProvider) && rejectsInvalid;
+  let observedHook = false;
+  const removeConfig = ctx.on('internal/config', function (input, next) {
+    const observed = typeof input?.resolveConfig === 'function' ? input : this;
+    if (observed === fiber) observedHook = modern === (input === fiber);
+    return next();
+  }, { global: true, prepend: true });
+  try {
+    const result = modern ? fiber.resolveConfig(candidate)
+      : resolveRuntimeConfig(fiber.runtime, ctx.waterfall(fiber, 'internal/config', candidate, () => candidate));
+    checks.configHook = observedHook && result && typeof result.then !== 'function'
+      && selectedId(result.searchProvider) === PRODUCT_PROVIDER_ID;
+  } finally { removeConfig?.(); }
+  checks.configUpdate = typeof entry.update === 'function' && typeof fiber.update === 'function'
+    && current === effectiveConfig(fiber) && rawBefore === fiber.config && optionsBefore === entry.options.config
+    && isDeepStrictEqual(raw, rawConfig(effectiveConfig(fiber)));
+  assertCurrent();
+
+  const probeName = `grok_compat_${randomUUID().replaceAll('-', '')}`;
+  let cleaned = false, activated = false, removed = false, toolRemoved = false;
+  const event = Symbol(probeName);
+  const execution = { name: probeName, callId: probeName, rootCallId: probeName,
+    arguments: {}, signal: new AbortController().signal, token: Object.freeze({}) };
+  const denial = 'dsh-grok-search compatibility sentinel';
+  let guardChecks = false, scopedTool = null;
+  const scope = ctx.plugin({ name: probeName, inject: ['web', 'tools'], apply(child) {
+    child.effect(() => () => { cleaned = true; });
+    const remove = child.on(event, (_value, next) => next(), { global: true, prepend: true });
+    removed = typeof remove === 'function';
+    const scopedTools = child.get('tools'), guard = scopedTools?.checkGuards ?? scopedTools?.guardReason;
+    if (typeof scopedTools?.guard === 'function' && typeof guard === 'function') {
+      const removeGuard = scopedTools.guard(exec => exec === execution ? denial : undefined);
+      try {
+        const result = guard.call(scopedTools, execution);
+        guardChecks = typeof removeGuard === 'function' && (result === denial || result?.reason === denial);
+      } finally { removeGuard?.(); }
+    }
+    scopedTool = {
+      name: probeName, description: 'Local compatibility sentinel; never performs a search.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] },
+      execute: () => ({}),
+    };
+    const removeTool = scopedTools.register(scopedTool);
+    try { toolRemoved = typeof removeTool === 'function' && scopedTools.get(probeName) === scopedTool; }
+    finally { removeTool?.(); }
+    toolRemoved &&= scopedTools.get(probeName) === undefined;
+    const sentinelFetch = () => { throw new Error('Compatibility checks never fetch.'); };
+    let observedGet = false;
+    const removeGet = child.on('internal/get', (caller, key, _error, next) => {
+      const service = next();
+      if (key !== 'web' || caller?.fiber?.uid !== child.fiber.uid || !service) return service;
+      observedGet = true;
+      return new Proxy(service, { get(target, property, receiver) {
+        return property === 'fetch' ? sentinelFetch : Reflect.get(target, property, receiver);
+      } });
+    }, { global: true, prepend: true });
+    try { checks.githubFetch = child.web.fetch === sentinelFetch && observedGet; }
+    catch { checks.githubFetch = false; }
+    finally { removeGet?.(); }
+    activated = true;
+  } });
+  try { await scope; assertCurrent(); }
+  finally { await scope.dispose(); }
+  checks.pluginDisposal = activated && cleaned && removed && scope.uid === null;
+
+  // No tool body is called: the bootstrap's first guard must stop this sentinel.
+  let dispatched = false, blocked = false;
+  try {
+    await ctx.waterfall('tools/execute', { ...execution, name: 'web_search' }, () => { dispatched = true; });
+  } catch (error) { blocked = /^COMPATIBILITY_/.test(error?.code ?? ''); }
+  checks.toolExecution = blocked && !dispatched;
+  let resultSeen = false;
+  const removeResult = ctx.on('tools/result', value => { if (value === execution) resultSeen = true; },
+    { global: true, prepend: true });
+  try {
+    // Enumerate but never broadcast a fabricated result into other plugins' observers.
+    const callbacks = ctx.events?.dispatch?.('emit', ['tools/result', execution, { isError: true, content: [] }]);
+    if (Array.isArray(callbacks)) callbacks[0]?.(execution, { isError: true, content: [] });
+  }
+  finally { removeResult?.(); }
+  checks.toolResult = resultSeen;
+  checks.toolGuards = guardChecks && toolRemoved;
+  const runtime = runtimeService(entry);
+  checks.webSelection = runtime !== null
+    && (raw.searchProvider === undefined
+      || isDeepStrictEqual(selectedId(runtime.searchProviderId ?? runtime.config?.searchProvider), raw.searchProvider));
+  checks.profileSelection = selection().bundles.includes(PRODUCT_SEARCH_BUNDLE);
+  assertCurrent();
+  return Object.freeze(checks);
 }
 
 export function readSelection(ctx) {
@@ -83,19 +197,20 @@ export function authorInjectSha256(ctx) {
   return createHash('sha256').update(stableJson(webEntry(ctx).options.inject ?? null)).digest('hex');
 }
 
-export function createProductStore(ctx) {
+export function createProductStore(ctx, { deferMaintenance = false } = {}) {
   const directory = join(ctx.profileContext.dir, 'control-intent.records');
   const legacyPath = join(ctx.profileContext.dir, 'control-intent.fixture.json');
   const maintenance = createStorageMaintenanceWorker({ directory, legacyPath, trustedRoot: ctx.profileContext.dir,
     onResult: result => {
       if (result.status === 'error') ctx.logger?.warn?.(`Control history maintenance failed: ${result.code ?? 'unknown'}`);
     } });
+  let maintenanceEnabled = !deferMaintenance;
   const store = createControlIntentStore({
     directory, legacyPath,
     trustedRoot: ctx.profileContext.dir,
     governance: true,
     autoMaintain: false, maintenanceScheduler: () => {
-      setImmediate(() => { void maintenance.schedule(); });
+      if (maintenanceEnabled) setImmediate(() => { if (!disposed) void maintenance.schedule(); });
     },
   });
   // Layout maintenance never changes the user's control intent. Unknown or
@@ -103,12 +218,17 @@ export function createProductStore(ctx) {
   // is reported separately and is not permission to restore another provider.
   let disposed = false;
   ctx.effect?.(() => () => { disposed = true; maintenance.dispose(); });
-  setImmediate(() => {
+  const startMaintenance = () => {
     if (disposed) return;
-    try { store.scheduleMaintenance(); }
-    catch (error) { ctx.logger?.warn?.(`Control history maintenance not scheduled: ${error.code ?? 'unknown'}`); }
-  });
-  return store;
+    maintenanceEnabled = true;
+    setImmediate(() => {
+      if (disposed) return;
+      try { store.scheduleMaintenance(); }
+      catch (error) { ctx.logger?.warn?.(`Control history maintenance not scheduled: ${error.code ?? 'unknown'}`); }
+    });
+  };
+  if (!deferMaintenance) startMaintenance();
+  return Object.freeze({ ...store, startMaintenance });
 }
 
 export function createAcquisition(ctx, observedAt = new Date().toISOString()) {
@@ -308,18 +428,10 @@ export async function takeOverAuthorRoute(ctx, acquisition, lease) {
       'The current web route is neither the recorded author nor the product provider.');
   }
   const current = rawConfig(effectiveConfig(entry.fiber));
-  const rollback = async () => {
-    try { await updateWebEntry(entry, current, true); } catch {}
-  };
-  try {
-    await updateWebEntry(entry, { ...current, searchProvider: PRODUCT_PROVIDER_ID }, true);
-  } catch (error) {
-    await rollback();
-    throw error;
-  }
+  // A failed takeover is not a release. Only an explicit release/recovery may restore the author.
+  await updateWebEntry(entry, { ...current, searchProvider: PRODUCT_PROVIDER_ID }, true);
   const updated = effectiveSearchProvider(entry);
   if (updated !== PRODUCT_PROVIDER_ID) {
-    await rollback();
     throw new ControlRecordError('CONTROL_ROUTE_UPDATE_NOT_APPLIED',
       'The web target did not apply the product search provider.');
   }

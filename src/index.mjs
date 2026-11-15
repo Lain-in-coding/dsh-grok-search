@@ -1,5 +1,3 @@
-import z from '@deepseek-ai/schemastery';
-import { WebError } from '@deepseek-ai/dsh-web';
 import { createGrokProvider } from './provider.mjs';
 import { createReleaseBarrier } from './core/release-transaction.mjs';
 import { GrokSearchError } from './core/errors.mjs';
@@ -9,14 +7,20 @@ import { createRoutedSearch } from './core/routed-search.mjs';
 
 export const name = 'dsh-grok-search';
 export const inject = ['web', 'profileContext', 'grokSearchProgram', 'grokSearchPreferences'];
-export const Config = z.object({
-  executable: z.string().default('').description('已有 grok-search-rs 程序的绝对路径。'),
-  executableArgs: z.array(z.string()).default([]).description('程序启动参数；内部离线验证也使用此字段。'),
-  configPath: z.string().default('').description('已有 Grok 配置文件的绝对路径；留空时由 Grok 按自身规则读取。'),
-  budgetMs: z.number().min(30_000).max(120_000).default(120_000).description('单次查询总预算，单位毫秒，包含排队与本地回收。'),
-});
+export { Config } from './core/product-config.mjs';
 
-export function apply(ctx, config) {
+export function apply(ctx, config, { WebError = ctx.get('grokSearchHostAdapter')?.WebError,
+  assertExecution = () => {
+    const compatibility = ctx.get('grokSearchCompatibility');
+    if (typeof compatibility?.assertSearchAllowed !== 'function') {
+      throw new GrokSearchError('COMPATIBILITY_CHECKING', 'Runtime compatibility has not been established.');
+    }
+    return compatibility.assertSearchAllowed('search');
+  },
+  executionEpoch = () => ctx.get('grokSearchCompatibility')?.captureEpoch() ?? 0 } = {}) {
+  if (typeof WebError !== 'function') {
+    throw new GrokSearchError('COMPATIBILITY_WEB_ERROR_UNAVAILABLE', 'The host search error contract is unavailable.');
+  }
   const program = ctx.get('grokSearchProgram');
   const preferences = ctx.get('grokSearchPreferences');
   const getConfig = () => {
@@ -27,11 +31,18 @@ export function apply(ctx, config) {
     return { ...createSharedConfigStore({ path }).readSnapshot(),
       execution: state.phase === 'ready' ? program.execution() : { executable: '', configPath: path } };
   };
-  const sourceRouter = createSourceRouter({
+  const rawSourceRouter = createSourceRouter({
     getConfig,
     budgetMs: config.budgetMs ?? 120_000,
     getPreferences: () => preferences?.snapshot?.() ?? null,
   });
+  const sourceRouter = { ...rawSourceRouter };
+  for (const method of ['search', 'diagnose', 'diagnoseProvider']) {
+    sourceRouter[method] = async (...args) => {
+      assertExecution();
+      return rawSourceRouter[method](...args);
+    };
+  }
   ctx.provide('grokSearchSourceRouter', sourceRouter);
   const core = createGrokProvider({ configuration: config,
     ...(program ? { executionConfiguration: () => program.execution() } : {}) });
@@ -45,7 +56,7 @@ export function apply(ctx, config) {
   const callRoutes = ctx.get('grokSearchCallRoutes');
   const routed = createRoutedSearch({ grok: core.provider, sourceRouter, preferences, releaseBarrier,
     searchLog: ctx.get('grokSearchLog'),
-    getConfig, budgetMs: config.budgetMs ?? 120_000 });
+    getConfig, budgetMs: config.budgetMs ?? 120_000, assertExecution, executionEpoch });
   const provider = {
     ...core.provider,
     available: () => releaseBarrier.snapshot().state === 'active'

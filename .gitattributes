@@ -1,3 +1,5 @@
 # 源码与证据采用 LF，保证跨平台检出和哈希核验一致。
 * text=auto eol=lf
 *.tgz binary
+# Preserve the reviewed candidate bytes during Git transport.
+support-matrix.json -text -eol whitespace=cr-at-eol

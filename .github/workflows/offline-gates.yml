@@ -14,19 +14,96 @@ on:
         description: Required frozen tarball SHA-256 when desktop_candidate is true.
         type: string
         default: ""
+      compatibility_stage:
+        description: Independent 0.4.0 acceptance branch only; does not publish or change main.
+        type: choice
+        options: [none, transport, acceptance]
+        default: none
+      confirm_public_compatibility:
+        description: Authorize selected public artifacts and standard runners for this acceptance stage.
+        type: boolean
+        default: false
+      source_commit:
+        description: Exact reviewed branch commit, required for transport.
+        type: string
+        default: ""
+      package_run_id:
+        description: Successful exact-package transport run, required for acceptance.
+        type: string
+        default: ""
+      old_package_run_id:
+        description: Successful pinned prior-package transport run, required for acceptance.
+        type: string
+        default: ""
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  compatibility-request:
+    if: github.event_name == 'workflow_dispatch' && inputs.compatibility_stage != 'none'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    env:
+      ACCEPTANCE_STAGE: ${{ inputs.compatibility_stage }}
+      CONFIRMED: ${{ inputs.confirm_public_compatibility }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      PACKAGE_RUN: ${{ inputs.package_run_id }}
+      OLD_RUN: ${{ inputs.old_package_run_id }}
+      DESKTOP_CANDIDATE: ${{ inputs.desktop_candidate }}
+    steps:
+      - name: Require the authorized isolated branch and an unambiguous request
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const e = process.env;
+          assert.equal(e.GITHUB_REPOSITORY, 'Lain-in-coding/dsh-grok-search');
+          assert.equal(e.GITHUB_REF, 'refs/heads/ci/compatibility-040-macos-20261115');
+          assert.equal(e.CONFIRMED, 'true', 'Explicit public compatibility authorization is required.');
+          assert.equal(e.DESKTOP_CANDIDATE, 'false', 'Do not combine the historical candidate job with these gates.');
+          assert.ok(['transport', 'acceptance'].includes(e.ACCEPTANCE_STAGE));
+          if (e.ACCEPTANCE_STAGE === 'transport') {
+            assert.match(e.SOURCE_COMMIT, /^[a-f0-9]{40}$/);
+            assert.equal(e.SOURCE_COMMIT, e.GITHUB_SHA, 'Transport must execute the reviewed dispatch commit.');
+            assert.equal(e.PACKAGE_RUN, '');
+            assert.equal(e.OLD_RUN, '');
+          } else {
+            assert.match(e.PACKAGE_RUN, /^[1-9]\d*$/);
+            assert.match(e.OLD_RUN, /^[1-9]\d*$/);
+            assert.equal(e.SOURCE_COMMIT, '');
+          }
+          NODE
+  compatibility-transport:
+    if: inputs.compatibility_stage == 'transport'
+    needs: compatibility-request
+    uses: ./.github/workflows/macos-package-transport.yml
+    with:
+      confirm_public_artifact: ${{ inputs.confirm_public_compatibility }}
+      source_commit: ${{ inputs.source_commit }}
+  compatibility-acceptance:
+    if: inputs.compatibility_stage == 'acceptance'
+    needs: compatibility-request
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/macos-full-acceptance.yml
+    with:
+      confirm_public_standard_runner: ${{ inputs.confirm_public_compatibility }}
+      package_run_id: ${{ inputs.package_run_id }}
+      package_artifact: macos-frozen-package-74b853274ca4
+      old_package_run_id: ${{ inputs.old_package_run_id }}
+      old_package_artifact: macos-old-package-24ab92c59221
+      old_package_sha256: 24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48
   desktop-candidate:
-    if: github.event_name == 'workflow_dispatch' && inputs.desktop_candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.desktop_candidate && inputs.compatibility_stage == 'none'
     uses: ./.github/workflows/macos-beta-gate.yml
     with:
       confirm_public_standard_runner: true
       expected_tarball_sha256: ${{ inputs.expected_tarball_sha256 }}
       search_log_only: true
   offline:
+    if: github.event_name != 'workflow_dispatch' || inputs.compatibility_stage == 'none'
     name: Offline gates on ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -41,7 +118,7 @@ jobs:
           node-version: "24"
           cache: npm
       - name: Install locked dependencies
-        run: npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund --registry=https://registry.npmjs.org/
+        run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
       - name: Build the browser client
         run: npm run build:client
       - name: Reject a stale generated client
@@ -49,6 +126,7 @@ jobs:
       - name: Run offline gates
         run: npm run test:all
   browser:
+    if: github.event_name != 'workflow_dispatch' || inputs.compatibility_stage == 'none'
     name: Chromium UI smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -59,7 +137,7 @@ jobs:
           node-version: "24"
           cache: npm
       - name: Install locked development dependencies
-        run: npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund --registry=https://registry.npmjs.org/
+        run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
       - name: Install only the test browser
         run: node node_modules/playwright/cli.js install chromium --with-deps --only-shell
       - name: Verify generated client and run UI smoke

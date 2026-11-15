@@ -2,41 +2,54 @@ import assert from 'node:assert/strict';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { existsSync, readFileSync } from 'node:fs';
-import { registerHooks } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
 
-// Run under the official Electron runtime with ELECTRON_RUN_AS_NODE=1.
+// Run with official Electron in Node mode (ASAR), or Node and an official CLI install root.
 // Real Cordis, tools registry, pipeline and web_fetch; synthetic HTTP only.
+function resolveHostInput(input) {
+  const base = resolve(input), desktop = existsSync(join(base, 'dsh', 'package.json'));
+  const runtime = desktop ? join(base, 'dsh') : base;
+  const hostRoot = join(runtime, 'node_modules', '@deepseek-ai');
+  const manifest = path => JSON.parse(readFileSync(path, 'utf8'));
+  const host = manifest(join(hostRoot, 'dsh', 'package.json'));
+  assert.equal(host.name, '@deepseek-ai/dsh', 'Expected the official CLI host package.');
+  assert.equal(typeof host.version, 'string', 'Host version is required.');
+  assert.match(host.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'Invalid host version.');
+  if (desktop) {
+    const app = manifest(join(base, 'package.json')), bundled = manifest(join(runtime, 'package.json'));
+    const release = manifest(join(runtime, 'desktop-runtime.json'));
+    assert.equal(app.name, '@deepseek-ai/dsh-desktop', 'Expected the official Desktop archive.');
+    assert.equal(app.version, host.version, 'Desktop and CLI host versions differ.');
+    // Desktop's container can be dsh-desktop-runtime, not the CLI package.
+    assert.equal(bundled.version, app.version, 'Desktop runtime versions differ.');
+    assert.equal(release.release?.version, app.version, 'Desktop release metadata differs.');
+  }
+  for (const name of ['dsh-tools', 'dsh-web', 'dsh-tool-web']) {
+    const dependency = manifest(join(hostRoot, name, 'package.json'));
+    assert.equal(dependency.name, `@deepseek-ai/${name}`, 'Unexpected host package identity.');
+    assert.equal(dependency.version, host.version, 'Host package versions differ.');
+  }
+  return { hostRoot, version: host.version };
+}
 const [archive, candidateDirectory] = process.argv.slice(2);
-if (!archive) throw new Error('Provide an official app.asar path.');
+if (!archive) throw new Error('Provide an official app.asar or CLI install root.');
+const { hostRoot: root, version } = resolveHostInput(archive);
 const product = candidateDirectory ? resolve(candidateDirectory) : resolve(import.meta.dirname, '..');
 const core = name => import(pathToFileURL(join(product, 'src/core', name + '.mjs')).href);
 const { createSearchLog } = await core('search-log');
 const { createToolRouteContext } = await core('tool-route-context');
-const root = join(archive, 'dsh', 'node_modules', '@deepseek-ai');
-const version = JSON.parse(readFileSync(join(archive, 'package.json'), 'utf8')).version;
-for (const name of ['dsh-tools', 'dsh-web']) {
-  assert.equal(JSON.parse(readFileSync(join(root, name, 'package.json'), 'utf8')).version, version);
-}
-const structuredGuards = /^0\.2\.2-rc\.(\d+)$/.exec(version)?.[1] >= 2;
-const githubHost = pathToFileURL(join(product, 'src/core/github-host.mjs'));
-const peerResolution = registerHooks({ resolve(specifier, context, next) {
-  if (specifier === '@deepseek-ai/dsh-web' && context.parentURL === githubHost.href) {
-    return { url: pathToFileURL(join(root, 'dsh-web/lib/index.js')).href, shortCircuit: true };
-  }
-  return next(specifier, context);
-} });
-let createGithubIntegration;
-try { ({ createGithubIntegration } = await import(githubHost.href)); }
-finally { peerResolution.deregister(); }
+const { createGithubIntegration } = await core('github-host');
 const imp = name => import(pathToFileURL(join(root, name, 'lib/index.js')).href);
 const { Context } = await imp('cordis');
+const { WebError } = await imp('dsh-web');
 const toolsModule = await imp('dsh-tools');
 const webTools = await imp('dsh-tool-web');
 const modern = existsSync(join(root, 'dsh-tool-executor-native/package.json'));
 const app = new Context();
 const log = createSearchLog(), routes = createToolRouteContext({ searchLog: log });
 let github, owner, webFiber, apiCalls = 0, ordinaryFetch = 0, status = 200, count = 101;
+let structuredGuards = false, evaluatedCapabilities;
+let capabilities = Object.freeze({ githubRead: false, githubFetch: false });
 const config = { enabled: false, token: '' };
 const originalFetch = async request => { ordinaryFetch++; return { url: request.url, statusCode: 200,
   body: { kind: 'text', content: 'ordinary fetch' }, truncated: false }; };
@@ -62,6 +75,43 @@ const fetchImpl = async input => {
   return answer(rows.slice((page - 1) * per, page * per), 200, page * per < count
     ? { link: `<https://api.github.com${parsed.pathname}?per_page=${per}&page=${page + 1}>; rel="next"` } : {});
 };
+function evaluateFixtureCapabilities(ctx) {
+  const tools = ctx.get('tools'), checkGuard = tools?.checkGuards ?? tools?.guardReason;
+  assert.equal(typeof WebError, 'function', 'the official host must supply WebError');
+  for (const method of ['register', 'get', 'guard']) assert.equal(typeof tools?.[method], 'function');
+  assert.equal(typeof checkGuard, 'function', 'the host must expose its guard decision');
+  const execution = { name: `github_contract_${randomUUID().replaceAll('-', '')}`,
+    arguments: {}, callId: randomUUID(), signal: new AbortController().signal };
+  const reason = 'GitHub validator capability sentinel';
+  const removeGuard = tools.guard(exec => exec === execution ? reason : undefined);
+  let guardsPassed = false;
+  try {
+    assert.equal(typeof removeGuard, 'function');
+    const denial = checkGuard.call(tools, execution);
+    structuredGuards = denial !== null && typeof denial === 'object' && denial.reason === reason;
+    guardsPassed = denial === reason || structuredGuards;
+    assert.equal(guardsPassed, true, 'the registered guard must deny the exact sentinel');
+  } finally { removeGuard?.(); }
+  assert.equal(checkGuard.call(tools, execution), undefined, 'the sentinel guard must be removed');
+  const sentinelFetch = () => { throw new Error('Capability checks never fetch.'); };
+  let observedGet = false, intercepted = false;
+  const removeGet = ctx.on('internal/get', (caller, key, _error, next) => {
+    const service = next();
+    if (key !== 'web' || caller?.fiber?.uid !== ctx.fiber.uid || !service) return service;
+    observedGet = true;
+    return new Proxy(service, { get(target, property, receiver) {
+      return property === 'fetch' ? sentinelFetch : Reflect.get(target, property, receiver);
+    } });
+  }, { global: true, prepend: true });
+  try {
+    assert.equal(typeof removeGet, 'function');
+    intercepted = ctx.web.fetch === sentinelFetch && observedGet;
+  } finally { removeGet?.(); }
+  return Object.freeze({
+    githubRead: guardsPassed,
+    githubFetch: guardsPassed && intercepted && typeof tools.get('web_fetch')?.execute === 'function',
+  });
+}
 try {
   await app.plugin(toolsModule.default);
   if (modern) await app.plugin(await imp('dsh-tool-executor-native'));
@@ -69,12 +119,17 @@ try {
   app.on('tools/result', (exec, result) => routes.finalize(exec, result), { global: true });
   // Install official web tool first: exercises an already-installed tool.
   await app.plugin(webTools, { search: false, fetch: true, fetchMaxOutputChars: 7000 });
-  owner = app.plugin({ name: 'github-candidate-test', apply(ctx) {
-    github = createGithubIntegration({ ctx, getState: () => config, searchLog: log, callRoutes: routes, readerOptions: { fetchImpl } });
+  owner = app.plugin({ name: 'github-candidate-test', inject: ['web', 'tools'], apply(ctx) {
+    evaluatedCapabilities = evaluateFixtureCapabilities(ctx);
+    assert.deepEqual(evaluatedCapabilities, { githubRead: true, githubFetch: true });
+    github = createGithubIntegration({ ctx, WebError, getCapabilities: () => capabilities,
+      getState: () => config, searchLog: log, callRoutes: routes, readerOptions: { fetchImpl } });
   } });
   await owner;
   assert.equal(app.tools.get('github_read'), undefined);
   config.enabled = true; github.sync();
+  assert.equal(app.tools.get('github_read'), undefined, 'user consent alone cannot bypass pending capability admission');
+  capabilities = evaluatedCapabilities; github.sync();
   assert.equal(app.tools.get('github_read'), github.definition);
   const agent = { session: { id: randomUUID() }, ctx: app };
   const identities = new WeakMap();
@@ -173,6 +228,25 @@ try {
   rejectAfterRead();
   assert.equal((await call('github_read', { url, cursor: deniedCursor })).error?.info?.code, 'GITHUB_CURSOR_INVALID');
   assert.equal((await call('github_read', { url, cursor: survivingCursor }, otherAgent)).isError, false);
+  const beforeRevoked = { apiCalls, ordinaryFetch };
+  try {
+    capabilities = Object.freeze({ ...evaluatedCapabilities, githubFetch: false });
+    const fetchBlocked = await call('web_fetch', { url });
+    assert.equal(fetchBlocked.isError, true);
+    assert.equal(fetchBlocked.error?.info?.code, 'GITHUB_FETCH_UNAVAILABLE');
+    assert.equal(app.tools.get('github_read'), github.definition, 'fetch-only revocation must preserve the direct tool');
+    assert.deepEqual({ apiCalls, ordinaryFetch }, beforeRevoked);
+    capabilities = Object.freeze({ githubRead: false, githubFetch: false }); github.sync();
+    assert.equal(config.enabled, true, 'capability revocation must not change user consent');
+    assert.equal(app.tools.get('github_read'), undefined);
+    assert.equal((await call('github_read', { url })).isError, true);
+    const revoked = await call('web_fetch', { url });
+    assert.equal(revoked.isError, true);
+    assert.equal(revoked.error?.info?.code, 'GITHUB_FETCH_UNAVAILABLE');
+    assert.deepEqual({ apiCalls, ordinaryFetch }, beforeRevoked,
+      'revoked GitHub capability must dispatch neither GitHub HTTP nor the original fetch');
+  } finally { capabilities = evaluatedCapabilities; github.sync(); }
+  assert.equal(app.tools.get('github_read'), github.definition);
   config.enabled = false; github.sync();
   assert.equal(app.tools.get('github_read'), undefined);
   assert.equal((await call('github_read', { url })).isError, true);
@@ -208,15 +282,17 @@ try {
   const files = ['github-host', 'github-read', 'search-log', 'tool-route-context'];
   console.log(JSON.stringify({ passed: true, version,
     candidate: JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version,
-    node: process.versions.node, modern, syntheticOnly: true,
+    node: process.versions.node, modern, syntheticOnly: true, evaluatedCapabilities,
     sourceHashes: files.map(name => ({ file: `src/core/${name}.mjs`,
       sha256: createHash('sha256').update(readFileSync(join(product, 'src/core', name + '.mjs'))).digest('hex') })),
     guardFormat: structuredGuards ? 'reason-object' : 'string', cases: [
-    'default-off', 'registered-tool', 'pagination-and-continuation', 'agent-isolation', 'official-web-fetch',
+    'default-off', 'evaluated-capability-contracts', 'pending-capability-no-registration',
+    'registered-tool', 'pagination-and-continuation', 'agent-isolation', 'official-web-fetch',
     'host-output-cap', 'no-method-mutation', 'no-provider-change', 'one-record-per-call', 'no-body-log',
     'permission-denial', 'github-specific-denial', 'stop-before-body', '401', 'post-policy-denial',
     'structured-github-errors', 'invalid-cursor-preserves-other-agent', '401-preserves-other-agent',
     'post-policy-final-log', 'post-policy-scope-cursors',
+    'fetch-only-capability-revocation', 'revoked-capability-no-original-fetch',
     'disable-and-restore', 'no-web-provider', 'small-output-cap-no-dispatch', 'third-party-same-name', 'dispose',
   ], apiCalls }));
 } finally {

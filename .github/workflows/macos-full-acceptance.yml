@@ -1,0 +1,267 @@
+name: macOS Seven-Version Exact-Package Acceptance
+
+on:
+  workflow_call:
+    inputs:
+      confirm_public_standard_runner:
+        type: boolean
+        required: true
+        default: false
+      package_run_id:
+        type: string
+        required: true
+      package_artifact:
+        type: string
+        required: true
+      old_package_run_id:
+        type: string
+        required: true
+      old_package_artifact:
+        type: string
+        required: true
+      old_package_sha256:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      confirm_public_standard_runner:
+        description: Authorize seven standard macos-15 jobs, at most two concurrent, with no publication.
+        type: boolean
+        required: true
+        default: false
+      package_run_id:
+        description: Successful same-repository Actions run holding the approved frozen package artifact.
+        type: string
+        required: true
+      package_artifact:
+        description: Root contains exactly the frozen tgz and package-receipt.json, no other material.
+        type: string
+        required: true
+        default: macos-frozen-package-74b853274ca4
+      old_package_run_id:
+        description: Successful transport run holding the pinned prior package; may equal package_run_id.
+        type: string
+        required: true
+      old_package_artifact:
+        description: Prior package artifact with exactly its tgz and package-receipt.json.
+        type: string
+        required: true
+        default: macos-old-package-24ab92c59221
+      old_package_sha256:
+        description: Explicit reviewed prior-package SHA256 for upgrade and rollback evidence.
+        type: string
+        required: true
+        default: 24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: macos-full-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_PACKAGE_SHA256: 74b853274ca4ad509b4bc6cce6cf4906c53400e5e01121e6c78e1f6114d34d1f
+
+jobs:
+  inputs:
+    if: inputs.confirm_public_standard_runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Validate same-repository transport without executing downloaded code
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+          PACKAGE_RUN: ${{ inputs.package_run_id }}
+          PACKAGE_ARTIFACT: ${{ inputs.package_artifact }}
+          OLD_RUN: ${{ inputs.old_package_run_id }}
+          OLD_ARTIFACT: ${{ inputs.old_package_artifact }}
+          OLD_SHA256: ${{ inputs.old_package_sha256 }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const e = process.env;
+          assert.match(e.GITHUB_REPOSITORY, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
+          assert.match(e.PACKAGE_RUN, /^[1-9]\d*$/);
+          assert.match(e.PACKAGE_ARTIFACT, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
+          const old = Boolean(e.OLD_RUN || e.OLD_ARTIFACT || e.OLD_SHA256);
+          if (old) {
+            assert.match(e.OLD_RUN, /^[1-9]\d*$/);
+            assert.match(e.OLD_ARTIFACT, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
+            assert.match(e.OLD_SHA256, /^[a-f0-9]{64}$/);
+          }
+          const get = async path => {
+            const response = await fetch('https://api.github.com/repos/' + e.GITHUB_REPOSITORY + path, {
+              redirect: 'error', signal: AbortSignal.timeout(20000),
+              headers: { authorization: 'Bearer ' + e.GH_READ_TOKEN, accept: 'application/vnd.github+json' },
+            });
+            assert.equal(response.status, 200, 'Package transport API failed.');
+            const chunks = [];
+            let size = 0;
+            for await (const chunk of response.body) {
+              size += chunk.length;
+              assert.ok(size <= 1048576, 'Transport API response exceeds budget.');
+              chunks.push(chunk);
+            }
+            return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          };
+          for (const [run, name] of [[e.PACKAGE_RUN, e.PACKAGE_ARTIFACT], ...(old ? [[e.OLD_RUN, e.OLD_ARTIFACT]] : [])]) {
+            const result = await get('/actions/runs/' + run);
+            assert.equal(String(result.id), run);
+            assert.equal(result.repository.full_name, e.GITHUB_REPOSITORY);
+            assert.equal(result.head_repository.full_name, e.GITHUB_REPOSITORY);
+            assert.equal(result.status, 'completed');
+            assert.equal(result.conclusion, 'success');
+            assert.ok(['workflow_dispatch', 'push'].includes(result.event), 'Pull-request artifacts are not trusted inputs.');
+            const listing = await get('/actions/runs/' + run + '/artifacts?per_page=100');
+            const matches = listing.artifacts.filter(row => row.name === name && !row.expired);
+            assert.equal(matches.length, 1, 'Select one non-expired approved artifact.');
+            assert.ok(matches[0].size_in_bytes > 0 && matches[0].size_in_bytes <= 34603008);
+          }
+          NODE
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.package_run_id }}
+          name: ${{ inputs.package_artifact }}
+          path: ${{ runner.temp }}/frozen-package
+      - if: inputs.old_package_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.old_package_run_id }}
+          name: ${{ inputs.old_package_artifact }}
+          path: ${{ runner.temp }}/old-package
+      - name: Install locked verifier dependencies, never rebuild or repack the product
+        run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Validate exact product archive and complete file inventory
+        run: |
+          node scripts/macos-full-acceptance.mjs check-package --package-directory "$RUNNER_TEMP/frozen-package" --expected-sha256 "$EXPECTED_PACKAGE_SHA256"
+      - name: Validate the explicitly pinned prior package
+        if: inputs.old_package_run_id != ''
+        env:
+          OLD_SHA256: ${{ inputs.old_package_sha256 }}
+        run: |
+          node scripts/macos-full-acceptance.mjs check-package --package-directory "$RUNNER_TEMP/old-package" --expected-sha256 "$OLD_SHA256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-frozen-input
+          path: ${{ runner.temp }}/frozen-package/*
+          if-no-files-found: error
+          retention-days: 1
+      - if: inputs.old_package_run_id != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-old-input
+          path: ${{ runner.temp }}/old-package/*
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS arm64 DSH ${{ matrix.version }}
+    needs: inputs
+    runs-on: macos-15
+    # Finite step caps total 145 minutes, including upload, inside the 150-minute job.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        version: ["0.2.1-rc.2", "0.2.1-rc.3", "0.2.1-rc.4", "0.2.1-rc.5", "0.2.2-rc.1", "0.2.2-rc.2", "0.2.2-rc.3"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        timeout-minutes: 3
+        with:
+          node-version: "24"
+      - name: Prepare locked acceptance tools without installing product code into the checkout
+        timeout-minutes: 10
+        run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        timeout-minutes: 3
+        with:
+          name: macos-frozen-input
+          path: ${{ runner.temp }}/frozen-package
+      - if: inputs.old_package_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        timeout-minutes: 3
+        with:
+          name: macos-old-input
+          path: ${{ runner.temp }}/old-package
+      - name: Confirm actual arm64 and set the disposable runner UI language
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          defaults write -g AppleLanguages -array zh-Hans en-US
+          defaults write -g AppleLocale zh_CN
+      - name: Run one official host with the same exact package and record every missing gate
+        timeout-minutes: 117
+        env:
+          TARGET_VERSION: ${{ matrix.version }}
+          OLD_PACKAGE_SHA256: ${{ inputs.old_package_sha256 }}
+        run: |
+          set -euo pipefail
+          args=(run --package-directory "$RUNNER_TEMP/frozen-package" --version "$TARGET_VERSION" --output-root "$RUNNER_TEMP/macos-full")
+          if [[ -n "$OLD_PACKAGE_SHA256" ]]; then
+            args+=(--old-package-directory "$RUNNER_TEMP/old-package" --old-package-sha256 "$OLD_PACKAGE_SHA256")
+          fi
+          # The runner's subprocess environment is an allowlist with isolated HOME/XDG/DSH roots.
+          # No github.token, Actions control file, live profile, or arbitrary metadata command is forwarded.
+          node scripts/macos-full-acceptance.mjs "${args[@]}"
+      - name: Preserve only named sanitized receipts after helper cleanup
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 5
+        with:
+          name: macos-full-${{ matrix.version }}
+          path: ${{ runner.temp }}/macos-full/evidence/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  evidence:
+    if: always() && needs.inputs.result == 'success'
+    needs: [inputs, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: macos-frozen-input
+          path: ${{ runner.temp }}/frozen-package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        continue-on-error: true
+        with:
+          pattern: macos-full-*
+          merge-multiple: false
+          path: ${{ runner.temp }}/macos-evidence
+      - name: Rehash all actual helper receipts, reject mixed packages, preserve not-run targets
+        run: |
+          mkdir -p "$RUNNER_TEMP/macos-evidence"
+          node scripts/macos-full-acceptance.mjs collect --package-directory "$RUNNER_TEMP/frozen-package" --evidence-root "$RUNNER_TEMP/macos-evidence" --output-root "$RUNNER_TEMP/macos-handoff"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-seven-version-handoff
+          path: ${{ runner.temp }}/macos-handoff/macos-acceptance.json
+          if-no-files-found: error
+          retention-days: 14

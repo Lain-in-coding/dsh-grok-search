@@ -1,6 +1,7 @@
-import { SETTINGS_DESCRIPTORS } from './settings-ui.mjs';
+import { SETTINGS_DESCRIPTORS } from './core/settings-contract.mjs';
+import { COMPATIBILITY_DESCRIPTORS } from './core/compatibility-contract.mjs';
 
-const invocations = SETTINGS_DESCRIPTORS;
+const invocations = Object.freeze([...SETTINGS_DESCRIPTORS, ...COMPATIBILITY_DESCRIPTORS]);
 
 export const TYPERT = Object.freeze({
   package: 'dsh-grok-search',

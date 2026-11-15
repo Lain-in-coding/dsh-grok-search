@@ -1,0 +1,123 @@
+name: macOS Frozen Package Transport
+
+on:
+  workflow_call:
+    inputs:
+      confirm_public_artifact:
+        required: true
+        type: boolean
+        default: false
+      source_commit:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      confirm_public_artifact:
+        description: Authorize exact frozen-candidate packing and pinned official 0.3.0 download on standard Windows; no publication.
+        required: true
+        type: boolean
+        default: false
+      source_commit:
+        description: Exact reviewed same-repository commit containing the frozen product and selected public verification helpers.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: inputs.confirm_public_artifact
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      EXPECTED_PACKAGE_SHA256: 74b853274ca4ad509b4bc6cce6cf4906c53400e5e01121e6c78e1f6114d34d1f
+    steps:
+      - name: Require an explicitly reviewed immutable source commit
+        shell: pwsh
+        run: |
+          if ($env:SOURCE_COMMIT -cnotmatch '^[a-f0-9]{40}$') { throw 'source_commit must be an exact reviewed commit SHA.' }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Install locked transport tools without rebuilding the reviewed frozen client
+        shell: pwsh
+        run: |
+          npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+          if ($LASTEXITCODE -ne 0) { throw 'Locked verifier dependency installation failed.' }
+      - name: Produce once, reject different bytes, transport only the reviewed package and receipt
+        shell: pwsh
+        run: |
+          @'
+          import assert from 'node:assert/strict';
+          import { constants, copyFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { packInternal } from './scripts/pack-internal.mjs';
+          import { cleanEnvironment } from './scripts/lib/internal-candidate-utils.mjs';
+          import { hashFile } from './scripts/lib/compatibility-evidence.mjs';
+          import { FROZEN_PRODUCT_SHA256, readPackageArtifact } from './scripts/lib/macos-acceptance-evidence.mjs';
+          import { reviewedMacosSourceClosure } from './scripts/macos-full-acceptance.mjs';
+          const expected = process.env.EXPECTED_PACKAGE_SHA256;
+          assert.match(expected, /^[a-f0-9]{64}$/);
+          assert.equal(FROZEN_PRODUCT_SHA256, expected, 'Selected source changed the workflow frozen package pin.');
+          const root = realpathSync(process.env.RUNNER_TEMP);
+          const build = join(root, 'macos-package-build'), transport = join(root, 'macos-package-transport');
+          assert.equal(existsSync(build), false); assert.equal(existsSync(transport), false);
+          mkdirSync(build); mkdirSync(transport);
+          const environment = cleanEnvironment(join(root, 'macos-package-environment'));
+          for (const name of Object.keys(environment)) if (/PROXY/i.test(name)) delete environment[name];
+          for (const name of Object.keys(process.env)) delete process.env[name];
+          Object.assign(process.env, environment);
+          const result = await packInternal(build, { release: true });
+          assert.equal(await hashFile(result.tarball), expected,
+            'Rebuild is not the frozen package. Use a separately approved exact-artifact transfer; never update the expected hash.');
+          assert.equal(result.packageReceipt.sha256, expected);
+          copyFileSync(result.tarball, join(transport, 'dsh-grok-search-0.4.0.tgz'), constants.COPYFILE_EXCL);
+          copyFileSync(join(build, 'package-receipt.json'), join(transport, 'package-receipt.json'), constants.COPYFILE_EXCL);
+          const checked = readPackageArtifact(transport, expected);
+          const source = await reviewedMacosSourceClosure(checked.product);
+          console.log(JSON.stringify({ reviewedSourceClosure: source }));
+          console.log(JSON.stringify({ sha256: checked.product.sha256, files: checked.product.fileCount,
+            size: checked.product.size, acceptanceExecuted: false, published: false }));
+          '@ | node --input-type=module
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen-package reproduction or transport validation failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-frozen-package-74b853274ca4
+          path: |
+            ${{ runner.temp }}/macos-package-transport/dsh-grok-search-0.4.0.tgz
+            ${{ runner.temp }}/macos-package-transport/package-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Transport the pinned published prior package without installing or executing it
+        shell: pwsh
+        run: |
+          @'
+          import assert from 'node:assert/strict';
+          import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { downloadPublishedOldPackage, PUBLISHED_OLD_PRODUCT, readPackageArtifact } from './scripts/lib/macos-acceptance-evidence.mjs';
+          const directory = join(realpathSync(process.env.RUNNER_TEMP), 'macos-old-package-transport');
+          assert.equal(existsSync(directory), false, 'Refusing to overwrite a previous transport.');
+          const { bytes, receipt } = await downloadPublishedOldPackage({ signal: AbortSignal.timeout(60000) });
+          mkdirSync(directory);
+          writeFileSync(join(directory, 'dsh-grok-search-0.3.0.tgz'), bytes, { flag: 'wx' });
+          writeFileSync(join(directory, 'package-receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { flag: 'wx' });
+          const checked = readPackageArtifact(directory, PUBLISHED_OLD_PRODUCT.sha256);
+          console.log(JSON.stringify({ sha256: checked.product.sha256, files: checked.product.fileCount,
+            size: checked.product.size, acceptanceExecuted: false, published: false }));
+          '@ | node --input-type=module
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned prior-package transport validation failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-old-package-24ab92c59221
+          path: |
+            ${{ runner.temp }}/macos-old-package-transport/dsh-grok-search-0.3.0.tgz
+            ${{ runner.temp }}/macos-old-package-transport/package-receipt.json
+          if-no-files-found: error
+          retention-days: 7

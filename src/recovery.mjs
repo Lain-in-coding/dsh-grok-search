@@ -9,8 +9,8 @@ import {
 export const name = 'dsh-grok-search-recovery';
 export const inject = ['loader', 'profileContext'];
 
-export function apply(ctx) {
-  const store = createProductStore(ctx);
+export function apply(ctx, { store: suppliedStore = null } = {}) {
+  const store = suppliedStore ?? createProductStore(ctx);
   const loadId = randomUUID();
   let disposed = false;
   let task = null;

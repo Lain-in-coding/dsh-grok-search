@@ -2,18 +2,128 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { apply as applySettings, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { SETTINGS_DESCRIPTORS as PURE_SETTINGS_DESCRIPTORS } from '../src/core/settings-contract.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { createConnectionSecurity } from '../src/core/connection-security.mjs';
 import { createConfigLocationOpener } from '../src/core/config-opener.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
 import { createToolRouteContext } from '../src/core/tool-route-context.mjs';
 
+// Explicit unit fixtures; production apply must resolve the host constructors.
+class TestService {
+  constructor(ctx, name) { this.ctx = ctx; this.name = name; ctx.provide?.(name, this); }
+}
+class TestRemoteError extends Error {
+  constructor(code, message, details) {
+    super(message); this.code = code; this.details = details; this.isDSHRemoteError = true;
+  }
+}
+const Gateway = createSettingsGateway({ Service: TestService, RemoteError: TestRemoteError });
+
+test('settings factory requires explicit constructors and retains the injected error protocol', async () => {
+  for (const peers of [undefined, {}, { Service: TestService }, { RemoteError: TestRemoteError },
+    { Service: {}, RemoteError: TestRemoteError }]) {
+    assert.throws(() => createSettingsGateway(peers), { name: 'TypeError' });
+  }
+  assert.equal(Object.getPrototypeOf(Gateway.prototype), TestService.prototype);
+  const security = createConnectionSecurity();
+  try {
+    const gateway = new Gateway({ get: key => key === 'grokSearchConnectionSecurity' ? security : null, provide() {} });
+    await assert.rejects(gateway.snapshot(), error => error instanceof TestRemoteError
+      && error.isDSHRemoteError === true && error.code === 'SETTINGS_AUTH_REQUIRED');
+  } finally { security.dispose(); }
+});
+
+const peerFixture = (scenario, code) => {
+  const service = `export class Service {
+    constructor(ctx, key) { this.ctx = ctx; ctx.provide?.(key, this); }
+  }`;
+  const remoteError = `export class RemoteError extends Error {
+    constructor(code, message, details) {
+      super(message); this.code = code; this.details = details; this.isDSHRemoteError = true;
+    }
+  }`;
+  const loader = `data:text/javascript,${encodeURIComponent(`
+    const scenario = ${JSON.stringify(scenario)};
+    export function resolve(specifier, context, next) {
+      if (specifier === '@deepseek-ai/cordis') {
+        if (scenario === 'missing-cordis') {
+          throw Object.assign(new Error('Synthetic host dependency unavailable'), { code: 'ERR_MODULE_NOT_FOUND' });
+        }
+        return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(service)}`)}, shortCircuit: true };
+      }
+      if (specifier === '@deepseek-ai/dsh-typert-protocol') {
+        if (scenario === 'missing-protocol' || scenario === 'failed-protocol') {
+          throw Object.assign(new Error('Synthetic protocol import failure'),
+            { code: scenario === 'missing-protocol' ? 'ERR_MODULE_NOT_FOUND' : 'HOST_PROTOCOL_FAILED' });
+        }
+        const source = scenario === 'invalid-protocol' ? 'export const RemoteError = null;' : ${JSON.stringify(remoteError)};
+        return { url: 'data:text/javascript,' + encodeURIComponent(source), shortCircuit: true };
+      }
+      return next(specifier, context);
+    }
+  `)}`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { register } from 'node:module';
+    register(${JSON.stringify(loader)});
+    const { apply, createSettingsGateway, SETTINGS_DESCRIPTORS } =
+      await import(${JSON.stringify(new URL('../src/settings-ui.mjs', import.meta.url).href)});
+    assert.equal(typeof createSettingsGateway, 'function');
+    assert.equal(SETTINGS_DESCRIPTORS.length, 25);
+    ${code}
+  `], { encoding: 'utf8', timeout: 10000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+};
+
+test('production settings apply rejects unavailable or malformed peers without registration', async t => {
+  for (const scenario of ['missing-cordis', 'missing-protocol', 'failed-protocol', 'invalid-protocol']) {
+    await t.test(scenario, () => peerFixture(scenario, `
+      let registrations = 0;
+      await assert.rejects(apply({ plugin() { registrations++; } }), error =>
+        ${JSON.stringify(scenario)} === 'invalid-protocol' ? error instanceof TypeError
+          : error.code === (${JSON.stringify(scenario)} === 'failed-protocol' ? 'HOST_PROTOCOL_FAILED' : 'ERR_MODULE_NOT_FOUND'));
+      assert.equal(registrations, 0);
+    `));
+  }
+});
+
+test('production settings apply waits for registration and propagates child startup failure', () => {
+  peerFixture('available', `
+    const { Service } = await import('@deepseek-ai/cordis');
+    const { RemoteError } = await import('@deepseek-ai/dsh-typert-protocol');
+    let registered, release, entered, settled = false;
+    const registration = new Promise(resolve => { entered = resolve; });
+    const pending = new Promise(resolve => { release = resolve; });
+    const task = apply({ plugin(Plugin) { registered = Plugin; entered(); return pending; } })
+      .then(() => { settled = true; });
+    await Promise.race([registration, task]);
+    assert.ok(registered);
+    assert.equal(Object.getPrototypeOf(registered.prototype), Service.prototype);
+    assert.equal(settled, false, 'optional availability must wait for child registration');
+    release();
+    await task;
+    assert.equal(settled, true);
+    const gateway = new registered({ get() {}, provide() {} });
+    await assert.rejects(gateway.snapshot(), error => error instanceof RemoteError && error.isDSHRemoteError === true);
+    const failure = new Error('Synthetic gateway startup failure');
+    await assert.rejects(apply({ plugin() { return Promise.reject(failure); } }), error => error === failure);
+  `);
+});
+
+test('the legacy settings descriptor export shares the pure static contract', () => {
+  assert.equal(SETTINGS_DESCRIPTORS, PURE_SETTINGS_DESCRIPTORS);
+  assert.equal(SETTINGS_DESCRIPTORS.length, 25);
+  assert.equal(createHash('sha256').update(JSON.stringify(SETTINGS_DESCRIPTORS)).digest('hex'),
+    'a755d8697157ad8437a08f22cdf73eb90dafa33996fca0741c8b15f4fe3deb96');
+});
+
 test('settings gateway reads shared config, saves with CAS and keeps secrets out of snapshot', async () => {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-gateway-'));
   const configPath = join(directory, 'config.toml');
   writeFileSync(configPath, 'grok_api_key = "secret-value"\ngrok_model = "grok-test"\n');
@@ -65,8 +175,6 @@ test('settings gateway reads shared config, saves with CAS and keeps secrets out
 });
 
 test('configuration history restore requires both owner and secret-write authorization', async () => {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   const calls = [];
   const security = {
     requireOwner() { calls.push('owner'); },
@@ -84,8 +192,7 @@ test('configuration history restore requires both owner and secret-write authori
 });
 
 test('private cache repair has its own owner-checked RPC and does not accept a caller path or version', async () => {
-  let Gateway, deny = false, repairs = 0;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
+  let deny = false, repairs = 0;
   const state = { phase: 'ready', configPath: '/synthetic/config.toml', program: null, error: null, canRepair: false };
   const gateway = new Gateway({
     get: name => name === 'grokSearchConnectionSecurity'
@@ -104,8 +211,6 @@ test('private cache repair has its own owner-checked RPC and does not accept a c
 });
 
 test('remote HTTP cannot redirect stored credentials by changing a service URL', async () => {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-destination-'));
   const path = join(directory, 'config.toml');
   const original = 'tavily_api_key = "synthetic-destination-key"\n';
@@ -151,8 +256,6 @@ test('legacy stop RPC remains available without requiring a user-visible stop bu
 });
 
 test('all settings methods remain SRC-discoverable when an old host caches older Typert metadata', () => {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   for (const descriptor of SETTINGS_DESCRIPTORS) {
     const text = Gateway.prototype[descriptor.method].toString();
     const parameters = /^\s*async function\s*\(([^)]*)\)/.exec(text)?.[1].trim();
@@ -270,8 +373,6 @@ test('chat route RPC requires owner and exact session/call identity without expo
 });
 
 test('private data RPCs require actual connection security even if the client claims otherwise', async () => {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   for (const security of [null, {
     requireOwner() {},
     requireSecret() { throw new GrokSearchError('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。'); },
@@ -408,9 +509,7 @@ test('settings gateway declares the host Remote error protocol it imports', () =
     manifest.peerDependencies['@deepseek-ai/dsh']);
 });
 
-function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github = null } = {}) {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
+function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github = null, compatibility } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-diagnose-'));
   if (preferences) {
     mkdirSync(join(directory, 'grok-search'), { recursive: true });
@@ -421,11 +520,79 @@ function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github =
     ['grokSearchCore', core],
     ['grokSearchSourceRouter', sourceRouter],
     ['grokSearchGithub', github],
+    ['grokSearchCompatibility', compatibility],
     ['grokSearchConnectionSecurity', { requireOwner() {}, requireSecret() {},
       capabilities: () => ({ secretsAllowed: true, transport: 'loopback', reason: null }) }],
   ]);
   return new Gateway({ profileContext: { dir: directory }, get: name => services.get(name), provide: () => {} });
 }
+
+test('compatibility blocks every direct diagnosis and search-test path before dispatch or release tracking', async () => {
+  const operations = [];
+  const forbidden = () => assert.fail('Blocked diagnostics must not reach providers or release tracking');
+  const gateway = diagnosticGateway({
+    compatibility: { assertSearchAllowed(operation) {
+      operations.push(operation);
+      throw new GrokSearchError('HOST_COMPATIBILITY_BLOCKED', 'Search is unavailable.');
+    } },
+    core: { testGrok: forbidden, testSearch: forbidden, releaseBarrier: { begin: forbidden, settle: forbidden } },
+    sourceRouter: { diagnose: forbidden, diagnoseProvider: forbidden, search: forbidden },
+    github: { test: forbidden, sync() {} },
+  });
+  const preferences = await gateway.preferences();
+  await gateway.savePreferences({ expectedRevision: preferences.revision, value: { ...preferences.value, githubReadEnabled: true } });
+  const snapshot = await gateway.snapshot();
+  const requests = [
+    () => gateway.diagnose(),
+    () => gateway.diagnoseProvider({ provider: 'tavily' }),
+    () => gateway.diagnoseProvider({ provider: 'grok' }),
+    () => gateway.diagnoseProvider({ provider: 'github' }),
+    () => gateway.previewGithubConnection({ expectedRevision: snapshot.config.revision,
+      configIdentity: snapshot.config.quotaRevision, operationId: randomUUID() }),
+    () => gateway.testSearch({ query: 'blocked test' }),
+  ];
+  for (const request of requests) await assert.rejects(request(), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  gateway.core = {};
+  await assert.rejects(gateway.testSearch({ query: 'blocked source-only test' }), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  assert.deepEqual(operations, Array(7).fill('diagnosis'));
+  assert.equal(gateway.diagnostics.size, 0);
+});
+
+test('diagnosis capability is rechecked without weakening owner checks or the legacy absent-service fixture', async () => {
+  const operations = [];
+  let allowed = true, requests = 0;
+  const compatibility = { assertSearchAllowed(operation) {
+    operations.push(operation);
+    if (!allowed) throw new GrokSearchError('HOST_COMPATIBILITY_BLOCKED', 'Search is unavailable.');
+  } };
+  const gateway = diagnosticGateway({ compatibility, sourceRouter: {
+    diagnose: async () => { requests++; return []; },
+    search: async () => { requests++; return { sources: [], search_provider: 'tavily' }; },
+  } });
+  assert.deepEqual(await gateway.diagnose(), []);
+  assert.equal((await gateway.testSearch({ query: 'allowed test' })).provider, 'tavily');
+  allowed = false;
+  await assert.rejects(gateway.diagnose(), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  gateway.security.requireOwner = () => { throw new GrokSearchError('SETTINGS_AUTH_REQUIRED', 'Denied.'); };
+  await assert.rejects(gateway.diagnose(), { code: 'SETTINGS_AUTH_REQUIRED' });
+  assert.deepEqual(operations, ['diagnosis', 'diagnosis', 'diagnosis']);
+  assert.equal(requests, 2);
+  const legacy = diagnosticGateway({ sourceRouter: { diagnose: async () => [] } });
+  assert.deepEqual(await legacy.diagnose(), []);
+});
+
+test('an asynchronous compatibility denial is awaited before any diagnostic or routed test request', async () => {
+  const forbidden = () => assert.fail('An asynchronous denial must not dispatch a request');
+  const gateway = diagnosticGateway({
+    compatibility: { async assertSearchAllowed() {
+      throw new GrokSearchError('HOST_COMPATIBILITY_BLOCKED', 'Search is unavailable.');
+    } },
+    sourceRouter: { diagnose: forbidden, search: forbidden },
+  });
+  await assert.rejects(gateway.diagnose(), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  await assert.rejects(gateway.testSearch({ query: 'blocked test' }), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  assert.equal(gateway.diagnostics.size, 0);
+});
 
 function observeConfigReads(gateway) {
   const reads = { paired: 0, snapshot: 0, effective: 0 }, original = gateway._store.bind(gateway);
@@ -696,8 +863,6 @@ test('GitHub draft connection tests do not save token or enable reading; cancell
 });
 
 function viewGateway({ configPath, transport = 'loopback', core = {}, configuration, preferences, withProgram = true } = {}) {
-  let Gateway;
-  applySettings({ plugin(Plugin) { Gateway = Plugin; } });
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-view-'));
   if (preferences) {
     mkdirSync(join(directory, 'grok-search'), { recursive: true });

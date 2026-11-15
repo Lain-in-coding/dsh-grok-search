@@ -35,10 +35,13 @@ export function projectPublicSnapshot(current, disposed = false) {
   };
 }
 
-export async function apply(ctx, { counterSnapshot = null } = {}) {
-  const store = createProductStore(ctx);
+export async function apply(ctx, { counterSnapshot = null, store: suppliedStore = null,
+  canAcquire = () => true, isCurrent = () => true, onStop = () => {}, onStart = null, signal = null,
+  keepAliveOnFailure = false } = {}) {
+  const store = suppliedStore ?? createProductStore(ctx);
   let disposed = false;
   const acquisitionAbort = new AbortController();
+  const acquisitionSignal = signal ? AbortSignal.any([signal, acquisitionAbort.signal]) : acquisitionAbort.signal;
   let routeVerifier = null;
   let task = null;
   let releaseTask = null;
@@ -146,14 +149,19 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
         state.error = null;
         return snapshot();
       }
+      if (!canAcquire() || !isCurrent()) {
+        state.phase = 'incomplete';
+        state.error = { code: 'COMPATIBILITY_CORE_BLOCKED', message: 'Runtime admission is required before taking over search.' };
+        return snapshot();
+      }
       const currentLease = createLease(ctx);
       const currentAcquisition = createAcquisition(ctx);
       const reactivating = existing?.intent.policy === 'released' || existing?.intent.pause?.confirmed === true;
       if (reactivating) {
         existing = await writeControlIntent(store, { expectedRevision: existing.revision,
           intent: requiredIntent(selection, currentAcquisition, currentLease, existing.intent),
-          signal: acquisitionAbort.signal });
-        if (disposed || stopRequested) return snapshot();
+          signal: acquisitionSignal });
+        if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
         setRecord(existing);
         state.releaseOutcome = null;
         state.releaseOperationId = null;
@@ -172,14 +180,14 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
         if (!sameLease(existing.intent.lease, currentLease) || acquisitionChanged(recorded, currentAcquisition)) {
           const intent = requiredIntent(selection, currentAcquisition, currentLease, existing.intent);
           existing = await writeControlIntent(store, { expectedRevision: existing.revision, intent,
-            signal: acquisitionAbort.signal });
-          if (disposed || stopRequested) return snapshot();
+            signal: acquisitionSignal });
+          if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
           setRecord(existing);
         }
       } else {
         const intent = requiredIntent(selection, currentAcquisition, currentLease);
-        existing = await writeControlIntent(store, { expectedRevision: 0, intent, signal: acquisitionAbort.signal });
-        if (disposed || stopRequested) return snapshot();
+        existing = await writeControlIntent(store, { expectedRevision: 0, intent, signal: acquisitionSignal });
+        if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
         setRecord(existing);
       }
       const core = ctx.get('grokSearchCore');
@@ -191,7 +199,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       try { takeover = await pending; }
       finally { takeovers.delete(pending); }
       // The release restores the author after this late host update settles.
-      if (disposed || stopRequested) return snapshot();
+      if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
       acquired = true;
       state.phase = 'required';
       state.error = null;
@@ -210,6 +218,10 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     if (disposed) return Promise.reject(new ControlRecordError('CONTROL_OWNER_ABSENT', 'The product owner is absent.'));
     if (releaseTask) return releaseTask;
     stopRequested = true;
+    let runtimeStop;
+    try { runtimeStop = Promise.resolve(onStop()); }
+    catch (error) { runtimeStop = Promise.reject(error); }
+    runtimeStop.catch(() => {});
     acquisitionAbort.abort(new ControlRecordError('CONTROL_ACQUISITION_CANCELLED', 'Explicit stop cancelled pending acquisition.'));
     const stopFailure = error => {
       state.phase = 'incomplete';
@@ -245,7 +257,7 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
       owner = createLease(ctx);
       controller = createProductReleaseController({ ctx, priorIntent, core, routeVerifier,
         ...(unloading && counterSnapshot ? { counterSnapshot } : {}),
-        pendingTakeovers: () => Promise.allSettled([...takeovers]),
+        pendingTakeovers: async () => { await Promise.allSettled([...takeovers]); await runtimeStop; },
         onState: phase => { state.phase = phase; } });
     } catch (error) {
       stopFailure(error);
@@ -294,6 +306,12 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
     snapshot,
     publicSnapshot,
     retry: () => refresh(),
+    start: () => {
+      if (disposed || typeof onStart !== 'function') {
+        return Promise.reject(new ControlRecordError('CONTROL_SETTINGS_UNAVAILABLE', 'The runtime cannot restart this owner.'));
+      }
+      return onStart();
+    },
     // A settings retry must never create a new stop intent or undo one. The
     // native switch remains the initiating control; this only resumes its
     // incomplete release while this exact owner is still alive.
@@ -310,5 +328,11 @@ export async function apply(ctx, { counterSnapshot = null } = {}) {
   // Startup must not report the control entry as ready while the author route is
   // still active. The web route is volatile, so takeover updates its live config
   // without restarting this dependency fiber.
-  await ctx.inject(['web'], async () => { await refresh(); });
+  await ctx.inject(['web'], async () => {
+    try { await refresh(); }
+    catch (error) {
+      if (!keepAliveOnFailure) throw error;
+      ctx.logger?.warn?.('dsh-grok-search control remains available after failed acquisition.');
+    }
+  });
 }

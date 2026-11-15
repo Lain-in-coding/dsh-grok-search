@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import { buildClient } from '../scripts/build-client.mjs';
 import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { COMPATIBILITY_DESCRIPTORS } from '../src/core/compatibility-contract.mjs';
 import { createQuotaView } from '../src/ui/quota-view.mjs';
 import { createSourceChain } from '../src/core/source-chain.mjs';
 import { createToolRouteView } from '../src/ui/tool-route-view.mjs';
@@ -45,11 +46,133 @@ test('client exposes the real settings contribution and all route methods', () =
   assert.equal(client.__test.descriptors.every(descriptor => descriptor.invocation.kind === 'direct'), true);
 });
 
-test('client declares the owners of its remote and keyed detail slot', () => {
+test('optional client package owners no longer gate the product bundle', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-api-remotes'));
-  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-plugin-manager'));
-  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-tool'));
+  for (const dependency of ['@deepseek-ai/dsh-api-remotes', '@deepseek-ai/dsh-client-ui-plugin-manager',
+    '@deepseek-ai/dsh-client-ui-tool', '@deepseek-ai/dsh-client-ui-theme', '@deepseek-ai/dsh-client-i18n']) {
+    assert.equal((manifest.dsh.client.inject ?? []).includes(dependency), false);
+  }
+  assert.deepEqual(Array.from(loadClient().inject), ['slots', 'locale', 'remote']);
+});
+
+test('client mounts old settings and independent compatibility descriptors once without changing old codecs', async () => {
+  const client = loadClient(), mounted = [], registrations = [];
+  let removed = 0;
+  const ctx = {
+    logger: { warn() {} }, effect: effect => effect(), locale: { register: () => () => {} },
+    remote: { $mount: async value => { mounted.push(value); return () => { removed++; }; } },
+    slots: {
+      inject: (name, setup) => name === 'tool.call.toolview' ? undefined : setup(),
+      register: (options, component) => { registrations.push({ options, component }); return () => {}; },
+    },
+    inject: () => Object.assign(new Promise(() => {}), { dispose: async () => {} }),
+  };
+  const dispose = await client.apply(ctx);
+  assert.equal(mounted.length, 1);
+  assert.equal(JSON.stringify(mounted[0].descriptors), JSON.stringify([...SETTINGS_DESCRIPTORS, ...COMPATIBILITY_DESCRIPTORS]));
+  assert.equal(registrations.filter(row => row.options.name === 'plugins.bundle.config').length, 1);
+  assert.equal(JSON.stringify(client.__test.descriptors), JSON.stringify(SETTINGS_DESCRIPTORS));
+  await dispose(); await dispose();
+  assert.equal(removed, 1);
+});
+
+test('new client preserves old-server settings when compatibility or optional slots are absent', async () => {
+  const client = loadClient(), slots = [], callbacks = new Map(), warnings = [];
+  let reads = 0, mounts = 0;
+  const remote = {
+    grokSearchSettings: { snapshot: async () => { reads++; return { ok: true, value: { old: true } }; } },
+    $mount: async () => { mounts++; return () => {}; },
+  };
+  const ctx = {
+    remote, logger: { warn: value => warnings.push(value) }, effect: effect => effect(),
+    locale: { register: () => () => {} },
+    inject(names, setup) {
+      if (names.includes('remote.grokSearchCompatibility')) return Promise.reject(new Error('old server'));
+      if (names.includes('theme')) throw new Error('no theme');
+      return Object.assign(Promise.resolve(setup(ctx)), { dispose: async () => {} });
+    },
+    slots: {
+      inject(name, setup) { callbacks.set(name, setup); if (name === 'plugins.bundle.config') return setup(); },
+      register(options, component) {
+        if (options.name === 'plugins.detail.badge') throw new Error('late unavailable badge');
+        slots.push({ options, component }); return () => {};
+      },
+      entries() { throw new Error('missing chat slot'); },
+      subscribe() { throw new Error('missing chat subscription'); },
+    },
+  };
+  const dispose = await client.apply(ctx);
+  await Promise.resolve();
+  assert.doesNotThrow(() => callbacks.get('plugins.detail.badge')());
+  assert.doesNotThrow(() => callbacks.get('tool.call.toolview')());
+  const page = slots.find(row => row.options.name === 'plugins.bundle.config');
+  assert.ok(page);
+  const connection = page.options.inject().connection;
+  assert.equal(connection.compatibility, null);
+  assert.deepEqual(await connection.settings.snapshot(), { old: true });
+  assert.equal(reads, 1);
+  assert.equal(mounts, 1);
+  assert.ok(warnings.some(value => value.includes('COMPATIBILITY')));
+  await dispose();
+});
+
+test('minimal compatibility keeps one settings-page entry while full settings is missing or arrives later', async () => {
+  const client = loadClient(), registrations = [], pending = new Map();
+  const remote = { grokSearchCompatibility: {}, $mount: async () => () => {} };
+  const ctx = {
+    remote, effect: effect => effect(), locale: { register: () => () => {} }, logger: { warn() {} },
+    inject(names, setup) {
+      const key = names[0];
+      if (key === 'remote.grokSearchCompatibility') return Object.assign(Promise.resolve(setup(ctx)), { dispose: async () => {} });
+      pending.set(key, setup);
+      return Object.assign(new Promise(() => {}), { dispose: async () => {} });
+    },
+    slots: {
+      inject: (name, setup) => name === 'tool.call.toolview' ? undefined : setup(),
+      register: (options, component) => { registrations.push({ options, component }); return () => {}; },
+    },
+  };
+  const dispose = await client.apply(ctx);
+  const connection = registrations.find(row => row.options.name === 'plugins.bundle.config').options.inject().connection;
+  assert.equal(typeof connection.compatibility.compatibilityReport, 'function');
+  assert.equal(connection.settings, null);
+  let updates = 0;
+  connection.listeners.add(() => { updates++; });
+  remote.grokSearchSettings = {};
+  const detach = pending.get('remote.grokSearchSettings')(ctx);
+  assert.equal(typeof connection.settings.snapshot, 'function');
+  assert.equal(updates, 1);
+  assert.equal(registrations.filter(row => row.options.name === 'plugins.bundle.config').length, 1);
+  detach();
+  assert.equal(connection.settings, null);
+  await dispose();
+});
+
+test('missing client common base returns safely without mounting or mutating backend services', async () => {
+  const client = loadClient();
+  let effects = 0, mounts = 0, stops = 0;
+  const dispose = await client.apply({
+    logger: { warn() {} },
+    effect() { effects++; }, remote: { $mount() { mounts++; } },
+    grokSearchControl: { stop() { stops++; } },
+  });
+  await dispose();
+  assert.deepEqual([effects, mounts, stops], [0, 0, 0]);
+});
+
+test('compatibility adapter addresses its own namespace without affecting legacy settings RPCs', async () => {
+  const client = loadClient(), calls = [];
+  const remote = {
+    grokSearchSettings: { snapshot: async () => { calls.push('settings'); return { ok: true, value: 'legacy' }; } },
+    grokSearchCompatibility: { compatibilityReport: async () => {
+      calls.push('compatibility');
+      return { ok: false, error: { code: 'COMPATIBILITY_STATE_FULL', message: 'state full' } };
+    } },
+  };
+  const compatibility = client.__test.remoteAdapter(remote, client.__test.compatibilityDescriptors);
+  await assert.rejects(compatibility.compatibilityReport(), { code: 'COMPATIBILITY_STATE_FULL' });
+  assert.equal(await client.__test.remoteAdapter(remote).snapshot(), 'legacy');
+  assert.deepEqual(calls, ['compatibility', 'settings']);
 });
 
 test('chat and settings whale assets are compact variants and preserve the source artwork', () => {

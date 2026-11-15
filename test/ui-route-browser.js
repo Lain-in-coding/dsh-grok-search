@@ -906,6 +906,68 @@ async page => {
     check('healthy program still uses the compatible detection RPC',
       await read(() => window.harness.state.calls.some(call => call.method === 'prepareProgram')));
     await close();
+    const compatibilityReport = (overrides = {}) => ({
+      schemaVersion: 1, hostVersion: '0.2.2-rc.3', pluginVersion: '0.4.0', channel: 'rc',
+      minimumAdmitted: true, verification: 'unverified', phase: 'ready', revision: 'missing',
+      confirmationRequired: false, confirmed: false, notified: false, coreReady: true, code: null,
+      optionalFeatures: Object.fromEntries(['settings', 'chat', 'github'].map(name => [name, { available: true, code: null }])),
+      ...overrides,
+    });
+    await state('returning');
+    const showCompatibility = async (report, error = null) => {
+      await page.evaluate(({ report, error }) => {
+        window.harness.compatibility(report, error);
+        window.harness.refresh();
+      }, { report, error });
+    };
+    await showCompatibility(compatibilityReport());
+    await page.locator('[data-compatibility-notice]').waitFor({ state: 'visible' });
+    check('RC compatibility does not ask for experimental consent', await page.locator('[data-compatibility-consent]').isVisible(), false);
+    check('RC compatibility remains explicitly unverified', await page.locator('[data-compatibility-pair]').textContent().then(text => text.includes('未验证组合')));
+    await page.locator('[data-compatibility-dismiss]').click();
+    await page.locator('[data-compatibility-notice]').waitFor({ state: 'hidden' });
+    check('dismissal only acknowledges the notice', await read(() => window.harness.compatibilityCalls
+      .filter(call => call.method !== 'compatibilityReport').map(call => call.method)), ['acknowledgeCompatibilityNotice']);
+    await showCompatibility(compatibilityReport({ hostVersion: '0.2.2-rc.4' }));
+    await page.locator('[data-compatibility-notice]').waitFor({ state: 'visible' });
+    check('new exact pair keeps its own notice', await page.locator('[data-compatibility-pair]').textContent().then(text => text.includes('0.2.2-rc.4')));
+    const experiment = compatibilityReport({ hostVersion: '0.2.3-beta.1', channel: 'beta', coreReady: false,
+      phase: 'waiting-confirmation', confirmationRequired: true, code: 'COMPATIBILITY_CONFIRMATION_REQUIRED' });
+    await showCompatibility(experiment);
+    await page.locator('[data-compatibility-consent]').waitFor({ state: 'visible' });
+    check('experimental confirm starts disabled', await page.locator('[data-compatibility-confirm]').isDisabled());
+    check('experimental pair is never auto-confirmed', await read(() => window.harness.compatibilityCalls.some(call => call.method === 'confirmCompatibility')), false);
+    await page.locator('[data-compatibility-consent]').click();
+    check('deliberate risk checkbox enables confirmation', await page.locator('[data-compatibility-confirm]').isEnabled());
+    await page.locator('[data-compatibility-confirm]').click();
+    await page.locator('[data-compatibility-consent]').waitFor({ state: 'hidden' });
+    check('confirmation sends the exact displayed version pair and revision', await read(() =>
+      window.harness.compatibilityCalls.find(call => call.method === 'confirmCompatibility')?.request),
+    { expectedRevision: 'missing', hostVersion: experiment.hostVersion, pluginVersion: '0.4.0', acceptRisk: true });
+    check('confirmed experiment is not mislabeled verified', await page.locator('[data-compatibility-pair]').textContent().then(text =>
+      text.includes('未验证组合') && text.includes('已确认实验风险')));
+    const pending = { available: false, code: 'COMPATIBILITY_OPTIONAL_PENDING' };
+    await showCompatibility(compatibilityReport({ code: 'COMPATIBILITY_OPTIONAL_PENDING', notified: true,
+      optionalFeatures: { settings: pending, github: pending, chat: pending } }));
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot
+      .querySelector('[data-compatibility-features]').textContent.includes('GitHub 读取：状态待确认'));
+    await page.evaluate(report => window.harness.compatibility(report),
+      compatibilityReport({ code: 'COMPATIBILITY_OPTIONAL_PENDING', notified: true,
+        optionalFeatures: { ...compatibilityReport().optionalFeatures, chat: pending } }));
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot
+      .querySelector('[data-compatibility-features]').textContent.includes('GitHub 读取：可用'));
+    check('pending server modules update without a manual refresh', await page.locator('[data-compatibility-features]').textContent().then(text =>
+      text.includes('完整设置：可用') && text.includes('客户端状态待确认')));
+    await page.setViewportSize({ width: 390, height: 844 });
+    check('compatibility card fits a narrow viewport', await page.locator('.compatibility-banner').evaluate(element =>
+      element.scrollWidth <= element.clientWidth + 1));
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await showCompatibility(compatibilityReport(), 'COMPATIBILITY_UNAVAILABLE');
+    await page.locator('[data-dsg-compatibility][data-compatibility-phase=unavailable]').waitFor();
+    check('failed compatibility report keeps the original settings visible', await page.locator('#routeCard').isVisible());
+    await showCompatibility(compatibilityReport({ notified: true }));
+    await page.locator('[data-dsg-compatibility][data-compatibility-phase=ready]').waitFor();
+    check('compatibility recovery keeps one settings card', await page.locator('#routeCard').count(), 1);
     await page.emulateMedia({ reducedMotion: 'no-preference' });
     await page.evaluate(() => { for (let i = 0; i < 4; i++) window.harness.remount(); });
     await page.locator('#routeCard:not([data-s=load])').waitFor();

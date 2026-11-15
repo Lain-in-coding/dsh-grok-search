@@ -1,20 +1,47 @@
 import { effectiveConfig } from './product-control.mjs';
+import { resolveRuntimeConfig } from './product-config.mjs';
 
 const TOOL_MODULE = '@deepseek-ai/dsh-tool-web';
 const plain = value => Object.fromEntries(Object.entries(value ?? {})
   .map(([key, item]) => [key, typeof item?.get === 'function' ? item.get() : item]));
+const target = fiber => fiber?.uid !== null && fiber?.runtime?.name === 'tool-web'
+  && fiber.entry?.options?.name === TOOL_MODULE && fiber.entry.options.disabled !== true;
+
+/** Check budget candidates without leasing, enabling tools, or publishing effective config. */
+export function checkToolBudgetContracts(ctx, budgetMs) {
+  let checked = 0;
+  for (const runtime of ctx.registry.values()) {
+    for (const fiber of runtime.fibers) {
+      if (!target(fiber) || effectiveConfig(fiber)?.search === false) continue;
+      const before = effectiveConfig(fiber), raw = plain(before);
+      if (typeof fiber.update !== 'function' || typeof fiber.await !== 'function'
+        || !fiber.runtime.Config) throw Object.assign(new Error('Search budget configuration cannot be validated.'), {
+        code: 'COMPATIBILITY_BUDGET_UNCONFIRMED',
+      });
+      const candidate = plain(resolveRuntimeConfig(fiber.runtime, { ...raw, searchTimeoutMs: budgetMs }));
+      if (candidate.searchTimeoutMs !== budgetMs || candidate.search !== raw.search
+        || candidate.fetch !== raw.fetch || candidate.fetchTimeoutMs !== raw.fetchTimeoutMs
+        || before !== effectiveConfig(fiber)) {
+        throw Object.assign(new Error('The host does not preserve the search budget candidate contract.'), {
+          code: 'COMPATIBILITY_BUDGET_UNCONFIRMED',
+        });
+      }
+      checked++;
+    }
+  }
+  return Object.freeze({ checked });
+}
 
 /** Runtime-only leases; never edit a profile, enable a tool or patch a method. */
-export function createToolBudgetController({ ctx, budgetMs, required, resolveConfig, onError = () => {} }) {
+export function createToolBudgetController({ ctx, budgetMs, required, canLease = () => true,
+  resolveConfig = resolveRuntimeConfig, onError = () => {} }) {
   const leases = new Map(), own = new Set(), yielded = new WeakSet();
   let releasing = false, serial = Promise.resolve();
-  const target = fiber => fiber?.uid !== null && fiber?.runtime?.name === 'tool-web'
-    && fiber.entry?.options?.name === TOOL_MODULE && fiber.entry.options.disabled !== true;
   const hook = function (input, next) {
     const modern = typeof input?.resolveConfig === 'function';
     const fiber = modern ? input : this;
     const value = next();
-    if (!target(fiber) || releasing || !required() || yielded.has(fiber) || value?.search === false) return value;
+    if (!target(fiber) || releasing || !required() || !canLease() || yielded.has(fiber) || value?.search === false) return value;
     const lease = leases.get(fiber);
     // Active candidate resolution may be a validation-only call. Return the
     // author's candidate; yield ownership only if internal/update commits it.
@@ -38,13 +65,22 @@ export function createToolBudgetController({ ctx, budgetMs, required, resolveCon
     try { await fiber.update(raw, true); await fiber.await?.(); }
     finally { own.delete(fiber); }
   };
+  const verifyLease = fiber => {
+    if (yielded.has(fiber) || !canLease() || releasing) return;
+    if (fiber.state !== 2 || plain(effectiveConfig(fiber)).searchTimeoutMs !== budgetMs) {
+      throw Object.assign(new Error('The host did not apply the search budget lease.'), {
+        code: 'COMPATIBILITY_BUDGET_UNCONFIRMED',
+      });
+    }
+  };
   const acquire = async () => {
     for (const runtime of ctx.registry.values()) {
       for (const fiber of [...runtime.fibers]) {
-        if (!target(fiber) || yielded.has(fiber) || !required() || releasing) continue;
+        if (!target(fiber) || yielded.has(fiber) || !required() || !canLease() || releasing) continue;
         if (effectiveConfig(fiber)?.search === false) continue;
         const raw = 'effectiveConfig' in fiber ? fiber.config : fiber.entry.options.config ?? plain(effectiveConfig(fiber));
         await refresh(fiber, raw);
+        verifyLease(fiber);
       }
     }
   };

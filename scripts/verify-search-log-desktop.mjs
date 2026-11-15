@@ -5,8 +5,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { candidateRuntime } from './lib/candidate-runtime.mjs';
-import { prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
+import { parseRuntimeReceiptArguments, readDesktopGateRuntimes, prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
 import { createSharedConfigStore, resolveSharedConfigPath, CONFIG_FIELDS } from '../src/core/shared-config.mjs';
@@ -15,15 +14,16 @@ import { findExistingGrok } from '../src/core/program-discovery.mjs';
 import { followStreamingSearchCard } from './lib/browser-gates.mjs';
 
 // Opt-in live services, no live key ever enters arguments, screenshots or files.
-const live = process.argv.includes('--allow-live');
-const liveSmoke = process.argv.includes('--live-smoke');
-const editable = process.argv.includes('--editable-config');
-const githubRead = process.argv.includes('--github-read');
-const clientBaseline = process.argv.includes('--frozen-client-baseline');
-const args = process.argv.slice(2).filter(value => !['--allow-live', '--editable-config', '--live-smoke', '--github-read','--frozen-client-baseline'].includes(value));
+const { args: inputArguments, runtimeOptions } = parseRuntimeReceiptArguments(process.argv.slice(2));
+const live = inputArguments.includes('--allow-live');
+const liveSmoke = inputArguments.includes('--live-smoke');
+const editable = inputArguments.includes('--editable-config');
+const githubRead = inputArguments.includes('--github-read');
+const clientBaseline = inputArguments.includes('--frozen-client-baseline');
+const args = inputArguments.filter(value => !['--allow-live', '--editable-config', '--live-smoke', '--github-read','--frozen-client-baseline'].includes(value));
 if(clientBaseline&&live)throw new Error('A client performance baseline may only use synthetic services.');
-if (args.length < 2 || live && editable || liveSmoke && !live) throw new Error('Usage: node scripts/verify-search-log-desktop.mjs [--allow-live [--live-smoke] | --editable-config] <tgz> <official-executables...>');
-const tarball = resolve(args[0]), runtimes = args.slice(1).map(candidateRuntime);
+if (args.length < 2 || live && editable || liveSmoke && !live) throw new Error('Usage: node scripts/verify-search-log-desktop.mjs [--allow-live [--live-smoke] | --editable-config] [--runtime-receipt <json> --runtime-receipt-sha256 <hash> (one host only)] <tgz> <official-executables...>');
+const tarball = resolve(args[0]), runtimes = readDesktopGateRuntimes(args.slice(1), runtimeOptions);
 const packageReceipt = JSON.parse(readFileSync(join(dirname(tarball), 'package-receipt.json'), 'utf8'));
 assert.equal(sha256(tarball), packageReceipt.sha256);
 for (const row of packageReceipt.sourceHashes) {
@@ -198,7 +198,8 @@ try {
   for (const runtime of runtimes) {
     mode = 'ok';
     const version = runtime.app.version, folder = inside(join(temporary, version));
-    prepareDesktopFixture(runtime.executable, folder, { versionedControlRecord: true, pluginManagerEntries: true, liveHmr: true });
+    prepareDesktopFixture(runtime.executable, folder, { versionedControlRecord: true, pluginManagerEntries: true,
+      liveHmr: true, ...runtimeOptions });
     const control = JSON.parse(readFileSync(join(folder, 'local-control.json'), 'utf8'));
     secrets.add(control.token);
     const extraction = inside(join(folder, 'tarball'));

@@ -2,7 +2,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
-import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { SETTINGS_DESCRIPTORS } from '../src/core/settings-contract.mjs';
+import { COMPATIBILITY_DESCRIPTORS } from '../src/core/compatibility-contract.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const artifact = join(root, 'src', 'client.js');
@@ -28,7 +29,7 @@ function clientData() {
     `data:image/${file.endsWith('.svg') ? 'svg+xml' : 'png'};base64,${readFileSync(join(root, 'src', 'assets', 'logos', file)).toString('base64')}`,
   ]));
   // Only wire JSON crosses this boundary. Host services are never browser inputs.
-  const data = { LOGOS, SETTINGS_DESCRIPTORS, TOOL_ROUTE_CSS: text('tool-route.css'),
+  const data = { LOGOS, SETTINGS_DESCRIPTORS, COMPATIBILITY_DESCRIPTORS, TOOL_ROUTE_CSS: text('tool-route.css'),
     ROUTE_CSS: text('route.css') + '\n' + text('search-log.css'),
     ROUTE_CARD: text('route-card.html'), ROUTE_LAYER: text('route-layer.html') };
   return Object.entries(data).map(([key, value]) => `export const ${key} = ${JSON.stringify(value)};`).join('\n');

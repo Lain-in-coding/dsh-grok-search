@@ -1,14 +1,146 @@
 import { mkdirSync, readFileSync, writeFileSync, copyFileSync, cpSync, existsSync, lstatSync, realpathSync, readdirSync, readlinkSync, symlinkSync, constants } from 'node:fs';
-import { resolve, dirname, join, relative, isAbsolute, sep } from 'node:path';
+import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { candidateRuntime, CANDIDATE_VERSIONS } from './lib/candidate-runtime.mjs';
+import { confinedPath, requireSha256 } from './lib/compatibility-evidence.mjs';
 
-export function fixtureDshEngines(version) {
-  if (!CANDIDATE_VERSIONS.includes(version)) throw new Error('Unsupported isolated fixture host version.');
+const verifiedFixtureVersions = new WeakMap();
+export const DESKTOP_NATIVE_INSTALL_POLICY = Object.freeze({
+  autoInstallPeers: true, strictPeerDependencies: true, legacyPeerDeps: false, force: false,
+});
+const NATIVE_INSTALL_NPMRC = 'auto-install-peers=true\nstrict-peer-dependencies=true\nlegacy-peer-deps=false\nforce=false\n';
+const PRIVATE_HOST_PEERS = new Set(['cordis', 'dsh', 'dsh-app-boot', 'dsh-typert-protocol', 'dsh-web', 'schemastery']
+  .map(name => '@deepseek-ai/' + name));
+
+/** Post-install filesystem evidence only; the caller must separately prove native install success. */
+export function inspectDesktopNativeInstall(profile, expectedVersion) {
+  const root = realpathSync(profile), seen = new Set();
+  const inside = path => {
+    const rel = relative(root, path);
+    return rel === '' || !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep);
+  };
+  const local = path => {
+    const actual = realpathSync(path);
+    if (!inside(actual)) throw new Error('Native install audit cannot follow a path outside the isolated profile.');
+    return actual;
+  };
+  const config = new Map();
+  for (const line of readFileSync(local(join(root, '.npmrc')), 'utf8').split(/\r?\n/)) {
+    if (!line.trim() || /^[#;]/.test(line.trim())) continue;
+    const entry = /^\s*([^=\s]+)\s*=\s*(.*?)\s*$/.exec(line);
+    if (!entry || config.has(entry[1].toLowerCase())) throw new Error('Ambiguous native install policy.');
+    config.set(entry[1].toLowerCase(), entry[2]);
+  }
+  for (const [key, value] of [['auto-install-peers', 'true'], ['strict-peer-dependencies', 'true'],
+    ['legacy-peer-deps', 'false'], ['force', 'false']]) {
+    if (config.get(key) !== value) throw new Error('Native install requires the normal strict peer policy.');
+  }
+  const manifest = JSON.parse(readFileSync(local(join(root, 'node_modules/dsh-grok-search/package.json')), 'utf8'));
+  if (typeof expectedVersion !== 'string' || !expectedVersion || manifest.name !== 'dsh-grok-search'
+    || manifest.version !== expectedVersion) throw new Error('Native install product identity differs from the expected candidate.');
+  const visit = directory => {
+    const entry = lstatSync(directory, { throwIfNoEntry: false });
+    if (!entry) return;
+    const actual = local(directory);
+    if (seen.has(actual)) return;
+    if (seen.size >= 10000) throw new Error('Native install audit exceeded its module-directory budget.');
+    seen.add(actual);
+    const inspectPackage = (name, path) => {
+      const resolved = local(path), metadata = join(resolved, 'package.json');
+      const installedName = existsSync(metadata) ? JSON.parse(readFileSync(local(metadata), 'utf8')).name : name;
+      if (PRIVATE_HOST_PEERS.has(name) || PRIVATE_HOST_PEERS.has(installedName)) {
+        throw new Error('Native install contains a private host peer: ' + (PRIVATE_HOST_PEERS.has(name) ? name : installedName));
+      }
+      visit(join(resolved, 'node_modules'));
+    };
+    for (const item of readdirSync(actual, { withFileTypes: true })) {
+      if (!item.isDirectory() && !item.isSymbolicLink()) continue;
+      const path = join(actual, item.name);
+      if (item.name === '.pnpm') {
+        for (const slot of readdirSync(local(path), { withFileTypes: true })) {
+          if (slot.isDirectory() || slot.isSymbolicLink()) {
+            visit(slot.name === 'node_modules' ? join(path, slot.name) : join(path, slot.name, 'node_modules'));
+          }
+        }
+      } else if (item.name.startsWith('@')) {
+        for (const pkg of readdirSync(local(path), { withFileTypes: true })) {
+          if (pkg.isDirectory() || pkg.isSymbolicLink()) inspectPackage(item.name + '/' + pkg.name, join(path, pkg.name));
+        }
+      } else if (!item.name.startsWith('.')) inspectPackage(item.name, path);
+    }
+  };
+  visit(join(root, 'node_modules'));
+  return { schemaVersion: 1, installedVersion: manifest.version, installPolicy: DESKTOP_NATIVE_INSTALL_POLICY,
+    hostCopies: false, checkedModuleDirectories: seen.size, policyScope: 'profile-local-config-and-installed-tree' };
+}
+
+export function fixtureDshEngines(version, verified) {
+  // Only receipts returned by this preparation preflight attest a new fixture version.
+  const trusted = verified == null ? CANDIDATE_VERSIONS.includes(version)
+    : verifiedFixtureVersions.has(verified) && verifiedFixtureVersions.get(verified) === version;
+  if (!trusted) {
+    throw new Error('Unsupported isolated fixture host version or unverified runtime receipt.');
+  }
   return { dsh: version };
+}
+
+function runtimeReceiptOptions({ runtimeReceiptPath, runtimeReceiptSha256 } = {}) {
+  if (runtimeReceiptPath === undefined && runtimeReceiptSha256 === undefined) return {};
+  if (typeof runtimeReceiptPath !== 'string' || !isAbsolute(runtimeReceiptPath)
+    || /[\0\r\n]/.test(runtimeReceiptPath) || /^[\\/]{2}/.test(runtimeReceiptPath)) {
+    throw new Error('--runtime-receipt requires an absolute local receipt file and --runtime-receipt-sha256.');
+  }
+  requireSha256(runtimeReceiptSha256);
+  const receiptPath = resolve(runtimeReceiptPath);
+  return { receiptPath, receiptSha256: runtimeReceiptSha256, root: dirname(receiptPath) };
+}
+
+export function parseRuntimeReceiptArguments(argv) {
+  if (!Array.isArray(argv)) throw new Error('Expected named runtime receipt arguments.');
+  const args = [], values = {};
+  const flags = new Map([['--runtime-receipt', 'runtimeReceiptPath'],
+    ['--runtime-receipt-sha256', 'runtimeReceiptSha256']]);
+  for (let index = 0; index < argv.length; index++) {
+    const value = argv[index];
+    if (typeof value !== 'string' || !value.trim() || /[\0\r\n]/.test(value)) {
+      throw new Error('Expected nonempty runtime receipt arguments.');
+    }
+    const key = flags.get(value);
+    if (!key) { args.push(value); continue; }
+    const next = argv[++index];
+    if (Object.hasOwn(values, key) || typeof next !== 'string' || !next.trim()
+      || next.startsWith('--') || /[\0\r\n]/.test(next)) {
+      throw new Error('Expected unique runtime receipt arguments with explicit values.');
+    }
+    values[key] = next;
+  }
+  const runtime = runtimeReceiptOptions(values);
+  return { args, runtimeOptions: runtime.receiptPath
+    ? { runtimeReceiptPath: runtime.receiptPath, runtimeReceiptSha256: runtime.receiptSha256 } : {} };
+}
+
+function checkReceiptExecutable(desktopExecutable, receiptOptions) {
+  if (!receiptOptions.root) return;
+  confinedPath(receiptOptions.root, basename(receiptOptions.receiptPath));
+  confinedPath(receiptOptions.root, relative(receiptOptions.root, resolve(desktopExecutable)).split(sep).join('/'));
+}
+
+export function readDesktopGateRuntimes(executables, runtimeOptions = {}) {
+  if (!Array.isArray(executables) || !executables.length || executables.some(value =>
+    typeof value !== 'string' || !value.trim() || value.startsWith('--') || /[\0\r\n]/.test(value))) {
+    throw new Error('Expected explicit Desktop executable paths.');
+  }
+  const receiptOptions = runtimeReceiptOptions(runtimeOptions);
+  if (receiptOptions.receiptPath && executables.length !== 1) {
+    throw new Error('A runtime receipt may select only one specified Desktop host.');
+  }
+  return executables.map(executable => {
+    checkReceiptExecutable(executable, receiptOptions);
+    return candidateRuntime(executable, receiptOptions);
+  });
 }
 
 // 只检查官方程序的 fuse 字节，不修改二进制或放宽运行策略。
@@ -109,23 +241,39 @@ export function resolveNewTemporaryRunRoot(runRoot) {
   return root;
 }
 
-export function inspectDesktopPreparation(desktopExecutable, runRoot) {
+export function inspectDesktopPreparation(desktopExecutable, runRoot, runtimeOptions = {}) {
   const root = resolveNewTemporaryRunRoot(runRoot);
-  const desktop = candidateRuntime(desktopExecutable);
+  const receiptOptions = runtimeReceiptOptions(runtimeOptions);
+  checkReceiptExecutable(desktopExecutable, receiptOptions);
+  if (receiptOptions.root) {
+    const runtimeRoot = realpathSync(receiptOptions.root);
+    if (isPathInside(runtimeRoot, root) || isPathInside(root, runtimeRoot)) {
+      throw new Error('The fixture output must not overlap the verified runtime root.');
+    }
+  }
+  const desktop = candidateRuntime(desktopExecutable, receiptOptions);
   const source = desktop.binaryDir;
   const pnpmEntry = join(desktop.resourcesDir, desktop.app.version === '0.2.0-rc.2'
     ? 'runtime/pnpm/bin/pnpm.mjs'
     : 'runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs');
   if (!existsSync(pnpmEntry)) throw new Error('The matching Desktop pnpm resource is missing.');
+  if (receiptOptions.root) {
+    confinedPath(receiptOptions.root, relative(receiptOptions.root, pnpmEntry).split(sep).join('/'));
+  }
   const fuses = readElectronFuseWire(readFileSync(desktop.fuseBinary));
   assertDevelopmentFuseCompatibility(fuses);
-  return { root, desktop, source, resourcesDir: desktop.resourcesDir, pnpmEntry, fuses };
+  if (desktop.candidateReceipt) verifiedFixtureVersions.set(desktop.candidateReceipt, desktop.app.version);
+  const fixtureEngines = fixtureDshEngines(desktop.app.version, desktop.candidateReceipt);
+  const runtimeReceipt = desktop.candidateReceipt
+    ? { sha256: receiptOptions.receiptSha256, assetSha256: desktop.candidateReceipt.asset.sha256 } : null;
+  return { root, desktop, source, resourcesDir: desktop.resourcesDir, pnpmEntry, fuses, fixtureEngines, runtimeReceipt };
 }
 
 export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedControlRecord = false, productEntries = false,
   pluginManagerEntries = false, liveHmr = false, uxEntries = false, m004 = false, m004BudgetMs = 120000,
-  grokProgram = null, grokResponsesUrl = null, grokKey = null } = {}) {
-  const { root, desktop, source, resourcesDir, pnpmEntry, fuses } = inspectDesktopPreparation(desktopExecutable, runRoot);
+  grokProgram = null, grokResponsesUrl = null, grokKey = null, runtimeReceiptPath, runtimeReceiptSha256 } = {}) {
+  const { root, desktop, source, resourcesDir, pnpmEntry, fuses, fixtureEngines, runtimeReceipt } =
+    inspectDesktopPreparation(desktopExecutable, runRoot, { runtimeReceiptPath, runtimeReceiptSha256 });
   const actualProject = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const profile = join(root, 'dsh-home', 'profiles', 'desktop');
   const hashFile = file => createHash('sha256').update(readFileSync(file)).digest('hex');
@@ -189,7 +337,7 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
     const path = join(profile, 'node_modules', name); mkdirSync(path);
     write(join(path, 'package.json'), { name, version: '0.0.0', private: true, type: 'module',
       exports: { './package.json': './package.json', './cordis.patch.yml': './cordis.patch.yml', ...exports },
-      engines: fixtureDshEngines(desktop.app.version), dsh: { bundle: { patch: './cordis.patch.yml' } } });
+      engines: fixtureEngines, dsh: { bundle: { patch: './cordis.patch.yml' } } });
     write(join(path, 'cordis.patch.yml'), patch); return path;
   };
   const fixture = createBundle('candidate-offline-fixture', { '.': './desktop-fixture.mjs' }, [{ insert: [
@@ -208,7 +356,7 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
   } }] }]);
   const copyCore = destination => {
     mkdirSync(destination, { recursive: true });
-    for (const module of ['control-intent-store.mjs', 'startup-recovery.mjs', 'release-transaction.mjs', 'product-control.mjs', 'original-search-counter.mjs', 'errors.mjs', 'mcp-search.mjs', 'session-owner.mjs', 'result-map.mjs', 'search-executor.mjs', 'owned-lock.mjs', 'storage-worker.mjs', 'search-query.mjs']) {
+    for (const module of ['control-intent-store.mjs', 'startup-recovery.mjs', 'release-transaction.mjs', 'product-control.mjs', 'product-config.mjs', 'original-search-counter.mjs', 'errors.mjs', 'mcp-search.mjs', 'session-owner.mjs', 'result-map.mjs', 'search-executor.mjs', 'owned-lock.mjs', 'storage-worker.mjs', 'search-query.mjs']) {
       copyFileSync(join(actualProject, 'src/core', module), join(destination, module), constants.COPYFILE_EXCL);
     }
   };
@@ -274,17 +422,17 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
       symlinkSync(join(actualProject, 'node_modules', name), join(productModules, name),
         process.platform === 'win32' ? 'junction' : 'dir');
     }
-    write(join(profile, 'package.json'), { name: 'isolated-desktop-profile', private: true, type: 'module', dependencies: {
+    write(join(profile, 'package.json'), { name: 'isolated-desktop-profile', private: true, type: 'module', engines: fixtureEngines, dependencies: {
       'candidate-offline-fixture': '0.0.0', 'dsh-grok-search': metadata.version,
     }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
       'candidate-offline-fixture', 'dsh-grok-search'] } } });
   } else if (pluginManagerEntries) {
     const fixtureDependency = join(root, 'fixture-package');
     cpSync(fixture, fixtureDependency, { recursive: true, errorOnExist: true, force: false });
-    write(join(profile, 'package.json'), { name: 'isolated-desktop-profile', version: '0.0.0', private: true, type: 'module',
+    write(join(profile, 'package.json'), { name: 'isolated-desktop-profile', version: '0.0.0', private: true, type: 'module', engines: fixtureEngines,
       dependencies: { 'candidate-offline-fixture': 'file:../../../fixture-package' },
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'candidate-offline-fixture'] } } });
-    write(join(profile, '.npmrc'), 'auto-install-peers=false\nstrict-peer-dependencies=false\n');
+    write(join(profile, '.npmrc'), NATIVE_INSTALL_NPMRC);
     write(join(profile, 'cordis.patch.yml'), liveHmr ? '[]\n' : '- id: hmr\n  disabled: true\n');
   } else {
   for (const [name, parts] of [['candidate-controlled-search', [['owner', 'applyOwner', ['loader', 'profileContext']], ['provider', 'applyProvider', ['web', 'candidateControlOwner']]]],
@@ -296,7 +444,7 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
       .replaceAll('../../src/core/', './'));
     for (const [label, apply, inject] of parts) write(join(bundle, label + '.mjs'), `export { ${apply} as apply } from './control.mjs'; export const name='desktop-control-${label}'; export const inject=${JSON.stringify(inject)};\n`);
   }
-  write(join(profile, 'package.json'), { name: 'isolated-desktop-profile', private: true, type: 'module', dependencies: {
+  write(join(profile, 'package.json'), { name: 'isolated-desktop-profile', private: true, type: 'module', engines: fixtureEngines, dependencies: {
     'candidate-offline-fixture': '0.0.0', 'candidate-controlled-search': '0.0.0', 'candidate-search-recovery': '0.0.0',
   }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app',
     'candidate-offline-fixture', 'candidate-controlled-search', 'candidate-search-recovery'] } } });
@@ -310,35 +458,50 @@ export function prepareDesktopFixture(desktopExecutable, runRoot, { versionedCon
   write(join(root, 'local-control.json'), paths);
   write(join(root, 'preparation.json'), { version: desktop.app.version, binaryCopies: identities,
     appArchiveSha256: hashFile(desktop.archivePath), originalSourceUnchanged: true,
+    ...(runtimeReceipt ? { runtimeReceipt } : {}),
+    ...(pluginManagerEntries ? { installPolicy: DESKTOP_NATIVE_INSTALL_POLICY } : {}),
     macAppBundleValidation, grokProgramValidation,
     startupMode: process.platform === 'darwin' ? (pluginManagerEntries ? 'official-packaged-mac-app' : 'official-mac-app-copy-default-app-development-load-original-asar')
       : 'official-default-app-development-load-original-asar', packagedStartupValidated: false,
     dependenciesInstalled: false, profile: '<temporary-profile>', privateCapabilityExcluded: true, fuses });
   return { version: desktop.app.version, root: '<independent-temporary-run>', binaryCopies: identities.length,
+    ...(runtimeReceipt ? { runtimeReceipt } : {}),
+    ...(pluginManagerEntries ? { installPolicy: DESKTOP_NATIVE_INSTALL_POLICY } : {}),
     macAppBundleValidation, grokProgramValidation,
     originalAsarUnmodified: true, startupMode: process.platform === 'darwin' ? (pluginManagerEntries ? 'packaged-app' : 'mac-development') : 'development', dependencyInstall: false };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+export function parseDesktopPreparationArguments(argv) {
+  const { args, runtimeOptions } = parseRuntimeReceiptArguments(argv);
   const options = new Map();
-  for (let i = 2; i < process.argv.length; i += 2) {
+  for (let i = 0; i < args.length; i += 2) {
     if (!['--desktop', '--run-root', '--control-record-mode', '--entry-mode', '--m004-budget',
-      '--grok-program', '--grok-responses-url', '--grok-key'].includes(process.argv[i]) || !process.argv[i + 1]
-      || options.has(process.argv[i].slice(2))) throw new Error('Expected unique named preparation arguments.');
-    options.set(process.argv[i].slice(2), process.argv[i + 1]);
+      '--grok-program', '--grok-responses-url', '--grok-key'].includes(args[i])
+      || typeof args[i + 1] !== 'string' || !args[i + 1].trim() || args[i + 1].startsWith('--')
+      || /[\0\r\n]/.test(args[i + 1]) || options.has(args[i].slice(2))) {
+      throw new Error('Expected unique named preparation arguments with explicit values.');
+    }
+    options.set(args[i].slice(2), args[i + 1]);
   }
+  if (!options.has('desktop') || !options.has('run-root')) throw new Error('--desktop and --run-root are required.');
   const mode = options.get('control-record-mode') ?? 'legacy';
   if (!['legacy', 'versioned'].includes(mode)) throw new Error('Expected legacy or versioned control record mode.');
   const entryMode = options.get('entry-mode') ?? 'fixture';
   const m004BudgetMs = Number(options.get('m004-budget') ?? 120000);
   if (![60000, 90000, 120000].includes(m004BudgetMs)) throw new Error('M0-04 budget must be 60000, 90000 or 120000 ms.');
   if (!['fixture', 'product', 'plugin-manager', 'plugin-manager-live', 'm0-04', 'ux'].includes(entryMode)) throw new Error('Unsupported entry mode.');
-  console.log(JSON.stringify(prepareDesktopFixture(options.get('desktop'), options.get('run-root'), {
+  return { desktop: options.get('desktop'), runRoot: options.get('run-root'),
     versionedControlRecord: mode === 'versioned', productEntries: entryMode === 'product' || entryMode === 'm0-04',
     pluginManagerEntries: ['plugin-manager', 'plugin-manager-live'].includes(entryMode),
     liveHmr: entryMode === 'plugin-manager-live', m004: entryMode === 'm0-04', m004BudgetMs,
     uxEntries: entryMode === 'ux',
     grokProgram: options.get('grok-program') ?? null, grokResponsesUrl: options.get('grok-responses-url') ?? null,
     grokKey: options.get('grok-key') ?? null,
-  })));
+    ...runtimeOptions,
+  };
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const { desktop, runRoot, ...options } = parseDesktopPreparationArguments(process.argv.slice(2));
+  console.log(JSON.stringify(prepareDesktopFixture(desktop, runRoot, options)));
 }

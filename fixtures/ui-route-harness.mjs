@@ -24,6 +24,7 @@ let diagnostics = {}, calls = [], themeListener = null, theme = 'light', fiberEr
 let logRecords = [], logError = null, quotaReplies = {}, quotaError = false, quotaDelay = 0, quotaIgnoreCancellation = false;
 let snapshotError = null, snapshotDelay = 0, logDelay = 0;
 let nextRepairError = null, nextGithubError = null, pendingRelease = false, releaseError = null;
+let compatibilityReport = null, compatibilityError = null, compatibilityCalls = [];
 const cancelledOperations = new Set(), activeDiagnostics = new Map();
 let counters = { added: 0, removed: 0 };
 const failure = (code, message) => ({ ok: false, error: { code, message, details: {} } });
@@ -271,6 +272,8 @@ function reset(state = 'returning') {
   quotaDelay = 0; quotaIgnoreCancellation = false; quotaError = false; quotaReplies = {}; logError = null; revealDelay = 0; openError = null; openResult = null;
   snapshotError = null; snapshotDelay = 0; logDelay = 0;
   nextRepairError = null; nextGithubError = null; pendingRelease = false; releaseError = null;
+  compatibilityReport = null; compatibilityError = null; compatibilityCalls = [];
+  delete ctx.remote.grokSearchCompatibility;
   prefs = { value: { schemaVersion: 1, grokEnabled: true, githubEnabled: true, githubReadEnabled: state !== 'fresh',
     sourceOrder: [...sourceNames], sourceEnabled: Object.fromEntries(sourceNames.map(id => [id, true])) }, revision: 'missing' };
   control = { available: true, phase: 'required', policy: 'required', routeVerified: true, completionCommitted: false };
@@ -330,6 +333,28 @@ window.harness = {
     if (options.route) route = clone(options.route);
   },
   refresh() { document.dispatchEvent(new Event('visibilitychange')); },
+  compatibility(report, error = null) {
+    compatibilityReport = clone(report);
+    compatibilityError = error;
+    const result = () => compatibilityError ? failure(compatibilityError, 'Synthetic compatibility failure')
+      : { ok: true, value: clone(compatibilityReport) };
+    const mutate = (method, request) => {
+      compatibilityCalls.push({ method, request: clone(request) });
+      if (!compatibilityReport || request.hostVersion !== compatibilityReport.hostVersion
+        || request.pluginVersion !== compatibilityReport.pluginVersion) return failure('COMPATIBILITY_PAIR_MISMATCH', 'Synthetic pair changed');
+      if (request.expectedRevision !== compatibilityReport.revision) return failure('COMPATIBILITY_CONFLICT', 'Synthetic revision changed');
+      if (method === 'confirmCompatibility' && request.acceptRisk !== true) return failure('COMPATIBILITY_REQUEST_INVALID', 'Explicit consent required');
+      compatibilityReport = { ...compatibilityReport, notified: true, revision: 'b'.repeat(64),
+        ...(method === 'confirmCompatibility' ? { confirmed: true, coreReady: true, phase: 'ready', code: null } : {}) };
+      return result();
+    };
+    ctx.remote.grokSearchCompatibility = {
+      async compatibilityReport() { compatibilityCalls.push({ method: 'compatibilityReport' }); return result(); },
+      async confirmCompatibility(request) { return mutate('confirmCompatibility', request); },
+      async acknowledgeCompatibilityNotice(request) { return mutate('acknowledgeCompatibilityNotice', request); },
+    };
+  },
+  get compatibilityCalls() { return clone(compatibilityCalls); },
   get state() { return { snapshot: snapshot(), prefs: clone(prefs), content: clone(content),
     calls: clone(calls), counters: clone(counters), fiberErrors }; },
 };

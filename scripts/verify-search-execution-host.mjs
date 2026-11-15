@@ -4,12 +4,36 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 
-// Run with an official Electron runtime in Node mode and an extracted candidate.
+// Run with official Electron in Node mode (ASAR), or Node and an official CLI install root.
 // Real host tools, policies and WebRuntime; only provider responses are synthetic.
+function resolveHostInput(input) {
+  const base = resolve(input), desktop = existsSync(join(base, 'dsh', 'package.json'));
+  const runtime = desktop ? join(base, 'dsh') : base;
+  const hostRoot = join(runtime, 'node_modules', '@deepseek-ai');
+  const manifest = path => JSON.parse(readFileSync(path, 'utf8'));
+  const host = manifest(join(hostRoot, 'dsh', 'package.json'));
+  assert.equal(host.name, '@deepseek-ai/dsh', 'Expected the official CLI host package.');
+  assert.equal(typeof host.version, 'string', 'Host version is required.');
+  assert.match(host.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/, 'Invalid host version.');
+  if (desktop) {
+    const app = manifest(join(base, 'package.json')), bundled = manifest(join(runtime, 'package.json'));
+    const release = manifest(join(runtime, 'desktop-runtime.json'));
+    assert.equal(app.name, '@deepseek-ai/dsh-desktop', 'Expected the official Desktop archive.');
+    assert.equal(app.version, host.version, 'Desktop and CLI host versions differ.');
+    // Desktop's container can be dsh-desktop-runtime, not the CLI package.
+    assert.equal(bundled.version, app.version, 'Desktop runtime versions differ.');
+    assert.equal(release.release?.version, app.version, 'Desktop release metadata differs.');
+  }
+  for (const name of ['dsh-tools', 'dsh-web', 'dsh-tool-web']) {
+    const dependency = manifest(join(hostRoot, name, 'package.json'));
+    assert.equal(dependency.name, `@deepseek-ai/${name}`, 'Unexpected host package identity.');
+    assert.equal(dependency.version, host.version, 'Host package versions differ.');
+  }
+  return { hostRoot, version: host.version };
+}
 const [archive, productPath] = process.argv.slice(2);
-if (!archive || !productPath) throw new Error('Provide an official app.asar and extracted candidate package directory.');
-const product = resolve(productPath), hostRoot = join(archive, 'dsh/node_modules/@deepseek-ai');
-const version = JSON.parse(readFileSync(join(archive, 'package.json'), 'utf8')).version;
+if (!archive || !productPath) throw new Error('Provide an official app.asar or CLI install root, and an extracted candidate package directory.');
+const product = resolve(productPath), { hostRoot, version } = resolveHostInput(archive);
 const candidate = JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version;
 const upstream = name => import(pathToFileURL(join(hostRoot, name, 'lib/index.js')).href);
 const core = name => import(pathToFileURL(join(product, 'src/core', name + '.mjs')).href);

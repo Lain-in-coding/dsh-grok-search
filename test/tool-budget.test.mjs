@@ -2,10 +2,27 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import { effectiveConfig } from '../src/core/product-control.mjs';
-import { createToolBudgetController } from '../src/core/tool-budget.mjs';
+import { createToolBudgetController, checkToolBudgetContracts } from '../src/core/tool-budget.mjs';
 
 const BUDGET_MS = 90_000;
 const AUTHOR_CONFIG = { search: true, searchTimeoutMs: 60_000, fetchTimeoutMs: 23_000, fetch: false };
+
+test('budget contract candidates validate without publishing a lease or enabling a disabled tool', () => {
+  const runtime = { name: 'tool-web', fibers: new Set(),
+    Config: { '~standard': { version: 1, validate: value => ({ value: { ...value } }) } } };
+  const config = { ...AUTHOR_CONFIG };
+  const fiber = { uid: 1, state: 2, runtime, config, update() { throw new Error('must not update'); }, await() {},
+    entry: { options: { name: '@deepseek-ai/dsh-tool-web', config } } };
+  runtime.fibers.add(fiber);
+  const ctx = { registry: new Map([['tool-web', runtime]]) };
+  assert.deepEqual(checkToolBudgetContracts(ctx, BUDGET_MS), { checked: 1 });
+  assert.equal(fiber.config, config);
+  assert.deepEqual(config, AUTHOR_CONFIG);
+  runtime.Config['~standard'].validate = value => ({ value: { ...value, fetch: true } });
+  assert.throws(() => checkToolBudgetContracts(ctx, BUDGET_MS), { code: 'COMPATIBILITY_BUDGET_UNCONFIRMED' });
+  config.search = false;
+  assert.deepEqual(checkToolBudgetContracts(ctx, BUDGET_MS), { checked: 0 });
+});
 
 function deferred() {
   let resolve, reject;
@@ -14,7 +31,7 @@ function deferred() {
 }
 
 // Synthetic lifecycle seams cover both config shapes, not a real host load.
-function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, settle = () => {} }) {
+function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, settle = () => {}, canLease = () => true }) {
   const hooks = new Map(), calls = [], awaits = [], errors = [];
   const runtime = { name: 'tool-web', fibers: new Set() };
   const ctx = {
@@ -22,7 +39,7 @@ function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, sett
     on: (name, callback) => hooks.set(name, callback),
   };
   const controller = createToolBudgetController({
-    ctx, budgetMs: BUDGET_MS, required: () => true,
+    ctx, budgetMs: BUDGET_MS, required: () => true, canLease,
     resolveConfig: (_runtime, raw) => structuredClone(raw),
     onError: error => errors.push(error),
   });
@@ -72,6 +89,31 @@ function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, sett
 
 for (const modern of [false, true]) {
   const label = modern ? 'modern raw/effective config' : 'legacy resolved config';
+
+  test(`${label}: early hooks leave budgets unchanged until admitted and release is never gated`, async () => {
+    let admitted = false;
+    const h = fixture({ modern, canLease: () => admitted });
+    assert.deepEqual(h.resolveCandidate(h.fiber, AUTHOR_CONFIG), AUTHOR_CONFIG);
+    await h.controller.acquire();
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.controller.snapshot().owned, 0);
+    admitted = true;
+    await h.controller.acquire();
+    assert.equal(effectiveConfig(h.fiber).searchTimeoutMs, BUDGET_MS);
+    admitted = false;
+    await h.controller.release();
+    assert.deepEqual(effectiveConfig(h.fiber), AUTHOR_CONFIG);
+    assert.equal(h.controller.snapshot().owned, 0);
+  });
+
+  test(`${label}: successful update settlement is not proof that the budget was applied`, async () => {
+    const h = fixture({ modern, afterUpdate: ({ fiber }) => {
+      effectiveConfig(fiber).searchTimeoutMs = AUTHOR_CONFIG.searchTimeoutMs;
+    } });
+    await assert.rejects(h.controller.acquire(), { code: 'COMPATIBILITY_BUDGET_UNCONFIRMED' });
+    await h.controller.release();
+    assert.deepEqual(effectiveConfig(h.fiber), AUTHOR_CONFIG);
+  });
 
   test(`${label}: a failed refresh rejects its caller and a later acquire succeeds`, async () => {
     const failure = new Error('first update failed');

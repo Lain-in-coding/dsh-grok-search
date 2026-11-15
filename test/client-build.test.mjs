@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import vm from 'node:vm';
 import test from 'node:test';
 import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { COMPATIBILITY_DESCRIPTORS } from '../src/core/compatibility-contract.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const artifact = join(root, 'src/client.js');
@@ -52,6 +53,7 @@ test('browser metafile contains real UI imports and no server, Node or bundled R
     'src/client.template.js',
     'src/core/settings-codec.mjs',
     'src/core/source-chain.mjs',
+    'src/ui/compatibility-view.mjs',
     'src/ui/quota-view.mjs',
     'src/ui/route-controller.mjs',
     'src/ui/route-form.mjs',
@@ -73,7 +75,9 @@ test('built client keeps the host ModuleLoader and React factory contract', () =
   assert.equal(typeof client.apply, 'function');
   assert.deepEqual(Array.from(client.inject), ['slots', 'locale', 'remote']);
   assert.equal(JSON.stringify(client.__test.descriptors), JSON.stringify(SETTINGS_DESCRIPTORS));
-  for (const name of ['routeController', 'searchLogView', 'quotaView', 'toolRouteView']) {
+  assert.equal(JSON.stringify(client.__test.compatibilityDescriptors), JSON.stringify(COMPATIBILITY_DESCRIPTORS));
+  assert.equal(JSON.stringify(client.__test.allDescriptors), JSON.stringify([...SETTINGS_DESCRIPTORS, ...COMPATIBILITY_DESCRIPTORS]));
+  for (const name of ['routeController', 'searchLogView', 'quotaView', 'toolRouteView', 'compatibilityView']) {
     assert.equal(typeof client.__test[name], 'function', name);
   }
 });

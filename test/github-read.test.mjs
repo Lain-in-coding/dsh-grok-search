@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { register } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { createGithubReader, createGithubScheduling, parseGithubUrl, formatGithubRead } from '../src/core/github-read.mjs';
 
 const url = 'https://github.com/octocat/example/issues/7';
@@ -604,19 +604,31 @@ const loadHost = () => hostModule ??= (async () => {
     }
     export class WebError extends HarnessError {}
   `)}`;
-  register(`data:text/javascript,${encodeURIComponent(`
-    export function resolve(specifier, context, next) {
-      return specifier === '@deepseek-ai/dsh-web'
-        ? { url: ${JSON.stringify(webUrl)}, shortCircuit: true } : next(specifier, context);
-    }
-  `)}`, import.meta.url);
   return { ...await import('../src/core/github-host.mjs'), ...await import(webUrl) };
 })();
 
+test('GitHub integration imports without any optional host peer', () => {
+  const loader = `data:text/javascript,${encodeURIComponent(`
+    export function resolve(specifier, context, next) {
+      if (specifier.startsWith('@deepseek-ai/')) throw new Error('Optional host peer must be injected');
+      return next(specifier, context);
+    }
+  `)}`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { register } from 'node:module';
+    register(${JSON.stringify(loader)});
+    const adapter = await import(${JSON.stringify(new URL('../src/core/github-host.mjs', import.meta.url).href)});
+    assert.equal(typeof adapter.createGithubIntegration, 'function');
+  `], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+});
+
 async function hostFixture(options = {}) {
-  const { createGithubIntegration, HarnessError } = await loadHost();
+  const { createGithubIntegration, HarnessError, WebError } = await loadHost();
   const events = new Map(), effects = [];
   const definitions = new Map(), config = { enabled: true, token: '' };
+  const capabilities = { githubRead: true, githubFetch: true, ...options.capabilities };
   const tools = {
     register(definition) { definitions.set(definition.name, definition); return () => definitions.delete(definition.name); },
     get(name) { return definitions.get(name); }, checkGuards: () => undefined,
@@ -627,10 +639,11 @@ async function hostFixture(options = {}) {
     inject(_services, apply) { apply(ctx); },
     effect(dispose) { effects.push(dispose()); },
     on(event, listener) { const listeners = events.get(event) ?? []; listeners.push(listener); events.set(event, listeners); },
-    get(name) { return name === 'tools' ? tools : undefined; },
+    get(name) { return name === 'tools' ? tools : name === 'grokSearchCompatibility' ? options.compatibility : undefined; },
   };
   const comments = [{ id: 1000, body: 'long-answer-'.repeat(5000) }];
-  const github = createGithubIntegration({ ctx, getState: () => config,
+  const github = createGithubIntegration({ ctx, getState: () => config, WebError: options.withoutWebError ? undefined : WebError,
+    getCapabilities: Object.hasOwn(options, 'getCapabilities') ? options.getCapabilities : () => capabilities,
     callRoutes: { capture: () => null, finalizeRead() {}, read: () => ({ routes: options.noRoute ? [] : [{ served: 'github' }] }) },
     readerOptions: { ...options.reader, fetchImpl: async (input, init) => options.fetch
       ? options.fetch(input, init) : response(new URL(input).pathname.endsWith('/comments') ? comments : root) } });
@@ -655,9 +668,129 @@ async function hostFixture(options = {}) {
     for (const observer of events.get('tools/result')) observer(exec, result);
     return result;
   };
-  return { github, execute, run, config, events, tools,
+  return { github, execute, run, config, capabilities, events, tools,
     async dispose() { github.dispose(); for (const effect of effects.reverse()) await effect?.(); } };
 }
+
+test('without an injected WebError constructor GitHub failures retain their original code and message', async () => {
+  const f = await hostFixture({ withoutWebError: true });
+  try {
+    await assert.rejects(f.github.definition.execute({ url, cursor: 'missing' },
+      { agent: { session: { id: 'host-session' } }, signal: new AbortController().signal }),
+    failure => failure.code === 'GITHUB_CURSOR_INVALID' && typeof failure.message === 'string');
+  } finally { await f.dispose(); }
+});
+
+test('a direct GitHub connection test awaits compatibility before creating a network request', async () => {
+  const denial = Object.assign(new Error('Search is unavailable.'), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  const operations = [];
+  const f = await hostFixture({
+    compatibility: { async assertSearchAllowed(operation) { operations.push(operation); throw denial; } },
+    fetch: async () => assert.fail('Blocked GitHub diagnostics must not dispatch'),
+  });
+  try {
+    await assert.rejects(f.github.test(), failure => failure === denial);
+    assert.deepEqual(operations, ['diagnosis']);
+  } finally { await f.dispose(); }
+});
+
+test('GitHub stays unregistered and fails closed until capability evaluation explicitly admits it', async () => {
+  for (const getCapabilities of [undefined, () => null, () => ({ githubRead: 'yes', githubFetch: true }),
+    () => { throw new Error('Probe did not complete'); }]) {
+    const f = await hostFixture({ getCapabilities, fetch: async () => assert.fail('Unadmitted GitHub must not request data') });
+    try {
+      assert.equal(f.github.snapshot().registered, false);
+      assert.equal(f.tools.get('github_read'), undefined);
+      const agent = { session: { id: 'host-session' } };
+      assert.equal((await f.execute('github_read', { url }, agent)).error.info?.code, 'GITHUB_UNAVAILABLE');
+      assert.equal((await f.execute('web_fetch', { url }, agent)).error.info?.code, 'GITHUB_FETCH_UNAVAILABLE');
+    } finally { await f.dispose(); }
+  }
+});
+
+test('GitHub tool registration follows evaluated capabilities without allowing fetch fallback', async () => {
+  const f = await hostFixture({ capabilities: { githubRead: false, githubFetch: false } });
+  try {
+    assert.equal(f.github.snapshot().registered, false);
+    f.capabilities.githubRead = true;
+    f.github.sync();
+    assert.equal(f.tools.get('github_read'), f.github.definition);
+    const agent = { session: { id: 'host-session' } };
+    assert.equal((await f.execute('github_read', { url }, agent)).isError, false);
+    assert.equal((await f.execute('web_fetch', { url }, agent)).error.info?.code, 'GITHUB_FETCH_UNAVAILABLE');
+    f.capabilities.githubFetch = true;
+    assert.equal((await f.execute('web_fetch', { url }, agent)).isError, false);
+    f.capabilities.githubRead = false;
+    f.github.sync();
+    assert.equal(f.github.snapshot().registered, false);
+    assert.equal(f.tools.get('github_read'), undefined);
+  } finally { await f.dispose(); }
+});
+
+test('an unavailable fetch adapter blocks the original tool before service interception can be skipped', async () => {
+  const { WebError } = await loadHost();
+  const f = await hostFixture({ capabilities: { githubFetch: false } });
+  try {
+    await assert.rejects(f.events.get('tools/execute')[0]({
+      name: 'web_fetch', arguments: { url }, agent: { session: { id: 'host-session' } },
+      signal: new AbortController().signal,
+    }, async () => assert.fail('The original provider must not execute when the fetch adapter is unavailable')),
+    failure => failure instanceof WebError && failure.code === 'GITHUB_FETCH_UNAVAILABLE');
+  } finally { await f.dispose(); }
+});
+
+test('GitHub capabilities are rechecked on execution and before delivering an in-flight result', async () => {
+  let f;
+  f = await hostFixture({ fetch: async input => {
+    f.capabilities.githubRead = false;
+    return response(new URL(input).pathname.endsWith('/comments') ? [] : root);
+  } });
+  try {
+    const agent = { session: { id: 'host-session' } };
+    assert.equal((await f.execute('github_read', { url }, agent)).error.info?.code, 'GITHUB_UNAVAILABLE');
+    assert.equal((await f.execute('web_fetch', { url }, agent)).error.info?.code, 'GITHUB_FETCH_UNAVAILABLE');
+  } finally { await f.dispose(); }
+});
+
+test('injected WebError identity is preserved for both direct and intercepted requests', async () => {
+  const { WebError } = await loadHost();
+  const f = await hostFixture({ fetch: async () => response({}, 401) });
+  try {
+    for (const name of ['github_read', 'web_fetch']) {
+      await assert.rejects(f.run({ name, arguments: { url }, agent: { session: { id: 'host-session' } },
+        signal: new AbortController().signal }), failure => failure instanceof WebError && failure.code === 'GITHUB_AUTH');
+    }
+  } finally { await f.dispose(); }
+});
+
+test('a missing fetch guard contract blocks interception without disabling the direct GitHub tool or falling back', async () => {
+  const requests = [];
+  const f = await hostFixture({ fetch: async input => {
+    const path = new URL(input).pathname;
+    requests.push(path);
+    return response(path.endsWith('/comments') ? [] : root);
+  } });
+  try {
+    f.tools.checkGuards = undefined;
+    const agent = { session: { id: 'host-session' } };
+    assert.equal((await f.execute('web_fetch', { url }, agent)).error.info?.code, 'GITHUB_PERMISSION');
+    assert.deepEqual(requests, []);
+    assert.equal((await f.execute('github_read', { url }, agent)).isError, false);
+    assert.deepEqual(requests, ['/repos/octocat/example/issues/7', '/repos/octocat/example/issues/7/comments']);
+  } finally { await f.dispose(); }
+});
+
+test('fetch interception accepts the legacy guard contract and rejects an ambiguous guard result', async () => {
+  const f = await hostFixture();
+  try {
+    f.tools.checkGuards = undefined;
+    f.tools.guardReason = () => undefined;
+    const agent = { session: { id: 'host-session' } };
+    assert.equal((await f.execute('web_fetch', { url }, agent)).isError, false);
+    f.tools.guardReason = () => null;
+    assert.equal((await f.execute('web_fetch', { url }, agent)).error.info?.code, 'GITHUB_PERMISSION');
+  } finally { await f.dispose(); }
+});
 
 test('direct and diverted GitHub failures keep their host error identity without invalidating other Agent cursors', async () => {
   const one = { session: { id: 'host-session' } }, other = { session: { id: 'host-session' } };

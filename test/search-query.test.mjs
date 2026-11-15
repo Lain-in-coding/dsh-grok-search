@@ -6,7 +6,15 @@ import { createSearchExecutor } from '../src/core/search-executor.mjs';
 import { createSourceRouter } from '../src/core/source-adapters.mjs';
 import { createRoutedSearch } from '../src/core/routed-search.mjs';
 import { createReleaseBarrier } from '../src/core/release-transaction.mjs';
-import { apply, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+
+class TestService {
+  constructor(ctx) { this.ctx = ctx; }
+}
+class TestRemoteError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+const Gateway = createSettingsGateway({ Service: TestService, RemoteError: TestRemoteError });
 
 test('search limit counts Unicode code points and never trims accepted input', () => {
   assert.equal(MAX_SEARCH_QUERY_CHARS, 8192);
@@ -49,8 +57,7 @@ test('oversized query is refused before configuration, queue, process or source 
 });
 
 test('settings gateway rejects over-limit payloads with a useful message, including old descriptor callers', async () => {
-  let Gateway, called = 0, ownerChecks = 0;
-  apply({ plugin(Plugin) { Gateway = Plugin; } });
+  let called = 0, ownerChecks = 0;
   const gateway = new Gateway({ provide() {}, get: name =>
     name === 'grokSearchConnectionSecurity' ? { requireOwner() { ownerChecks++; } }
       : name === 'grokSearchCore' ? { testSearch() { called++; } } : null });

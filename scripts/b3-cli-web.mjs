@@ -7,9 +7,12 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   utimesSync,
@@ -18,10 +21,12 @@ import {
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { arch, homedir, platform, release, tmpdir } from 'node:os';
+import { arch, platform, release, tmpdir, userInfo } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { gunzipSync } from 'node:zlib';
 import { connectRenderer, waitForRenderer } from './lib/renderer-cdp.mjs';
+import semver from 'semver';
+import { readRuntimeReceipt, validateCandidate, requireSha256 } from './lib/compatibility-evidence.mjs';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const PROJECT_ROOT = resolve(dirname(SCRIPT_PATH), '..');
@@ -46,12 +51,307 @@ const VERSIONS = Object.freeze({
 });
 const MODERN_VERSIONS = new Set(['022-rc1', '022-rc2']);
 const CASES = new Set(['smoke', 'stop', 'full']);
+const HOST_PEERS = Object.freeze(['cordis', 'dsh', 'dsh-app-boot', 'dsh-typert-protocol', 'dsh-web', 'schemastery']
+  .map(name => `@deepseek-ai/${name}`));
+const RELOAD_TRANSIENT_CODES = new Set([
+  // Epoch disposal cancels admission/work; these do not include timeout, ABI or safety failures.
+  'ABORTED', 'CANCELLED', 'GROK_SEARCH_STOPPING', 'GROK_SEARCH_CANCELLED', 'GROK_CANCELLED',
+  'CONTROL_ACQUISITION_CANCELLED', 'CONTROL_ROUTE_VERIFIER_DISPOSED',
+  'COMPATIBILITY_STOPPED', 'COMPATIBILITY_CHECKING', 'COMPATIBILITY_CORE_PENDING',
+  'COMPATIBILITY_CONTRACT_PENDING', 'COMPATIBILITY_ROUTE_UNCONFIRMED',
+  'COMPATIBILITY_BUDGET_UNCONFIRMED', 'COMPATIBILITY_INITIALIZATION_PENDING',
+]);
+const REAL_SEARCH_TEXT = 'Linux grok-search-rs 0.1.26 real MCP search succeeded.';
 
-export function cliNodeVersionSupported(version, dshVersion) {
+export function cliWebNpmEnvironment(runRoot, inherited = process.env) {
+  return {
+    PATH: `${dirname(process.execPath)}:${inherited.PATH ?? ''}`,
+    HOME: join(runRoot, 'home'),
+    LANG: inherited.LANG ?? 'C.UTF-8',
+    LC_ALL: inherited.LC_ALL ?? '',
+    TMPDIR: join(runRoot, 'tmp'),
+    npm_config_userconfig: join(runRoot, 'npm-user.npmrc'),
+    npm_config_globalconfig: join(runRoot, 'npm-global.npmrc'),
+    npm_config_cache: join(runRoot, 'npm-cache'),
+    npm_config_registry: REGISTRY,
+    npm_config_strict_peer_deps: 'true',
+    npm_config_legacy_peer_deps: 'false',
+    npm_config_force: 'false',
+    CI: '1',
+    NO_COLOR: '1',
+  };
+}
+
+export function cliWebPluginAddArguments({ copiedCli, productCopy, pnpmStore, pnpmCache }) {
+  return [
+    copiedCli, 'plugin', '--profile', 'web', 'add', productCopy,
+    '--offline', '--store-dir', pnpmStore, '--cache-dir', pnpmCache, '--ignore-scripts',
+    '--config.auto-install-peers=true', '--config.strict-peer-dependencies=true',
+    '--registry', REGISTRY,
+  ];
+}
+
+export function resolveCliWebRunRoot(options) {
+  if (platform() !== 'linux' || options.worker !== true || options.bootstrapFile) {
+    throw new Error('--run-root is only supported by a direct Linux --worker invocation.');
+  }
+  const target = options.runRoot;
+  if (typeof target !== 'string' || !target.startsWith('/') || !isAbsolute(target)
+    || /[\\\x00-\x1f\x7f]/.test(target) || target !== resolve(target) || target === '/') {
+    throw new Error('--run-root must be a normalized absolute Linux path without unsafe segments.');
+  }
+  if (options.runId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(options.runId)) {
+    throw new Error('--run-id must be a safe artifact directory name.');
+  }
+  try {
+    lstatSync(target);
+    throw new Error('--run-root must be a fresh, nonexistent directory.');
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const parent = dirname(target), owner = lstatSync(parent);
+  if (!owner.isDirectory() || owner.isSymbolicLink() || owner.uid !== process.getuid()
+    || (owner.mode & 0o022) !== 0) {
+    throw new Error('--run-root parent must be an existing owned directory without group/world write access.');
+  }
+  for (let cursor = parent; ; cursor = dirname(cursor)) {
+    const entry = lstatSync(cursor);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error('--run-root ancestors must be real directories, not links.');
+    if (dirname(cursor) === cursor) break;
+  }
+  if (realpathSync(parent) !== parent) throw new Error('--run-root parent must be canonical.');
+  const inside = (base, path) => {
+    const rel = relative(base, path);
+    return rel === '' || !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../');
+  };
+  const protectedPaths = [PROJECT_ROOT, dirname(options.productPackage), findInstallRoot(options.dshCli),
+    options.pnpmStore, options.pnpmCache, options.candidateRoot].filter(Boolean);
+  for (const path of protectedPaths) {
+    for (const boundary of [resolve(path), realpathSync(path)]) {
+      if (inside(boundary, target) || inside(target, boundary)) {
+        throw new Error('--run-root must not overlap the project, product, host, store or cache.');
+      }
+    }
+  }
+  return target;
+}
+
+export function inspectCliWebHostPeers(profile, { hostRoot } = {}) {
+  const root = realpathSync(profile), modules = join(root, 'node_modules'), seen = new Set();
+  if (!existsSync(modules)) throw new Error('Peer audit requires the installed profile node_modules.');
+  const stagedHost = hostRoot ? realpathSync(hostRoot) : null;
+  const provided = new Map(HOST_PEERS.filter(name => existsSync(join(modules, name)))
+    .map(name => [name, realpathSync(join(modules, name))]));
+  const hostProvided = new Map(HOST_PEERS.filter(name => stagedHost && existsSync(join(stagedHost, 'node_modules', name)))
+    .map(name => [name, realpathSync(join(stagedHost, 'node_modules', name))]));
+  const nested = [], hostPeers = [];
+  const beneath = (base, path) => {
+    const rel = relative(base, path);
+    return rel === '' || !isAbsolute(rel) && rel !== '..' && !rel.startsWith('../') && !rel.startsWith('..\\');
+  };
+  const inside = path => beneath(root, path) || stagedHost && beneath(stagedHost, path);
+  const visit = directory => {
+    if (!existsSync(directory)) return;
+    const actual = realpathSync(directory);
+    if (!inside(actual)) throw new Error('Peer audit cannot follow a node_modules link outside the isolated profile.');
+    if (!beneath(root, actual)) return;
+    if (seen.has(actual)) return;
+    if (seen.size >= 10_000) throw new Error('Peer audit exceeded its bounded module-directory limit.');
+    seen.add(actual);
+    const inspectPackage = (name, path) => {
+      const resolved = realpathSync(path);
+      if (!inside(resolved)) throw new Error('Peer audit cannot follow a package link outside the isolated profile.');
+      if (HOST_PEERS.includes(name)) {
+        const item = { name, path: relative(root, path).split('\\').join('/'),
+          realPath: beneath(root, resolved) ? relative(root, resolved).split('\\').join('/')
+            : '<STAGED_HOST>/' + relative(stagedHost, resolved).split('\\').join('/') };
+        hostPeers.push(item);
+        if (provided.get(name) !== resolved && hostProvided.get(name) !== resolved) nested.push(item);
+      }
+      visit(join(resolved, 'node_modules'));
+    };
+    for (const entry of readdirSync(actual, { withFileTypes: true })) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const path = join(actual, entry.name);
+      if (entry.name === '.pnpm') {
+        if (!inside(realpathSync(path))) throw new Error('Peer audit cannot follow a virtual store outside the isolated profile.');
+        for (const slot of readdirSync(path, { withFileTypes: true })) {
+          if (slot.isDirectory() || slot.isSymbolicLink()) visit(slot.name === 'node_modules' ? join(path, slot.name)
+            : join(path, slot.name, 'node_modules'));
+        }
+      } else if (entry.name.startsWith('@')) {
+        if (!inside(realpathSync(path))) throw new Error('Peer audit cannot follow a package scope outside the isolated profile.');
+        for (const pkg of readdirSync(path, { withFileTypes: true })) {
+          if (pkg.isDirectory() || pkg.isSymbolicLink()) inspectPackage(`${entry.name}/${pkg.name}`, join(path, pkg.name));
+        }
+      } else if (!entry.name.startsWith('.')) inspectPackage(entry.name, path);
+    }
+  };
+  visit(modules);
+  return { scope: 'isolated profile node_modules, including pnpm virtual-store slots',
+    providedHostPeers: [...provided.keys()], stagedHostPeers: [...hostProvided.keys()], hostPeers, nestedHostPeers: nested };
+}
+
+export function cliWebReloadOutcome(reloadProbe) {
+  const result = reloadProbe?.toolResult;
+  const text = result?.content?.filter(part => part.type === 'text' && typeof part.text === 'string')
+    .map(part => part.text).join('\n') ?? '';
+  if (reloadProbe?.overlappedReload !== true || !result) return { accepted: false, code: null, kind: 'invalid' };
+  if (result.isError !== true) return { accepted: text.includes(REAL_SEARCH_TEXT), code: null, kind: 'served' };
+  // The rc.2 tool boundary retains this exact bundle guard message but drops its code.
+  // This is only an admission observation; the separate real-search recovery gate is mandatory.
+  if (reloadProbe.toolErrorCode == null && result.content?.length === 1
+    && text === 'Error: Search is blocked until runtime compatibility is established.'
+    && ['reloadStartedAt', 'reloadSettledAt', 'toolCallAt', 'toolResultAt'].every(key => Number.isFinite(reloadProbe[key]))
+    && reloadProbe.toolCallAt <= reloadProbe.reloadStartedAt
+    && reloadProbe.reloadStartedAt <= reloadProbe.toolResultAt
+    && reloadProbe.toolResultAt <= reloadProbe.reloadSettledAt) {
+    return { accepted: true, code: null, kind: 'admission-pending', evidence: 'exact-compatibility-guard-message' };
+  }
+  // Prefer the host's structured error; text-only legacy hosts must name an exact code.
+  const tokens = [...new Set(text.match(/\b(?:COMPATIBILITY|CONTROL|WEB_PROVIDER|GROK)_[A-Z0-9_]+\b|\b(?:ABORTED|CANCELLED)\b/g) ?? [])];
+  const code = reloadProbe.toolErrorCode ?? (tokens.length === 1 ? tokens[0] : null);
+  const admissionRevoked = code === 'UNKNOWN_TOOL'
+    && /^(?:Error:\s*)?unknown tool\s*:?\s*["'`]?web_search["'`]?[.!]?$/i.test(text.trim());
+  return { accepted: admissionRevoked || RELOAD_TRANSIENT_CODES.has(code)
+    && tokens.every(token => RELOAD_TRANSIENT_CODES.has(token)), code,
+    kind: admissionRevoked ? 'admission-revoked' : 'fail-closed' };
+}
+
+export function cliWebReloadRecoveryPassed({ recovered, grokRequestsBefore, grokRequestsAfter,
+  officialRequestsBefore, officialRequestsAfter }) {
+  return recovered?.toolCall?.name === 'web_search' && recovered.toolResult?.isError !== true
+    && recovered.toolResult?.text?.includes(REAL_SEARCH_TEXT) === true
+    && recovered.snapshot?.runtimeWeb?.searchProviderId === 'grok-search'
+    && recovered.snapshot?.calls?.original === 0 && recovered.snapshot?.originalSearchCounter?.calls === 0
+    && grokRequestsAfter > grokRequestsBefore && officialRequestsBefore === 0 && officialRequestsAfter === 0;
+}
+
+export function cliNodeVersionSupported(version, dshVersion, candidateReceipt) {
   const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version);
-  if (!match || !Object.hasOwn(VERSIONS, dshVersion)) return false;
+  if (!match) return false;
+  if (!Object.hasOwn(VERSIONS, dshVersion)) {
+    try {
+      validateCandidate(candidateReceipt?.asset);
+      requireSha256(candidateReceipt.asset.sha256);
+      return candidateReceipt.kind === 'verified-runtime-candidate'
+        && candidateReceipt.asset.lane === 'linux-cli' && candidateReceipt.asset.version === dshVersion
+        && typeof candidateReceipt.asset.nodeRange === 'string'
+        && semver.satisfies(version.replace(/^v/, ''), candidateReceipt.asset.nodeRange);
+    } catch { return false; }
+  }
   const major = Number(match[1]), minor = Number(match[2]);
   return MODERN_VERSIONS.has(dshVersion) ? major > 24 || major === 24 && minor >= 9 : major >= 22;
+}
+
+export function createCliWebBrowserTemporaryRoot(parent = join(userInfo().homedir, '.cache')) {
+  if (platform() !== 'linux') throw new Error('Browser temporary roots require Linux.');
+  if (typeof parent !== 'string' || !parent.startsWith('/') || parent !== resolve(parent)
+    || /[\\\x00-\x1f\x7f]/.test(parent)) {
+    throw new Error('Browser temporary parent must be a normalized absolute Linux path.');
+  }
+  const owner = lstatSync(parent);
+  if (!owner.isDirectory() || owner.isSymbolicLink() || owner.uid !== process.getuid()
+    || (owner.mode & 0o022) !== 0) {
+    throw new Error('Browser temporary parent must be owned and not group/world writable.');
+  }
+  for (let cursor = parent; ; cursor = dirname(cursor)) {
+    const entry = lstatSync(cursor);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error('Browser temporary ancestors must not be links.');
+    if (dirname(cursor) === cursor) break;
+  }
+  if (realpathSync(parent) !== parent) throw new Error('Browser temporary parent must be canonical.');
+  // Chromium adds this suffix in TMPDIR; Linux sockaddr_un.sun_path includes a terminating NUL.
+  const socketSuffix = '/org.chromium.Chromium.XXXXXX/SingletonSocket';
+  const prefix = join(parent, 'b3-cdp-');
+  if (Buffer.byteLength(prefix + 'XXXXXX' + socketSuffix) >= 108) {
+    throw new Error('Browser temporary parent is too long for the Chromium singleton socket.');
+  }
+  const path = mkdtempSync(prefix);
+  const created = lstatSync(path);
+  const singletonSocketMaxBytes = Buffer.byteLength(path + socketSuffix);
+  if (!created.isDirectory() || created.isSymbolicLink() || created.uid !== process.getuid()
+    || (created.mode & 0o777) !== 0o700 || realpathSync(path) !== path || singletonSocketMaxBytes >= 108) {
+    throw new Error('Browser temporary root must be a fresh private canonical directory with a bounded socket path.');
+  }
+  return { path, singletonSocketMaxBytes };
+}
+
+export function cliWebBrowserArguments(profile) {
+  return [
+    '--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+    '--no-first-run', '--no-default-browser-check', `--user-data-dir=${profile}`,
+    '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', 'about:blank',
+  ];
+}
+
+export function observeCliWebBrowser(child, { timeoutMs = 30_000, outputLimit = 4 * 1024 * 1024 } = {}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1
+    || !Number.isSafeInteger(outputLimit) || outputLimit < 1) {
+    throw new TypeError('Browser observation requires bounded positive deadlines and output limits.');
+  }
+  let stdout = '', stderr = '', exitCode = null, signal = null, spawnError = null;
+  let exited = false, closed = false, startupFailure = null, port = null, settled = false;
+  let readyResolve, readyReject, closedResolve, timer;
+  const ready = new Promise((resolvePromise, reject) => { readyResolve = resolvePromise; readyReject = reject; });
+  const whenClosed = new Promise(resolvePromise => { closedResolve = resolvePromise; });
+  const snapshot = () => ({ stdout, stderr, exitCode, signal, spawnError, exited, closed, port, startupFailure });
+  const fail = kind => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    startupFailure = { kind, exitCode, signal, spawnError };
+    const detail = spawnError ? `${spawnError.code ?? 'unknown'}: ${spawnError.message}`
+      : `exitCode=${exitCode ?? 'null'}, signal=${signal ?? 'null'}`;
+    readyReject(new Error(`Linux browser DevTools startup failed (${kind}; ${detail}). See linux-browser.stderr.log.`));
+  };
+  const onStdout = chunk => { stdout += String(chunk).slice(0, Math.max(0, outputLimit - stdout.length)); };
+  const onStderr = chunk => {
+    stderr += String(chunk).slice(0, Math.max(0, outputLimit - stderr.length));
+    if (settled) return;
+    if (exited || child.exitCode != null || child.signalCode != null) {
+      exitCode = child.exitCode ?? exitCode;
+      signal = child.signalCode ?? signal;
+      exited = true;
+      fail(signal ? 'early-signal' : 'early-exit');
+      return;
+    }
+    const match = stderr.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);
+    if (!match || Number(match[1]) < 1 || Number(match[1]) > 65_535) return;
+    settled = true;
+    clearTimeout(timer);
+    port = Number(match[1]);
+    readyResolve({ port });
+  };
+  const onError = error => {
+    spawnError = { code: error.code ?? null, message: error.message };
+    fail('spawn-error');
+  };
+  const onExit = (code, exitSignal) => {
+    exited = true;
+    exitCode = code;
+    signal = exitSignal;
+    fail(signal ? 'early-signal' : 'early-exit');
+  };
+  const onClose = (code, exitSignal) => {
+    if (!exited) onExit(code, exitSignal);
+    closed = true;
+    clearTimeout(timer);
+    child.stdout?.off('data', onStdout);
+    child.stderr?.off('data', onStderr);
+    child.off('error', onError);
+    child.off('exit', onExit);
+    child.off('close', onClose);
+    closedResolve({ code: exitCode, signal });
+  };
+  child.stdout?.setEncoding('utf8');
+  child.stderr?.setEncoding('utf8');
+  child.stdout?.on('data', onStdout);
+  child.stderr?.on('data', onStderr);
+  child.on('error', onError);
+  child.once('exit', onExit);
+  child.once('close', onClose);
+  timer = setTimeout(() => fail('endpoint-timeout'), timeoutMs);
+  if (child.exitCode != null || child.signalCode != null) onExit(child.exitCode, child.signalCode);
+  return { ready, whenClosed, snapshot };
 }
 
 function usage() {
@@ -62,6 +362,8 @@ function usage() {
     '    --browser-executable <linux-browser-path>',
     '    --pnpm-entry <pnpm.cjs> --pnpm-store <path> --pnpm-cache <path>',
     '    [--linux-node <absolute-linux-node-path>]',
+    '    [--candidate-receipt <json> --candidate-sha256 <sha256> --candidate-root <directory>]',
+    '    [--worker --run-root <fresh-owned-linux-directory>] (direct Linux only)',
   ].join('\n');
 }
 
@@ -75,6 +377,7 @@ function parseArgs(argv) {
     ['--browser-executable', 'browserExecutable'],
     ['--case', 'case'],
     ['--run-id', 'runId'],
+    ['--run-root', 'runRoot'],
     ['--staged-runtime-archive', 'stagedRuntimeArchive'],
     ['--bootstrap-file', 'bootstrapFile'],
     ['--wsl-distro', 'wslDistro'],
@@ -83,6 +386,9 @@ function parseArgs(argv) {
     ['--pnpm-cache', 'pnpmCache'],
     ['--first-use', 'firstUse'],
     ['--linux-node', 'linuxNode'],
+    ['--candidate-receipt', 'candidateReceiptPath'],
+    ['--candidate-sha256', 'candidateReceiptSha256'],
+    ['--candidate-root', 'candidateRoot'],
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -101,7 +407,8 @@ function parseArgs(argv) {
   if (!options.browserExecutable) {
     throw new Error(`--browser-executable is required for every case (settings DOM is always checked).\n${usage()}`);
   }
-  if (!Object.hasOwn(VERSIONS, options.dshVersion)) {
+  if (!Object.hasOwn(VERSIONS, options.dshVersion)
+    && !(options.candidateReceiptPath && options.candidateReceiptSha256 && options.candidateRoot)) {
     throw new Error(`Unsupported --dsh-version ${JSON.stringify(options.dshVersion)}; expected ${Object.keys(VERSIONS).join(', ')}.`);
   }
   if (!CASES.has(options.case)) {
@@ -118,6 +425,20 @@ function parseArgs(argv) {
   for (const key of ['pnpmEntry', 'pnpmStore', 'pnpmCache']) {
     if (options[key]) options[key] = resolve(options[key]);
   }
+  if (options.candidateReceiptPath || options.candidateReceiptSha256 || options.candidateRoot) {
+    const expected = VERSIONS[options.dshVersion] ?? options.dshVersion;
+    const verified = readRuntimeReceipt({ receiptPath: options.candidateReceiptPath,
+      receiptSha256: options.candidateReceiptSha256, root: options.candidateRoot,
+      version: expected, platform: 'linux', arch: 'x64', roles: ['executable', 'cliManifest'] });
+    if (verified.files.executable !== options.dshCli) throw new Error('CLI path differs from its verified candidate receipt.');
+    const manifest = JSON.parse(readFileSync(verified.files.cliManifest, 'utf8'));
+    if (manifest.name !== '@deepseek-ai/dsh' || manifest.version !== expected
+      || (manifest.engines?.node ?? null) !== (verified.receipt.asset.nodeRange ?? null)) throw new Error('CLI manifest differs from official candidate metadata.');
+    options.candidateReceiptPath = resolve(options.candidateReceiptPath);
+    options.candidateRoot = resolve(options.candidateRoot);
+    options.candidateReceipt = verified.receipt;
+  }
+  if (options.runRoot !== undefined) options.runRoot = resolveCliWebRunRoot(options);
   return options;
 }
 
@@ -308,7 +629,7 @@ async function startLocalPnpmRegistry({ storeIndex, npmCache, runtimeRoot, pnpmW
     port,
     snapshot: () => ({
       source: 'host pnpm store index + host npm content cache',
-      storeIndex: '<HOST_PNPM_STORE>/index.db',
+      storeIndex: '<OWNED_PNPM_STORE>/index.db',
       npmCache: '<HOST_NPM_CACHE>',
       packageNames: packages.size,
       metadataRequests: metadataRequests.slice(-300),
@@ -669,6 +990,7 @@ function wslUncPath(distro, linuxPath) {
 }
 
 async function windowsBootstrap(options) {
+  if (options.runRoot !== undefined) throw new Error('--run-root requires direct Linux --worker; Windows path mapping is not supported.');
   const distro = process.env.DSH_CLI_WEB_WSL_DISTRO ?? DEFAULT_DISTRO;
   const runId = isoRunId(options.dshVersion);
   const runRoot = `/tmp/dsh-grok-cli-web-${runId}`;
@@ -724,8 +1046,9 @@ async function windowsBootstrap(options) {
     if (preflight.code !== 0) throw new Error(`WSL preflight failed: ${preflight.stderr.trim()}`);
     const environment = preflight.stdout.trim().split(/\r?\n/);
     if (environment[0] !== 'x86_64') throw new Error(`Expected WSL x86_64, got ${environment[0]}.`);
-    if (!cliNodeVersionSupported(environment[1], options.dshVersion)) {
-      throw new Error(`Expected WSL Node >= ${MODERN_VERSIONS.has(options.dshVersion) ? '24.9' : '22'}, got ${environment[1]}.`);
+    if (!cliNodeVersionSupported(environment[1], options.dshVersion, options.candidateReceipt)) {
+      throw new Error(`Expected WSL Node ${options.candidateReceipt?.asset.nodeRange
+        ?? (MODERN_VERSIONS.has(options.dshVersion) ? '>=24.9.0' : '>=22.0.0')}, got ${environment[1]}.`);
     }
 
     stage = 'create-temporary-root';
@@ -755,6 +1078,8 @@ async function windowsBootstrap(options) {
       pnpmEntry: options.pnpmEntry,
       pnpmStore: options.pnpmStore,
       pnpmCache: options.pnpmCache,
+      ...(options.candidateReceipt ? { candidateReceiptPath: options.candidateReceiptPath,
+        candidateRoot: options.candidateRoot } : {}),
     })) {
       const mapped = await runSync('wsl.exe', ['-d', distro, '--exec', 'wslpath', '-a', '-u', value]);
       if (mapped.code !== 0) throw new Error(`Could not map ${key} into WSL: ${mapped.stderr.trim()}`);
@@ -798,6 +1123,8 @@ async function windowsBootstrap(options) {
         '--pnpm-entry', paths.pnpmEntry,
         '--pnpm-store', paths.pnpmStore,
         '--pnpm-cache', paths.pnpmCache,
+        ...(options.candidateReceipt ? ['--candidate-receipt', paths.candidateReceiptPath,
+          '--candidate-root', paths.candidateRoot, '--candidate-sha256', options.candidateReceiptSha256] : []),
       ], {
         stdio: 'inherit',
         windowsHide: true,
@@ -1084,7 +1411,7 @@ async function linuxWorker(options) {
     'package.json', 'README.md', 'support-matrix.json', 'LICENSE', 'cordis.patch.yml', ...runtimeFiles('src')]
     .map(file => ({ file, sha256: sha256(join(PROJECT_ROOT, file)) }));
   const runId = options.runId ?? isoRunId(options.dshVersion);
-  const runRoot = `/tmp/dsh-grok-cli-web-${runId}`;
+  const runRoot = options.runRoot !== undefined ? resolveCliWebRunRoot(options) : `/tmp/dsh-grok-cli-web-${runId}`;
   const dshHome = join(runRoot, 'dsh-home');
   const workspace = join(runRoot, 'workspace');
   const home = join(runRoot, 'home');
@@ -1092,7 +1419,7 @@ async function linuxWorker(options) {
   mkdirSync(ARTIFACT_ROOT, { recursive: true });
   if (!existsSync(artifactDir)) mkdirSync(artifactDir, { recursive: false });
   else if (!statSync(artifactDir).isDirectory()) throw new Error(`Artifact path is not a directory: ${artifactDir}`);
-  if (!existsSync(runRoot)) mkdirSync(runRoot, { recursive: false });
+  if (options.runRoot !== undefined || !existsSync(runRoot)) mkdirSync(runRoot, { recursive: false, mode: 0o700 });
   for (const path of [dshHome, workspace, home, join(runRoot, 'tmp'),
     join(runRoot, 'xdg-config'), join(runRoot, 'xdg-cache'), join(runRoot, 'xdg-data')]) {
     mkdirSync(path, { recursive: true });
@@ -1108,8 +1435,8 @@ async function linuxWorker(options) {
     [options.productPackage, '<PRODUCT_PACKAGE>'],
     [options.grokLinuxArchive, '<OFFICIAL_GROK_LINUX_ARCHIVE>'],
     [options.pnpmEntry, '<PNPM_ENTRY>'],
-    [options.pnpmStore, '<HOST_PNPM_STORE>'],
-    [options.pnpmCache, '<HOST_PNPM_CACHE>'],
+    [options.pnpmStore, '<OWNED_PNPM_STORE>'],
+    [options.pnpmCache, '<OWNED_PNPM_CACHE>'],
     ...(options.browserExecutable ? [[options.browserExecutable, '<BROWSER_EXECUTABLE>']] : []),
   ]);
   const steps = [];
@@ -1158,8 +1485,9 @@ async function linuxWorker(options) {
     if (platform() !== 'linux' || arch() !== 'x64') {
       throw new Error(`Linux x64 is required, got ${platform()} ${arch()}.`);
     }
-    check('linux-node-supported', cliNodeVersionSupported(process.versions.node, options.dshVersion),
-      { node: process.versions.node, minimum: MODERN_VERSIONS.has(options.dshVersion) ? '24.9.0' : '22.0.0' });
+    check('linux-node-supported', cliNodeVersionSupported(process.versions.node, options.dshVersion, options.candidateReceipt),
+      { node: process.versions.node, minimum: options.candidateReceipt?.asset.nodeRange
+        ?? (MODERN_VERSIONS.has(options.dshVersion) ? '24.9.0' : '22.0.0') });
     packageReceipt = JSON.parse(readFileSync(packageReceiptPath, 'utf8'));
     if (options.bootstrapFile && existsSync(options.bootstrapFile)) {
       bootstrap = JSON.parse(readFileSync(options.bootstrapFile, 'utf8'));
@@ -1194,6 +1522,12 @@ async function linuxWorker(options) {
     check('extract-cli-runtime', extracted.exitCode === 0 && !extracted.timedOut, { exitCode: extracted.exitCode });
     const copiedCli = join(runtimeRoot, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
     check('copied-cli-present', existsSync(copiedCli), { path: '<RUN_ROOT>/cli-runtime/node_modules/@deepseek-ai/dsh/lib/bin.js' });
+    if (options.candidateReceipt) {
+      const copiedManifest = join(runtimeRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+      check('copied-cli-candidate-hashes',
+        sha256(copiedCli) === options.candidateReceipt.files.executable.sha256
+        && sha256(copiedManifest) === options.candidateReceipt.files.cliManifest.sha256);
+    }
 
     check('official-linux-grok-archive-present',
       existsSync(options.grokLinuxArchive) && statSync(options.grokLinuxArchive).isFile(), {
@@ -1253,18 +1587,10 @@ async function linuxWorker(options) {
       exitCode: grokVersion.exitCode,
     });
 
-    const npmEnv = {
-      PATH: `${dirname(process.execPath)}:${process.env.PATH}`,
-      HOME: homedir(),
-      LANG: process.env.LANG ?? 'C.UTF-8',
-      LC_ALL: process.env.LC_ALL ?? '',
-      TMPDIR: join(runRoot, 'tmp'),
-      npm_config_registry: REGISTRY,
-      npm_config_store_dir: options.pnpmStore,
-      npm_config_cache_dir: options.pnpmCache,
-      CI: '1',
-      NO_COLOR: '1',
-    };
+    const npmEnv = cliWebNpmEnvironment(runRoot);
+    writeFileSync(npmEnv.npm_config_userconfig, '', { flag: 'wx', mode: 0o600 });
+    writeFileSync(npmEnv.npm_config_globalconfig, '', { flag: 'wx', mode: 0o600 });
+    mkdirSync(npmEnv.npm_config_cache, { recursive: false });
     const nativeDestination = join(runtimeRoot, 'node_modules', LINUX_NATIVE);
     if (!existsSync(nativeDestination)) {
       const overlay = join(runRoot, 'linux-overlay');
@@ -1399,6 +1725,14 @@ async function linuxWorker(options) {
       XDG_CONFIG_HOME: join(runRoot, 'xdg-config'),
       XDG_CACHE_HOME: join(runRoot, 'xdg-cache'),
       XDG_DATA_HOME: join(runRoot, 'xdg-data'),
+      npm_config_userconfig: npmEnv.npm_config_userconfig,
+      npm_config_globalconfig: npmEnv.npm_config_globalconfig,
+      npm_config_cache: npmEnv.npm_config_cache,
+      npm_config_strict_peer_deps: 'true',
+      npm_config_strict_peer_dependencies: 'true',
+      npm_config_auto_install_peers: 'true',
+      npm_config_legacy_peer_deps: 'false',
+      npm_config_force: 'false',
       npm_config_registry: REGISTRY,
       COREPACK_NPM_REGISTRY: REGISTRY,
       COREPACK_DEFAULT_TO_LATEST: '0',
@@ -1409,7 +1743,7 @@ async function linuxWorker(options) {
     const cliVersion = await runCaptured('dsh-version', process.execPath, [copiedCli, '--version'], {
       cwd: workspace, env: dshEnv, timeoutMs: 30_000,
     }, evidence);
-    const expectedVersion = VERSIONS[options.dshVersion];
+    const expectedVersion = VERSIONS[options.dshVersion] ?? options.candidateReceipt?.asset.version;
     check('dsh-version', cliVersion.exitCode === 0 && cliVersion.stdout.trim() === expectedVersion, {
       expected: expectedVersion,
       actual: cliVersion.stdout.trim(),
@@ -1423,15 +1757,9 @@ async function linuxWorker(options) {
       size: statSync(productCopy).size,
     });
 
-    const pluginInstall = await runCaptured('plugin-add', process.execPath, [
-      copiedCli, 'plugin', '--profile', 'web', 'add', productCopy,
-      '--offline',
-      '--store-dir', options.pnpmStore,
-      '--cache-dir', options.pnpmCache,
-      '--ignore-scripts',
-      '--config.auto-install-peers=false',
-      '--registry', REGISTRY,
-    ], {
+    const pluginInstall = await runCaptured('plugin-add', process.execPath, cliWebPluginAddArguments({
+      copiedCli, productCopy, pnpmStore: options.pnpmStore, pnpmCache: options.pnpmCache,
+    }), {
       cwd: workspace,
       env: dshEnv,
       timeoutMs: 360_000,
@@ -1439,12 +1767,16 @@ async function linuxWorker(options) {
     evidence.json('plugin-install-offline-source.json', {
       pnpmVersion: DEFAULT_PNPM_VERSION,
       pnpmSource: '<PNPM_ENTRY>',
-      store: '<HOST_PNPM_STORE>',
-      cache: '<HOST_PNPM_CACHE>',
+      store: '<OWNED_PNPM_STORE>',
+      cache: '<OWNED_PNPM_CACHE>',
       registry: REGISTRY,
       offline: true,
       ignoreScripts: true,
-      autoInstallPeers: false,
+      autoInstallPeers: true,
+      strictPeerDependencies: true,
+      legacyPeerDeps: false,
+      force: false,
+      ordinaryInstallScope: 'official dsh plugin add with normal peer resolution; offline cache and lifecycle scripts disabled',
     });
     check('plugin-add', pluginInstall.exitCode === 0 && !pluginInstall.timedOut, {
       exitCode: pluginInstall.exitCode,
@@ -1462,13 +1794,15 @@ async function linuxWorker(options) {
     writeFileSync(join(runRoot, 'xdg-config', 'pnpm', 'config.yaml'), [
       `storeDir: ${options.pnpmStore}`,
       `cacheDir: ${options.pnpmCache}`,
+      'autoInstallPeers: true',
+      'strictPeerDependencies: true',
       '',
     ].join('\n'));
     writeFileSync(join(profile, '.npmrc'), [
       `store-dir=${options.pnpmStore}`,
       `cache-dir=${options.pnpmCache}`,
-      'auto-install-peers=false',
-      'strict-peer-dependencies=false',
+      'auto-install-peers=true',
+      'strict-peer-dependencies=true',
       '',
     ].join('\n'));
     const installedManifestPath = join(profile, 'node_modules', 'dsh-grok-search', 'package.json');
@@ -1489,6 +1823,9 @@ async function linuxWorker(options) {
       expectedVersion: packageReceipt.version,
     });
     const installedProduct = join(profile, 'node_modules', 'dsh-grok-search');
+    const peerAudit = inspectCliWebHostPeers(profile, { hostRoot: runtimeRoot });
+    evidence.json('installed-host-peer-audit.json', peerAudit);
+    check('installed-zero-nested-host-peers', peerAudit.nestedHostPeers.length === 0, peerAudit);
     check('product-package-receipt-sha256', packageReceipt.sha256 === productSha256, {
       expected: packageReceipt.sha256, actual: productSha256,
     });
@@ -2017,26 +2354,19 @@ async function linuxWorker(options) {
     const browserSettingsDom = async () => {
       const browserProfile = join(runRoot, 'browser-profile');
       mkdirSync(browserProfile, { recursive: false });
+      const browserTemporary = createCliWebBrowserTemporaryRoot();
+      evidence.replacements.unshift([browserTemporary.path, '<BROWSER_TMP_ROOT>']);
       const browserEnv = {
         ...dshEnv,
         HOME: home,
-        TMPDIR: join(runRoot, 'tmp'),
+        TMPDIR: browserTemporary.path,
         XDG_CONFIG_HOME: join(runRoot, 'xdg-config'),
         XDG_CACHE_HOME: join(runRoot, 'xdg-cache'),
         XDG_DATA_HOME: join(runRoot, 'xdg-data'),
       };
-      const child = spawn(options.browserExecutable, [
-        '--headless=new',
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-default-browser-check',
-        `--user-data-dir=${browserProfile}`,
-        '--remote-debugging-address=127.0.0.1',
-        '--remote-debugging-port=0',
-        'about:blank',
-      ], {
+      const browserArgs = cliWebBrowserArguments(browserProfile);
+      const startedAt = Date.now();
+      const child = spawn(options.browserExecutable, browserArgs, {
         cwd: workspace,
         env: browserEnv,
         shell: false,
@@ -2044,22 +2374,17 @@ async function linuxWorker(options) {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-      child.stdout.on('data', chunk => { if (stdout.length < 4 * 1024 * 1024) stdout += chunk; });
-      child.stderr.on('data', chunk => { if (stderr.length < 4 * 1024 * 1024) stderr += chunk; });
-      const exited = new Promise(resolvePromise => {
-        child.once('close', (code, signal) => resolvePromise({ code, signal }));
-      });
+      const observation = observeCliWebBrowser(child);
+      const waitClosed = async timeoutMs => {
+        let timer;
+        try {
+          return await Promise.race([observation.whenClosed,
+            new Promise(resolvePromise => { timer = setTimeout(() => resolvePromise(null), timeoutMs); })]);
+        } finally { clearTimeout(timer); }
+      };
       let renderer = null;
-      const startedAt = Date.now();
       try {
-        const debug = await waitFor(() => {
-          const match = stderr.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)\//);
-          return match ? { port: Number(match[1]) } : null;
-        }, 30_000, 'Linux browser DevTools endpoint');
+        const debug = await observation.ready;
         renderer = await connectRenderer(debug.port, { timeoutMs: 20_000 });
         await renderer.send('Page.enable');
         await renderer.send('Network.enable');
@@ -2416,23 +2741,35 @@ async function linuxWorker(options) {
         return detail;
       } finally {
         renderer?.close();
-        try { process.kill(-child.pid, 'SIGTERM'); } catch {}
-        const graceful = await Promise.race([exited, delay(5_000).then(() => null)]);
-        if (graceful === null) {
-          try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-          await Promise.race([exited, delay(2_000)]);
+        if (!observation.snapshot().exited && child.pid) {
+          try { process.kill(-child.pid, 'SIGTERM'); } catch {}
         }
-        const result = await Promise.race([exited, Promise.resolve({ code: null, signal: 'running' })]);
+        const graceful = await waitClosed(5_000);
+        if (graceful === null) {
+          if (!observation.snapshot().exited && child.pid) {
+            try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+          }
+          await waitClosed(2_000);
+        }
+        const { stdout, stderr, ...result } = observation.snapshot();
         evidence.text('logs/linux-browser.stdout.log', stdout);
         evidence.text('logs/linux-browser.stderr.log', stderr);
+        evidence.json('linux-browser-launch.json', {
+          ...evidence.commandView(options.browserExecutable, browserArgs, workspace),
+          temporaryRoot: browserTemporary.path,
+          temporaryRootBytes: Buffer.byteLength(browserTemporary.path),
+          singletonSocketMaxBytes: browserTemporary.singletonSocketMaxBytes,
+          profile: browserProfile,
+          ...result,
+        });
         evidence.recordExecution({
           label: 'linux-browser-settings-dom',
-          command: options.browserExecutable,
-          args: ['--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-            '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0'],
-          cwd: '<WORKSPACE>',
-          exitCode: result.code,
-          signal: result.signal,
+          ...evidence.commandView(options.browserExecutable, browserArgs, workspace),
+          exitCode: result.exitCode,
+          signal: result.exited ? result.signal : 'running',
+          spawnError: result.spawnError,
+          startupFailure: result.startupFailure,
+          closed: result.closed,
           durationMs: Date.now() - startedAt,
         });
       }
@@ -2656,29 +2993,33 @@ async function linuxWorker(options) {
           originalSearchCounter: reloadState.originalSearchCounter,
           searchProviderId: reloadState.runtimeWeb?.searchProviderId ?? null,
         });
-      check('config-reload-search-served-by-grok', reloadState.reloadProbe?.toolResult?.isError === true
-        || grokRequestsDuringReload >= 1, {
+      const reloadOutcome = cliWebReloadOutcome(reloadState.reloadProbe);
+      check('config-reload-search-served-or-explicitly-cancelled', reloadOutcome.accepted
+        && (reloadOutcome.kind !== 'served' || grokRequestsDuringReload >= 1), {
           grokRequestsDuringReload,
-          toolResultIsError: reloadState.reloadProbe?.toolResult?.isError ?? null,
+          ...reloadOutcome,
         });
       check('config-reload-search-overlapped', reloadState.reloadProbe?.overlappedReload === true
         && Boolean(reloadState.reloadProbe?.toolResult), {
           reloadProbe: reloadState.reloadProbe,
         });
-      if (reloadState.reloadProbe?.toolResult?.isError) {
-        const revokedAdmission = MODERN_VERSIONS.has(options.dshVersion)
-          && reloadState.reloadProbe.toolErrorCode === 'UNKNOWN_TOOL'
-          && /unknown tool.*web_search/i.test(JSON.stringify(reloadState.reloadProbe.toolResult));
-        check('config-reload-error-explicit', revokedAdmission || /CONTROL_|WEB_PROVIDER_|GROK_/i
-          .test(JSON.stringify(reloadState.reloadProbe.toolResult)), {
-            toolResult: reloadState.reloadProbe.toolResult,
-          });
-        if (revokedAdmission) {
-          const recovered = await runTurn('post-reload-admission-recovery', 'search', 'web_search');
-          check('post-reload-admission-restored', recovered.snapshot.runtimeWeb.searchProviderId === 'grok-search'
-            && recovered.snapshot.calls.original === 0 && officialStub.requests.length === officialRequestsBeforeReload);
-        }
-      }
+      const beforeRecovery = grokResponsesStub.requests.length;
+      await waitFor(async () => {
+        const value = await probe();
+        return value.runtimeWeb?.searchProviderId === 'grok-search' && value.control?.phase === 'required'
+          && value.program?.phase === 'ready' ? value : null;
+      }, 30_000, 'post-reload route and program readiness');
+      const recovered = await runTurn('post-reload-admission-recovery', 'search', 'web_search');
+      check('post-reload-real-search-recovered', cliWebReloadRecoveryPassed({
+        recovered, grokRequestsBefore: beforeRecovery, grokRequestsAfter: grokResponsesStub.requests.length,
+        officialRequestsBefore: officialRequestsBeforeReload, officialRequestsAfter: officialStub.requests.length,
+      }), {
+        outcome: reloadOutcome,
+        grokRequestsAfterReload: grokResponsesStub.requests.length - beforeRecovery,
+        officialRequestsAfterReload: officialStub.requests.length,
+        canonicalCounter: recovered.snapshot.originalSearchCounter,
+        toolResult: recovered.toolResult,
+      });
       grokRequestsAfterTakeover = grokResponsesStub.requests.length;
     }
     step('conversation-flow', {
@@ -3269,7 +3610,7 @@ async function linuxWorker(options) {
     status,
     runId,
     case: options.case,
-    dshVersion: VERSIONS[options.dshVersion],
+    dshVersion: VERSIONS[options.dshVersion] ?? options.candidateReceipt?.asset.version,
     startedAt,
     finishedAt: new Date().toISOString(),
     sourceHashes: sourceHashesBefore,
@@ -3295,7 +3636,7 @@ async function linuxWorker(options) {
         version: DEFAULT_PNPM_VERSION,
         source: 'provided pnpm entry',
         entry: '<PNPM_ENTRY>',
-        store: '<HOST_PNPM_STORE>',
+        store: '<OWNED_PNPM_STORE>',
       },
       isolatedDshHome: '<RUN_ROOT>/dsh-home',
       isolatedWorkspace: '<RUN_ROOT>/workspace',
@@ -3322,6 +3663,9 @@ async function linuxWorker(options) {
       'The MCP process is the official grok-search-rs 0.1.26 Linux x64 release binary, hash-verified against the upstream SHA256SUMS.',
       'Grok config and its synthetic API key are confined to this temporary run; Responses API calls go only to a 127.0.0.1 local stub, not xAI.',
       'The model and fetch provider are isolated offline fixtures.',
+      'Plugin installation uses official dsh plugin add, strict peers and normal peer auto-resolution; offline cache and ignore-scripts are explicit verifier constraints, not an online-default install claim.',
+      'Nested host peer copies are audited separately from legitimate profile-root host peers; no peer-conflict fallback, global configuration edit or store repair is attempted.',
+      'This fixture does not exercise a GitHub read tool or deterministic queued/active search cancellation; reload cancellation is not equivalent evidence.',
       'The official search path enables the real dsh web-search-deepseek provider against a 127.0.0.1-only Anthropic-format stub.',
       'Canonical official-search evidence comes from the product route verifier and dsh-session canonical event; the fixture event listener is a supporting cross-check only.',
       'Web startup, owner-authenticated RPC, Plugins detail DOM/shared configuration and native bundle disable/re-enable are real dsh HTTP/Web paths.',
@@ -3333,6 +3677,8 @@ async function linuxWorker(options) {
       bootstrap: 'bootstrap.json',
       profileInstalled: 'profile-package-installed.json',
       profileConfigured: 'profile-package-configured.json',
+      hostPeerAudit: existsSync(join(artifactDir, 'installed-host-peer-audit.json'))
+        ? 'installed-host-peer-audit.json' : null,
       pnpmLocalRegistry: existsSync(join(artifactDir, 'pnpm-local-registry-after-install.json'))
         ? 'pnpm-local-registry-after-install.json' : null,
       routeTakeover: 'snapshot-route-takeover.json',
@@ -3356,7 +3702,7 @@ async function linuxWorker(options) {
     runId,
     status,
     case: options.case,
-    dshVersion: VERSIONS[options.dshVersion],
+    dshVersion: VERSIONS[options.dshVersion] ?? options.candidateReceipt?.asset.version,
     productSha256: summary.productPackage?.sha256 ?? null,
     officialCanonicalPathValidated: status === 'pass' && checks.some(check =>
       check.name === 'post-stop-canonical-observer-positive-control' && check.status === 'pass'),

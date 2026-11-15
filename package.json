@@ -1,11 +1,11 @@
 {
   "name": "dsh-grok-search",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "填写任一可用搜索来源的 API Key，开启插件即可接管网页搜索；支持共享配置、补充来源静默回退和即时恢复官方搜索。",
   "engines": {
     "node": ">=22.0.0",
-    "dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2"
+    "dsh": ">=0.2.1-rc.2"
   },
   "scripts": {
     "check": "node scripts/check.mjs",
@@ -26,6 +26,7 @@
     "test:ui": "node scripts/run-ui.mjs",
     "test:ui:smoke": "node scripts/run-ui.mjs --smoke",
     "test:closeout": "node --test test/search-query.test.mjs test/control-retry.test.mjs test/quota-view-safety.test.mjs test/browser-gates.test.mjs test/shared-styles.test.mjs",
+    "test:compatibility": "node --test test/runtime-compat.test.mjs test/compatibility-state.test.mjs test/compatibility-service.test.mjs test/compatibility-evidence.test.mjs test/compatibility-smoke-runner.test.mjs test/compatibility-process.test.mjs test/compatibility-smoke-host.test.mjs test/bootstrap.test.mjs test/compatibility-view.test.mjs",
     "test:settings": "node --test test/settings-gateway.test.mjs test/config-opener.test.mjs test/config-opener-windows.test.mjs",
     "build:client": "node scripts/build-client.mjs",
     "test:program": "node --test test/program-discovery.test.mjs test/program-install.test.mjs test/program-controller.test.mjs",
@@ -34,7 +35,7 @@
     "check:commit": "node scripts/check-commit-message.mjs",
     "verify:internal": "node scripts/internal-candidate.mjs",
     "check:client": "node scripts/build-client.mjs --check",
-    "test:all": "npm run check && npm run check:client && npm run test:provider && npm run test:control && npm run test:release && npm run test:wiring && npm run test:client && npm run test:session && npm run test:mcp && npm run test:acceptance && npm run test:config && npm run test:program && npm run test:security && npm run test:source && npm run test:settings && npm run test:github && npm run test:closeout",
+    "test:all": "npm run check && npm run check:client && npm run test:provider && npm run test:control && npm run test:release && npm run test:wiring && npm run test:client && npm run test:session && npm run test:mcp && npm run test:acceptance && npm run test:config && npm run test:program && npm run test:security && npm run test:source && npm run test:settings && npm run test:github && npm run test:closeout && npm run test:compatibility",
     "prepack": "npm run build:client && npm run test:all",
     "prepublishOnly": "npm run test:all",
     "pack:beta": "node scripts/pack-internal.mjs --beta",
@@ -54,6 +55,7 @@
     "src/recovery.mjs",
     "src/route-verifier.mjs",
     "src/settings-ui.mjs",
+    "src/compatibility-service.mjs",
     "src/typert.host.mjs",
     "src/client.js",
     "cordis.patch.yml",
@@ -61,6 +63,9 @@
     "support-matrix.json",
     "LICENSE"
   ],
+  "bin": {
+    "dsh-grok-search-compatibility": "./src/core/compatibility-cli.mjs"
+  },
   "main": "src/bundle.mjs",
   "exports": {
     ".": "./src/bundle.mjs",
@@ -79,15 +84,36 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5 || ~4.1.0",
-    "@deepseek-ai/dsh": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
-    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
-    "@deepseek-ai/dsh-web": "0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
-    "@deepseek-ai/schemastery": "~3.18.5 || ~3.19.0"
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh": "*",
+    "@deepseek-ai/dsh-app-boot": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-web": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-app-boot": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-typert-protocol": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-web": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@modelcontextprotocol/client": "2.4.0",
+    "semver": "7.8.5",
     "smol-toml": "1.9.1"
   },
   "dsh": {
@@ -95,13 +121,7 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": [
-        "@deepseek-ai/dsh-api-remotes",
-        "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-plugin-manager",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-tool"
-      ],
+      "inject": [],
       "platform": "web"
     }
   },

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { createSettingsCodec } from '../src/core/settings-codec.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
-import { SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { SETTINGS_DESCRIPTORS } from '../src/core/settings-contract.mjs';
 
 const codec = schema => createSettingsCodec('test/settings', schema).create();
 const rejects = (parser, values) => {
@@ -12,6 +13,60 @@ const rejects = (parser, values) => {
     assert.equal(parser.safeParse(value).success, false);
   }
 };
+
+test('Typert combines both pure contracts without host peers or a Service fallback', () => {
+  const loader = `data:text/javascript,${encodeURIComponent(`
+    export function resolve(specifier, context, next) {
+      if (specifier.startsWith('@deepseek-ai/')) {
+        throw Object.assign(new Error('Host peer is unavailable'), { code: 'ERR_MODULE_NOT_FOUND' });
+      }
+      if (/\\/(?:settings-ui|compatibility-service)\\.mjs$/.test(specifier)) {
+        throw new Error('Service modules and their fallbacks must not be evaluated by Typert');
+      }
+      return next(specifier, context);
+    }
+  `)}`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { register } from 'node:module';
+    register(${JSON.stringify(loader)});
+    const host = await import(${JSON.stringify(new URL('../src/typert.host.mjs', import.meta.url).href)});
+    const contract = await import(${JSON.stringify(new URL('../src/core/settings-contract.mjs', import.meta.url).href)});
+    const compatibility = await import(${JSON.stringify(new URL('../src/core/compatibility-contract.mjs', import.meta.url).href)});
+    const expected = [...contract.SETTINGS_DESCRIPTORS, ...compatibility.COMPATIBILITY_DESCRIPTORS];
+    assert.equal(host.default, host.TYPERT);
+    assert.equal(contract.SETTINGS_DESCRIPTORS.length, 25);
+    assert.equal(expected.length, contract.SETTINGS_DESCRIPTORS.length + compatibility.COMPATIBILITY_DESCRIPTORS.length);
+    assert.equal(host.TYPERT.invocations.length, expected.length);
+    assert.deepEqual(host.TYPERT.invocations, expected);
+    assert.equal(Object.isFrozen(host.TYPERT.invocations), true);
+    assert.equal(new Set(host.TYPERT.invocations.map(row => row.id)).size, expected.length);
+    const contribution = host.clientContribution();
+    assert.equal(contribution.package, 'dsh-grok-search');
+    assert.equal(contribution.descriptors.length, expected.length);
+    assert.deepEqual(contribution.descriptors, expected);
+    assert.equal(contract.REMOTE_SERVICE, 'grokSearchSettings');
+    for (const descriptor of contract.SETTINGS_DESCRIPTORS) {
+      assert.equal(descriptor.service, contract.REMOTE_SERVICE);
+      assert.equal(descriptor.namespace, contract.REMOTE_SERVICE);
+    }
+    assert.equal(compatibility.COMPATIBILITY_REMOTE_SERVICE, 'grokSearchCompatibilityRemote');
+    assert.equal(compatibility.COMPATIBILITY_NAMESPACE, 'grokSearchCompatibility');
+    assert.deepEqual(compatibility.COMPATIBILITY_DESCRIPTORS.map(row => row.method),
+      ['compatibilityReport', 'confirmCompatibility', 'acknowledgeCompatibilityNotice']);
+    for (const descriptor of compatibility.COMPATIBILITY_DESCRIPTORS) {
+      assert.equal(descriptor.service, compatibility.COMPATIBILITY_REMOTE_SERVICE);
+      assert.equal(descriptor.namespace, compatibility.COMPATIBILITY_NAMESPACE);
+    }
+    for (const [index, descriptor] of expected.entries()) {
+      assert.equal(host.TYPERT.invocations[index], descriptor);
+      assert.equal(contribution.descriptors[index].result, descriptor.result);
+      assert.equal(contribution.descriptors[index].parameters, descriptor.parameters);
+      assert.equal(typeof descriptor.result.create().parse, 'function');
+    }
+  `], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+});
 
 test('settings codec enforces numeric bounds, integer unions and scalar enum choices', () => {
   const integer = codec({ type: ['integer', 'null'], minimum: 0, maximum: 3 });

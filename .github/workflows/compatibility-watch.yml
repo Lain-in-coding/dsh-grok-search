@@ -1,0 +1,317 @@
+name: Released Package Compatibility Watch
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Published npm latest by default; a candidate requires a pinned workflow artifact.
+        type: choice
+        options: [released, candidate]
+        default: released
+      candidate_run_id:
+        description: Same-repository Actions run containing the frozen candidate artifact.
+        type: string
+        default: ""
+      candidate_artifact:
+        description: Artifact containing exactly one tgz and its package-receipt.json.
+        type: string
+        default: dsh-grok-search-release-tarball
+      candidate_sha256:
+        description: Mandatory exact tgz SHA-256 for candidate mode; never a URL.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: compatibility-watch-${{ github.event.inputs.target || 'released' }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      plan_sha256: ${{ steps.discover.outputs.plan_sha256 }}
+      has_work: ${{ steps.discover.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Validate explicit candidate selection
+        env:
+          TARGET: ${{ inputs.target || 'released' }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import assert from 'node:assert/strict';
+          if (process.env.TARGET === 'candidate') {
+            assert.equal(process.env.GITHUB_EVENT_NAME, 'workflow_dispatch');
+            assert.match(process.env.CANDIDATE_RUN_ID, /^[1-9]\d*$/);
+            assert.match(process.env.CANDIDATE_SHA256, /^[a-f0-9]{64}$/);
+            assert.match(process.env.CANDIDATE_ARTIFACT, /^[a-zA-Z0-9_-]{1,100}$/);
+          } else assert.equal(process.env.TARGET, 'released');
+          NODE
+      - name: Install locked development dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Test the discovery and evidence boundary without live services
+        run: node --test test/compatibility-evidence.test.mjs
+      - name: Select previous same-workflow evidence and optional candidate
+        id: selection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.target || 'released' }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import assert from 'node:assert/strict';
+          import { appendFileSync } from 'node:fs';
+          const base = 'https://api.github.com/repos/' + process.env.GITHUB_REPOSITORY;
+          const get = async path => {
+            const response = await fetch(base + path, { redirect: 'error', signal: AbortSignal.timeout(20000),
+              headers: { authorization: 'Bearer ' + process.env.GH_TOKEN, accept: 'application/vnd.github+json' } });
+            assert.equal(response.ok, true);
+            return response.json();
+          };
+          const target = process.env.TARGET;
+          const runs = await get('/actions/workflows/compatibility-watch.yml/runs?per_page=30');
+          let previous = '';
+          for (const run of runs.workflow_runs) {
+            if (String(run.id) === process.env.GITHUB_RUN_ID || run.status !== 'completed'
+              || !['schedule', 'workflow_dispatch'].includes(run.event)
+              || run.head_branch !== process.env.DEFAULT_BRANCH
+              || run.head_repository?.full_name !== process.env.GITHUB_REPOSITORY) continue;
+            const artifacts = await get('/actions/runs/' + run.id + '/artifacts?per_page=100');
+            if (artifacts.artifacts.some(row => row.name === 'compatibility-state-' + target && !row.expired)) {
+              previous = String(run.id); break;
+            }
+          }
+          if (target === 'candidate') {
+            const run = await get('/actions/runs/' + process.env.CANDIDATE_RUN_ID);
+            assert.equal(run.repository.full_name, process.env.GITHUB_REPOSITORY);
+            assert.equal(run.head_repository.full_name, process.env.GITHUB_REPOSITORY);
+            assert.equal(run.conclusion, 'success');
+            assert.notEqual(run.event, 'pull_request');
+            assert.notEqual(run.event, 'pull_request_target');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'previous=' + previous + '\n');
+          NODE
+      - name: Download previous evidence from this workflow
+        if: steps.selection.outputs.previous != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.selection.outputs.previous }}
+          name: compatibility-state-${{ inputs.target || 'released' }}
+          path: ${{ runner.temp }}/compatibility-previous
+      - name: Download the explicitly pinned candidate artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.target == 'candidate'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_run_id }}
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}/compatibility-candidate
+      - name: Discover official feeds and freeze the exact npm release
+        id: discover
+        env:
+          TARGET: ${{ inputs.target || 'released' }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+          PREVIOUS_SELECTED: ${{ steps.selection.outputs.previous }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import assert from 'node:assert/strict';
+          import { spawnSync } from 'node:child_process';
+          import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { smokeEnvironment } from './scripts/compatibility-watch.mjs';
+          const root = join(process.env.RUNNER_TEMP, 'dsh-compatibility-discover');
+          const args = ['scripts/compatibility-watch.mjs', '--output-root', root, '--target', process.env.TARGET];
+          const previous = join(process.env.RUNNER_TEMP, 'compatibility-previous', 'state.json');
+          if (process.env.PREVIOUS_SELECTED) assert.ok(existsSync(previous), 'Previous state is missing; do not reset asset trust');
+          if (existsSync(previous)) args.push('--previous', previous);
+          if (process.env.TARGET === 'candidate') {
+            const candidateRoot = join(process.env.RUNNER_TEMP, 'compatibility-candidate');
+            const entries = readdirSync(candidateRoot);
+            assert.equal(entries.length, 2, 'Artifact must contain only the tgz and package-receipt.json at its root');
+            const files = entries.filter(name => /^[A-Za-z0-9_.-]+\.tgz$/.test(name)).map(name => join(candidateRoot, name));
+            assert.ok(entries.includes('package-receipt.json'));
+            for (const name of entries) {
+              const stat = lstatSync(join(candidateRoot, name));
+              assert.ok(stat.isFile() && !stat.isSymbolicLink());
+            }
+            assert.equal(files.length, 1);
+            args.push('--candidate-path', files[0], '--candidate-sha256', process.env.CANDIDATE_SHA256);
+          }
+          const result = spawnSync(process.execPath, args, { encoding: 'utf8', shell: false,
+            env: { ...smokeEnvironment(process.env, root), RUNNER_TEMP: process.env.RUNNER_TEMP }, maxBuffer: 1048576 });
+          process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
+          assert.equal(result.status, 0, 'Discovery did not produce a valid plan');
+          const plan = JSON.parse(readFileSync(join(root, 'plan.json')));
+          const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
+          appendFileSync(process.env.GITHUB_OUTPUT, 'matrix=' + JSON.stringify({ include: plan.matrix }) + '\n'
+            + 'plan_sha256=' + summary.planSha256 + '\nhas_work=' + (plan.matrix.length > 0) + '\n');
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: compatibility-plan
+          path: |
+            ${{ runner.temp }}/dsh-compatibility-discover/plan.json
+            ${{ runner.temp }}/dsh-compatibility-discover/product.tgz
+            ${{ runner.temp }}/dsh-compatibility-discover/failure.json
+          if-no-files-found: error
+          retention-days: 30
+
+  smoke:
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Prepare pinned Windows archive reader outside the checkout
+        if: matrix.lane == 'windows-desktop'
+        shell: pwsh
+        run: |
+          $tools = Join-Path $env:RUNNER_TEMP 'dsh-compatibility-tools'
+          npm install --prefix $tools --ignore-scripts --no-save --package-lock=false --no-audit --no-fund --registry=https://registry.npmjs.org/ 7zip-bin@5.2.0
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned archive reader preparation failed.' }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: compatibility-plan
+          path: ${{ runner.temp }}/compatibility-input
+      - name: Run only the fixed local synthetic smoke adapter
+        shell: pwsh
+        env:
+          COMPATIBILITY_LANE: ${{ matrix.lane }}
+          PLAN_SHA256: ${{ needs.discover.outputs.plan_sha256 }}
+        run: |
+          $inputRoot = Join-Path $env:RUNNER_TEMP 'compatibility-input'
+          $outputRoot = Join-Path $env:RUNNER_TEMP 'dsh-compatibility-smoke'
+          $lane = $env:COMPATIBILITY_LANE
+          $hash = $env:PLAN_SHA256
+          $temporary = $env:RUNNER_TEMP
+          $repository = $env:GITHUB_REPOSITORY
+          $runId = $env:GITHUB_RUN_ID
+          $runAttempt = $env:GITHUB_RUN_ATTEMPT
+          $commit = $env:GITHUB_SHA
+          # Candidate code receives no Actions credentials or runner control-file paths.
+          Get-ChildItem Env: | Where-Object {
+            $_.Name -notmatch '^(PATH|SYSTEMROOT|WINDIR|SYSTEMDRIVE|COMSPEC|PATHEXT|LANG|LC_ALL|DISPLAY|WAYLAND_DISPLAY|RUNNER_TEMP)$'
+          } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }
+          $env:HOME = Join-Path $temporary 'dsh-compatibility-smoke-home'
+          $env:USERPROFILE = $env:HOME
+          $env:TMP = $temporary
+          $env:TEMP = $temporary
+          $env:TMPDIR = $temporary
+          $env:CI = '1'
+          node scripts/compatibility-watch.mjs --mode smoke --plan (Join-Path $inputRoot 'plan.json') --plan-sha256 $hash --product-path (Join-Path $inputRoot 'product.tgz') --lane $lane --output-root $outputRoot --run-repository $repository --run-id $runId --run-attempt $runAttempt --run-commit $commit
+          if ($LASTEXITCODE -ne 0) { throw 'The isolated smoke gate failed or has no reviewed runner.' }
+      - name: Select only hash-checked gate evidence, never runtime or profile trees
+        if: always()
+        id: gate_files
+        shell: pwsh
+        run: |
+          @'
+          import { appendFileSync, existsSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { confinedPath, hashFile, readJsonReceipt } from './scripts/lib/compatibility-evidence.mjs';
+          const root = join(process.env.RUNNER_TEMP, 'dsh-compatibility-smoke');
+          const paths = new Set();
+          for (const name of ['smoke.json', 'failure.json']) {
+            if (existsSync(join(root, name))) paths.add(confinedPath(root, name));
+          }
+          if (existsSync(join(root, 'smoke.json'))) {
+            const receipt = readJsonReceipt(join(root, 'smoke.json'));
+            for (const gate of receipt.result.gates) {
+              for (const item of gate.evidence) {
+                const path = confinedPath(root, item.path);
+                if (await hashFile(path, { limit: 8 * 1024 * 1024 }) !== item.sha256) {
+                  throw new Error('Gate evidence changed before upload');
+                }
+                paths.add(path);
+              }
+            }
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, 'paths<<COMPATIBILITY_EVIDENCE\n'
+            + [...paths].join('\n') + '\nCOMPATIBILITY_EVIDENCE\n');
+          '@ | node --input-type=module -
+          if ($LASTEXITCODE -ne 0) { throw 'Evidence selection failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: compatibility-smoke-${{ matrix.lane }}
+          path: ${{ steps.gate_files.outputs.paths }}
+          if-no-files-found: error
+          retention-days: 30
+
+  evidence:
+    needs: [discover, smoke]
+    if: always() && needs.discover.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - run: npm ci --ignore-scripts --legacy-peer-deps=false --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: compatibility-*
+          path: ${{ runner.temp }}/compatibility-results
+      - name: Require every platform result, including explicit failures
+        env:
+          PLAN_SHA256: ${{ needs.discover.outputs.plan_sha256 }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { existsSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { smokeEnvironment } from './scripts/compatibility-watch.mjs';
+          const base = join(process.env.RUNNER_TEMP, 'compatibility-results');
+          const root = join(process.env.RUNNER_TEMP, 'dsh-compatibility-evidence');
+          const args = ['scripts/compatibility-watch.mjs', '--mode', 'collect', '--output-root', root,
+            '--plan', join(base, 'compatibility-plan', 'plan.json'), '--plan-sha256', process.env.PLAN_SHA256];
+          for (const lane of ['windows-desktop', 'macos-desktop', 'linux-cli']) {
+            const result = join(base, 'compatibility-smoke-' + lane, 'smoke.json');
+            if (existsSync(result)) args.push('--result', result);
+          }
+          const execution = spawnSync(process.execPath, args, { stdio: 'inherit', shell: false,
+            env: { ...smokeEnvironment(process.env, root), RUNNER_TEMP: process.env.RUNNER_TEMP } });
+          process.exitCode = execution.status ?? 1;
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: compatibility-state-${{ inputs.target || 'released' }}
+          path: |
+            ${{ runner.temp }}/dsh-compatibility-evidence/state.json
+            ${{ runner.temp }}/dsh-compatibility-evidence/failure.json
+          if-no-files-found: error
+          retention-days: 30

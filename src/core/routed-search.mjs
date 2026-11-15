@@ -8,6 +8,7 @@ import { validateSearchQuery } from './search-query.mjs';
 
 const CODE = /^[\w.-]{1,64}$/;
 const SOURCES = new Set(['grok', 'tavily', 'exa', 'tinyfish', 'firecrawl']);
+const EXECUTION_EPOCH = Symbol('executionEpoch');
 const codeOf = error => typeof error?.code === 'string' && CODE.test(error.code) ? error.code : 'GROK_SEARCH_FAILED';
 const failureRows = list => (Array.isArray(list) ? list : []).slice(0, 8)
   .map(item => ({ provider: String(item?.provider ?? ''), code: codeOf(item) }))
@@ -22,10 +23,21 @@ const failureRows = list => (Array.isArray(list) ? list : []).slice(0, 8)
  * upstream text.
  */
 export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBarrier, searchLog: suppliedLog,
-  getConfig = () => ({}), budgetMs = 120_000, cleanupMs = 2_000, now = Date.now }) {
+  getConfig = () => ({}), budgetMs = 120_000, cleanupMs = 2_000, now = Date.now,
+  assertExecution = () => {}, executionEpoch = () => 0 }) {
   let lastRoute = null, lastRouteIdentity = null;
   const identityKey = randomBytes(32);
   const searchLog = suppliedLog ?? createSearchLog({ now });
+  const checkExecution = request => {
+    const decision = assertExecution();
+    if (decision === false || decision && typeof decision.then === 'function') {
+      if (decision && typeof decision.then === 'function') Promise.resolve(decision).catch(() => {});
+      throw new GrokSearchError('COMPATIBILITY_CHECKING', 'Search admission must be synchronous.');
+    }
+    if (request && request[EXECUTION_EPOCH] !== executionEpoch()) {
+      throw new GrokSearchError('GROK_SEARCH_STOPPING', 'The search runtime changed before dispatch.');
+    }
+  };
   const fromSources = (result, grokCode) => ({ outcome: 'ok',
     served: SOURCES.has(result?.search_provider) ? result.search_provider : null,
     grokCode, fallbackUsed: true, failures: failureRows(result?.diagnostic?.failures) });
@@ -51,9 +63,11 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
       : { outcome: 'ok', served: 'grok', grokCode: null, fallbackUsed: false, failures: [], ...details };
   };
   const tracked = async work => {
+    checkExecution();
+    const epoch = executionEpoch();
     const operationId = randomUUID();
     releaseBarrier.begin({ operationId });
-    try { return await work(); }
+    try { return await work(epoch); }
     finally { releaseBarrier.settle({ operationId }); }
   };
   const configuration = request => {
@@ -157,6 +171,7 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
           : new GrokSearchError('GROK_SEARCH_FAILED', 'Grok 查询失败，请检查程序和配置。');
       }
       try {
+        checkExecution(request);
         const result = await sourceRouter.search({ ...sourceInput, reason: 'grok-unavailable' });
         signal?.throwIfAborted();
         const output = bounded(result, maxChars, request.maxResults);
@@ -189,8 +204,10 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
   const executor = createSearchExecutor({
     // A host batch may contain ten queries. Leave bounded room for a batch
     // alongside existing work without increasing upstream concurrency.
-    budgetMs, cleanupMs, maxRunning: 1, maxQueued: 16, snapshot: configuration,
+    budgetMs, cleanupMs, maxRunning: 1, maxQueued: 16,
+    snapshot: request => { checkExecution(request); return configuration(request); },
     runQuery: ({ request, signal, maxChars, config, execution, grokEnabled, remainingMs, identity }) => {
+      checkExecution(request);
       if (request[SEARCH_DIAGNOSTIC]) return request[SEARCH_DIAGNOSTIC](signal, remainingMs);
       const captured = { ...request, ...(execution ? { [SEARCH_EXECUTION]: execution } : {}) };
       return request.testPrimary
@@ -214,7 +231,7 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
     const routeToken = logToken ?? {};
     routeToken.trace = attribution;
     try {
-      const result = await tracked(() => executor.search({ ...request, origin, logToken: routeToken }, signal));
+       const result = await tracked(epoch => executor.search({ ...request, origin, logToken: routeToken, [EXECUTION_EPOCH]: epoch }, signal));
       searchLog.finish(logToken, routeToken.route);
       attribution?.finish(routeToken.route);
       return result;
@@ -231,9 +248,9 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
 
   // Diagnostics test the primary engine alone: no supplementary fallback, so a
   // failed Grok key is reported instead of being hidden by another source.
-  const testGrok = (request, signal) => tracked(() => executor.search({ ...request, testPrimary: true }, signal));
-  const scheduleDiagnosis = (work, signal) => tracked(() => executor.search({
-    query: 'DeepSeek Harness', testPrimary: true, [SEARCH_DIAGNOSTIC]: work,
+  const testGrok = (request, signal) => tracked(epoch => executor.search({ ...request, testPrimary: true, [EXECUTION_EPOCH]: epoch }, signal));
+  const scheduleDiagnosis = (work, signal) => tracked(epoch => executor.search({
+    query: 'DeepSeek Harness', testPrimary: true, [SEARCH_DIAGNOSTIC]: work, [EXECUTION_EPOCH]: epoch,
   }, signal));
 
   return { search, testGrok, scheduleDiagnosis, searchLog, dispose: async () => { if (!suppliedLog) searchLog.dispose(); return executor.dispose(); }, snapshot: executor.snapshot,

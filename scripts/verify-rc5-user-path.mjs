@@ -6,27 +6,29 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSy
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
+import { parseRuntimeReceiptArguments, readDesktopGateRuntimes, prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
 import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
 
 // Unlike the historical desktop suite, this starts without the fixture bundle,
 // replacement providers, pre-created preferences, control records or shared keys.
-const liveInstall = process.argv.includes('--live-install');
-const registryInstall = process.argv.includes('--registry-install');
-const openConfig = process.argv.includes('--open-config');
-const hiddenFolder = process.argv.includes('--hidden-folder');
+const { args: inputArguments, runtimeOptions } = parseRuntimeReceiptArguments(process.argv.slice(2));
+const liveInstall = inputArguments.includes('--live-install');
+const registryInstall = inputArguments.includes('--registry-install');
+const openConfig = inputArguments.includes('--open-config');
+const hiddenFolder = inputArguments.includes('--hidden-folder');
 assert.ok(!hiddenFolder || openConfig, '--hidden-folder requires --open-config');
 assert.ok(!registryInstall || liveInstall, '--registry-install requires --live-install');
-const input = process.argv.slice(2).filter(value => !['--live-install', '--registry-install', '--open-config', '--hidden-folder'].includes(value));
+const input = inputArguments.filter(value => !['--live-install', '--registry-install', '--open-config', '--hidden-folder'].includes(value));
 const upgradeIndex = input.indexOf('--upgrade-from');
 if (upgradeIndex >= 0) assert.ok(input[upgradeIndex + 1] && !input[upgradeIndex + 1].startsWith('--'), '--upgrade-from requires an old tarball');
 const upgradeFrom = upgradeIndex < 0 ? null : resolve(input.splice(upgradeIndex, 2)[1]);
-assert.equal(input.length, 2, 'Usage: [--live-install [--registry-install] | --upgrade-from <old tgz>] [--open-config] <tgz> <official Desktop executable>');
+assert.equal(input.length, 2, 'Usage: [--live-install [--registry-install] | --upgrade-from <old tgz>] [--open-config] [--runtime-receipt <json> --runtime-receipt-sha256 <hash>] <tgz> <official Desktop executable>');
 const [tarball, executable] = input.map(value => resolve(value));
 assert.ok(tarball && executable, 'Usage: <tgz> <official Desktop executable>');
 assert.equal(liveInstall && Boolean(upgradeFrom), false, 'Choose fresh installation or upgrade, not both');
+const [runtime] = readDesktopGateRuntimes([executable], runtimeOptions);
 const packageReceipt = JSON.parse(readFileSync(join(dirname(tarball), 'package-receipt.json'), 'utf8'));
 assert.equal(sha256(tarball), packageReceipt.sha256, 'test the frozen candidate');
 const repositoryReadmeDiffers = packageReceipt.sourceHashes.some(row =>
@@ -39,7 +41,7 @@ for (const row of packageReceipt.sourceHashes) {
 }
 const run = freshRun('rc5-user-path');
 const root = join(tmpdir(), 'dsh-deferred-desktop-user-path-' + run.runId + (openConfig ? " 中文 空格 ' & $" : ''));
-prepareDesktopFixture(executable, root, { pluginManagerEntries: true, liveHmr: true });
+prepareDesktopFixture(runtime.executable, root, { pluginManagerEntries: true, liveHmr: true, ...runtimeOptions });
 const control = JSON.parse(readFileSync(join(root, 'local-control.json'), 'utf8'));
 const extraction = join(root, 'extracted-product');
 mkdirSync(extraction);

@@ -8,7 +8,7 @@ import test from 'node:test';
 import { apply as applyControl, projectPublicSnapshot } from '../src/control.mjs';
 import { apply as applyRecovery } from '../src/recovery.mjs';
 import { apply as applyRouteVerifier } from '../src/route-verifier.mjs';
-import { apply as applySettingsUi, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID, createAcquisition, createLease, createProductStore,
   createProductReleaseController, effectiveFetchProvider, effectiveSearchProvider, routeReceipt, takeOverAuthorRoute,
@@ -190,6 +190,87 @@ test('product control reasserts takeover after a live search-provider config rel
   assert.equal(snapshot.phase, 'required');
   assert.equal(ctx.get('web').searchProviderId, 'grok-search');
   assert.equal(entry.options.config.searchProvider, 'candidate-original');
+});
+
+test('compatibility admission never rewrites required intent while control release remains available', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  let admitted = true, stops = 0;
+  await applyControl(ctx, { canAcquire: () => admitted, onStop: () => { admitted = false; stops++; } });
+  const service = ctx.get('grokSearchControl');
+  const store = createProductStore(ctx);
+  const required = store.read();
+  admitted = false;
+  await service.retry();
+  assert.deepEqual(store.read(), required);
+  assert.equal(service.publicSnapshot().policy, 'required');
+  const released = await service.stop('explicit-release-while-compatibility-blocked');
+  assert.equal(released.kind, 'released');
+  assert.equal(stops, 1);
+  assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  ctx.dispose();
+});
+
+test('an unadmitted control owner stays reachable without creating an acquisition', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx, { canAcquire: () => false });
+  assert.equal(createProductStore(ctx).read(), null);
+  assert.equal(ctx.get('grokSearchControl').publicSnapshot().available, true);
+  assert.equal(ctx.get('grokSearchControl').publicSnapshot().policy, null);
+  assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  ctx.dispose();
+});
+
+test('bootstrap keeps a failed acquisition owner alive for explicit release', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const entry = ctx.loader.entries()[0], update = entry.update;
+  entry.update = async options => {
+    await update(options);
+    if (options.config.searchProvider === 'grok-search') throw new Error('host applied the route then rejected');
+  };
+  await applyControl(ctx, { keepAliveOnFailure: true });
+  const owner = ctx.get('grokSearchControl');
+  assert.equal(owner.publicSnapshot().available, true);
+  assert.equal(owner.publicSnapshot().phase, 'incomplete');
+  assert.equal(owner.publicSnapshot().policy, 'required');
+  assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+  const outcome = await owner.stop('explicit-release-after-initialization-failure');
+  assert.equal(outcome.kind, 'released');
+  assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  ctx.dispose();
+});
+
+test('explicit release waits for program cancellation before committing released intent', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), cancellation = deferred();
+  await applyControl(ctx, { onStop: () => cancellation.promise });
+  const owner = ctx.get('grokSearchControl'), store = createProductStore(ctx);
+  const pending = owner.stop('explicit-stop-with-preparing-program');
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(store.read().intent.policy, 'required');
+    assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+    cancellation.resolve();
+    assert.equal((await pending).kind, 'released');
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  } finally { cancellation.resolve(); await pending; ctx.dispose(); }
+});
+
+test('failed program cancellation preserves required intent and a retry can finish the explicit release', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const failure = Object.assign(new Error('program not reaped'), { code: 'GROK_PROGRAM_REAP_FAILED' });
+  let stopped = false;
+  await applyControl(ctx, { onStop: () => stopped ? Promise.resolve() : Promise.reject(failure) });
+  const owner = ctx.get('grokSearchControl'), store = createProductStore(ctx);
+  try {
+    await assert.rejects(owner.stop('explicit-stop-with-unreaped-program'),
+      error => error.code === 'CONTROL_RELEASE_IN_FLIGHT' && error.cause === failure);
+    assert.equal(store.read().intent.policy, 'required');
+    assert.equal(owner.publicSnapshot().completionCommitted, false);
+    assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+    stopped = true;
+    assert.equal((await owner.retryRelease()).completionCommitted, true);
+    assert.equal(store.read().intent.policy, 'released');
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  } finally { ctx.dispose(); }
 });
 
 test('product control tolerates an older required acquisition without the new author-presence field', async () => {
@@ -459,7 +540,7 @@ test('route takeover rejects when the host does not apply the product provider',
   assert.equal(effectiveSearchProvider(entry), 'candidate-original');
 });
 
-test('route takeover rolls back when the host update throws after applying a change', async () => {
+test('route takeover never restores the author automatically when the host throws after applying a change', async () => {
   const runtime = { searchProviderId: 'candidate-original', fetchProviderId: 'candidate-fetch' };
   let attempts = 0;
   const entry = {
@@ -481,8 +562,9 @@ test('route takeover rolls back when the host update throws after applying a cha
   const ctx = { loader: { entries: () => [entry] } };
   await assert.rejects(() => takeOverAuthorRoute(ctx, { authorSearchProvider: 'candidate-original' },
     { entryId: 'web', moduleName: '@deepseek-ai/dsh-web' }), error => error.message === 'host update failed');
-  assert.equal(effectiveSearchProvider(entry), 'candidate-original');
+  assert.equal(effectiveSearchProvider(entry), 'grok-search');
   assert.equal(effectiveFetchProvider(entry), 'candidate-fetch');
+  assert.equal(attempts, 1);
 });
 
 test('effective provider parsing is safe when the runtime service lookup throws and includes the fetch env fallback', () => {
@@ -688,12 +770,22 @@ test('public snapshot keeps route verification separate from committed completio
   assert.equal(projected.phase, 'incomplete');
 });
 
+// These wiring fixtures inject stand-ins without changing production peer loading.
+const SettingsGateway = createSettingsGateway({
+  Service: class {
+    constructor(ctx, key) { this.ctx = ctx; ctx.provide?.(key, this); }
+  },
+  RemoteError: class extends Error {
+    constructor(code, message, details) {
+      super(message); this.code = code; this.details = details; this.isDSHRemoteError = true;
+    }
+  },
+});
+
 test('settings gateway unavailable snapshot includes completionCommitted', async () => withIsolatedHome(async home => {
-  let Gateway;
-  applySettingsUi({ plugin(Plugin) { Gateway = Plugin; } });
   // The owner check fails closed without connection security; this case covers
   // the unavailable control projection, so supply a verified local owner.
-  const gateway = new Gateway({ get: key => key === 'grokSearchConnectionSecurity' ? {
+  const gateway = new SettingsGateway({ get: key => key === 'grokSearchConnectionSecurity' ? {
     requireOwner() {},
     capabilities: () => ({ secretsAllowed: false, transport: 'restricted', reason: null }),
   } : null, provide() {} });
@@ -716,9 +808,7 @@ test('real control snapshot and stop results satisfy the strict settings RPC cod
     requireOwner() {}, requireSecret() {},
     capabilities: () => ({ secretsAllowed: true, transport: 'loopback', reason: null }),
   });
-  let Gateway;
-  applySettingsUi({ plugin(Plugin) { Gateway = Plugin; } });
-  const gateway = new Gateway(ctx);
+  const gateway = new SettingsGateway(ctx);
   const snapshot = await gateway.snapshot();
   const resultCodec = method => SETTINGS_DESCRIPTORS.find(row => row.method === method).result.create();
   assert.equal(resultCodec('snapshot').safeParse(snapshot).success, true);
@@ -1013,8 +1103,8 @@ test('the product manifest ships search, settings and recovery entries in one bu
   assert.equal(root.exports['./search-core'], './src/index.mjs');
   assert.equal((rootPatch.match(/- id:/g) ?? []).length, 1);
   const bundle = readFileSync(new URL('../src/bundle.mjs', import.meta.url), 'utf8');
-  assert.match(bundle, /ctx\.plugin\(recovery\)/);
-  assert.match(bundle, /ctx\.plugin\(settings\)/);
+  assert.match(bundle, /recovery:\s*\(\) => import\('\.\/recovery\.mjs'\)/);
+  assert.match(bundle, /settings:\s*\(\) => import\('\.\/settings-ui\.mjs'\)/);
   assert.ok(root.files.includes('src/route-verifier.mjs'));
   assert.ok(root.files.includes('src/bundle.mjs'));
   assert.ok(root.files.includes('src/control.mjs'));

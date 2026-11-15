@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { WebError } from '@deepseek-ai/dsh-web';
 import { createGithubReader, createGithubScheduling, parseGithubUrl, formatGithubRead } from './github-read.mjs';
 import { effectiveConfig } from './product-control.mjs';
 import { GrokSearchError, isCancellation } from './errors.mjs';
@@ -14,19 +13,26 @@ const argumentsFor = args => {
   return args;
 };
 
-const hostFailure = (failure, signal) => {
+const hostFailure = (failure, signal, WebError) => {
   if (signal?.aborted && failure === signal.reason) return failure;
-  return failure instanceof GrokSearchError ? new WebError(failure.message, failure.code) : failure;
+  return failure instanceof GrokSearchError && WebError ? new WebError(failure.message, failure.code) : failure;
 };
 
 /** Service-access adapter: the original tool's execute and policy pipeline stay intact. */
-export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, readerOptions = {} }) {
+export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, readerOptions = {}, WebError, getCapabilities }) {
   const storage = new AsyncLocalStorage();
   const scheduling = createGithubScheduling();
   const reader = createGithubReader({ ...readerOptions, getState, scheduling });
   const agents = new WeakMap();
   let disposed = false, nextAgent = 0, registrationContext = null, unregister = null, lastState = null, registrationError = null;
   const enabled = () => { try { return !disposed && getState()?.enabled === true; } catch { return false; } };
+  // Bootstrap supplies a synchronous evaluated decision, never a host-version guess.
+  const capabilities = () => {
+    try {
+      const current = getCapabilities?.();
+      return { githubRead: current?.githubRead === true, githubFetch: current?.githubFetch === true };
+    } catch { return { githubRead: false, githubFetch: false }; }
+  };
   const identity = exec => {
     const agent = exec?.agent;
     if (!agent || typeof agent !== 'object' || typeof agent.session?.id !== 'string') {
@@ -38,13 +44,24 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
   const invalidateScope = exec => {
     if (exec?.agent && agents.has(exec.agent)) reader.invalidateScope(identity(exec));
   };
+  const assertCapability = (exec, fetch = false) => {
+    const current = capabilities();
+    if (!current.githubRead || fetch && !current.githubFetch) {
+      invalidateScope(exec);
+      throw new GrokSearchError(fetch ? 'GITHUB_FETCH_UNAVAILABLE' : 'GITHUB_UNAVAILABLE',
+        'GitHub 兼容能力尚未通过检查，本次请求未转交其他抓取服务。');
+    }
+  };
   const perform = async (args, exec, options = {}) => {
+    exec.signal?.throwIfAborted();
+    assertCapability(exec, exec.name === 'web_fetch');
     const input = argumentsFor(args);
     const scope = identity(exec);
     const route = callRoutes?.capture(exec.name);
     const token = searchLog?.beginRead(parseGithubUrl(input.url).url, route ?? { sessionId: scope.sessionId, callId: exec.callId });
     try {
       const result = await reader.read({ ...input, scope, signal: exec.signal, ...options });
+      assertCapability(exec, exec.name === 'web_fetch');
       searchLog?.finishRead(token, result);
       route?.finish({ served: 'github', outcome: 'ok', resultProviders: ['github'], resultProvidersComplete: true });
       return result;
@@ -79,7 +96,7 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
         const result = await perform(args, exec);
         return { text: formatGithubRead(result), url: result.url, segment: result.segment,
           acquiredComplete: result.acquiredComplete, hasMore: result.hasMore, nextCursor: result.nextCursor, cacheHit: result.cacheHit };
-      } catch (failure) { throw hostFailure(failure, exec.signal); }
+      } catch (failure) { throw hostFailure(failure, exec.signal, WebError); }
     },
     presentCall: args => ({ card: 'generic', title: typeof args?.url === 'string' ? args.url : 'GitHub 读取', kind: 'fetch' }),
     presentResult: (args, result) => result?.isError ? undefined : ({ card: 'generic',
@@ -88,10 +105,12 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
   const sync = () => {
     let current;
     try { current = getState(); } catch { current = { enabled: false }; }
-    const signature = JSON.stringify([current?.enabled === true, current?.token ?? '', current?.identity ?? null]);
+    const admission = capabilities();
+    const signature = JSON.stringify([current?.enabled === true, current?.token ?? '', current?.identity ?? null,
+      admission.githubRead, admission.githubFetch]);
     if (lastState !== null && signature !== lastState) reader.invalidate();
     lastState = signature;
-    if (disposed || current?.enabled !== true) { unregister?.(); unregister = null; }
+    if (disposed || current?.enabled !== true || !admission.githubRead) { unregister?.(); unregister = null; }
     else if (registrationContext && !unregister) {
       try { unregister = registrationContext.tools.register(definition); registrationError = null; }
       catch {
@@ -116,7 +135,16 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
       try { parseGithubUrl(exec.arguments?.url); githubRequested = true; } catch { /* Other URLs keep their original route. */ }
     }
     const current = { exec, active: true, githubRequested };
-    return storage.run(current, async () => { try { return await next(); } finally { current.active = false; } });
+    return storage.run(current, async () => {
+      try {
+        if (githubRequested) {
+          exec.signal?.throwIfAborted();
+          assertCapability(exec, true);
+        }
+        return await next();
+      } catch (failure) { throw hostFailure(failure, exec.signal, WebError); }
+      finally { current.active = false; }
+    });
   }, { global: true, prepend: true });
   ctx.on('tools/result', (exec, result) => {
     if (disposed) return;
@@ -143,7 +171,8 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
       || fiber.entry?.options?.name !== '@deepseek-ai/dsh-tool-web' || fiber.entry.options.disabled === true) return service;
     const config = effectiveConfig(fiber);
     if (config?.fetch === false) return service;
-    if (!enabled()) throw new WebError('GitHub 读取已停用，本次请求未转交其他抓取服务。', 'GITHUB_DISABLED');
+    if (!enabled()) throw hostFailure(new GrokSearchError('GITHUB_DISABLED', 'GitHub 读取已停用，本次请求未转交其他抓取服务。'),
+      current.exec.signal, WebError);
     // Only the official tool body can access this scoped service. Its parameter
     // validation and original pre-execute/permission checks have already run.
     return new Proxy(service, { get(target, property, receiver) {
@@ -151,6 +180,7 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
       return async (request, signal) => {
         try {
           if (disposed || !enabled()) throw new GrokSearchError('GITHUB_DISABLED', 'GitHub 读取已停用，请重新发起请求。');
+          assertCapability(current.exec, true);
           try { parseGithubUrl(request?.url); }
           catch { return Reflect.get(target, property, target).call(target, request, signal); }
           const exec = current.exec;
@@ -176,7 +206,7 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
             // the official truncation footer would incorrectly recommend a new URL.
             truncated: false };
         } catch (failure) {
-          throw hostFailure(failure, signal);
+          throw hostFailure(failure, signal, WebError);
         }
       };
     } });
@@ -189,6 +219,9 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
   return Object.freeze({ reader, invalidate: reader.invalidate, sync, dispose, definition,
     snapshot: () => ({ enabled: enabled(), registered: Boolean(unregister), error: registrationError }),
     async test({ token, signal } = {}) {
+      const admission = ctx.get?.('grokSearchCompatibility')?.assertSearchAllowed('diagnosis');
+      if (typeof admission?.then === 'function') await admission;
+      signal?.throwIfAborted();
       const preview = createGithubReader({ ...readerOptions, getState: () => ({ enabled: true, token }), budgetMs: 15000, scheduling });
       const start = performance.now();
       try {

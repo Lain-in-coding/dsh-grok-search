@@ -4,8 +4,9 @@ import { createServer } from 'node:http';
 import { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
-import { candidateRuntime } from './lib/candidate-runtime.mjs';
+import { createHash, randomUUID } from 'node:crypto';
+import semver from 'semver';
+import { inspectDesktopNativeInstall, parseRuntimeReceiptArguments, readDesktopGateRuntimes } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { desktopAcceptancePaths, desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
 import { discoverGrokCandidates } from '../src/core/program-discovery.mjs';
@@ -16,22 +17,37 @@ import { createSharedConfigStore } from '../src/core/shared-config.mjs';
 import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { createPrivateProgramInstaller } from '../src/core/program-install.mjs';
 import { probeMcpHandshake } from '../src/core/mcp-search.mjs';
-import { readUpgradePackage } from './verify-search-log-upgrade.mjs';
+import { readRetainedSession, readUpgradePackage } from './verify-search-log-upgrade.mjs';
+import { adaptRetainedSessionRpc, canonicalRetainedSessionCut, createRetainedSessionReader } from './lib/retained-session.mjs';
 
 const PRODUCT_BUNDLE = 'dsh-grok-search';
+const { args: inputArguments, runtimeOptions } = parseRuntimeReceiptArguments(process.argv.slice(2));
 const options = new Map();
-for (let index = 2; index < process.argv.length; index += 2) {
-  if (!['--desktop-rc2', '--desktop-rc21', '--product-package', '--first-use', '--diagnostics',
+for (let index = 0; index < inputArguments.length; index += 2) {
+  const flag = inputArguments[index], value = inputArguments[index + 1];
+  if (!['--desktop', '--desktop-rc2', '--desktop-rc21', '--product-package', '--first-use', '--diagnostics',
     '--source-only-config', '--manual-acceptance', '--upgrade-from', '--upgrade-cache',
-    '--upgrade-in-place-only', '--upgrade-old-source'].includes(process.argv[index])
-    || !process.argv[index + 1]) throw new Error('Expected named Desktop and package arguments.');
-  options.set(process.argv[index], process.argv[index + 1]);
+    '--upgrade-in-place-only', '--upgrade-old-source', '--upgrade-to-desktop',
+    '--upgrade-to-runtime-receipt', '--upgrade-to-runtime-receipt-sha256'].includes(flag)
+    || !value || value.startsWith('--') || options.has(flag)) throw new Error('Expected unique named Desktop and package arguments.');
+  options.set(flag, value);
 }
-const runtimes = [candidateRuntime(options.get('--desktop-rc2')), candidateRuntime(options.get('--desktop-rc21'))]
+const singleDesktop = options.has('--desktop');
+if (!options.has('--product-package')
+  || (singleDesktop ? options.has('--desktop-rc2') || options.has('--desktop-rc21')
+    : !options.has('--desktop-rc2') || !options.has('--desktop-rc21'))) {
+  throw new Error('Use --desktop or both --desktop-rc2 and --desktop-rc21, with --product-package.');
+}
+const selectedRuntimes = readDesktopGateRuntimes(singleDesktop ? [options.get('--desktop')]
+  : [options.get('--desktop-rc2'), options.get('--desktop-rc21')], runtimeOptions);
+// Explicit single-host selection is not filtered by historical two-host environment defaults.
+const runtimes = singleDesktop ? selectedRuntimes : selectedRuntimes
   .filter(runtime => !process.env.DSH_B2_ONLY_VERSION || runtime.app.version === process.env.DSH_B2_ONLY_VERSION);
-const targetVersions = (process.env.DSH_B2_TARGET_VERSIONS ?? '0.2.1-rc.2,0.2.1-rc.3').split(',').map(value => value.trim()).filter(Boolean);
-assert.deepEqual(runtimes.map(runtime => runtime.app.version),
-  process.env.DSH_B2_ONLY_VERSION ? [process.env.DSH_B2_ONLY_VERSION] : targetVersions);
+if (!singleDesktop) {
+  const targetVersions = (process.env.DSH_B2_TARGET_VERSIONS ?? '0.2.1-rc.2,0.2.1-rc.3').split(',').map(value => value.trim()).filter(Boolean);
+  assert.deepEqual(runtimes.map(runtime => runtime.app.version),
+    process.env.DSH_B2_ONLY_VERSION ? [process.env.DSH_B2_ONLY_VERSION] : targetVersions);
+}
 const productTarball = resolve(options.get('--product-package'));
 if (!existsSync(productTarball)) throw new Error('Package tarball is missing: ' + productTarball);
 const firstUse = options.get('--first-use') === 'download';
@@ -56,10 +72,24 @@ if (Boolean(upgradeFrom) !== Boolean(upgradeCache)
   || upgradeFrom && (firstUse || sourceOnlyConfig || manualAcceptance || diagnostics)) {
   throw new Error('Upgrade verification requires --upgrade-from and --upgrade-cache, without live or first-use modes.');
 }
+const upgradeToFlags = ['--upgrade-to-desktop', '--upgrade-to-runtime-receipt', '--upgrade-to-runtime-receipt-sha256'];
+const crossHostUpgrade = upgradeToFlags.some(flag => options.has(flag));
+if (crossHostUpgrade && (!upgradeToFlags.every(flag => options.has(flag)) || !singleDesktop
+  || !upgradeFrom || !upgradeInPlaceOnly)) {
+  throw new Error('A cross-host upgrade requires one baseline --desktop, all three --upgrade-to-* values and --upgrade-in-place-only true.');
+}
+const upgradeToRuntimeOptions = crossHostUpgrade ? {
+  runtimeReceiptPath: options.get('--upgrade-to-runtime-receipt'),
+  runtimeReceiptSha256: options.get('--upgrade-to-runtime-receipt-sha256'),
+} : {};
+const upgradeToRuntime = crossHostUpgrade
+  ? readDesktopGateRuntimes([options.get('--upgrade-to-desktop')], upgradeToRuntimeOptions)[0] : null;
+if (upgradeToRuntime) assert.notEqual(upgradeToRuntime.app.version, runtimes[0].app.version,
+  'Cross-host evidence requires distinct actual host versions.');
 if (options.has('--manual-acceptance') && !manualAcceptance) throw new Error('Expected --manual-acceptance true.');
 if (sourceOnlyConfig && (firstUse || diagnostics)) throw new Error('Source-only acceptance cannot use synthetic first-use/diagnosis mode.');
 if (manualAcceptance && (!sourceOnlyConfig || runtimes.length !== 1)) {
-  throw new Error('Manual acceptance requires a source-only config and one explicit DSH_B2_ONLY_VERSION.');
+  throw new Error('Manual acceptance requires a source-only config and one host selected by --desktop or DSH_B2_ONLY_VERSION.');
 }
 if (sourceOnlyConfig) {
   const fields = createSharedConfigStore({ path: sourceOnlyConfig, env: () => ({}) }).readEffective();
@@ -73,9 +103,10 @@ const { runId, directory } = freshRun(upgradeFrom ? 'plugin-manager-upgrade' : m
   : sourceOnlyConfig ? 'source-only-desktop' : diagnostics ? 'diagnostics-desktop'
   : firstUse ? 'first-use-desktop' : 'b2-plugin-manager-desktop');
 const temporary = join(tmpdir(), 'dsh-deferred-desktop-manager-' + runId);
+const allRuntimes = upgradeToRuntime ? [...runtimes, upgradeToRuntime] : runtimes;
 const replacements = [[temporary, '<TEMPORARY_RUN>'], [dirname(productTarball), '<PRODUCT_PACKAGE>'],
   [dirname(process.execPath), '<NODE_INSTALL>'],
-  ...runtimes.map(runtime => [dirname(runtime.executable), `<DESKTOP_${runtime.app.version}>`])];
+  ...allRuntimes.map(runtime => [dirname(runtime.executable), `<DESKTOP_${runtime.app.version}>`])];
 const secrets = new Set();
 if (sourceOnlyConfig) {
   replacements.push([sourceOnlyConfig, '<ISOLATED_SOURCE_CONFIG>']);
@@ -90,7 +121,7 @@ const sourceHashesBefore = [...new Set([...runtimeFiles('src'), 'package.json', 
   'fixtures/deferred-release/desktop-fixture.mjs', 'fixtures/internal-candidate/host-fixture.mjs',
   'scripts/deferred-release-desktop-prepare.mjs', 'scripts/lib/renderer-cdp.mjs',
   'scripts/lib/internal-candidate-utils.mjs', 'scripts/b2-plugin-manager-desktop.mjs',
-  'scripts/verify-search-log-upgrade.mjs'])]
+  'scripts/verify-search-log-upgrade.mjs', 'scripts/lib/retained-session.mjs'])]
   .map(file => ({ file, sha256: sha256(join(project, file)) }));
 const expectedProduct = readUpgradePackage(productTarball);
 const expectedProductReceipt = expectedProduct.receipt;
@@ -100,11 +131,26 @@ if (oldProductReceipt) {
   assert.notEqual(oldProductReceipt.sha256, expectedProductReceipt.sha256);
   replacements.push([dirname(upgradeFrom), '<OLD_PACKAGE>'], [upgradeCache, '<RETAINED_TEST_CACHE>']);
 }
+if (upgradeToRuntime) validateCrossHostUpgradePackages(readUpgradePackage(upgradeFrom).manifest,
+  expectedProduct.manifest, runtimes[0].app.version, upgradeToRuntime.app.version);
 for (const row of expectedProductReceipt.sourceHashes) {
   assert.equal(sha256(join(project, row.file)), row.sha256, 'Frozen package source differs: ' + row.file);
 }
 const results = [], children = [];
 const upgradeEnvironments = new Map();
+const upgradeRuntimeControls = new Map();
+
+function validateCrossHostUpgradePackages(oldManifest, nextManifest, fromVersion, toVersion) {
+  assert.ok(semver.gt(toVersion, fromVersion), 'This path tests a forward host upgrade only.');
+  const admits = (manifest, version) => typeof manifest.engines?.dsh === 'string'
+    && semver.validRange(manifest.engines.dsh) !== null
+    && semver.satisfies(version, manifest.engines.dsh, { includePrerelease: true });
+  assert.ok(admits(oldManifest, fromVersion), 'The unchanged old plugin must load normally on its baseline host.');
+  assert.ok(!admits(oldManifest, toVersion), 'This narrow pair mode requires the real old-plugin incompatibility boundary.');
+  assert.ok(admits(nextManifest, toVersion), 'The unchanged new plugin must admit the target host.');
+  assert.equal(oldManifest.name, PRODUCT_BUNDLE); assert.equal(nextManifest.name, PRODUCT_BUNDLE);
+  assert.notEqual(oldManifest.version, nextManifest.version);
+}
 let serial = 0, currentVersion = null;
 function protocolAssociation() {
   if (process.platform !== 'win32') return null;
@@ -237,36 +283,100 @@ async function settingsRpcSecurityFlow(host) {
 
 async function pluginManagerRendererSnapshot(host) {
   const renderer = await connectRenderer(host.debuggerPort);
+  const snapshotUi = () => renderer.evaluate(`(() => {
+    const visible = element => element.getClientRects().length > 0;
+    const buttons = root => [...root.querySelectorAll('button,[role="button"]')].filter(visible)
+      .slice(0, 100).map(element => ({
+        label: (element.getAttribute('aria-label') || element.innerText || '').trim().slice(0, 160),
+        current: element.getAttribute('aria-current'),
+        disabled: element.disabled === true || element.getAttribute('aria-disabled') === 'true',
+      }));
+    const dialogs = root => [...root.querySelectorAll('[role="dialog"]')].filter(visible).map(element => ({
+      id: element.id || null, label: element.getAttribute('aria-label'),
+      title: element.querySelector('h1,h2,h3')?.textContent?.trim().slice(0, 160) ?? null,
+      buttons: buttons(element),
+      fields: [...element.querySelectorAll('input,textarea,select')].map(input => ({
+        tag: input.tagName, type: input.getAttribute('type'), disabled: input.disabled === true,
+        readOnly: input.readOnly === true,
+      })),
+    }));
+    return {
+      documentTitle: document.title, visibility: document.visibilityState,
+      headings: [...document.querySelectorAll('h1,h2,h3')].filter(visible).slice(0, 30)
+        .map(element => element.textContent.trim().slice(0, 160)),
+      buttons: buttons(document), dialogs: dialogs(document),
+      loading: [...document.querySelectorAll('[data-plugin-loading]')].filter(visible).length,
+      details: [...document.querySelectorAll('[data-plugin-detail]')].filter(visible)
+        .map(element => element.getAttribute('data-plugin-detail')),
+      settingsLayers: ['[data-dsg-route]', '[data-dsg-layer]'].map(selector => {
+        const root = document.querySelector(selector)?.shadowRoot, overlay = root?.querySelector('#overlay');
+        return { selector, present: Boolean(root), overlayHidden: overlay?.hidden ?? null,
+          dialogs: root ? dialogs(root) : [] };
+      }),
+    };
+  })()`);
+  let step = 'navigation', before = null;
   try {
     await renderer.send('Page.bringToFront');
     await renderer.send('Emulation.setFocusEmulationEnabled', { enabled: true });
-    // Sidebar navigation can preserve the current package detail. Return via
-    // the host's own breadcrumb before expecting the installed-list heading.
-    await renderer.evaluate(`(() => {
-      const back = [...document.querySelectorAll('button')]
-        .find(item => /^(返回插件|Back to plugins)$/.test(item.getAttribute('aria-label') || '')
-          && item.getClientRects().length > 0);
-      back?.click(); return Boolean(back);
-    })()`);
+    before = await snapshotUi();
     await waitForRenderer(renderer, current => current.evaluate(`[...document.querySelectorAll('button,[role="button"]')]
-      .some(item => (item.getAttribute('aria-label') || item.innerText || '').trim() === '插件')`));
+      .some(item => (item.getAttribute('aria-label') || item.innerText || '').trim() === '插件'
+        && item.getClientRects().length > 0 && !item.disabled && item.getAttribute('aria-disabled') !== 'true')`));
     const opened = await renderer.evaluate(`(() => {
       const button = [...document.querySelectorAll('button')]
-        .find(item => (item.getAttribute('aria-label') || item.innerText || '').trim() === '插件');
+        .find(item => (item.getAttribute('aria-label') || item.innerText || '').trim() === '插件'
+          && item.getClientRects().length > 0 && !item.disabled && item.getAttribute('aria-disabled') !== 'true');
       if (!button) return false;
       button.click();
       return true;
     })()`);
     assert.equal(opened, true, 'Plugin Manager navigation button was not found.');
+    step = 'manager-surface-ready';
     await waitForRenderer(renderer, async current => {
       const ready = await current.evaluate(`(() => {
-        const text = document.body?.innerText ?? '';
-        return !/Loading plugins|正在加载插件/i.test(text)
-          && /插件管理|Plugin Manager|已安装|Installed/i.test(text);
+        const available = item => item.getClientRects().length > 0 && !item.disabled
+          && item.getAttribute('aria-disabled') !== 'true';
+        if ([...document.querySelectorAll('[role="dialog"],[data-plugin-loading]')]
+          .some(item => item.getClientRects().length > 0)) return false;
+        if (['[data-dsg-route]', '[data-dsg-layer]'].some(selector =>
+          [...(document.querySelector(selector)?.shadowRoot?.querySelectorAll('[role="dialog"]') || [])]
+            .some(item => item.getClientRects().length > 0))) return false;
+        const actions = [...document.querySelectorAll('button,[role="button"]')];
+        const detail = document.querySelector('[data-plugin-detail="dsh-grok-search"]');
+        // A retained package detail has its own heading, not the list's title.
+        return actions.some(item => available(item) && item.getAttribute('aria-label') === '查看 dsh-grok-search')
+          || Boolean(detail?.getClientRects().length && actions.some(item => available(item)
+            && /^(返回插件|Back to plugins)$/.test(item.getAttribute('aria-label') || '')));
       })()`);
       return ready ? true : null;
     });
-    const list = await renderer.evaluate(`(() => ({
+    // Enabling closes the install dialog before its async list refresh finishes;
+    // a retained detail can also appear after sidebar navigation.
+    step = 'return-to-installed-list';
+    await renderer.evaluate(`(() => {
+      const back = [...document.querySelectorAll('button')]
+        .find(item => /^(返回插件|Back to plugins)$/.test(item.getAttribute('aria-label') || '')
+          && item.getClientRects().length > 0 && !item.disabled && item.getAttribute('aria-disabled') !== 'true');
+      back?.click(); return Boolean(back);
+    })()`);
+    step = 'installed-action-ready';
+    await waitForRenderer(renderer, current => current.evaluate(`(() => {
+      if ([...document.querySelectorAll('[role="dialog"],[data-plugin-loading]')]
+        .some(item => item.getClientRects().length > 0)) return false;
+      const actions = [...document.querySelectorAll('button,[role="button"]')];
+      return !actions.some(item => /^(返回插件|Back to plugins)$/.test(item.getAttribute('aria-label') || '')
+        && item.getClientRects().length > 0)
+        && actions.some(item => item.getAttribute('aria-label') === '查看 dsh-grok-search'
+          && item.getClientRects().length > 0 && !item.disabled && item.getAttribute('aria-disabled') !== 'true');
+    })()`));
+    step = 'open-installed-detail';
+    const { list, detailOpened } = await renderer.evaluate(`(() => {
+      const button = [...document.querySelectorAll('button,[role="button"]')]
+        .find(item => item.getAttribute('aria-label') === '查看 dsh-grok-search'
+          && item.getClientRects().length > 0 && !item.disabled && item.getAttribute('aria-disabled') !== 'true');
+      if (!button) return { list: null, detailOpened: false };
+      const list = {
       title: document.title,
       href: location.href,
       text: document.body.innerText,
@@ -284,17 +394,14 @@ async function pluginManagerRendererSnapshot(host) {
         .map(element => ({ tag: element.tagName, type: element.getAttribute('type'),
           placeholder: element.getAttribute('placeholder'), value: element.value }))
         .slice(0, 100),
-    }))()`);
-    const detailOpened = await renderer.evaluate(`(() => {
-      const button = [...document.querySelectorAll('button,[role="button"]')]
-        .find(item => item.getAttribute('aria-label') === '查看 dsh-grok-search' && item.getClientRects().length > 0);
-      if (!button) return false;
+      };
       button.click();
-      return true;
+      return { list, detailOpened: true };
     })()`);
     assert.equal(detailOpened, true, 'Installed dsh-grok-search detail action was not visible.');
+    step = 'detail-visible';
     await waitForRenderer(renderer, current => current.evaluate(
-      `Boolean(document.querySelector('[data-plugin-detail="dsh-grok-search"]'))`));
+      `Boolean(document.querySelector('[data-plugin-detail="dsh-grok-search"]')?.getClientRects().length)`));
     const detail = await renderer.evaluate(`(() => {
       const root = document.querySelector('[data-plugin-detail="dsh-grok-search"]');
       return {
@@ -312,6 +419,13 @@ async function pluginManagerRendererSnapshot(host) {
       };
     })()`);
     return { list, detail };
+  } catch (error) {
+    const after = await snapshotUi().catch(() => ({ diagnosticUnavailable: true }));
+    writeJson(join(directory, `${host.prefix}-plugin-manager-ui-failure-${randomUUID()}.json`), safe({
+      schemaVersion: 1, operation: 'plugin-manager-navigation', step, message: error.message,
+      before, after, exceptions: renderer.exceptions, inputValuesIncluded: false,
+    }));
+    throw error;
   } finally {
     renderer.close();
   }
@@ -503,8 +617,12 @@ async function unusedPort() {
 }
 
 async function prepare(runtime, folder) {
+  const selectedRuntimeOptions = upgradeToRuntime && runtime.app.version === upgradeToRuntime.app.version
+    ? upgradeToRuntimeOptions : runtimeOptions;
   const args = [join(project, 'scripts/deferred-release-desktop-prepare.mjs'), '--desktop', runtime.executable,
-    '--run-root', folder, '--control-record-mode', 'versioned', '--entry-mode', 'plugin-manager-live'];
+    '--run-root', folder, '--control-record-mode', 'versioned', '--entry-mode', 'plugin-manager-live',
+    ...(selectedRuntimeOptions.runtimeReceiptPath ? ['--runtime-receipt', selectedRuntimeOptions.runtimeReceiptPath,
+      '--runtime-receipt-sha256', selectedRuntimeOptions.runtimeReceiptSha256] : [])];
   const execution = await commandResult(process.execPath, args, { cwd: project, timeoutMs: 120000, sanitize });
   writeJson(join(directory, runtime.app.version + '-prepare.json'), receipt(execution));
   assert.equal(execution.exitCode, 0, execution.stderr);
@@ -519,7 +637,9 @@ async function prepare(runtime, folder) {
 }
 
 async function start(runtime, folder, phase) {
-  const control = JSON.parse(readFileSync(join(folder, 'local-control.json'), 'utf8'));
+  const sharedControl = JSON.parse(readFileSync(join(folder, 'local-control.json'), 'utf8'));
+  const runtimeControl = upgradeRuntimeControls.get(runtime.app.version);
+  const control = selectUpgradeRuntimeControl(sharedControl, runtimeControl);
   // Windows packaged startup registers dsh:// globally before our fixture can
   // intervene. Use the shipped default_app + original ASAR, as the other
   // isolated Desktop gates do. No host code, binary or association is changed.
@@ -718,22 +838,27 @@ async function waitFor(host, predicate, label, timeoutMs = 30000) {
   throw new Error(label + ': ' + JSON.stringify(last));
 }
 
+async function authenticateModelSession(host) {
+  if (typeof host.rpc === 'function') return;
+  const auth = await host.probe('model-auth');
+  const response = await fetch(auth.url, { redirect: 'manual', signal: AbortSignal.timeout(10000) });
+  assert.equal(response.status, 303);
+  const cookie = response.headers.get('set-cookie')?.split(';', 1)[0];
+  assert.ok(cookie);
+  host.cookie = cookie;
+  host.rpc = async (endpoint, request) => {
+    const envelope = { type: 'client-request', rpcId: 'manager-rpc-' + (++serial), method: endpoint, payload: { args: { request } } };
+    const result = await fetch(host.address.hostOrigin + '/api/' + endpoint, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: host.address.hostOrigin, Cookie: host.cookie },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(20000) }).then(value => value.json());
+    assert.equal(result?.result?.ok, true, JSON.stringify(result));
+    return result.result.value;
+  };
+}
+
 async function modelTurn(host, mode) {
+  await authenticateModelSession(host);
   if (!host.modelSession) {
-    const auth = await host.probe('model-auth');
-    const response = await fetch(auth.url, { redirect: 'manual', signal: AbortSignal.timeout(10000) });
-    assert.equal(response.status, 303);
-    const cookie = response.headers.get('set-cookie')?.split(';', 1)[0];
-    assert.ok(cookie);
-    host.cookie = cookie;
-    host.rpc = async (endpoint, request) => {
-      const envelope = { type: 'client-request', rpcId: 'manager-rpc-' + (++serial), method: endpoint, payload: { args: { request } } };
-      const result = await fetch(host.address.hostOrigin + '/api/' + endpoint, { method: 'POST',
-        headers: { 'Content-Type': 'application/json', Origin: host.address.hostOrigin, Cookie: host.cookie },
-        body: JSON.stringify(envelope), signal: AbortSignal.timeout(20000) }).then(value => value.json());
-      assert.equal(result?.result?.ok, true, JSON.stringify(result));
-      return result.result.value;
-    };
     const created = await host.rpc('session/create', { cwd: host.control.workspace });
     assert.ok(created.sessionId);
     host.modelSession = created.sessionId;
@@ -751,13 +876,108 @@ async function modelTurn(host, mode) {
       && event.data.turn === final.data.turn && event.data.reason?.kind === 'completed');
     const toolResult = final && events.findLast(event => event.type === 'tool/result' && event.data.turn === final.data.turn);
     if (after.completed > before.completed && ended && (mode === 'chat' || toolResult)) {
-      return { mode, isError: toolResult?.data.message.isError === true,
+      return { mode, sessionId: host.modelSession, isError: toolResult?.data.message.isError === true,
         text: toolResult?.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') ?? '',
         beforeCalls: before.calls, afterCalls: after.calls };
     }
     await sleep(100);
   }
   throw new Error('Actual Desktop model turn did not complete: ' + mode);
+}
+
+function retainedSessionIdentity(retained) {
+  return { sessionId: retained.sessionId, throughSeq: retained.cursor, recordCount: retained.records.length,
+    recordsSha256: retained.recordsSha256, seededHostVersion: retained.hostVersion,
+    seededPluginVersion: retained.pluginVersion, seededPackageSha256: retained.packageSha256,
+    seedInstanceId: retained.instanceId, seedCutProof: retained.cut, seedHistoryRead: retained.historyRead };
+}
+
+function bindCrossHostFixture(folder, fromVersion, toVersion) {
+  const files = ['dsh-home/profiles/desktop/package.json', 'fixture-package/package.json',
+    'dsh-home/profiles/desktop/node_modules/candidate-offline-fixture/package.json'];
+  for (const file of files) {
+    const path = join(folder, file), manifest = JSON.parse(readFileSync(path, 'utf8'));
+    assert.ok(['isolated-desktop-profile', 'candidate-offline-fixture'].includes(manifest.name),
+      'Only the synthetic fixture and its owned profile may declare the two observed hosts.');
+    assert.equal(manifest.engines?.dsh, fromVersion);
+    manifest.engines.dsh = [fromVersion, toVersion].join(' || ');
+    writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
+  }
+}
+
+function selectUpgradeRuntimeControl(shared, runtime) {
+  if (!runtime) return shared;
+  const selected = { ...shared };
+  for (const key of ['electron', 'archive', 'runtime', 'primaryRuntime', 'pnpmEntry']) {
+    assert.ok(typeof runtime[key] === 'string' && isAbsolute(runtime[key]), 'The target runtime needs explicit prepared paths.');
+    selected[key] = runtime[key];
+  }
+  return selected;
+}
+
+async function observeRejectedOldPlugin(host, profile, receipt, targetVersion) {
+  assert.equal(existsSync(join(profile, 'compatibility.json')), false, 'No host version exemption may enter the pair fixture.');
+  const bundles = await nativeManagerRpc(host, 'listBundles', {});
+  const bundle = bundles.find(row => row.name === PRODUCT_BUNDLE);
+  assert.equal(bundle?.version, receipt.version);
+  assert.equal(bundle?.installed, true);
+  assert.equal(bundle?.enabled, true);
+  assert.equal(bundle?.error?.code, 'incompatible-version', 'Require the official manager incompatibility result.');
+  const issues = bundle.error.incompatible;
+  assert.ok(Array.isArray(issues) && issues.length === 1);
+  const issue = issues[0];
+  assert.equal(issue.name, PRODUCT_BUNDLE); assert.equal(issue.version, receipt.version);
+  assert.equal(issue.runtimeVersion, targetVersion);
+  const manifest = JSON.parse(readFileSync(join(profile, 'node_modules/dsh-grok-search/package.json'), 'utf8'));
+  assert.deepEqual(issue.requirements, { 'engines.dsh': manifest.engines.dsh });
+  const state = await host.probe('snapshot');
+  assert.equal(state.productControl, null); assert.equal(state.productProgram, null);
+  assert.ok(!state.entries.some(entry => entry.id === 'grok-search' && entry.state === 2));
+  assert.equal(state.calls.original, 0, 'Do not query an unprotected original provider while the old package is skipped.');
+  for (const row of receipt.sourceHashes) assert.equal(sha256(join(profile, 'node_modules/dsh-grok-search', row.file)), row.sha256);
+  return { hostVersion: targetVersion, pluginVersion: receipt.version, packageSha256: receipt.sha256,
+    code: bundle.error.code, requirements: issue.requirements, exempted: false, searchIssued: false,
+    officialSearchCalls: state.calls.original, oldPluginActive: false,
+    protectionStatus: 'old-plugin-unloaded-not-protected', evidence: 'official-plugin-manager-incompatible-result' };
+}
+
+async function captureRetainedUpgradeSession(host, receipt, hostVersion) {
+  assert.ok(typeof host.modelSession === 'string' && host.modelSession, 'Seed a real completed Session before retaining history.');
+  await authenticateModelSession(host);
+  const snapshot = await host.probe('snapshot');
+  const cut = canonicalRetainedSessionCut(snapshot, host.modelSession);
+  const page = await createRetainedSessionReader().readPage(host, {
+    sessionId: host.modelSession, throughSeq: cut.seq, maxMessages: 100, cutProof: cut,
+  });
+  return { sessionId: host.modelSession, cursor: page.cursor, records: structuredClone(page.records),
+    recordsSha256: createHash('sha256').update(JSON.stringify(page.records)).digest('hex'),
+    cut, historyRead: page.readEvidence, instanceId: snapshot.instanceId, hostVersion,
+    pluginVersion: receipt.version, packageSha256: receipt.sha256 };
+}
+
+async function readRetainedUpgradePage(host, retained) {
+  const adapted = adaptRetainedSessionRpc(host, createRetainedSessionReader(), retained);
+  return readRetainedSession(adapted, retained);
+}
+
+async function restoreRetainedUpgradeSession(host, retained, previousExit) {
+  assert.ok(typeof previousExit?.instanceId === 'string' && previousExit.instanceId,
+    'Cold history read requires the recorded prior host lifetime.');
+  assert.equal(previousExit.exitCode, 0, 'Cold history read requires normal prior-host exit.');
+  assert.equal(previousExit.signal, null);
+  assert.equal(previousExit.forced, false);
+  assert.equal(previousExit.closeError, null);
+  assert.ok(!host.modelSession, 'Read old history before any Session is activated in this host.');
+  const snapshot = await host.probe('snapshot');
+  assert.ok(typeof snapshot.instanceId === 'string' && snapshot.instanceId
+    && snapshot.instanceId !== previousExit.instanceId, 'Cold history read requires a new real host lifetime.');
+  await authenticateModelSession(host);
+  const page = await readRetainedUpgradePage(host, retained);
+  host.modelSession = retained.sessionId;
+  return { coldReadBeforePrompt: true, historyMatched: true, hostInstanceId: snapshot.instanceId,
+    previousHostInstanceId: previousExit.instanceId, previousExitCode: previousExit.exitCode,
+    previousExitSignal: previousExit.signal, previousExitForced: previousExit.forced,
+    historyRead: page.readEvidence };
 }
 
 function managerNames(state) {
@@ -1323,6 +1543,7 @@ async function runFirstUse(runtime) {
     assert.equal(managerNames(await host.probe('plugin-manager-state')).includes(PRODUCT_BUNDLE), false);
     const installed = await installBundle(host, productTarball, PRODUCT_BUNDLE);
     assertManagerApplied(installed, PRODUCT_BUNDLE);
+    const nativeInstallAudit = inspectDesktopNativeInstall(profile, expectedProductReceipt.version);
     ready = await waitFor(host, state => {
       if (state.productProgram?.phase === 'error') {
         throw new Error('First-use preparation failed: ' + JSON.stringify(state.productProgram.error));
@@ -1388,7 +1609,7 @@ async function runFirstUse(runtime) {
     assert.equal(exit.forced, false);
     assert.deepEqual(await matchingFirstUseProcesses(programPath), []);
     assert.ok(stub.requests.length >= 2 && stub.requests.every(row => row.authorizedWithSyntheticKey));
-    return { installed, detail, initialUi, configured, program: { version: active.version,
+    return { installed, nativeInstallAudit, detail, initialUi, configured, program: { version: active.version,
       source: 'private-cache', sha256: active.sha256, registry: active.registry,
       downloadRegistry: active.downloadRegistry, mcpHandshakeValidated: true },
       defaultConfigCreatedOnlyBySave: true, manualProfileEditRequired: false,
@@ -1509,12 +1730,19 @@ async function runUpgrade(runtime) {
   currentVersion = runtime.app.version;
   const folder = join(temporary, runtime.app.version);
   await prepare(runtime, folder);
+  if (upgradeToRuntime) {
+    const targetFolder = join(temporary, upgradeToRuntime.app.version + '-runtime');
+    await prepare(upgradeToRuntime, targetFolder);
+    upgradeRuntimeControls.set(upgradeToRuntime.app.version,
+      JSON.parse(readFileSync(join(targetFolder, 'local-control.json'), 'utf8')));
+    bindCrossHostFixture(folder, runtime.app.version, upgradeToRuntime.app.version);
+  }
   const profile = join(folder, 'dsh-home/profiles/desktop');
   const configPath = join(folder, 'user/.config/grok-search-rs/config.toml');
   const cache = await upgradeCacheFixture(folder);
   const stub = await firstUseStub();
   const stages = [];
-  let host;
+  let host, activeRuntime = runtime, crossHost = null;
   const configStore = createSharedConfigStore({ path: configPath, env: () => ({}) });
   const syntheticFields = ['grok_api_key', 'tavily_api_key', 'exa_api_key', 'tinyfish_api_key', 'firecrawl_api_key'];
   const fileTree = base => existsSync(base) ? readdirSync(base, { withFileTypes: true })
@@ -1530,7 +1758,7 @@ async function runUpgrade(runtime) {
     active: sha256(join(cache.cache, 'active.json')),
     binary: sha256(cache.target),
   });
-  let expected, recordsBefore;
+  let expected, recordsBefore, retainedSession = null, retainedRead = null;
   const verify = async (receipt, phase, { ui = true } = {}) => {
     const ready = await waitFor(host, state => {
       if (state.productProgram?.phase === 'error') throw new Error(JSON.stringify(state.productProgram.error));
@@ -1547,6 +1775,8 @@ async function runUpgrade(runtime) {
     const installed = realpathSync(join(profile, 'node_modules/dsh-grok-search'));
     for (const row of receipt.sourceHashes) assert.equal(sha256(join(installed, row.file)), row.sha256,
       'Installed package differs: ' + row.file);
+    const nativeInstallAudit = receipt.version === expectedProductReceipt.version
+      ? inspectDesktopNativeInstall(profile, receipt.version) : null;
     assert.deepEqual(preserved(), expected, 'Updating a plugin must retain settings and the program cache.');
     for (const row of recordsBefore) assert.equal(sha256(join(profile, row.file)), row.sha256);
     if (ui) {
@@ -1567,17 +1797,38 @@ async function runUpgrade(runtime) {
     assert.equal(search.afterCalls.original, search.beforeCalls.original);
     const fetch = await modelTurn(host, 'fetch'), chat = await modelTurn(host, 'chat');
     assert.equal(fetch.isError, false); assert.equal(chat.isError, false);
-    stages.push({ phase, pluginVersion: receipt.version, packageSha256: receipt.sha256,
+    if (!retainedSession) {
+      assert.equal(receipt.version, oldProductReceipt.version, 'Session retention must start with the real old plugin.');
+      retainedSession = await captureRetainedUpgradeSession(host, receipt, activeRuntime.app.version);
+      writeJson(join(directory, runtime.app.version + '-old-session-seed.json'), safe(retainedSessionIdentity(retainedSession)));
+    }
+    assert.equal(search.sessionId, retainedSession.sessionId, 'Every upgrade stage must search in the original Session.');
+    assert.equal(fetch.sessionId, retainedSession.sessionId);
+    assert.equal(chat.sessionId, retainedSession.sessionId);
+    const retainedPage = await readRetainedUpgradePage(host, retainedSession);
+    if (retainedRead) assert.equal((await host.probe('snapshot')).instanceId, retainedRead.hostInstanceId,
+      'A stage cannot combine cold-read evidence with a different host lifetime.');
+    stages.push({ phase, hostVersion: activeRuntime.app.version, pluginVersion: receipt.version, packageSha256: receipt.sha256,
       installedFilesVerified: receipt.sourceHashes.length, configurationUnchanged: true,
       programCacheUnchanged: true, programSource: 'private-cache', fileKeyEditable: true,
       searchPassed: true, fetchPassed: true, chatPassed: true, originalSearchDelta: 0,
-      controlRevision: ready.productControl.revision });
+      ...(nativeInstallAudit ? { nativeInstallAudit } : {}),
+      controlRevision: ready.productControl.revision,
+      retainedSession: { ...retainedSessionIdentity(retainedSession),
+        coldReadBeforePrompt: false, ...retainedRead, historyMatched: true, sameIdSearch: true,
+        searchSessionId: search.sessionId, originalCutReadbackAfterTurns: true,
+        historyReadAfterTurns: retainedPage.readEvidence } });
     writeJson(join(directory, runtime.app.version + '-' + phase + '.json'), safe(stages.at(-1)));
   };
-  const restart = async phase => {
+  const restart = async (phase, nextRuntime = activeRuntime) => {
+    const previous = await host.probe('snapshot');
     const exit = await close(host);
     assert.equal(exit.exitCode, 0); assert.equal(exit.forced, false);
-    host = await start(runtime, folder, phase);
+    assert.equal(exit.signal, null); assert.equal(exit.closeError, null);
+    activeRuntime = nextRuntime; currentVersion = activeRuntime.app.version;
+    host = await start(activeRuntime, folder, phase);
+    if (retainedSession) retainedRead = await restoreRetainedUpgradeSession(host, retainedSession,
+      { ...exit, instanceId: previous.instanceId });
   };
   try {
     host = await start(runtime, folder, 'upgrade-old-install');
@@ -1603,6 +1854,22 @@ async function runUpgrade(runtime) {
     await verify(oldProductReceipt, 'old-restarted');
 
     let removed = null, failed = null, recovery = null, newInstall = null, rollback = null;
+    if (upgradeToRuntime) {
+      const controlBefore = fileTree(join(profile, 'control-intent.records'));
+      await restart('upgrade-forward-host-old-package-rejected', upgradeToRuntime);
+      const oldPackageRejected = await observeRejectedOldPlugin(host, profile, oldProductReceipt, activeRuntime.app.version);
+      assert.deepEqual(preserved(), expected);
+      assert.deepEqual(fileTree(join(profile, 'control-intent.records')), controlBefore,
+        'The rejected old plugin must leave its existing ownership history untouched.');
+      crossHost = { fromHostVersion: runtime.app.version, toHostVersion: activeRuntime.app.version,
+        oldPluginVersion: oldProductReceipt.version, newPluginVersion: expectedProductReceipt.version,
+        oldPackageSha256: oldProductReceipt.sha256, newPackageSha256: expectedProductReceipt.sha256,
+        sameProfile: true, sameUserData: true, forwardOnly: true, hostDowngradeValidated: false,
+        targetRuntimeReceiptSha256: upgradeToRuntimeOptions.runtimeReceiptSha256,
+        oldPackageRejected, boundaryHistory: { ...retainedSessionIdentity(retainedSession), ...retainedRead },
+        configurationUnchangedAtBoundary: true, controlHistoryUnchangedAtBoundary: true };
+      writeJson(join(directory, activeRuntime.app.version + '-old-package-rejected.json'), safe(crossHost));
+    }
     if (!upgradeInPlaceOnly) {
       removed = await upgradeUiAction(host, 'remove');
       assert.deepEqual(preserved(), expected, 'Native uninstall must keep user data.');
@@ -1638,10 +1905,17 @@ async function runUpgrade(runtime) {
     await verify(expectedProductReceipt, 'tarball-in-place-restarted');
     const exit = await close(host);
     assert.equal(exit.exitCode, 0); assert.equal(exit.forced, false);
+    assert.equal(exit.signal, null); assert.equal(exit.closeError, null);
+    if (upgradeToRuntime) assert.equal(existsSync(join(profile, 'compatibility.json')), false);
     assert.deepEqual(await matchingFirstUseProcesses(cache.target), []);
     assert.equal(sha256(join(upgradeCache, 'active.json')), cache.sourceActiveHash);
     assert.equal(readdirSync(cache.cache).filter(name => lstatSync(join(cache.cache, name)).isDirectory()).length, 1);
+    assert.ok(stages.length >= 3 && stages.slice(1).every(stage => stage.retainedSession.coldReadBeforePrompt
+      && stage.retainedSession.sameIdSearch && stage.retainedSession.historyMatched));
     return { stages, oldInstall, removed, failedInstallCode: failed?.error.code ?? null, recovery, newInstall, rollback,
+      ...(crossHost ? { crossHost: { ...crossHost, passed: true, normalFinalExit: true,
+        configurationUnchanged: true, programCacheUnchanged: true, oldSessionHistoryRetained: true,
+        scope: 'forward-host-and-plugin-upgrade-original-session-cut' } } : {}),
       inPlaceTarball: { accepted: true, nativeServiceCalled: true,
         uiWorkflowTested: true, restarted: true }, inPlaceOnly: upgradeInPlaceOnly,
       oldPackageSource: upgradeOldRegistry ? 'registry-exact-version' : 'local-release-tarball',
@@ -1649,7 +1923,11 @@ async function runUpgrade(runtime) {
       retainedCacheFixture: cache.setup, cacheSha256: cache.binaryHash, cacheReused: true,
       mcpHandshake: cache.handshake, programOverrideRequired: false, configOverrideRequired: false,
       noNewProgramCacheDirectory: true, fileCredentialsRetained: syntheticFields,
-      rollbackScope: 'explicit-reinstall-of-old-package-not-cross-resource-atomicity',
+      retainedSession: { ...retainedSessionIdentity(retainedSession), passed: true,
+        coldReadStages: stages.filter(stage => stage.retainedSession.coldReadBeforePrompt).map(stage => stage.phase),
+        sameIdSearchEveryStage: true, scope: crossHost ? 'forward-host-and-plugin-upgrade-original-session-cut'
+          : 'same-host-plugin-upgrade-original-session-cut', hostTransitionValidated: Boolean(crossHost) },
+      rollbackScope: crossHost ? 'not-run-forward-only' : 'explicit-reinstall-of-old-package-not-cross-resource-atomicity',
       credentialScope: 'synthetic-loopback-only', requests: stub.requests };
   } finally {
     if (host) await close(host);
@@ -1674,6 +1952,7 @@ async function runVersion(runtime) {
 
   const productInstall = await installBundle(first, productTarball, PRODUCT_BUNDLE);
   assertManagerApplied(productInstall, PRODUCT_BUNDLE);
+  const nativeInstallAudit = inspectDesktopNativeInstall(profile, expectedProductReceipt.version);
   assert.equal(productInstall.bundle, PRODUCT_BUNDLE);
   const afterProductManager = await first.probe('plugin-manager-state');
   assert.ok(managerNames(afterProductManager).includes(PRODUCT_BUNDLE));
@@ -1692,6 +1971,7 @@ async function runVersion(runtime) {
   const productReady = await waitFor(productHost, snapshot => snapshot.productControl?.phase === 'required'
     && snapshot.productRecovery?.phase === 'still-selected' && snapshot.productRouteVerifier,
   'Product control and recovery entries did not load after PluginManager install and restart');
+  const restartNativeInstallAudit = inspectDesktopNativeInstall(profile, expectedProductReceipt.version);
   const before = productReady.productControl.recordEnvelope;
   assert.equal(before.intent.policy, 'required');
   assert.equal(productReady.productRecovery.phase, 'still-selected');
@@ -1844,7 +2124,8 @@ async function runVersion(runtime) {
   assert.equal(finalExit.exitCode, 0);
   assert.equal(finalExit.forced, false);
 
-  return { initialManager, productInstall, hotInstalled, hotInstalledUi, hotSettings, hotReenabled, settingsSecurity, settingsDialogs,
+  return { initialManager, productInstall, nativeInstallAudit, restartNativeInstallAudit,
+    hotInstalled, hotInstalledUi, hotSettings, hotReenabled, settingsSecurity, settingsDialogs,
     firstExit, before, settingsStop, stoppedRecord, productExit,
     releasedState, enabled, revived, revivedFetch, revivedChat, disabledAgain, stoppedAgain, revivedExit,
     uiDomValidated: true, productRemove, cleanedManager, cleaned, authorSearch, fetch, chat, cleanupExit,
@@ -1854,13 +2135,15 @@ async function runVersion(runtime) {
 let fatal = null;
 const associationBefore = await protocolAssociation();
 if (associationBefore && associationBefore.exitCode !== 0) throw new Error('Cannot verify dsh:// association before Desktop run.');
-const beforeHashes = Object.fromEntries(runtimes.map(runtime => [runtime.app.version,
+const beforeHashes = Object.fromEntries(allRuntimes.map(runtime => [runtime.app.version,
   { executable: sha256(runtime.executable), asar: sha256(runtime.archivePath) }]));
 try {
   for (const runtime of runtimes) {
     const evidence = await (upgradeFrom ? runUpgrade(runtime) : manualAcceptance ? holdManualAcceptance(runtime)
       : sourceOnlyConfig ? runSourceOnly(runtime) : firstUse ? runFirstUse(runtime) : runVersion(runtime));
-    results.push({ version: runtime.app.version, scenario: upgradeFrom ? 'released-package-upgrade-rollback-config-cache-retention'
+    results.push({ version: upgradeToRuntime?.app.version ?? runtime.app.version,
+      scenario: upgradeToRuntime ? 'forward-host-and-plugin-upgrade-retained-session'
+      : upgradeFrom ? 'released-package-upgrade-rollback-config-cache-retention'
       : manualAcceptance ? 'manual-isolated-environment-preparation'
       : firstUse
       ? 'first-use-native-install-auto-download-default-config-save-search-hot-toggle-reuse'
@@ -1870,13 +2153,15 @@ try {
   }
 } catch (error) {
   fatal = { version: currentVersion, message: error.message, stack: error.stack };
-    results.push({ version: currentVersion, scenario: upgradeFrom ? 'released-package-upgrade-rollback-config-cache-retention'
+    results.push({ version: upgradeToRuntime?.app.version ?? currentVersion,
+      scenario: upgradeToRuntime ? 'forward-host-and-plugin-upgrade-retained-session'
+      : upgradeFrom ? 'released-package-upgrade-rollback-config-cache-retention'
       : firstUse ? 'first-use-auto-download'
     : 'official-plugin-manager-install-enable-disable-remove-restart',
     status: 'fail', error: { message: error.message } });
 } finally {
   for (const child of children) await close(child);
-  const afterHashes = Object.fromEntries(runtimes.map(runtime => [runtime.app.version,
+  const afterHashes = Object.fromEntries(allRuntimes.map(runtime => [runtime.app.version,
     { executable: sha256(runtime.executable), asar: sha256(runtime.archivePath) }]));
   const unchanged = JSON.stringify(beforeHashes) === JSON.stringify(afterHashes);
   const associationAfter = await protocolAssociation();
@@ -1901,6 +2186,7 @@ try {
         : row.evidence?.uiDomValidated === true),
     firstUseAutoDownloadValidated: passed && firstUse,
     upgradeRetentionValidated: passed && Boolean(upgradeFrom),
+    crossHostProductUpgradeValidated: passed && Boolean(upgradeToRuntime),
     upgradeFailureRecoveryValidated: passed && Boolean(upgradeFrom) && !upgradeInPlaceOnly,
     productionDiagnosticsUiValidated: passed && diagnostics && results.length === runtimes.length
       && results.every(row => row.evidence?.diagnosticFlow?.failed === 0),
@@ -1919,7 +2205,7 @@ try {
     realHostCounterAdapterValidated: false,
     officialCounterContractFound: runtimes.some(runtime => auditCounterSource(runtime).officialCounterContractFound),
     productIntegrated: false,
-    hostCounterAudit: runtimes.map(auditCounterSource),
+    hostCounterAudit: allRuntimes.map(auditCounterSource),
     packageReceipts: { product: packageReceipt(productTarball), ...(oldProductReceipt ? { oldProduct: oldProductReceipt } : {}) },
     results: results.map(({ version, scenario, status, evidence, error }) => ({ version, scenario, status,
       ...(evidence ? { evidence } : {}), ...(error ? { error } : {}) })),

@@ -3,19 +3,30 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { candidateRuntime } from './lib/candidate-runtime.mjs';
+import { parseRuntimeReceiptArguments, readDesktopGateRuntimes } from './deferred-release-desktop-prepare.mjs';
 import { cleanEnvironment, commandResult, freshRun, npmCli, project, receipt, redact, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
 import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
 
+const { args: inputArguments, runtimeOptions } = parseRuntimeReceiptArguments(process.argv.slice(2));
 const options = new Map();
-for (let index = 2; index < process.argv.length; index += 2) {
-  if (!['--desktop-rc2', '--desktop-rc21', '--product-package'].includes(process.argv[index])
-    || !process.argv[index + 1]) throw new Error('Expected named Desktop and package arguments.');
-  options.set(process.argv[index], process.argv[index + 1]);
+for (let index = 0; index < inputArguments.length; index += 2) {
+  const flag = inputArguments[index], value = inputArguments[index + 1];
+  if (!['--desktop', '--desktop-rc2', '--desktop-rc21', '--product-package'].includes(flag)
+    || !value || value.startsWith('--') || options.has(flag)) throw new Error('Expected unique named Desktop and package arguments.');
+  options.set(flag, value);
 }
-const runtimes = [candidateRuntime(options.get('--desktop-rc2')), candidateRuntime(options.get('--desktop-rc21'))];
-const targetVersions = (process.env.DSH_B2_TARGET_VERSIONS ?? '0.2.1-rc.2,0.2.1-rc.3').split(',').map(value => value.trim()).filter(Boolean);
-assert.deepEqual(runtimes.map(runtime => runtime.app.version), targetVersions);
+const singleDesktop = options.has('--desktop');
+if (!options.has('--product-package')
+  || (singleDesktop ? options.has('--desktop-rc2') || options.has('--desktop-rc21')
+    : !options.has('--desktop-rc2') || !options.has('--desktop-rc21'))) {
+  throw new Error('Use --desktop or both --desktop-rc2 and --desktop-rc21, with --product-package.');
+}
+const runtimes = readDesktopGateRuntimes(singleDesktop ? [options.get('--desktop')]
+  : [options.get('--desktop-rc2'), options.get('--desktop-rc21')], runtimeOptions);
+if (!singleDesktop) {
+  const targetVersions = (process.env.DSH_B2_TARGET_VERSIONS ?? '0.2.1-rc.2,0.2.1-rc.3').split(',').map(value => value.trim()).filter(Boolean);
+  assert.deepEqual(runtimes.map(runtime => runtime.app.version), targetVersions);
+}
 const productTarball = resolve(options.get('--product-package'));
 if (!existsSync(productTarball)) throw new Error('Package tarball is missing: ' + productTarball);
 const { runId, directory } = freshRun('b2-product-install');
@@ -120,14 +131,15 @@ async function install(runtime) {
   writeFileSync(configFile, ''); writeFileSync(globalConfigFile, '');
   writeFileSync(join(profile, 'package.json'), JSON.stringify({ name: 'candidate-profile', version: '0.0.0', private: true, type: 'module' }, null, 2));
   const execution = await commandResult(process.execPath, [npmCli, 'install', productTarball,
-    '--ignore-scripts', '--legacy-peer-deps', '--no-audit', '--no-fund', '--cache', join(root, runtime.app.version, 'npm-cache'),
+    '--ignore-scripts', '--legacy-peer-deps=false', '--no-audit', '--no-fund', '--cache', join(root, runtime.app.version, 'npm-cache'),
     '--userconfig', configFile, '--globalconfig', globalConfigFile],
   { cwd: profile, env: { ...env, ELECTRON_RUN_AS_NODE: '' }, timeoutMs: 180_000 });
   writeJson(join(directory, runtime.app.version + '-npm-install.json'), receipt(execution));
   assert.equal(execution.exitCode, 0, execution.stderr);
   const productReceipt = packageReceipt(productTarball);
   const installed = [verifyInstalled(profile, productReceipt, project)];
-  return { profile, env, installed, productReceipt, installExitCode: execution.exitCode };
+  return { profile, env, installed, productReceipt, installExitCode: execution.exitCode,
+    installPolicy: { ignoreScripts: true, legacyPeerDeps: false } };
 }
 
 async function runVersion(runtime) {
@@ -205,8 +217,10 @@ finally {
     signal: host.state.signal ?? null, stderrTail: host.state.stderr.slice(-4000),
     events: host.state.events.filter(event => event.type !== 'ready').slice(-10) }));
   const summary = { runId, status: fatal ? 'fail' : 'pass', counts: { pass: results.filter(row => row.status === 'pass').length,
-    fail: fatal ? 1 : 0 }, fatal, ...(fatal ? { hostDiagnostics } : {}), scope: 'actual-RC2-Host-npm-installed-single-product-bundle',
-    npmInstallValidated: true, pluginManagerValidated: false, packagedDesktopInstallValidated: true,
+    fail: fatal ? 1 : 0 }, fatal, ...(fatal ? { hostDiagnostics } : {}), scope: 'actual-Desktop-Electron-Host-npm-installed-single-product-bundle',
+    installPolicy: { ignoreScripts: true, legacyPeerDeps: false },
+    npmInstallValidated: !fatal && results.length === runtimes.length,
+    pluginManagerValidated: false, packagedDesktopInstallValidated: !fatal && results.length === runtimes.length,
     releaseChannel: packageReceipt(productTarball).releaseChannel,
     candidatePackageValidated: !fatal, betaPackageValidated: !fatal && packageReceipt(productTarball).releaseChannel === 'beta',
     desktopUiValidated: false, productIntegrated: false, routeCounterAdapter: 'canonical-session-event', results,

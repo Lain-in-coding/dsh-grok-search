@@ -1,11 +1,12 @@
 import { dirname, join, resolve } from 'node:path';
 import { statSync, existsSync } from 'node:fs';
 import { readAsar } from './asar.mjs';
+import { readRuntimeReceipt } from './compatibility-evidence.mjs';
 
 export const CANDIDATE_VERSIONS = Object.freeze(['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.5', '0.2.2-rc.1', '0.2.2-rc.2']);
 
 // 独立于历史 M0 解析入口，不扩大旧探针的支持声明。
-export function candidateRuntime(executablePath) {
+export function candidateRuntime(executablePath, { receiptPath, receiptSha256, root } = {}) {
   if (!executablePath) throw new Error('请用 --desktop 指定实际 Desktop 程序。');
   const executable = resolve(executablePath);
   if (!statSync(executable).isFile()) throw new Error('Desktop 路径不是文件。');
@@ -22,11 +23,22 @@ export function candidateRuntime(executablePath) {
   const fuseBinary = existsSync(join(binaryDir, '..', 'Frameworks', 'Electron Framework.framework', 'Versions', 'A', 'Electron Framework'))
     ? join(binaryDir, '..', 'Frameworks', 'Electron Framework.framework', 'Versions', 'A', 'Electron Framework')
     : executable;
-  if (app.name !== '@deepseek-ai/dsh-desktop' || !CANDIDATE_VERSIONS.includes(app.version)
+  if (app.name !== '@deepseek-ai/dsh-desktop'
     || app.version !== runtime.version || app.version !== manifest.release?.version
     || manifest.platform !== process.platform || manifest.arch !== process.arch) {
     throw new Error('内部候选只验证与当前进程平台/架构一致、版本一致的官方 Desktop。');
   }
+  let candidateReceipt = null;
+  if (receiptPath || receiptSha256 || root || !CANDIDATE_VERSIONS.includes(app.version)) {
+    const verified = readRuntimeReceipt({ receiptPath, receiptSha256, root, version: app.version,
+      platform: process.platform, arch: process.arch, roles: ['executable', 'archive', 'fuseBinary'] });
+    if (verified.files.executable !== executable || verified.files.archive !== archivePath
+      || verified.files.fuseBinary !== resolve(fuseBinary)) {
+      throw new Error('Verified candidate paths differ from the selected runtime.');
+    }
+    candidateReceipt = verified.receipt;
+  }
   return { executable, binaryDir, resourcesDir, archivePath, archive, app, runtime, manifest, fuseBinary,
+    candidateReceipt,
     selectorKind: app.version === '0.2.0-rc.2' ? 'constructor' : 'volatile' };
 }

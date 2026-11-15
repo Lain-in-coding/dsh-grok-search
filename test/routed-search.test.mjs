@@ -12,7 +12,7 @@ const sourceResult = (provider, failures = []) => ({ content: '', sources: [{ ur
   diagnostic: { provider, failures } });
 
 function harness({ grok, sources = {}, prefs = { grokEnabled: true }, barrier = createReleaseBarrier(),
-  budgetMs = 120_000, cleanupMs = 2_000, getConfig = () => ({}) } = {}) {
+  budgetMs = 120_000, cleanupMs = 2_000, getConfig = () => ({}), assertExecution, executionEpoch } = {}) {
   const calls = { grok: 0, sources: [] };
   let clock = 1_000;
   const routed = createRoutedSearch({
@@ -23,13 +23,63 @@ function harness({ grok, sources = {}, prefs = { grokEnabled: true }, barrier = 
     },
     preferences: { snapshot: () => ({ value: prefs }) },
     releaseBarrier: barrier,
-    getConfig, budgetMs, cleanupMs,
+    getConfig, budgetMs, cleanupMs, assertExecution, executionEpoch,
     // Reading the clock is not the passage of time. History now samples both
     // start and completion; these route-shape assertions hold time fixed.
     now: () => clock,
   });
   return { routed, calls, barrier };
 }
+
+test('compatibility blocks direct searches and diagnoses without blocking disposal or touching configuration', async () => {
+  let reads = 0, diagnostics = 0;
+  const { routed, calls, barrier } = harness({
+    getConfig: () => { reads++; return {}; },
+    assertExecution: () => { throw new GrokSearchError('COMPAT_CONFIRMATION_REQUIRED', 'Confirmation is required.'); },
+  });
+  for (const start of [
+    () => routed.search({ query: QUERY }),
+    () => routed.testGrok({ query: QUERY }),
+    () => routed.scheduleDiagnosis(() => { diagnostics++; }),
+  ]) await assert.rejects(start, { code: 'COMPAT_CONFIRMATION_REQUIRED' });
+  assert.equal(reads, 0);
+  assert.equal(calls.grok, 0);
+  assert.equal(calls.sources.length, 0);
+  assert.equal(diagnostics, 0);
+  assert.deepEqual(barrier.snapshot().activeOperationIds, []);
+  await routed.dispose();
+});
+
+test('a false or asynchronous admission result cannot be mistaken for permission to dispatch', async () => {
+  for (const assertExecution of [() => false, () => Promise.resolve(true)]) {
+    const { routed, calls } = harness({ assertExecution });
+    await assert.rejects(() => routed.search({ query: QUERY }), { code: 'COMPATIBILITY_CHECKING' });
+    assert.equal(calls.grok, 0);
+    assert.equal(calls.sources.length, 0);
+    await routed.dispose();
+  }
+});
+
+test('queued work cannot use a new runtime epoch and a revoked primary cannot enter source fallback', async () => {
+  let epoch = 1, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { routed, calls } = harness({
+    executionEpoch: () => epoch,
+    grok: async () => { await gate; throw new GrokSearchError('GROK_UNAVAILABLE', 'Unavailable.'); },
+    sources: { search: async () => sourceResult('tavily') },
+  });
+  const first = routed.search({ query: QUERY });
+  const queued = routed.testGrok({ query: 'queued' });
+  const results = Promise.allSettled([first, queued]);
+  await new Promise(resolve => setImmediate(resolve));
+  epoch++;
+  release();
+  const settled = await results;
+  assert.ok(settled.every(result => result.status === 'rejected' && result.reason.code === 'GROK_SEARCH_STOPPING'));
+  assert.equal(calls.grok, 1);
+  assert.equal(calls.sources.length, 0);
+  await routed.dispose();
+});
 
 test('Grok success is recorded as served by grok', async () => {
   const { routed, barrier } = harness({ grok: async () => ({ content: 'ok', sources: [{ url: 'https://g.test' }] }) });

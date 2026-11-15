@@ -49,7 +49,7 @@ test('正式编号、lockfile、支持矩阵与 MCP 客户端身份一致且不�
   const lock = JSON.parse(read('package-lock.json'));
   assert.equal(validatePackChannel(manifest, matrix, { release: true }), 'release');
   assert.throws(() => validatePackChannel(manifest, matrix, { alpha: true }));
-  assert.equal(manifest.version, '0.3.0');
+  assert.equal(manifest.version, '0.4.0');
   assert.deepEqual(manifest.publishConfig, { tag: 'latest', access: 'public' });
   assert.equal(lock.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
@@ -57,6 +57,22 @@ test('正式编号、lockfile、支持矩阵与 MCP 客户端身份一致且不�
     .match(/new sdk\.Client\(\{ name: 'dsh-grok-search', version: '([^']+)' \}/)?.[1];
   assert.equal(clientVersion, manifest.version);
   assert.equal(manifest.scripts['pack:release'], 'node scripts/pack-internal.mjs --release');
+});
+
+test('release packaging refuses self-dependencies and preserves the intended CLI entry', () => {
+  const lock = JSON.parse(read('package-lock.json'));
+  for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) {
+    assert.equal(manifest[field]?.[manifest.name], undefined);
+    assert.equal(lock.packages[''][field]?.[manifest.name], undefined);
+    for (const spec of ['0.4.0', 'file:artifacts/product.tgz']) {
+      assert.throws(() => validatePackChannel({
+        ...manifest, [field]: { ...manifest[field], [manifest.name]: spec },
+      }, matrix, { release: true }), /SELF_DEPENDENCY_NOT_ALLOWED/);
+    }
+  }
+  assert.equal(lock.packages[`node_modules/${manifest.name}`], undefined);
+  assert.equal(manifest.bin['dsh-grok-search-compatibility'], './src/core/compatibility-cli.mjs');
+  assert.ok(read('src/core/compatibility-cli.mjs').startsWith('#!/usr/bin/env node'));
 });
 
 test('开发通道拒绝latest、错误版本和混合通道，保留正式通道正向验证', () => {
@@ -70,27 +86,31 @@ test('开发通道拒绝latest、错误版本和混合通道，保留正式通�
   assert.equal(validatePackChannel(release, { ...matrix, packageVersion: release.version }, { release: true }), 'release');
 });
 
-test('正式发布材料同步0.3.0入口与日期，不遗留候选公告或把旧包当当前版本', () => {
+test('0.4.0候选与已发布0.3.0入口分开，不把历史证据当作本次同包通过', () => {
   const readme = read('README.md');
   const changelog = read('CHANGELOG.md');
-  assert.match(readme, /Version-0\.3\.0-/);
-  assert.match(readme, /安装 \*\*0\.3\.0\*\*/);
+  assert.match(readme, /Version-0\.4\.0_candidate-/);
+  assert.match(readme, /安装已发布 \*\*0\.3\.0\*\*/);
   assert.match(readme, /releases\/tag\/v0\.3\.0/);
-  assert.doesNotMatch(readme, /待发布|尚未公开发布|当前公开版本为 \*\*0\.2\.1\*\*/);
+  assert.match(readme, /0\.4\.0 开发候选，尚未发布/);
+  assert.match(readme, /21 组同包验收/);
   assert.match(readme, /npm run pack:release/);
   assert.doesNotMatch(readme, /npm run pack:alpha|0\.3\.0-alpha\.1/);
   assert.match(changelog, /## 0\.3\.0 - 2026-11-13/);
+  assert.match(changelog, /## 0\.4\.0 - 开发中，尚未发布/);
   assert.doesNotMatch(changelog, /## 0\.3\.0-alpha/);
-  assert.match(matrix.channel, /0\.3\.0.*latest/);
-  assert.doesNotMatch(matrix.channel, /未公开发布|仍为0\.2\.1/);
+  assert.equal(matrix.packageVersion, manifest.version);
+  assert.match(matrix.channel, /0\.4\.0/);
 });
 
-test('默认安装示例固定当前发布版本，避免预览新版却按裸名解析旧版', () => {
+test('候选未发布时安装示例明确固定已发布版本，不声称registry已有候选', () => {
   const readme = read('README.md');
   const install = readme.split('### 方式一：在 DSH 中按名称安装')[1]?.split('\n### ')[0];
-  const expected = `${manifest.name}@${manifest.version}`;
+  const expected = `${manifest.name}@0.3.0`;
   assert.equal(install?.match(/```text\s+([^\r\n]+)\s+```/)?.[1]?.trim(), expected);
   assert.equal(readme.match(/^dsh plugin --profile web add (\S+)$/m)?.[1], expected);
+  assert.match(readme, /测试 0\.4\.0 时使用维护者交付的冻结/);
+  assert.equal(manifest.bin['dsh-grok-search-compatibility'], './src/core/compatibility-cli.mjs');
 });
 
 test('正式候选拒绝 Beta、内部版本和不规范的版本号', () => {

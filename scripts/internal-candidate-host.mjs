@@ -1,19 +1,45 @@
-import { mkdirSync, writeFileSync, readFileSync, copyFileSync, existsSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { mkdirSync, writeFileSync, readFileSync, copyFileSync, existsSync, lstatSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { randomUUID, randomInt } from 'node:crypto';
 import { createServer } from 'node:net';
+import semver from 'semver';
+import { readRuntimeReceipt } from './lib/compatibility-evidence.mjs';
+import {
+  prepareCompatibilitySmoke, snapshotCompatibility, invokeCompatibilitySearch,
+} from './compatibility-smoke-host.mjs';
 
-const [archive, directory] = process.argv.slice(2);
+export function candidateHostRuntimeRoot(input, explicitCli = false) {
+  return explicitCli ? resolve(input) : join(input, 'dsh');
+}
+
+export function writeCandidateConfiguration(path, contents, once = false, initialize = true) {
+  if (!once) { writeFileSync(path, contents); return; }
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat) {
+    assert.ok(stat.isFile() && !stat.isSymbolicLink(), 'The retained fixture configuration must be an ordinary file.');
+    return;
+  }
+  assert.equal(initialize, true, 'A cold fixture start cannot recreate missing retained configuration.');
+  writeFileSync(path, contents, { flag: 'wx', mode: 0o600 });
+}
+
+const [archive, directory, runtimeMode] = process.argv.slice(2);
+const explicitCli = runtimeMode === '--cli-runtime-root';
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const runtimeRoot = join(archive, 'dsh');
+const runtimeRoot = candidateHostRuntimeRoot(archive, explicitCli);
 const modernTools = existsSync(join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-tool-executor-native/package.json'));
 const imp = (name, file = 'lib/index.js') => import(pathToFileURL(join(runtimeRoot, 'node_modules', '@deepseek-ai', name, file)).href);
 const config = await new Promise(done => process.once('message', done));
+const nativeCli = explicitCli ? config.nativeCli : null;
 const productWiring = config.productWiring === true;
 const preserveProductSelection = config.preserveProductSelection === true;
+const compatibilitySmoke = config.compatibilitySmoke && typeof config.compatibilitySmoke === 'object'
+  ? config.compatibilitySmoke : null;
 const profile = join(process.env.DSH_HOME, 'profiles', 'candidate');
-const fixturePackage = join(profile, 'node_modules', 'candidate-offline-fixture');
+const fixturePackage = nativeCli ? join(directory, 'fixture-package')
+  : join(profile, 'node_modules', 'candidate-offline-fixture');
 const controlPath = join(directory, 'mcp-control.json');
 const eventPath = join(directory, 'mcp-events.jsonl');
 const trace = { instanceId: randomUUID(), searchQuery: config.realGrok?.query ?? null,
@@ -49,14 +75,52 @@ function snapshot() {
     productProgram: boot?.ctx.get('grokSearchProgram')?.snapshot?.() ?? null,
     selectedBundles: JSON.parse(readFileSync(join(profile, 'package.json'), 'utf8')).dsh?.profile?.bundles ?? [],
     webInject: [...boot.ctx.loader.entries()].find(entry => entry.options.id === 'web')?.options.inject,
-    mcpEvents: mcpEvents() };
+    mcpEvents: mcpEvents(),
+    ...(nativeCli ? { nativeCli: { version: nativeCli.version, configurationOnce: true },
+      entries: [...boot.ctx.loader.entries()].map(entry => ({ id: entry.options.id,
+        state: entry.fiber?.state ?? null, error: entry.fiber?.error ? safeError(entry.fiber.error) : null })) } : {}),
+    ...(compatibilitySmoke ? { compatibilitySmoke: snapshotCompatibility(boot.ctx, trace) } : {}) };
 }
 process.on('message', async message => {
   const { id, op, args = {} } = message;
   if (!id || !op) return;
   try {
     let value;
-    if (op === 'snapshot') value = snapshot();
+    if (op.startsWith('compatibility-')) {
+      if (!compatibilitySmoke) throw Object.assign(new Error('COMPATIBILITY_SMOKE_DISABLED'), { code: 'COMPATIBILITY_SMOKE_DISABLED' });
+      if (op === 'compatibility-snapshot') value = snapshotCompatibility(boot.ctx, trace);
+      else if (op === 'compatibility-search') {
+        const queries = args.queries ?? ['compatibility-smoke-direct'];
+        if (!Array.isArray(queries) || !queries.length || queries.length > 4
+          || queries.some(query => typeof query !== 'string' || !query.startsWith('compatibility-smoke-') || query.length > 100)) {
+          throw Object.assign(new Error('COMPATIBILITY_SMOKE_QUERY_INVALID'), { code: 'COMPATIBILITY_SMOKE_QUERY_INVALID' });
+        }
+        value = args.native === true
+          ? await invokeCompatibilitySearch(boot.ctx, { queries, modern: modernTools })
+          : await boot.ctx.web.search({ query: queries[0], maxResults: 2 });
+      } else if (op === 'compatibility-cancel-start') {
+        if (cancelTask) throw Object.assign(new Error('COMPATIBILITY_SMOKE_CANCEL_BUSY'), { code: 'COMPATIBILITY_SMOKE_CANCEL_BUSY' });
+        cancelController = new AbortController();
+        cancelReason = Object.assign(new Error('COMPATIBILITY_SMOKE_CANCELLED'), { code: 'COMPATIBILITY_SMOKE_CANCELLED' });
+        const reason = cancelReason;
+        cancelTask = boot.ctx.web.search({ query: 'compatibility-smoke-cancel', maxResults: 2 }, cancelController.signal)
+          .then(() => ({ ok: true, callerReasonPreserved: false }),
+            error => ({ ok: false, code: error === reason ? reason.code : 'COMPATIBILITY_SMOKE_CANCEL_FAILED',
+              callerReasonPreserved: error === reason }));
+        value = true;
+      } else if (op === 'compatibility-cancel-finish') {
+        if (!cancelTask) throw Object.assign(new Error('COMPATIBILITY_SMOKE_CANCEL_NOT_STARTED'), { code: 'COMPATIBILITY_SMOKE_CANCEL_NOT_STARTED' });
+        cancelController.abort(cancelReason);
+        value = await cancelTask;
+        cancelController = null; cancelReason = null; cancelTask = null;
+      } else throw Object.assign(new Error('COMPATIBILITY_SMOKE_OPERATION_INVALID'), { code: 'COMPATIBILITY_SMOKE_OPERATION_INVALID' });
+    } else if (op === 'snapshot') value = snapshot();
+    else if (op === 'plugin-manager-state') {
+      if (!nativeCli) throw new Error('Manager inspection requires explicit CLI acceptance mode.');
+      const manager = boot.ctx.get('pluginManager');
+      if (!manager?.listBundles) throw new Error('The official PluginManager service is unavailable.');
+      value = await manager.listBundles();
+    }
     else if (op === 'mode') { writeFileSync(controlPath, JSON.stringify({ mode: args.mode })); value = true; }
     else if (op === 'direct-search') {
       try { value = { ok: true, result: await boot.ctx.web.search({ query: '独立 seam 查询', maxResults: 5 }) }; }
@@ -103,6 +167,28 @@ process.on('message', async message => {
 });
 
 try {
+  if (explicitCli) {
+    assert.ok(nativeCli && productWiring && preserveProductSelection && config.realGrok === undefined);
+    assert.equal(process.platform, 'linux'); assert.equal(process.arch, 'x64');
+    assert.equal(nativeCli.configurationOnce, true);
+    const verified = readRuntimeReceipt({ receiptPath: nativeCli.receiptPath,
+      receiptSha256: nativeCli.receiptSha256, root: nativeCli.receiptRoot ?? runtimeRoot, version: nativeCli.version,
+      platform: 'linux', arch: 'x64', roles: ['executable', 'cliManifest'] });
+    assert.equal(verified.receipt.asset.lane, 'linux-cli');
+    assert.equal(verified.files.cliManifest, join(runtimeRoot, 'node_modules/@deepseek-ai/dsh/package.json'));
+    const manifest = JSON.parse(readFileSync(verified.files.cliManifest, 'utf8'));
+    assert.equal(manifest.name, '@deepseek-ai/dsh'); assert.equal(manifest.version, nativeCli.version);
+    assert.equal(manifest.engines?.node ?? null, verified.receipt.asset.nodeRange ?? null);
+    if (manifest.engines?.node) assert.ok(semver.satisfies(process.versions.node, manifest.engines.node),
+      'The explicit Node executable does not satisfy the official CLI requirement.');
+    assert.equal(process.argv.length, 5, 'Explicit CLI mode accepts exactly its verified runtime root and isolated directory.');
+    const appBoot = await imp('dsh-app-boot');
+    assert.equal(typeof appBoot.initProfile, 'function', 'Use the verified CLI host profile initializer.');
+    appBoot.initProfile(profile, ['candidate-offline-fixture', 'dsh-grok-search']);
+  }
+  if (compatibilitySmoke && (!productWiring || config.realGrok)) {
+    throw Object.assign(new Error('COMPATIBILITY_SMOKE_CONFIG_INVALID'), { code: 'COMPATIBILITY_SMOKE_CONFIG_INVALID' });
+  }
   const workspace = join(directory, 'workspace'); mkdirSync(workspace, { recursive: true });
   let port;
   for (let attempt = 0; attempt < 20 && port === undefined; attempt++) {
@@ -118,28 +204,34 @@ try {
   }
   if (!port) throw new Error('无法分配本地测试端口。');
   mkdirSync(fixturePackage, { recursive: true });
-  copyFileSync(join(project, 'fixtures/internal-candidate/host-fixture.mjs'), join(fixturePackage, 'fixture.mjs'));
+  const once = nativeCli?.configurationOnce === true;
+  const initialize = nativeCli?.initializeConfiguration === true;
+  const fixtureSource = join(project, 'fixtures/internal-candidate/host-fixture.mjs');
+  writeCandidateConfiguration(join(fixturePackage, 'fixture.mjs'), readFileSync(fixtureSource), once, initialize);
   const exports = {};
   for (const [label, apply, inject] of [
     ['model', 'applyModel', ['llm', 'tools']], ['providers', 'applyProviders', ['web']],
     ['existing', 'applyExisting', []], ['observer', 'applyObserver', ['sessionController', 'connection', 'webServer', 'typertGateway']],
   ]) {
-    writeFileSync(join(fixturePackage, label + '.mjs'), `export { ${apply} as apply } from './fixture.mjs'; export const name = 'candidate-${label}'; export const inject = ${JSON.stringify(inject)};\n`);
+    writeCandidateConfiguration(join(fixturePackage, label + '.mjs'),
+      `export { ${apply} as apply } from './fixture.mjs'; export const name = 'candidate-${label}'; export const inject = ${JSON.stringify(inject)};\n`, once, initialize);
     exports['./' + label] = './' + label + '.mjs';
   }
-  writeFileSync(join(fixturePackage, 'package.json'), JSON.stringify({ name: 'candidate-offline-fixture', version: '0.0.0', private: true,
+  const fixtureIdentity = { name: 'candidate-offline-fixture', version: '0.0.0', private: true,
     type: 'module', exports: { './package.json': './package.json', './cordis.patch.yml': './cordis.patch.yml', ...exports },
-    dsh: { bundle: { patch: './cordis.patch.yml' } } }, null, 2));
+    dsh: { bundle: { patch: './cordis.patch.yml' } } };
+  writeCandidateConfiguration(join(fixturePackage, 'package.json'), JSON.stringify(fixtureIdentity, null, 2), once, initialize);
   const manifestPath = join(profile, 'package.json');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  manifest.dependencies['candidate-offline-fixture'] = '0.0.0';
+  manifest.dependencies['candidate-offline-fixture'] = nativeCli ? 'file:' + fixturePackage : '0.0.0';
   if (!(productWiring && preserveProductSelection)) manifest.dsh = { profile: { bundles: productWiring
     ? ['candidate-offline-fixture', 'dsh-grok-search']
     : ['candidate-offline-fixture', 'dsh-grok-search'] } };
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  writeCandidateConfiguration(manifestPath, JSON.stringify(manifest, null, 2), once, initialize);
   writeFileSync(controlPath, JSON.stringify({ mode: 'structured' }));
   writeFileSync(eventPath, '', { flag: productWiring ? 'w' : 'wx' });
-  const index = join(profile, 'index.html'); writeFileSync(index, '<!doctype html><html lang="zh-CN"><body>内部候选隔离会话</body></html>');
+  const index = join(profile, 'index.html');
+  writeCandidateConfiguration(index, '<!doctype html><html lang="zh-CN"><body>内部候选隔离会话</body></html>', once, initialize);
   const row = (id, name, options = {}) => ({ id, name: '@deepseek-ai/' + name, config: options });
   const rows = [
     row('timer', 'cordis-plugin-timer'), row('config-editor', 'dsh-config-editor'),
@@ -159,6 +251,7 @@ try {
     row('typert', 'dsh-typert-registry'), row('typert-loader', 'dsh-typert-loader'),
     ...(existsSync(join(runtimeRoot, 'node_modules/@deepseek-ai/dsh-api-remote-access/package.json')) ? [row('remote-access', 'dsh-api-remote-access')] : []),
     row('gateway', 'dsh-api-gateway'),
+    ...(nativeCli ? [row('plugin-manager', 'dsh-plugin-manager')] : []),
     row('session-controller', 'dsh-api-session-controller', { nativeOpen: false }),
     row('webserver', 'dsh-host-webserver', { host: '127.0.0.1', port, compression: 'none' }),
     row('frontend', 'dsh-host-frontend-static', { distIndex: index }),
@@ -169,19 +262,29 @@ try {
     { id: 'fixture-existing', name: 'candidate-offline-fixture/existing' },
     { id: 'fixture-observer', name: 'candidate-offline-fixture/observer' },
   ];
-  writeFileSync(join(fixturePackage, 'cordis.patch.yml'), JSON.stringify([{ insert: rows }], null, 2));
-  const queryConfiguration = config.realGrok ? { executable: config.realGrok.executable, configPath: config.realGrok.configPath, budgetMs: 120_000 }
+  writeCandidateConfiguration(join(fixturePackage, 'cordis.patch.yml'),
+    JSON.stringify([{ insert: rows }], null, 2), once, initialize);
+  const queryConfiguration = compatibilitySmoke
+    ? prepareCompatibilitySmoke({ directory, profile, endpoint: compatibilitySmoke.endpoint })
+    : config.realGrok ? { executable: config.realGrok.executable, configPath: config.realGrok.configPath, budgetMs: 120_000 }
     : productWiring ? { executable: join(directory, 'intentionally-missing-grok-program'),
       configPath: join(directory, 'isolated-not-configured.toml'), budgetMs: 120_000 }
     : { executable: config.fixtureNode, executableArgs: [join(project, 'fixtures/internal-candidate/host-mcp.mjs'), controlPath, eventPath], budgetMs: 30_000 };
   // The shipped patch has one aggregate root. Configure that public entry;
   // nonexistent child loader entries cannot carry execution configuration.
-  writeFileSync(join(profile, 'cordis.patch.yml'), JSON.stringify([{ id: 'grok-search', config: queryConfiguration }], null, 2));
-  const appBoot = await imp('dsh-app-boot');
-  const { runProfile } = await imp('dsh', 'lib/profile-boot.js');
-  boot = await runProfile({ environment: appBoot.loadLayeredEnv('dsh', directory), profile: 'candidate', patchFiles: [], args: [] });
-  const failed = [...boot.ctx.loader.entries()].filter(entry => entry.fiber?.error).map(entry => ({ id: entry.options.id, error: safeError(entry.fiber.error) }));
-  process.send?.({ type: 'ready', workspace, failed, pending: [...boot.ctx.loader.entries()].filter(entry => entry.fiber?.state !== 2).map(entry => ({ id: entry.options.id, state: entry.fiber?.state ?? null })), versions: { node: process.versions.node, electron: process.versions.electron }, ...snapshot() });
+  writeCandidateConfiguration(join(profile, 'cordis.patch.yml'),
+    JSON.stringify([{ id: 'grok-search', config: nativeCli ? { budgetMs: 120_000 } : queryConfiguration }], null, 2), once, initialize);
+  if (nativeCli?.prepareOnly === true) {
+    assert.equal(initialize, true, 'Prepare-only must be an explicit first initialization.');
+    process.send?.({ type: 'prepared', workspace, profile, fixturePackage });
+    process.disconnect();
+  } else {
+    const appBoot = await imp('dsh-app-boot');
+    const { runProfile } = await imp('dsh', 'lib/profile-boot.js');
+    boot = await runProfile({ environment: appBoot.loadLayeredEnv('dsh', directory), profile: 'candidate', patchFiles: [], args: [] });
+    const failed = [...boot.ctx.loader.entries()].filter(entry => entry.fiber?.error).map(entry => ({ id: entry.options.id, error: safeError(entry.fiber.error) }));
+    process.send?.({ type: 'ready', workspace, failed, pending: [...boot.ctx.loader.entries()].filter(entry => entry.fiber?.state !== 2).map(entry => ({ id: entry.options.id, state: entry.fiber?.state ?? null })), versions: { node: process.versions.node, electron: process.versions.electron }, ...snapshot() });
+  }
 } catch (error) {
   process.send?.({ type: 'fatal', error: { ...safeError(error), stack: error.stack } });
   if (boot) await boot.shutdown.shutdown(1);

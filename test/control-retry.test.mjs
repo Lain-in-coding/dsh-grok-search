@@ -1,12 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apply, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { joinSentences } from '../src/ui/route-form.mjs';
 
+class TestService {
+  constructor(ctx) { this.ctx = ctx; }
+}
+class TestRemoteError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+const Gateway = createSettingsGateway({ Service: TestService, RemoteError: TestRemoteError });
+
 function gateway(control, authorize = () => {}) {
-  let Gateway;
-  apply({ plugin(Plugin) { Gateway = Plugin; } });
   const instance = new Gateway({ provide() {}, get: name => name === 'grokSearchControl' ? control
     : name === 'grokSearchConnectionSecurity' ? { requireOwner: authorize } : null });
   // This suite tests the new RPC dispatch; full snapshot codecs are covered

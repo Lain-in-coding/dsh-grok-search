@@ -1565,6 +1565,7 @@ async function runFirstUse(runtime) {
     assert.equal(active.mcpHandshakeValidated, true);
     assert.equal(active.credentialsValidated, false);
     assert.equal(sha256(programPath), active.sha256);
+    const hmrAfterPreparation = process.platform === 'darwin' ? await host.probe('hmr-files-readonly') : null;
     const detail = await pluginManagerRendererSnapshot(host);
     const initialUi = await settingsStopRendererFlow(host, 'first-use');
     // The host's own onboarding writes ui-chat/ui-settings rows. That is not a
@@ -1591,10 +1592,14 @@ async function runFirstUse(runtime) {
     assertNoProductPatch();
     const disabled = await setBundleEnabled(host, PRODUCT_BUNDLE, false);
     if (disabled.application !== 'applied') {
+      const installedSourceIdentity = expectedProductReceipt.sourceHashes.map(row => ({
+        file: row.file, expectedSha256: row.sha256,
+        actualSha256: sha256(join(profile, 'node_modules/dsh-grok-search', row.file)),
+      }));
       writeJson(join(directory, runtime.app.version + '-first-use-disable-diagnostic.json'), safe({
         manager: disabled, state: await host.probe('snapshot'),
         managerState: await host.probe('plugin-manager-state'),
-        hmrFiles: await host.probe('hmr-files-readonly'),
+        hmrAfterPreparation, hmrFiles: await host.probe('hmr-files-readonly'), installedSourceIdentity,
       }));
     }
     assertManagerApplied(disabled, PRODUCT_BUNDLE);

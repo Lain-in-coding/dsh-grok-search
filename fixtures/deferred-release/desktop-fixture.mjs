@@ -1,8 +1,9 @@
 import { createServer } from 'node:http';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { createControlIntentStore } from '../../src/core/control-intent-store.mjs';
 import { effectiveConfig } from '../../src/core/product-control.mjs';
 
@@ -325,6 +326,12 @@ export async function apply(ctx) {
             return records instanceof Map ? {
               available: true, observedAt: Reflect.get(files, 'observedAt'),
               pendingUrls: [...records].filter(([, identity]) => identity === undefined).map(([url]) => url),
+              records: [...records].filter(([url]) => url.includes('/dsh-grok-search/src/')).map(([url, identity]) => {
+                const file = statSync(fileURLToPath(url));
+                return { url, recordedIdentity: identity ?? null,
+                  currentIdentity: `${String(file.ino)}:${String(file.size)}:${String(file.mtimeMs)}`,
+                  modifiedAt: file.mtimeMs };
+              }),
             } : { available: false };
           }
           if (op === 'plugin-manager-state') {

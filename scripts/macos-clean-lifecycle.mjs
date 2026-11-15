@@ -10,7 +10,7 @@ import { chromium } from 'playwright';
 import {
   acceptanceEnvironment, acceptanceVerifierIdentity, downloadPinnedMacosHost, newTemporaryOutput, prepareRuntime,
 } from './macos-full-acceptance.mjs';
-import { FROZEN_PRODUCT_SHA256, macosHostPin, readPackageArtifact } from './lib/macos-acceptance-evidence.mjs';
+import { FROZEN_PRODUCT_SHA256, hashPackageSource, macosHostPin, readPackageArtifact } from './lib/macos-acceptance-evidence.mjs';
 import { hashFile, sha256 } from './lib/compatibility-evidence.mjs';
 import { runBoundedCommand } from './lib/compatibility-process.mjs';
 import { inspectDesktopNativeInstall } from './deferred-release-desktop-prepare.mjs';
@@ -462,7 +462,7 @@ export async function runCleanLifecycle({ packageDirectory, outputRoot, version 
       const installed = join(profile, 'node_modules', BUNDLE);
       if (existsSync(installed)) {
         for (const row of pkg.product.sourceHashes) {
-          if (!existsSync(join(installed, row.file)) || await hashFile(join(installed, row.file)) !== row.sha256) unchanged = false;
+          if (!existsSync(join(installed, row.file)) || hashPackageSource(join(installed, row.file)) !== row.sha256) unchanged = false;
         }
         observation.productUnchanged = unchanged;
       } else observation.productUnchanged = null;

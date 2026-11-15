@@ -918,6 +918,15 @@ test('clean observations distinguish measured failure, broken channels and inter
   await assert.rejects(boundedObservation(() => new Promise(() => {}), { timeout: 1000, signal: AbortSignal.timeout(10) }));
 });
 
+test('clean product integrity includes intentional empty package files without weakening asset hashing', () => {
+  const file = join(temporary(), 'empty.md');
+  writeFileSync(file, '');
+  assert.equal(hashPackageSource(file), sha256(Buffer.alloc(0)));
+  const script = readFileSync(join(root, 'scripts/macos-clean-lifecycle.mjs'), 'utf8');
+  assert.match(script, /hashPackageSource\(join\(installed, row\.file\)\)/);
+  assert.doesNotMatch(script, /hashFile\(join\(installed, row\.file\)\)/);
+});
+
 test('partial macOS diagnostics keep the collector seven-target contract and preserve real HMR failure data', () => {
   const text = readFileSync(join(root, '.github/workflows/macos-full-acceptance.yml'), 'utf8');
   assert.match(text, /version: \$\{\{ fromJSON\(inputs\.target_version == 'all'/);

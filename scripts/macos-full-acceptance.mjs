@@ -27,7 +27,7 @@ export const ACCEPTANCE_WORKFLOW_FILES = Object.freeze([
   workflow, '.github/workflows/macos-package-transport.yml', '.github/workflows/offline-gates.yml',
 ]);
 export const ACCEPTANCE_TOOL_FILES = Object.freeze([
-  'scripts/macos-full-acceptance.mjs', 'scripts/lib/macos-acceptance-evidence.mjs',
+  'scripts/macos-full-acceptance.mjs', 'scripts/macos-clean-lifecycle.mjs', 'scripts/lib/macos-acceptance-evidence.mjs',
   'scripts/lib/compatibility-evidence.mjs', 'scripts/lib/compatibility-smoke.mjs',
   'scripts/lib/compatibility-process.mjs', 'scripts/lib/asar.mjs', 'scripts/lib/candidate-runtime.mjs',
   'scripts/lib/internal-candidate-utils.mjs', 'scripts/lib/renderer-cdp.mjs', 'scripts/lib/retained-session.mjs',
@@ -192,7 +192,7 @@ export function verifyExtractedMacosArchive(root, entries) {
   }
 }
 
-async function prepareRuntime(root, asset, environment, signal) {
+export async function prepareRuntime(root, asset, environment, signal) {
   const archivePath = confinedPath(root, 'official-host.zip');
   const entries = inspectZip(readFileSync(archivePath));
   const host = create(root, 'official-runtime');

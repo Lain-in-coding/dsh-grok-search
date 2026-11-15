@@ -21,6 +21,9 @@ import {
   downloadPinnedMacosHost, newTemporaryOutput, parseArguments, parseHelperPayload, prepareExecutionTree, programStageArguments,
   reviewedMacosSourceClosure, verifyExecutionTreeInputs, verifyExtractedMacosArchive,
 } from '../scripts/macos-full-acceptance.mjs';
+import {
+  boundedObservation, classifyCleanLifecycle, parseCleanArguments, pollUntil, readReleaseCompletion,
+} from '../scripts/macos-clean-lifecycle.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const version = '0.2.2-rc.3', hash = 'a'.repeat(64), verifierHash = 'b'.repeat(64);
@@ -794,12 +797,16 @@ test('workflow preserves exact package, all seven targets, read-only privileges 
   assert.equal(driverMinutes, 115);
   const macJob = text.split(/^  macos:\s*$/m)[1].split(/^  evidence:\s*$/m)[0];
   const actionBudgets = [...macJob.matchAll(/^        timeout-minutes: (\d+)$/gm)].map(match => Number(match[1]));
-  assert.deepEqual(actionBudgets, [3, 3, 10, 3, 3, 1, 117, 5]);
+  assert.deepEqual(actionBudgets, [3, 3, 10, 3, 3, 1, 117, 15, 5, 2]);
   assert.equal(actionBudgets.length, (macJob.match(/^      - /gm) ?? []).length, 'Every action needs its own finite timeout.');
   assert.equal(actionBudgets.slice(0, 6).reduce((sum, value) => sum + value, 0), 23);
   assert.equal(actionBudgets[6] - driverMinutes, 2, 'The execution step leaves time after the driver deadline.');
-  assert.equal(jobMinutes - actionBudgets.reduce((sum, value) => sum + value, 0), 5,
+  const fullBudgets = actionBudgets.filter((_, index) => index !== 7 && index !== 9);
+  const cleanBudgets = actionBudgets.filter((_, index) => index !== 4 && index !== 6);
+  assert.equal(jobMinutes - fullBudgets.reduce((sum, value) => sum + value, 0), 5,
     'All setup, execution and receipt-upload caps fit inside the job with a five-minute overhead margin.');
+  assert.ok(cleanBudgets.reduce((sum, value) => sum + value, 0) < jobMinutes);
+  assert.match(macJob, /if: \$\{\{ !inputs\.clean_lifecycle \}\}/);
   assert.deepEqual(EVIDENCE_TIMEOUTS, { metadata: 20_000, asset: 900_000 });
   const stepTimeouts = [...driver.matchAll(/timeout: ([\d_]+)/g)].map(match => Number(match[1].replaceAll('_', '')));
   assert.deepEqual(stepTimeouts, [180_000, 600_000, 120_000, 180_000, 600_000, 780_000]);
@@ -836,6 +843,7 @@ test('registered branch entry rejects unauthorized or ambiguous compatibility di
   run({});
   run({ ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '123' });
   run({ ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '123', TARGET_VERSION: version });
+  run({ ACCEPTANCE_STAGE: 'clean-lifecycle', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '', TARGET_VERSION: '0.2.1-rc.2' });
   for (const overrides of [
     { GITHUB_REF: 'refs/heads/main' }, { GITHUB_REPOSITORY: 'other/repository' }, { CONFIRMED: 'false' },
     { DESKTOP_CANDIDATE: 'true' }, { ACCEPTANCE_STAGE: 'unknown' }, { SOURCE_COMMIT: 'b'.repeat(40) },
@@ -843,6 +851,8 @@ test('registered branch entry rejects unauthorized or ambiguous compatibility di
     { TARGET_VERSION: '0.2.1-rc.2' }, { TARGET_VERSION: 'untrusted' },
     { ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '', OLD_RUN: '123' },
     { ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '0' },
+    { ACCEPTANCE_STAGE: 'clean-lifecycle', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '', TARGET_VERSION: 'all' },
+    { ACCEPTANCE_STAGE: 'clean-lifecycle', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '123', TARGET_VERSION: '0.2.1-rc.2' },
   ]) assert.throws(() => run(overrides), 'An invalid dispatch must not start a runner.');
   assert.match(text, /compatibility-transport:[\s\S]*?needs: compatibility-request/);
   assert.match(text, /compatibility-acceptance:[\s\S]*?needs: compatibility-request/);
@@ -856,6 +866,56 @@ test('registered branch entry rejects unauthorized or ambiguous compatibility di
     assert.match(reusable, /workflow_call:/);
     assert.match(reusable, /workflow_dispatch:/);
   }
+});
+
+test('clean lifecycle reports host warnings separately and never passes unobserved or failed behavior', () => {
+  const observation = Object.fromEntries(['cleanProfile', 'nativeInstall', 'programPrepared', 'searchBefore',
+    'disabledSelection', 'releaseCompleted', 'processStopped', 'reenabledSelection', 'searchAfter', 'cacheReused',
+    'configurationPreserved', 'productUnchanged', 'hostUnchanged', 'hostExited', 'finalProcessStopped'].map(name => [name, true]));
+  observation.managerResults = [{ action: 'disable', result: { application: 'restart-required', restartReason: 'unmanaged-plugin' } }];
+  const result = classifyCleanLifecycle(observation);
+  assert.equal(result.functionalPassed, true);
+  assert.equal(result.status, 'functional-pass-with-host-warning');
+  assert.deepEqual(result.hostWarnings, [{ action: 'disable', reason: 'unmanaged-plugin' }]);
+  assert.equal(result.fullMatrixPassed, false);
+  assert.equal(result.userAcceptancePassed, false);
+  assert.equal(classifyCleanLifecycle({ ...observation, searchAfter: null }).status, 'incomplete');
+  assert.equal(classifyCleanLifecycle({ ...observation, executionError: true }).status, 'incomplete');
+  assert.equal(classifyCleanLifecycle({ ...observation, searchAfter: false }).status, 'functional-failure');
+  assert.equal(classifyCleanLifecycle({ ...observation, managerResults: [
+    { action: 'enable', result: { application: 'failed', error: { code: 'fixture' } } },
+  ] }).functionalPassed, false);
+});
+
+test('clean control reads only immutable release receipts and accepts one named host', () => {
+  const profile = temporary();
+  assert.equal(readReleaseCompletion(profile), null);
+  const folder = join(profile, 'control-intent.records'); mkdirSync(folder);
+  json(join(folder, 'v000000000001.json'), { format: 'dsh-grok-search/control-intent', revision: 1, intent: { policy: 'required' } });
+  json(join(folder, 'v000000000002.json'), { format: 'dsh-grok-search/control-intent', revision: 2, intent: { policy: 'released' } });
+  assert.equal(readReleaseCompletion(profile).intent.policy, 'released');
+  const args = ['--package-directory', '/input', '--output-root', '/new', '--version', '0.2.1-rc.2'];
+  assert.equal(parseCleanArguments(args)['--version'], '0.2.1-rc.2');
+  assert.throws(() => parseCleanArguments([...args.slice(0, -1), 'all']));
+  assert.throws(() => parseCleanArguments([...args, '--fixture', 'on']));
+  const script = readFileSync(join(root, 'scripts/macos-clean-lifecycle.mjs'), 'utf8');
+  assert.doesNotMatch(script, /prepareDesktopFixture\s*\(|\.utimes\s*\(|\.route\s*\(|DSH_DESKTOP_FIXTURE_TOKEN|candidate-offline-fixture/);
+  assert.match(script, /assert\.equal\(existsSync\(profile\), false/);
+  assert.match(script, /await switchBundle\(false\)/);
+  assert.match(script, /await switchBundle\(true\)/);
+  const workflow = readFileSync(join(root, '.github/workflows/macos-full-acceptance.yml'), 'utf8');
+  assert.match(workflow, /if: always\(\) && needs\.inputs\.result == 'success' && !inputs\.clean_lifecycle/);
+  assert.match(workflow, /--version "0\.2\.1-rc\.2"/);
+});
+
+test('clean observations distinguish measured failure, broken channels and interrupted waits', async () => {
+  await assert.rejects(pollUntil('program remains', () => false, 10),
+    error => error.code === 'CLEAN_OBSERVATION_TIMEOUT' && error.observed && error.lastValue === false);
+  await assert.rejects(pollUntil('probe unavailable', () => { throw new Error('ps unavailable'); }, 10),
+    error => error.code === 'CLEAN_OBSERVATION_TIMEOUT' && error.observed === false);
+  await assert.rejects(boundedObservation(() => new Promise(() => {}), { timeout: 10 }),
+    error => error.code === 'CLEAN_CHANNEL_TIMEOUT');
+  await assert.rejects(boundedObservation(() => new Promise(() => {}), { timeout: 1000, signal: AbortSignal.timeout(10) }));
 });
 
 test('partial macOS diagnostics keep the collector seven-target contract and preserve real HMR failure data', () => {

@@ -17,7 +17,7 @@ on:
       compatibility_stage:
         description: Independent 0.4.0 acceptance branch only; does not publish or change main.
         type: choice
-        options: [none, transport, acceptance]
+        options: [none, transport, acceptance, clean-lifecycle]
         default: none
       confirm_public_compatibility:
         description: Authorize selected public artifacts and standard runners for this acceptance stage.
@@ -67,7 +67,7 @@ jobs:
           assert.equal(e.GITHUB_REF, 'refs/heads/ci/compatibility-040-macos-20261115');
           assert.equal(e.CONFIRMED, 'true', 'Explicit public compatibility authorization is required.');
           assert.equal(e.DESKTOP_CANDIDATE, 'false', 'Do not combine the historical candidate job with these gates.');
-          assert.ok(['transport', 'acceptance'].includes(e.ACCEPTANCE_STAGE));
+          assert.ok(['transport', 'acceptance', 'clean-lifecycle'].includes(e.ACCEPTANCE_STAGE));
           assert.ok(['all', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5',
             '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3'].includes(e.TARGET_VERSION));
           if (e.ACCEPTANCE_STAGE === 'transport') {
@@ -76,6 +76,11 @@ jobs:
             assert.equal(e.PACKAGE_RUN, '');
             assert.equal(e.OLD_RUN, '');
             assert.equal(e.TARGET_VERSION, 'all');
+          } else if (e.ACCEPTANCE_STAGE === 'clean-lifecycle') {
+            assert.match(e.PACKAGE_RUN, /^[1-9]\d*$/);
+            assert.equal(e.OLD_RUN, '');
+            assert.equal(e.SOURCE_COMMIT, '');
+            assert.equal(e.TARGET_VERSION, '0.2.1-rc.2', 'One previously failing official host only.');
           } else {
             assert.match(e.PACKAGE_RUN, /^[1-9]\d*$/);
             assert.match(e.OLD_RUN, /^[1-9]\d*$/);
@@ -90,7 +95,7 @@ jobs:
       confirm_public_artifact: ${{ inputs.confirm_public_compatibility }}
       source_commit: ${{ inputs.source_commit }}
   compatibility-acceptance:
-    if: inputs.compatibility_stage == 'acceptance'
+    if: inputs.compatibility_stage == 'acceptance' || inputs.compatibility_stage == 'clean-lifecycle'
     needs: compatibility-request
     permissions:
       contents: read
@@ -104,6 +109,7 @@ jobs:
       old_package_artifact: macos-old-package-24ab92c59221
       old_package_sha256: 24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48
       target_version: ${{ inputs.compatibility_target }}
+      clean_lifecycle: ${{ inputs.compatibility_stage == 'clean-lifecycle' }}
   desktop-candidate:
     if: github.event_name == 'workflow_dispatch' && inputs.desktop_candidate && inputs.compatibility_stage == 'none'
     uses: ./.github/workflows/macos-beta-gate.yml

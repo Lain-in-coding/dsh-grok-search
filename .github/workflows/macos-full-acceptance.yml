@@ -26,6 +26,10 @@ on:
         type: string
         required: false
         default: all
+      clean_lifecycle:
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       confirm_public_standard_runner:
@@ -61,6 +65,10 @@ on:
         type: choice
         options: [all, "0.2.1-rc.2", "0.2.1-rc.3", "0.2.1-rc.4", "0.2.1-rc.5", "0.2.2-rc.1", "0.2.2-rc.2", "0.2.2-rc.3"]
         default: all
+      clean_lifecycle:
+        description: One clean official host lifecycle control, not matrix acceptance.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,6 +102,7 @@ jobs:
           OLD_ARTIFACT: ${{ inputs.old_package_artifact }}
           OLD_SHA256: ${{ inputs.old_package_sha256 }}
           TARGET_VERSION: ${{ inputs.target_version }}
+          CLEAN_LIFECYCLE: ${{ inputs.clean_lifecycle }}
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -103,7 +112,13 @@ jobs:
           assert.match(e.PACKAGE_ARTIFACT, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
           assert.ok(['all', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5',
             '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3'].includes(e.TARGET_VERSION));
-          const old = Boolean(e.OLD_RUN || e.OLD_ARTIFACT || e.OLD_SHA256);
+          if (e.CLEAN_LIFECYCLE === 'true') {
+            assert.equal(e.GITHUB_REPOSITORY, 'Lain-in-coding/dsh-grok-search');
+            assert.equal(e.GITHUB_REF, 'refs/heads/ci/compatibility-040-macos-20261115');
+            assert.equal(e.TARGET_VERSION, '0.2.1-rc.2');
+            assert.equal(e.OLD_RUN, '');
+          }
+          const old = e.CLEAN_LIFECYCLE !== 'true' && Boolean(e.OLD_RUN || e.OLD_ARTIFACT || e.OLD_SHA256);
           if (old) {
             assert.match(e.OLD_RUN, /^[1-9]\d*$/);
             assert.match(e.OLD_ARTIFACT, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
@@ -220,6 +235,7 @@ jobs:
           defaults write -g AppleLanguages -array zh-Hans en-US
           defaults write -g AppleLocale zh_CN
       - name: Run one official host with the same exact package and record every missing gate
+        if: ${{ !inputs.clean_lifecycle }}
         timeout-minutes: 117
         env:
           TARGET_VERSION: ${{ matrix.version }}
@@ -233,18 +249,38 @@ jobs:
           # The runner's subprocess environment is an allowlist with isolated HOME/XDG/DSH roots.
           # No github.token, Actions control file, live profile, or arbitrary metadata command is forwarded.
           node scripts/macos-full-acceptance.mjs "${args[@]}"
+      - name: Observe one clean official host without business fixture plugins
+        if: inputs.clean_lifecycle
+        timeout-minutes: 15
+        run: |
+          node scripts/macos-clean-lifecycle.mjs --package-directory "$RUNNER_TEMP/frozen-package" --version "0.2.1-rc.2" --output-root "$RUNNER_TEMP/macos-full"
       - name: Preserve only named sanitized receipts after helper cleanup
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         timeout-minutes: 5
         with:
-          name: macos-full-${{ matrix.version }}
+          name: ${{ inputs.clean_lifecycle && 'macos-clean-lifecycle' || 'macos-full' }}-${{ matrix.version }}
           path: ${{ runner.temp }}/macos-full/evidence/*.json
           if-no-files-found: error
           retention-days: 14
+      - name: Preserve the clean control's masked UI observations
+        if: always() && inputs.clean_lifecycle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 2
+        with:
+          name: macos-clean-lifecycle-ui-${{ matrix.version }}
+          path: |
+            ${{ runner.temp }}/macos-full/evidence/initial-ui.png
+            ${{ runner.temp }}/macos-full/evidence/ready-ui.png
+            ${{ runner.temp }}/macos-full/evidence/disabled-ui.png
+            ${{ runner.temp }}/macos-full/evidence/reenabled-ui.png
+            ${{ runner.temp }}/macos-full/evidence/working-again-ui.png
+            ${{ runner.temp }}/macos-full/evidence/failure-ui.png
+          if-no-files-found: warn
+          retention-days: 14
 
   evidence:
-    if: always() && needs.inputs.result == 'success'
+    if: always() && needs.inputs.result == 'success' && !inputs.clean_lifecycle
     needs: [inputs, macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 10

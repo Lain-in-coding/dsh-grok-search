@@ -22,6 +22,10 @@ on:
       old_package_sha256:
         type: string
         required: true
+      target_version:
+        type: string
+        required: false
+        default: all
   workflow_dispatch:
     inputs:
       confirm_public_standard_runner:
@@ -52,6 +56,11 @@ on:
         type: string
         required: true
         default: 24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48
+      target_version:
+        description: A partial diagnostic run never completes the seven-version acceptance matrix.
+        type: choice
+        options: [all, "0.2.1-rc.2", "0.2.1-rc.3", "0.2.1-rc.4", "0.2.1-rc.5", "0.2.2-rc.1", "0.2.2-rc.2", "0.2.2-rc.3"]
+        default: all
 
 permissions:
   contents: read
@@ -84,6 +93,7 @@ jobs:
           OLD_RUN: ${{ inputs.old_package_run_id }}
           OLD_ARTIFACT: ${{ inputs.old_package_artifact }}
           OLD_SHA256: ${{ inputs.old_package_sha256 }}
+          TARGET_VERSION: ${{ inputs.target_version }}
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -91,6 +101,8 @@ jobs:
           assert.match(e.GITHUB_REPOSITORY, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
           assert.match(e.PACKAGE_RUN, /^[1-9]\d*$/);
           assert.match(e.PACKAGE_ARTIFACT, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
+          assert.ok(['all', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5',
+            '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3'].includes(e.TARGET_VERSION));
           const old = Boolean(e.OLD_RUN || e.OLD_ARTIFACT || e.OLD_SHA256);
           if (old) {
             assert.match(e.OLD_RUN, /^[1-9]\d*$/);
@@ -176,7 +188,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        version: ["0.2.1-rc.2", "0.2.1-rc.3", "0.2.1-rc.4", "0.2.1-rc.5", "0.2.2-rc.1", "0.2.2-rc.2", "0.2.2-rc.3"]
+        version: ${{ fromJSON(inputs.target_version == 'all' && '["0.2.1-rc.2", "0.2.1-rc.3", "0.2.1-rc.4", "0.2.1-rc.5", "0.2.2-rc.1", "0.2.2-rc.2", "0.2.2-rc.3"]' || format('["{0}"]', inputs.target_version)) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         timeout-minutes: 3

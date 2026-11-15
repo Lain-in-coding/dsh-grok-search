@@ -1590,6 +1590,13 @@ async function runFirstUse(runtime) {
     assert.equal(chat.isError, false);
     assertNoProductPatch();
     const disabled = await setBundleEnabled(host, PRODUCT_BUNDLE, false);
+    if (disabled.application !== 'applied') {
+      writeJson(join(directory, runtime.app.version + '-first-use-disable-diagnostic.json'), safe({
+        manager: disabled, state: await host.probe('snapshot'),
+        managerState: await host.probe('plugin-manager-state'),
+        hmrFiles: await host.probe('hmr-files-readonly'),
+      }));
+    }
     assertManagerApplied(disabled, PRODUCT_BUNDLE);
     await waitFor(host, state => state.runtimeWeb?.searchProviderId === 'candidate-original'
       && !state.productProgram, 'First-use native disable did not restore the original route.');

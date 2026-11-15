@@ -377,6 +377,16 @@ export async function runMacosAcceptance({ packageDirectory, oldPackageDirectory
         payload = parseHelperPayload(bytes.toString('utf8'));
         sourceEvidence = { group: groups[id], runId: directories[0], sha256: sha256(bytes) };
         assert.equal(payload.runId, directories[0], 'Helper summary differs from its execution directory.');
+        if (id === 'first-use' && result.code !== 0) {
+          const diagnostic = confinedPath(group, directories[0] + '/' + version + '-first-use-disable-diagnostic.json',
+            { allowMissing: true });
+          if (existsSync(diagnostic)) {
+            assert.ok(lstatSync(diagnostic).size <= EVIDENCE_LIMITS.gate);
+            const output = confinedPath(evidenceRoot, 'first-use-disable-diagnostic.json', { allowMissing: true });
+            copyFileSync(diagnostic, output, constants.COPYFILE_EXCL);
+            console.log(JSON.stringify({ firstUseFailureDiagnostic: 'first-use-disable-diagnostic.json' }));
+          }
+        }
       }
       await record(id, result, payload);
       if (sourceEvidence) {

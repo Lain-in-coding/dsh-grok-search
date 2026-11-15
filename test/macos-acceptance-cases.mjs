@@ -785,14 +785,17 @@ test('registered branch entry rejects unauthorized or ambiguous compatibility di
     GITHUB_REF: 'refs/heads/ci/compatibility-040-macos-20261115',
     GITHUB_SHA: 'a'.repeat(40), ACCEPTANCE_STAGE: 'transport', CONFIRMED: 'true',
     SOURCE_COMMIT: 'a'.repeat(40), PACKAGE_RUN: '', OLD_RUN: '', DESKTOP_CANDIDATE: 'false',
+    TARGET_VERSION: 'all',
   };
   const run = overrides => runInNewContext(body, { assert, process: { env: { ...environment, ...overrides } } }, { timeout: 1000 });
   run({});
   run({ ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '123' });
+  run({ ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '123', TARGET_VERSION: version });
   for (const overrides of [
     { GITHUB_REF: 'refs/heads/main' }, { GITHUB_REPOSITORY: 'other/repository' }, { CONFIRMED: 'false' },
     { DESKTOP_CANDIDATE: 'true' }, { ACCEPTANCE_STAGE: 'unknown' }, { SOURCE_COMMIT: 'b'.repeat(40) },
     { PACKAGE_RUN: '123' }, { OLD_RUN: '123' },
+    { TARGET_VERSION: '0.2.1-rc.2' }, { TARGET_VERSION: 'untrusted' },
     { ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '', OLD_RUN: '123' },
     { ACCEPTANCE_STAGE: 'acceptance', SOURCE_COMMIT: '', PACKAGE_RUN: '123', OLD_RUN: '0' },
   ]) assert.throws(() => run(overrides), 'An invalid dispatch must not start a runner.');
@@ -808,6 +811,19 @@ test('registered branch entry rejects unauthorized or ambiguous compatibility di
     assert.match(reusable, /workflow_call:/);
     assert.match(reusable, /workflow_dispatch:/);
   }
+});
+
+test('partial macOS diagnostics keep the collector seven-target contract and preserve real HMR failure data', () => {
+  const text = readFileSync(join(root, '.github/workflows/macos-full-acceptance.yml'), 'utf8');
+  assert.match(text, /version: \$\{\{ fromJSON\(inputs\.target_version == 'all'/);
+  assert.match(text, /target_version:[\s\S]*?default: all/);
+  const driver = readFileSync(join(root, 'scripts/macos-full-acceptance.mjs'), 'utf8');
+  assert.match(driver, /id === 'first-use' && result\.code !== 0/);
+  assert.match(driver, /first-use-disable-diagnostic\.json/);
+  const fixture = readFileSync(join(root, 'fixtures/deferred-release/desktop-fixture.mjs'), 'utf8');
+  const probe = fixture.slice(fixture.indexOf("if (op === 'hmr-files-readonly')"), fixture.indexOf("if (op === 'plugin-manager-state')"));
+  assert.match(probe, /identity === undefined/);
+  assert.doesNotMatch(probe, /reconcileProfile\(|\.refresh\(|\.observe\(|\.set\(|\.delete\(/);
 });
 
 test('Git transport preserves the frozen support matrix instead of normalizing package bytes', () => {

@@ -35,6 +35,10 @@ on:
         description: Successful pinned prior-package transport run, required for acceptance.
         type: string
         default: ""
+      compatibility_target:
+        description: all for the full matrix, or one version for bounded failure diagnosis only.
+        type: string
+        default: all
 
 permissions:
   contents: read
@@ -52,6 +56,7 @@ jobs:
       PACKAGE_RUN: ${{ inputs.package_run_id }}
       OLD_RUN: ${{ inputs.old_package_run_id }}
       DESKTOP_CANDIDATE: ${{ inputs.desktop_candidate }}
+      TARGET_VERSION: ${{ inputs.compatibility_target }}
     steps:
       - name: Require the authorized isolated branch and an unambiguous request
         run: |
@@ -63,11 +68,14 @@ jobs:
           assert.equal(e.CONFIRMED, 'true', 'Explicit public compatibility authorization is required.');
           assert.equal(e.DESKTOP_CANDIDATE, 'false', 'Do not combine the historical candidate job with these gates.');
           assert.ok(['transport', 'acceptance'].includes(e.ACCEPTANCE_STAGE));
+          assert.ok(['all', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5',
+            '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3'].includes(e.TARGET_VERSION));
           if (e.ACCEPTANCE_STAGE === 'transport') {
             assert.match(e.SOURCE_COMMIT, /^[a-f0-9]{40}$/);
             assert.equal(e.SOURCE_COMMIT, e.GITHUB_SHA, 'Transport must execute the reviewed dispatch commit.');
             assert.equal(e.PACKAGE_RUN, '');
             assert.equal(e.OLD_RUN, '');
+            assert.equal(e.TARGET_VERSION, 'all');
           } else {
             assert.match(e.PACKAGE_RUN, /^[1-9]\d*$/);
             assert.match(e.OLD_RUN, /^[1-9]\d*$/);
@@ -95,6 +103,7 @@ jobs:
       old_package_run_id: ${{ inputs.old_package_run_id }}
       old_package_artifact: macos-old-package-24ab92c59221
       old_package_sha256: 24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48
+      target_version: ${{ inputs.compatibility_target }}
   desktop-candidate:
     if: github.event_name == 'workflow_dispatch' && inputs.desktop_candidate && inputs.compatibility_stage == 'none'
     uses: ./.github/workflows/macos-beta-gate.yml

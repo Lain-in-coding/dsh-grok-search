@@ -76,7 +76,7 @@ export async function apply(ctx) {
     const message = values?.[0];
     if (!message || !['warn', 'error'].includes(message.type)) return;
     const text = JSON.stringify(message.args ?? []).slice(0, 2000);
-    if (!/grok|CONTROL_/i.test(text + (message.name ?? ''))) return;
+    if (!/grok|CONTROL_|hmr|unmanaged-plugin|changed modules/i.test(text + (message.name ?? ''))) return;
     hostLogs.push({ type: message.type, name: message.name ?? null, text });
     if (hostLogs.length > 50) hostLogs.shift();
   });
@@ -317,6 +317,15 @@ export async function apply(ctx) {
             const target = rows.some(row => row.options.id === 'grok-search-control')
               ? entry('grok-search-control') : entry('grok-search');
             await target.fiber.dispose(); await ctx.loader.await(); return snapshot();
+          }
+          if (op === 'hmr-files-readonly') {
+            // Diagnostic only: never refresh, reconcile or modify the host's records.
+            const hmr = ctx.get('hmr'), files = hmr && Reflect.get(hmr, 'files');
+            const records = files && Reflect.get(files, 'records');
+            return records instanceof Map ? {
+              available: true, observedAt: Reflect.get(files, 'observedAt'),
+              pendingUrls: [...records].filter(([, identity]) => identity === undefined).map(([url]) => url),
+            } : { available: false };
           }
           if (op === 'plugin-manager-state') {
             const manager = ctx.get('pluginManager');

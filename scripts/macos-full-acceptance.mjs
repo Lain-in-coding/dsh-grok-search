@@ -277,6 +277,7 @@ export async function runMacosAcceptance({ packageDirectory, oldPackageDirectory
   const stages = [], environment = acceptanceEnvironment(create(privateRoot, 'environment'));
   let asset = null, prepared = null, upgradeSource = null, oldProduct = null;
   let blocker = null, cleanupVerified = false, currentStage = 'preparation', upgradeSelection = null;
+  let firstUsePreparation = null;
   const record = async (id, result, payload) => {
     assert.ok(MACOS_STAGES.includes(id) && !stages.some(row => row.id === id));
     const name = id + '.json', path = confinedPath(evidenceRoot, name, { allowMissing: true });
@@ -387,13 +388,30 @@ export async function runMacosAcceptance({ packageDirectory, oldPackageDirectory
             console.log(JSON.stringify({ firstUseFailureDiagnostic: 'first-use-disable-diagnostic.json' }));
           }
         }
+        if (id === 'first-use') {
+          const checkpoint = confinedPath(group, directories[0] + '/' + version + '-first-use-program-prepared.json',
+            { allowMissing: true });
+          if (existsSync(checkpoint)) {
+            assert.ok(lstatSync(checkpoint).size <= EVIDENCE_LIMITS.gate);
+            const bytes = readFileSync(checkpoint);
+            const value = JSON.parse(bytes);
+            assert.equal(value.hostVersion, version);
+            assert.equal(value.productSha256, product.sha256);
+            assert.equal(value.scope, 'first-use-preparation-checkpoint-not-complete-lifecycle-acceptance');
+            assert.equal(value.program.source, 'private-cache');
+            assert.equal(value.program.mcpHandshakeValidated, true);
+            const destination = confinedPath(evidenceRoot, 'first-use-program-prepared.json', { allowMissing: true });
+            copyFileSync(checkpoint, destination, constants.COPYFILE_EXCL);
+            firstUsePreparation = { ...value, evidence: { path: 'first-use-program-prepared.json', sha256: sha256(bytes) } };
+          }
+        }
       }
       await record(id, result, payload);
       if (sourceEvidence) {
         assert.equal(stages.at(-1).evidence.sha256, sourceEvidence.sha256, 'Original helper summary serialization differs.');
         stages.at(-1).sourceEvidence = sourceEvidence;
       }
-      if (id === 'first-use' && payload.firstUseAutoDownloadValidated === true && payload.status === 'pass') {
+      if (id === 'first-use' && firstUsePreparation) {
         assert.match(payload.runId, /^[a-zA-Z0-9_.-]{1,128}$/);
         cache = confinedPath(realpathSync(environment.TMPDIR),
           `dsh-deferred-desktop-manager-${payload.runId}/${version}/dsh-home/profiles/desktop/grok-search/runtime-cache`);
@@ -401,7 +419,8 @@ export async function runMacosAcceptance({ packageDirectory, oldPackageDirectory
         assert.ok(lstatSync(activePath).size <= EVIDENCE_LIMITS.receipt);
         const active = JSON.parse(readFileSync(activePath, 'utf8'));
         grok = confinedPath(cache, active.executable);
-        assert.equal(await hashFile(grok), payload.results?.[0]?.evidence?.program?.sha256);
+        assert.equal(await hashFile(activePath), firstUsePreparation.activeSha256);
+        assert.equal(await hashFile(grok), firstUsePreparation.program.sha256);
         if (!hostCopies && install.code === 0 && !install.failure) {
           currentStage = 'program-host';
           const output = confinedPath(privateRoot, 'program-host', { allowMissing: true });
@@ -441,6 +460,7 @@ export async function runMacosAcceptance({ packageDirectory, oldPackageDirectory
     cleanupVerified, realCredentialsUsed: false,
     counterScope: 'protected-search-windows-only; explicit release/disable restoration calls are separate',
     upgradeSelection, oldProduct,
+    firstUsePreparation,
     upgradeSourceHost: upgradeSource ? { asset: upgradeSource.asset, runtimeFiles: upgradeSource.files } : null,
     hostTransitions: { status: 'not-run', inferredFromVersionMatrix: false },
     primaryGrokVerified: false, published: false };

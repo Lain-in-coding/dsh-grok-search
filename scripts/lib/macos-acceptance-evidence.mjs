@@ -505,6 +505,8 @@ function verifyRecordedHost(value, stages) {
   const firstUse = stages.find(row => row.id === 'first-use' && row.status === 'passed');
   if (program && firstUse) assert.equal(program.payload.grokSha256,
     firstUse.payload.results[0].evidence.program.sha256, 'Managed program probe must use the actual first-use binary.');
+  if (program && value.firstUsePreparation) assert.equal(program.payload.grokSha256,
+    value.firstUsePreparation.program.sha256, 'Independent managed cases must bind to the actual preparation checkpoint.');
 }
 
 export async function collectMacosEvidence(root, product, { runId, runAttempt, commit, repository, verifierSha256 } = {}) {
@@ -540,6 +542,22 @@ export async function collectMacosEvidence(root, product, { runId, runAttempt, c
       if (expected !== undefined) assert.equal(value.execution.context[key], expected, 'Evidence belongs to another CI run.');
     }
     const stages = await readStageEvidence(directory, value.stages);
+    if (value.firstUsePreparation) {
+      const preparation = value.firstUsePreparation;
+      assert.equal(preparation.evidence?.path, 'first-use-program-prepared.json');
+      const path = confinedPath(directory, preparation.evidence.path);
+      assert.equal(await hashFile(path, { limit: EVIDENCE_LIMITS.gate }), requireSha256(preparation.evidence.sha256));
+      const checkpoint = JSON.parse(readFileSync(path, 'utf8'));
+      const { evidence: _evidence, ...recorded } = preparation;
+      assert.deepEqual(checkpoint, recorded, 'Preparation checkpoint was rewritten in the final receipt.');
+      assert.equal(checkpoint.hostVersion, version);
+      assert.equal(checkpoint.productSha256, product.sha256);
+      assert.equal(checkpoint.scope, 'first-use-preparation-checkpoint-not-complete-lifecycle-acceptance');
+      assert.equal(checkpoint.program?.source, 'private-cache');
+      assert.equal(checkpoint.program?.mcpHandshakeValidated, true);
+      requireSha256(checkpoint.program.sha256);
+      requireSha256(checkpoint.activeSha256);
+    }
     verifyRecordedHost(value, stages);
     const gates = mapMacosGates({ product, version, stages });
     assert.deepEqual(value.gates, gates, 'Summary differs from actual helper evidence.');

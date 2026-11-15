@@ -1565,6 +1565,13 @@ async function runFirstUse(runtime) {
     assert.equal(active.mcpHandshakeValidated, true);
     assert.equal(active.credentialsValidated, false);
     assert.equal(sha256(programPath), active.sha256);
+    writeJson(join(directory, runtime.app.version + '-first-use-program-prepared.json'), safe({
+      hostVersion: runtime.app.version, productSha256: expectedProductReceipt.sha256,
+      program: { version: active.version, sha256: active.sha256, source: 'private-cache',
+        mcpHandshakeValidated: active.mcpHandshakeValidated },
+      configCreated: false, activeSha256: activeHash, nativeInstallAudit,
+      scope: 'first-use-preparation-checkpoint-not-complete-lifecycle-acceptance',
+    }));
     const hmrAfterPreparation = process.platform === 'darwin' ? await host.probe('hmr-files-readonly') : null;
     const detail = await pluginManagerRendererSnapshot(host);
     const initialUi = await settingsStopRendererFlow(host, 'first-use');

@@ -624,6 +624,46 @@ test('failed program-stage receipts keep local case evidence but cannot make the
   assert.match(driver, /passed: gates\.every\(row => row\.passed\) && cleanupVerified && helpersSucceeded\(actual\)/);
 });
 
+test('a preparation checkpoint enables independent proof but cannot promote failed first-use lifecycle', async () => {
+  const directory = temporary(), target = join(directory, 'macos-full-' + version);
+  mkdirSync(target);
+  const stages = successfulStages({ program: true });
+  const firstUse = stages.find(row => row.id === 'first-use');
+  firstUse.status = 'failed'; firstUse.exitCode = 1;
+  firstUse.payload.status = 'fail'; firstUse.payload.fatal = { code: 'FIRST_USE_HMR_FAILED' };
+  for (const row of stages) {
+    json(join(target, row.evidence.path), row.payload);
+    row.evidence.sha256 = sha256(readFileSync(join(target, row.evidence.path)));
+  }
+  const checkpoint = { hostVersion: version, productSha256: product.sha256,
+    program: { version: '0.1.26', sha256: 'd'.repeat(64), source: 'private-cache', mcpHandshakeValidated: true },
+    configCreated: false, activeSha256: hash, nativeInstallAudit: nativeAudit(),
+    scope: 'first-use-preparation-checkpoint-not-complete-lifecycle-acceptance' };
+  json(join(target, 'first-use-program-prepared.json'), checkpoint);
+  const value = { kind: 'macos-exact-package-acceptance', platform: 'darwin-arm64', version, product,
+    hostAsset: macosHostPin(version),
+    runtimeFiles: Object.fromEntries(Object.entries(MACOS_RUNTIME_FILES).map(([role, path]) => [role, { path, sha256: hash }])),
+    upgradeSelection: { eligible: true, version, code: null, hostRange: version },
+    verifierSha256: verifierHash, passed: false, cleanupVerified: false, realCredentialsUsed: false, published: false,
+    gates: mapMacosGates({ product, version, stages }),
+    firstUsePreparation: { ...checkpoint, evidence: { path: 'first-use-program-prepared.json',
+      sha256: sha256(readFileSync(join(target, 'first-use-program-prepared.json'))) } },
+    execution: { platform: 'darwin', arch: 'arm64', context: { kind: 'local' },
+      startedAt: '2026-11-14T00:00:00.000Z', finishedAt: '2026-11-14T01:00:00.000Z' },
+    stages: stages.map(({ payload, ...row }) => row) };
+  const write = () => json(join(target, 'receipt.json'), { ...value, runSha256: executionSha256(value) });
+  write();
+  const result = await collectMacosEvidence(directory, product, { verifierSha256: verifierHash });
+  assert.equal(result.summary.failed, 1);
+  assert.equal(result.targets.find(row => row.version === version).gates.find(row => row.id === 'cancellation').passed, true);
+  assert.equal(result.targets.find(row => row.version === version).gates.find(row => row.id === 'program-preparation').passed, false);
+  value.passed = true; write();
+  await assert.rejects(collectMacosEvidence(directory, product, { verifierSha256: verifierHash }));
+  value.passed = false; write();
+  json(join(target, 'first-use-program-prepared.json'), { ...checkpoint, program: { ...checkpoint.program, sha256: hash } });
+  await assert.rejects(collectMacosEvidence(directory, product, { verifierSha256: verifierHash }));
+});
+
 test('collector verifies both official runtime inventories for forward-only product upgrade evidence', async () => {
   const directory = temporary(), target = join(directory, 'macos-full-' + version);
   mkdirSync(target);
@@ -820,6 +860,8 @@ test('partial macOS diagnostics keep the collector seven-target contract and pre
   const driver = readFileSync(join(root, 'scripts/macos-full-acceptance.mjs'), 'utf8');
   assert.match(driver, /id === 'first-use' && result\.code !== 0/);
   assert.match(driver, /first-use-disable-diagnostic\.json/);
+  assert.match(driver, /if \(id === 'first-use' && firstUsePreparation\)/);
+  assert.match(driver, /assert\.equal\(await hashFile\(grok\), firstUsePreparation\.program\.sha256\)/);
   const fixture = readFileSync(join(root, 'fixtures/deferred-release/desktop-fixture.mjs'), 'utf8');
   const probe = fixture.slice(fixture.indexOf("if (op === 'hmr-files-readonly')"), fixture.indexOf("if (op === 'plugin-manager-state')"));
   assert.match(probe, /identity === undefined/);

@@ -1017,6 +1017,39 @@ test('B2 normal and first-use paths audit actual installs and normal restart wit
   }
 });
 
+test('first-use disable distinguishes the observed advisory from actual release and keeps later checks', () => {
+  const source = readFileSync(new URL('../scripts/b2-plugin-manager-desktop.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('function assertFirstUseDisableReported(');
+  const end = source.indexOf('\nasync function installBundle(', start);
+  assert.ok(start > 0 && end > start);
+  const { check, releaseObserved } = new Function('assert', source.slice(start, end)
+    + '\nreturn { check: assertFirstUseDisableReported, releaseObserved: firstUseReleaseObserved };')(assert);
+  const applied = { application: 'applied', changed: true, target: 'dsh-grok-search', enabled: false };
+  assert.equal(check(applied, applied.target), false);
+  assert.equal(check({ ...applied, application: 'restart-required', restartReason: 'unmanaged-plugin' }, applied.target), true);
+  for (const override of [
+    { application: 'failed' }, { application: 'overridden' }, { changed: false }, { enabled: true },
+    { target: 'different-plugin' }, { error: { code: 'release-failed' } },
+    { application: 'restart-required', restartReason: 'no-hmr' },
+    { application: 'restart-required', restartReason: 'package-moved' },
+  ]) assert.throws(() => check({ ...applied, ...override }, applied.target));
+  const lifecycle = source.slice(source.indexOf('async function runFirstUse('), source.indexOf('async function upgradeCacheFixture('));
+  const released = { runtimeWeb: { searchProviderId: 'candidate-original' },
+    record: { policy: 'released', releaseCompletion: { routeVerified: true } },
+    productProgram: null, productControl: null, productRecovery: null, productRouteVerifier: null };
+  assert.equal(releaseObserved(released), true);
+  for (const service of ['productProgram', 'productControl', 'productRecovery', 'productRouteVerifier']) {
+    assert.equal(releaseObserved({ ...released, [service]: {} }), false);
+  }
+  assert.match(lifecycle, /waitFor\(host, firstUseReleaseObserved/);
+  assert.ok(lifecycle.indexOf('progress.releaseCompletion = releaseCompletion') < lifecycle.indexOf('const enabled = await setBundleEnabled'));
+  assert.match(lifecycle, /assert\.deepEqual\(await matchingFirstUseProcesses\(programPath\), \[\]\)/);
+  assert.match(lifecycle, /assertManagerApplied\(enabled, PRODUCT_BUNDLE\)/);
+  assert.match(lifecycle, /progress\.searchAfterReenable = true/);
+  assert.match(lifecycle, /managerOutcomes: \{ disabled, enabled \}, releaseCompletion/);
+  assert.match(source, /validationFlagSemantics: 'false means not validated/);
+});
+
 test('forward host upgrade retains the new plugin on rc.2 and never schedules an old-host rollback', () => {
   const runtimes = ['0.2.2-rc.1', '0.2.2-rc.2'].map(version => ({ app: { version } }));
   const forward = searchLogUpgradeStages({ forwardHostUpgrade: true, runtimes });

@@ -137,6 +137,7 @@ for (const row of expectedProductReceipt.sourceHashes) {
   assert.equal(sha256(join(project, row.file)), row.sha256, 'Frozen package source differs: ' + row.file);
 }
 const results = [], children = [];
+const firstUseProgress = [];
 const upgradeEnvironments = new Map();
 const upgradeRuntimeControls = new Map();
 
@@ -991,6 +992,24 @@ function assertManagerApplied(result, target, application = 'applied') {
   assert.equal(result.error ?? null, null, JSON.stringify(result));
 }
 
+function assertFirstUseDisableReported(result, target) {
+  // A clean official macOS control reproduced this advisory while release,
+  // process shutdown and same-process re-enable actually succeeded.
+  const advisory = result.application === 'restart-required' && result.restartReason === 'unmanaged-plugin';
+  assert.ok(result.application === 'applied' || advisory, JSON.stringify(result));
+  assert.equal(result.changed, true, JSON.stringify(result));
+  assert.equal(result.target, target, JSON.stringify(result));
+  assert.equal(result.enabled, false, JSON.stringify(result));
+  assert.equal(result.error ?? null, null, JSON.stringify(result));
+  return advisory;
+}
+
+function firstUseReleaseObserved(state) {
+  return state.runtimeWeb?.searchProviderId === 'candidate-original'
+    && !state.productProgram && !state.productControl && !state.productRecovery && !state.productRouteVerifier
+    && state.record?.policy === 'released' && state.record?.releaseCompletion?.routeVerified === true;
+}
+
 async function installBundle(host, spec, name) {
   return nativeManagerRpc(host, 'installBundle', { spec, options: { enabled: true, requestId: randomUUID() } });
 }
@@ -1521,6 +1540,10 @@ async function productionDiagnosticsFlow(host, stub) {
 
 async function runFirstUse(runtime) {
   currentVersion = runtime.app.version;
+  const progress = { hostVersion: currentVersion, programPrepared: null, configurationSaved: null,
+    searchesBeforeDisable: null, nativeDisable: null, nativeReenable: null, searchAfterReenable: null,
+    managedProcessCleanup: null, managerDisable: null, managerEnable: null, releaseCompletion: null };
+  firstUseProgress.push(progress);
   const requestedFolder = join(temporary, runtime.app.version);
   await prepare(runtime, requestedFolder);
   // macOS aliases /var to /private/var. Use the resolved run root for both the
@@ -1565,6 +1588,7 @@ async function runFirstUse(runtime) {
     assert.equal(active.mcpHandshakeValidated, true);
     assert.equal(active.credentialsValidated, false);
     assert.equal(sha256(programPath), active.sha256);
+    progress.programPrepared = true;
     writeJson(join(directory, runtime.app.version + '-first-use-program-prepared.json'), safe({
       hostVersion: runtime.app.version, productSha256: expectedProductReceipt.sha256,
       program: { version: active.version, sha256: active.sha256, source: 'private-cache',
@@ -1581,6 +1605,7 @@ async function runFirstUse(runtime) {
     const patchAfterOnboarding = sha256(patchPath);
     const configured = await firstUseConfigure(host, stub);
     assert.equal(configured.configPath, configPath);
+    progress.configurationSaved = true;
     assertNoProductPatch();
     const first = await modelTurn(host, 'search');
     assert.equal(first.isError, false, JSON.stringify(first));
@@ -1596,8 +1621,10 @@ async function runFirstUse(runtime) {
     const fetch = await modelTurn(host, 'fetch'), chat = await modelTurn(host, 'chat');
     assert.equal(fetch.isError, false);
     assert.equal(chat.isError, false);
+    progress.searchesBeforeDisable = true;
     assertNoProductPatch();
     const disabled = await setBundleEnabled(host, PRODUCT_BUNDLE, false);
+    progress.managerDisable = disabled;
     if (disabled.application !== 'applied') {
       const installedSourceIdentity = expectedProductReceipt.sourceHashes.map(row => ({
         file: row.file, expectedSha256: row.sha256,
@@ -1609,31 +1636,42 @@ async function runFirstUse(runtime) {
         hmrAfterPreparation, hmrFiles: await host.probe('hmr-files-readonly'), installedSourceIdentity,
       }));
     }
-    assertManagerApplied(disabled, PRODUCT_BUNDLE);
-    await waitFor(host, state => state.runtimeWeb?.searchProviderId === 'candidate-original'
-      && !state.productProgram, 'First-use native disable did not restore the original route.');
+    const hostRestartAdvisory = assertFirstUseDisableReported(disabled, PRODUCT_BUNDLE);
+    const released = await waitFor(host, firstUseReleaseObserved, 'First-use native disable did not finish actual release.');
+    const releaseCompletion = released.record.releaseCompletion;
+    assert.equal(releaseCompletion.kind, 'explicit-release-completion');
+    assert.equal(releaseCompletion.routeEvidence?.fetchPreserved, true);
+    assert.equal(releaseCompletion.routeEvidence?.dependenciesPreserved, true);
+    progress.releaseCompletion = releaseCompletion;
     assert.deepEqual(await matchingFirstUseProcesses(programPath), []);
+    progress.nativeDisable = true;
     const enabled = await setBundleEnabled(host, PRODUCT_BUNDLE, true);
+    progress.managerEnable = enabled;
     assertManagerApplied(enabled, PRODUCT_BUNDLE);
     const reused = await waitFor(host, state => state.productProgram?.phase === 'ready'
       && state.productControl?.phase === 'required', 'Re-enable did not reuse the prepared private program.');
     assert.equal(reused.productProgram.program.path, programPath);
     assert.equal(sha256(join(cache, 'active.json')), activeHash, 'Re-enable must not redownload the private program.');
+    progress.nativeReenable = true;
     const third = await modelTurn(host, 'search');
     assert.equal(third.isError, false);
     assert.equal(third.afterCalls.original, third.beforeCalls.original);
+    progress.searchAfterReenable = true;
     const diagnosticFlow = diagnostics ? await productionDiagnosticsFlow(host, stub) : null;
     const exit = await close(host);
     assert.equal(exit.exitCode, 0);
     assert.equal(exit.forced, false);
     assert.deepEqual(await matchingFirstUseProcesses(programPath), []);
+    progress.managedProcessCleanup = true;
     assert.ok(stub.requests.length >= 2 && stub.requests.every(row => row.authorizedWithSyntheticKey));
     return { installed, nativeInstallAudit, detail, initialUi, configured, program: { version: active.version,
       source: 'private-cache', sha256: active.sha256, registry: active.registry,
       downloadRegistry: active.downloadRegistry, mcpHandshakeValidated: true },
       defaultConfigCreatedOnlyBySave: true, manualProfileEditRequired: false,
       productPatchEntriesAdded: false, hostOnboardingMayWriteProfile: true,
-      profilePatchUnchangedAfterOnboarding: sha256(patchPath) === patchAfterOnboarding, hostRestartRequired: false,
+      profilePatchUnchangedAfterOnboarding: sha256(patchPath) === patchAfterOnboarding,
+      hostRestartRequired: hostRestartAdvisory, hostRestartPerformed: false,
+      managerOutcomes: { disabled, enabled }, releaseCompletion,
       queries: [first, second, third], sameManagedProcessReused: true, nativeDisableReenableValidated: true,
       cacheReused: true, fetch, chat, diagnosticFlow, upstream: { scope: 'loopback-only', syntheticKeyOnly: true,
         requests: stub.requests }, exit, orphanPrograms: 0 };
@@ -2204,6 +2242,8 @@ try {
       && results.every(row => firstUse ? row.evidence?.configured?.savedThroughProductionDialog === true
         : row.evidence?.uiDomValidated === true),
     firstUseAutoDownloadValidated: passed && firstUse,
+    validationFlagSemantics: 'false means not validated, not independently observed failure; null progress is unverified',
+    firstUseProgress: safe(firstUseProgress),
     upgradeRetentionValidated: passed && Boolean(upgradeFrom),
     crossHostProductUpgradeValidated: passed && Boolean(upgradeToRuntime),
     upgradeFailureRecoveryValidated: passed && Boolean(upgradeFrom) && !upgradeInPlaceOnly,

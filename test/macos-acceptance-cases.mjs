@@ -657,6 +657,11 @@ test('a preparation checkpoint enables independent proof but cannot promote fail
   assert.equal(result.summary.failed, 1);
   assert.equal(result.targets.find(row => row.version === version).gates.find(row => row.id === 'cancellation').passed, true);
   assert.equal(result.targets.find(row => row.version === version).gates.find(row => row.id === 'program-preparation').passed, false);
+  const preparation = value.firstUsePreparation;
+  delete value.firstUsePreparation; write();
+  await assert.rejects(collectMacosEvidence(directory, product, { verifierSha256: verifierHash }),
+    /require their actual preparation checkpoint/);
+  value.firstUsePreparation = preparation; write();
   value.passed = true; write();
   await assert.rejects(collectMacosEvidence(directory, product, { verifierSha256: verifierHash }));
   value.passed = false; write();
@@ -881,6 +886,7 @@ test('authorized transport producer cannot silently replace the frozen artifact 
   assert.match(text, /workflow_dispatch:/);
   assert.match(text, /if: inputs\.confirm_public_artifact/);
   assert.match(text, /source_commit:/);
+  assert.match(text, /if \(\$env:SOURCE_COMMIT -cne \$env:GITHUB_SHA\) \{ throw /);
   assert.match(text, /persist-credentials: false/);
   assert.match(text, /runs-on: windows-2025/);
   assert.match(text, /assert\.equal\(await hashFile\(result\.tarball\), expected/);

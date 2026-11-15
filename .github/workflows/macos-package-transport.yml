@@ -38,6 +38,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:SOURCE_COMMIT -cnotmatch '^[a-f0-9]{40}$') { throw 'source_commit must be an exact reviewed commit SHA.' }
+          if ($env:SOURCE_COMMIT -cne $env:GITHUB_SHA) { throw 'source_commit must equal the reviewed dispatch commit.' }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.source_commit }}

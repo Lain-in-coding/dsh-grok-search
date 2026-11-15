@@ -542,6 +542,13 @@ export async function collectMacosEvidence(root, product, { runId, runAttempt, c
       if (expected !== undefined) assert.equal(value.execution.context[key], expected, 'Evidence belongs to another CI run.');
     }
     const stages = await readStageEvidence(directory, value.stages);
+    const firstUse = stages.find(row => row.id === 'first-use');
+    const independentPreparationUsed = stages.some(row => ['program-host', 'renderer', 'upgrade'].includes(row.id)
+      && row.status !== 'not-run');
+    if (independentPreparationUsed && (!firstUse || !stageSucceeded(firstUse)
+      || !sourceCheck('first-use', firstUse.payload, product, version))) {
+      assert.ok(value.firstUsePreparation, 'Independent stages require their actual preparation checkpoint when first-use failed.');
+    }
     if (value.firstUsePreparation) {
       const preparation = value.firstUsePreparation;
       assert.equal(preparation.evidence?.path, 'first-use-program-prepared.json');
@@ -555,6 +562,8 @@ export async function collectMacosEvidence(root, product, { runId, runAttempt, c
       assert.equal(checkpoint.scope, 'first-use-preparation-checkpoint-not-complete-lifecycle-acceptance');
       assert.equal(checkpoint.program?.source, 'private-cache');
       assert.equal(checkpoint.program?.mcpHandshakeValidated, true);
+      assert.equal(checkpoint.configCreated, false);
+      assert.equal(nativeInstallChecked(checkpoint.nativeInstallAudit, product.version), true);
       requireSha256(checkpoint.program.sha256);
       requireSha256(checkpoint.activeSha256);
     }

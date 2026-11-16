@@ -1,7 +1,7 @@
 async page => {
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
   const results = [], errors = [];
-  let fatal = null;
+  let fatal = null, failure, screenshotError;
   page.on('pageerror', error => errors.push(String(error)));
   const check = (name, actual, expected = true) => {
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
@@ -921,53 +921,46 @@ async page => {
       }, { report, error });
     };
     await showCompatibility(compatibilityReport());
-    await page.locator('[data-compatibility-notice]').waitFor({ state: 'visible' });
-    check('RC compatibility does not ask for experimental consent', await page.locator('[data-compatibility-consent]').isVisible(), false);
-    check('RC compatibility remains explicitly unverified', await page.locator('[data-compatibility-pair]').textContent().then(text => text.includes('未验证组合')));
-    await page.locator('[data-compatibility-dismiss]').click();
-    await page.locator('[data-compatibility-notice]').waitFor({ state: 'hidden' });
-    check('dismissal only acknowledges the notice', await read(() => window.harness.compatibilityCalls
-      .filter(call => call.method !== 'compatibilityReport').map(call => call.method)), ['acknowledgeCompatibilityNotice']);
-    await showCompatibility(compatibilityReport({ hostVersion: '0.2.2-rc.4' }));
-    await page.locator('[data-compatibility-notice]').waitFor({ state: 'visible' });
-    check('new exact pair keeps its own notice', await page.locator('[data-compatibility-pair]').textContent().then(text => text.includes('0.2.2-rc.4')));
-    const experiment = compatibilityReport({ hostVersion: '0.2.3-beta.1', channel: 'beta', coreReady: false,
-      phase: 'waiting-confirmation', confirmationRequired: true, code: 'COMPATIBILITY_CONFIRMATION_REQUIRED' });
-    await showCompatibility(experiment);
-    await page.locator('[data-compatibility-consent]').waitFor({ state: 'visible' });
-    check('experimental confirm starts disabled', await page.locator('[data-compatibility-confirm]').isDisabled());
-    check('experimental pair is never auto-confirmed', await read(() => window.harness.compatibilityCalls.some(call => call.method === 'confirmCompatibility')), false);
-    await page.locator('[data-compatibility-consent]').click();
-    check('deliberate risk checkbox enables confirmation', await page.locator('[data-compatibility-confirm]').isEnabled());
-    await page.locator('[data-compatibility-confirm]').click();
-    await page.locator('[data-compatibility-consent]').waitFor({ state: 'hidden' });
-    check('confirmation sends the exact displayed version pair and revision', await read(() =>
-      window.harness.compatibilityCalls.find(call => call.method === 'confirmCompatibility')?.request),
-    { expectedRevision: 'missing', hostVersion: experiment.hostVersion, pluginVersion: '0.4.0', acceptRisk: true });
-    check('confirmed experiment is not mislabeled verified', await page.locator('[data-compatibility-pair]').textContent().then(text =>
-      text.includes('未验证组合') && text.includes('已确认实验风险')));
-    const pending = { available: false, code: 'COMPATIBILITY_OPTIONAL_PENDING' };
-    await showCompatibility(compatibilityReport({ code: 'COMPATIBILITY_OPTIONAL_PENDING', notified: true,
-      optionalFeatures: { settings: pending, github: pending, chat: pending } }));
-    await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot
-      .querySelector('[data-compatibility-features]').textContent.includes('GitHub 读取：状态待确认'));
-    await page.evaluate(report => window.harness.compatibility(report),
-      compatibilityReport({ code: 'COMPATIBILITY_OPTIONAL_PENDING', notified: true,
-        optionalFeatures: { ...compatibilityReport().optionalFeatures, chat: pending } }));
-    await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot
-      .querySelector('[data-compatibility-features]').textContent.includes('GitHub 读取：可用'));
-    check('pending server modules update without a manual refresh', await page.locator('[data-compatibility-features]').textContent().then(text =>
-      text.includes('完整设置：可用') && text.includes('客户端状态待确认')));
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]')?.shadowRoot
+      ?.querySelector('[data-dsg-compatibility]')?.dataset.compatibilityPhase === 'normal');
+    check('normal compatibility stays hidden', await page.locator('.compatibility-banner').isVisible(), false);
+    await showCompatibility(compatibilityReport({ phase: 'checking', coreReady: false, code: 'COMPATIBILITY_CORE_PENDING' }));
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]')?.shadowRoot
+      ?.querySelector('[data-dsg-compatibility]')?.dataset.compatibilityPhase === 'normal');
+    check('pending capability checks are not presented as a compatibility failure',
+      await page.locator('.compatibility-banner').isVisible(), false);
+    const optional = compatibilityReport({ phase: 'degraded', code: 'COMPATIBILITY_OPTIONAL_UNAVAILABLE',
+      optionalFeatures: { ...compatibilityReport().optionalFeatures,
+        github: { available: false, code: 'COMPATIBILITY_GITHUB_UNAVAILABLE' } } });
+    await showCompatibility(optional);
+    await page.locator('[data-compatibility-title]').filter({ hasText: '可选功能暂不可用' }).waitFor();
+    check('optional failure explicitly keeps core search available',
+      await page.locator('[data-compatibility-text]').textContent(), 'GitHub 链接读取暂不可用；核心搜索不受影响。');
+    check('optional warning hides exact versions until requested',
+      await page.locator('[data-compatibility-detail]').isVisible(), false);
+    await page.locator('[data-compatibility-details]').click();
+    check('optional details reveal the exact tested pair on demand',
+      await page.locator('[data-compatibility-detail]').textContent(), '宿主版本：0.2.2-rc.3 · 插件版本：0.4.0');
+    await page.locator('[data-compatibility-recheck]').click();
+    check('recheck uses the read-only capability RPC',
+      await read(() => window.harness.compatibilityCalls.filter(call => call.method === 'recheckCompatibility').length), 1);
+    await showCompatibility(compatibilityReport({
+      phase: 'blocked', coreReady: false, code: 'COMPATIBILITY_CORE_SHAPE',
+    }));
+    await page.locator('[data-compatibility-title]').filter({ hasText: '核心搜索暂不可用' }).waitFor();
+    check('confirmed core block never forwards to official search',
+      await page.locator('[data-compatibility-text]').textContent(), '搜索已暂停，当前不会转交官方搜索。');
     await page.setViewportSize({ width: 390, height: 844 });
     check('compatibility card fits a narrow viewport', await page.locator('.compatibility-banner').evaluate(element =>
       element.scrollWidth <= element.clientWidth + 1));
     await page.setViewportSize({ width: 1440, height: 1000 });
+    await showCompatibility(compatibilityReport());
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]')?.shadowRoot
+      ?.querySelector('[data-dsg-compatibility]')?.dataset.compatibilityPhase === 'normal');
     await showCompatibility(compatibilityReport(), 'COMPATIBILITY_UNAVAILABLE');
-    await page.locator('[data-dsg-compatibility][data-compatibility-phase=unavailable]').waitFor();
-    check('failed compatibility report keeps the original settings visible', await page.locator('#routeCard').isVisible());
-    await showCompatibility(compatibilityReport({ notified: true }));
-    await page.locator('[data-dsg-compatibility][data-compatibility-phase=ready]').waitFor();
-    check('compatibility recovery keeps one settings card', await page.locator('#routeCard').count(), 1);
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]')?.shadowRoot
+      ?.querySelector('[data-dsg-compatibility]')?.dataset.compatibilityPhase === 'normal');
+    check('RPC failure does not invent a compatibility error or hide settings', await page.locator('#routeCard').isVisible());
     await page.emulateMedia({ reducedMotion: 'no-preference' });
     await page.evaluate(() => { for (let i = 0; i < 4; i++) window.harness.remount(); });
     await page.locator('#routeCard:not([data-s=load])').waitFor();
@@ -977,20 +970,27 @@ async page => {
     check('unmount removes route DOM', await page.locator('#routeCard').count(), 0);
     check('no page errors', errors.length, 0);
   } catch (error) {
+    failure = error;
     fatal = String(error);
     if (!results.some(row => row.passed === false)) results.push({ name: 'browser-run', passed: false, error: fatal });
-    await page.screenshot({ path: run.directory + '/failure.png' });
+    try { await page.screenshot({ path: run.directory + '/failure.png' }); }
+    catch (error) { screenshotError = String(error); }
   }
   const summary = { runId: run.runId, scope: 'generated production client + offline synthetic host shim; not Desktop or paid-provider evidence',
     command: 'playwright-cli run-code --filename=test/ui-route-browser.js',
     passed: results.filter(result => result.passed).length, failed: results.filter(result => !result.passed).length,
-    pageErrors: errors, fatal, results };
-  const evidence = await page.evaluate(async summary => {
-    const response = await fetch('/evidence', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(summary) });
-    return { ok: response.ok, text: await response.text() };
-  }, summary);
-  if (!evidence.ok) throw new Error('Evidence write failed: ' + evidence.text);
-  if (summary.failed) throw new Error(`Browser regression failed (${summary.failed}); evidence: ${run.runId}`);
+    pageErrors: errors, fatal, results, ...(screenshotError ? { screenshotError } : {}) };
+  try {
+    const evidence = await page.evaluate(async summary => {
+      const response = await fetch('/evidence', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(summary) });
+      return { ok: response.ok, text: await response.text() };
+    }, summary);
+    if (!evidence.ok) throw new Error('Evidence write failed: ' + evidence.text);
+  } catch (error) {
+    if (!summary.failed) throw error;
+    console.error('Evidence write failed:', String(error));
+  }
+  if (summary.failed) throw failure;
   return { runId: run.runId, passed: summary.passed, failed: summary.failed, directory: run.directory,
     ...(summary.failed ? { failure: results.filter(result => !result.passed) } : {}) };
 }

@@ -14,6 +14,7 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
   const loadId = randomUUID();
   let disposed = false;
   let task = null;
+  const lifetime = new AbortController();
   const state = {
     phase: 'idle',
     outcome: null,
@@ -77,9 +78,12 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
           restoreRoute: ({ priorIntent }) => restoreAuthorRoute(ctx, priorIntent),
           verifyRoute,
           operationId: randomUUID(),
+          signal: lifetime.signal,
         });
+        if (disposed) return snapshot();
         const control = ctx.get('grokSearchControl');
         if (control?.retry) await Promise.resolve(control.retry()).catch(() => {});
+        if (disposed) return snapshot();
         state.phase = outcome.kind;
         state.outcome = outcome;
         setRecord(store.read());
@@ -103,13 +107,16 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
         verifyRoute,
         restoreRoute: ({ priorIntent }) => restoreAuthorRoute(ctx, priorIntent),
         operationId: randomUUID(),
+        signal: lifetime.signal,
       });
+      if (disposed) return snapshot();
       state.phase = outcome.kind;
       state.outcome = outcome;
       setRecord(store.read());
       state.error = null;
       return snapshot();
     })().catch(error => {
+      if (disposed) return snapshot();
       state.phase = 'incomplete';
       state.error = { code: error.code ?? null, message: error.message };
       state.outcome = error.recoveryOutcome ?? { kind: 'incomplete', recordCommitted: false,
@@ -136,6 +143,7 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
   ctx.inject(['web', 'grokSearchControl'], () => background('legal-web-activation'));
   ctx.effect(() => () => {
     disposed = true;
+    lifetime.abort(new ControlRecordError('CONTROL_RECOVERY_CANCELLED', 'The recovery owner was disposed.'));
     state.phase = 'disposed';
   });
 }

@@ -75,12 +75,13 @@ function releasedProvenance(prior) {
  * CAS commits one record only; it is not a cross-resource Host transaction.
  */
 export async function completeDeferredStartup({ store, observe, verifyRoute, restoreRoute = null,
-  operationId = randomUUID() }) {
+  operationId = randomUUID(), signal = null }) {
   if (!store || typeof store.read !== 'function' || typeof store.compareAndSwap !== 'function'
     || typeof observe !== 'function' || typeof verifyRoute !== 'function'
     || (restoreRoute !== null && typeof restoreRoute !== 'function') || !UUID.test(operationId)) {
     fail('CONTROL_RECOVERY_ARGUMENT_INVALID');
   }
+  signal?.throwIfAborted();
   const before = store.read();
   if (!before) return outcome('no-record', null);
   const prior = before.intent;
@@ -98,21 +99,25 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
   if (prior.policy === 'released' && !correctableRelease) return outcome(prior.recovery?.action === 'startup-state-correction'
     ? 'already-corrected' : 'already-released', before);
   const observation = validateObservation(await observe());
+  signal?.throwIfAborted();
   if (observation.selectedBundles.includes(observation.searchBundle)) return outcome('still-selected', before);
   const provenance = correctableRelease ? releasedProvenance(prior) : prior;
   const { lease, acquisition } = validateRequiredProvenance(provenance, observation);
+  const counterBaseline = observation.observer?.counter?.calls;
+  if (!Number.isSafeInteger(counterBaseline) || counterBaseline < 0) fail('CONTROL_ROUTE_COUNTER_REQUIRED');
   let routeChanged = false;
   if (restoreRoute) {
     const restored = await restoreRoute({ priorIntent: prior, observation });
+    signal?.throwIfAborted();
     if (!restored || typeof restored.routeChanged !== 'boolean') fail('CONTROL_RECOVERY_RESTORE_INVALID');
     routeChanged = restored.routeChanged;
   }
-  const counterBaseline = observation.observer?.counter?.calls;
-  if (!Number.isSafeInteger(counterBaseline) || counterBaseline < 0) fail('CONTROL_ROUTE_COUNTER_REQUIRED');
   const receipt = structuredClone(await verifyRoute(restoreRoute
     ? { ...observation, routeChanged, counterBaseline } : { ...observation, counterBaseline }));
+  signal?.throwIfAborted();
   validateReceipt(receipt, observation.authorSearchProvider, routeChanged, counterBaseline);
   const latest = validateObservation(await observe());
+  signal?.throwIfAborted();
   if (!isDeepStrictEqual(stableObservation(latest), stableObservation(observation))) fail('CONTROL_RECOVERY_INPUT_CHANGED');
   const recovery = {
     action: 'startup-state-correction', observedAt: observation.observedAt,
@@ -137,7 +142,8 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
   const intent = { ...archivedIntent, policy: 'released', reason: 'legal-load-observed-unselected-at-author',
     priorIntent: structuredClone(prior), recovery, release: null };
   try {
-    const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId });
+    const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId,
+      ...(signal ? { signal } : {}) });
     return outcome('corrected', envelope, { recordCommitted: true, routeVerified: true, routeChanged });
   } catch (error) {
     if (error instanceof ControlRecordError) {
@@ -155,12 +161,13 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
  * preserved; this branch adds only startup completion evidence.
  */
 export async function completeReleaseRecovery({ store, observe, restoreRoute, verifyRoute,
-  operationId = randomUUID() }) {
+  operationId = randomUUID(), signal = null }) {
   if (!store || typeof store.read !== 'function' || typeof store.compareAndSwap !== 'function'
     || typeof observe !== 'function' || typeof restoreRoute !== 'function'
     || typeof verifyRoute !== 'function' || !UUID.test(operationId)) {
     fail('CONTROL_RECOVERY_ARGUMENT_INVALID');
   }
+  signal?.throwIfAborted();
   const before = store.read();
   if (!before) return outcome('no-record', null);
   const prior = before.intent;
@@ -174,6 +181,7 @@ export async function completeReleaseRecovery({ store, observe, restoreRoute, ve
     fail('CONTROL_RECOVERY_HISTORIC_RELEASE_CONFLICT');
   }
   const observation = validateObservation(await observe());
+  signal?.throwIfAborted();
   if (observation.component.role !== 'recovery') fail('CONTROL_RECOVERY_COMPONENT_REQUIRED');
   const priorIntent = prior.priorIntent;
   const acquisition = priorIntent.acquisition;
@@ -185,11 +193,14 @@ export async function completeReleaseRecovery({ store, observe, restoreRoute, ve
   const counterBaseline = observation.observer?.counter?.calls;
   if (!Number.isSafeInteger(counterBaseline) || counterBaseline < 0) fail('CONTROL_ROUTE_COUNTER_REQUIRED');
   const restored = await restoreRoute({ priorIntent, observation, counterBaseline });
+  signal?.throwIfAborted();
   if (!restored || typeof restored.routeChanged !== 'boolean') fail('CONTROL_RECOVERY_RESTORE_INVALID');
   const routeChanged = restored.routeChanged;
   const receipt = structuredClone(await verifyRoute({ ...observation, routeChanged, counterBaseline }));
+  signal?.throwIfAborted();
   validateReceipt(receipt, acquisition.authorSearchProvider, routeChanged, counterBaseline);
   const latest = validateObservation(await observe());
+  signal?.throwIfAborted();
   if (!isDeepStrictEqual(stableObservation(latest), stableObservation(observation))) fail('CONTROL_RECOVERY_INPUT_CHANGED');
   const completion = {
     kind: 'explicit-release-completion', operationId, releaseOperationId: prior.release.operationId,
@@ -217,7 +228,8 @@ export async function completeReleaseRecovery({ store, observe, restoreRoute, ve
   };
   const intent = { ...prior, releaseCompletion: completion, recovery };
   try {
-    const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId });
+    const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId,
+      ...(signal ? { signal } : {}) });
     return outcome('completed', envelope, { recordCommitted: true, completionCommitted: true,
       routeVerified: true, routeChanged });
   } catch (error) {

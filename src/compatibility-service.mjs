@@ -8,7 +8,8 @@ export const name = 'dsh-grok-search-compatibility-service';
 export const inject = ['grokSearchCompatibility', 'grokSearchConnectionSecurity'];
 const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-methods';
 const publicCodes = new Set([
-  'COMPATIBILITY_UNAVAILABLE', 'COMPATIBILITY_REQUEST_INVALID', 'COMPATIBILITY_REPORT_INVALID',
+  'COMPATIBILITY_UNAVAILABLE', 'COMPATIBILITY_RECHECK_FAILED',
+  'COMPATIBILITY_REQUEST_INVALID', 'COMPATIBILITY_REPORT_INVALID',
   'COMPATIBILITY_PAIR_MISMATCH', 'COMPATIBILITY_IDENTITY_UNKNOWN', 'COMPATIBILITY_CONFLICT',
   'COMPATIBILITY_STATE_PATH_INVALID', 'COMPATIBILITY_STATE_PATH_UNSAFE', 'COMPATIBILITY_STATE_INVALID',
   'COMPATIBILITY_STATE_READ_FAILED', 'COMPATIBILITY_STATE_WRITE_FAILED', 'COMPATIBILITY_STATE_BUSY',
@@ -66,6 +67,14 @@ export function createCompatibilityGateway({ Service, RemoteError }) {
 
     async compatibilityReport() {
       if (typeof this.coordinator?.report !== 'function') fail('COMPATIBILITY_UNAVAILABLE');
+      return this.coordinator.report();
+    }
+
+    async recheckCompatibility() {
+      this._secure();
+      if (typeof this.coordinator?.recheck !== 'function') fail('COMPATIBILITY_UNAVAILABLE');
+      await this.coordinator.recheck();
+      this._owner();
       return this.coordinator.report();
     }
 

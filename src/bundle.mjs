@@ -10,7 +10,9 @@ import { createConnectionSecurity } from './core/connection-security.mjs';
 import { createSearchLog } from './core/search-log.mjs';
 import { createToolRouteContext } from './core/tool-route-context.mjs';
 import { createToolBudgetController, checkToolBudgetContracts } from './core/tool-budget.mjs';
-import { createRuntimeCompatibility, assessRuntimeCapabilities } from './core/runtime-compat.mjs';
+import {
+  createRuntimeCompatibility, assessRuntimeCapabilities, isConfirmedCoreCompatibilityFault,
+} from './core/runtime-compat.mjs';
 import { createCompatibilityState } from './core/compatibility-state.mjs';
 import { GrokSearchError } from './core/errors.mjs';
 import { parseGithubUrl } from './core/github-read.mjs';
@@ -36,21 +38,23 @@ const modules = Object.freeze({
 });
 const loadModule = key => modules[key]();
 const unavailable = code => new GrokSearchError(code, 'Search is blocked until runtime compatibility is established.');
+const defaultRetryDelay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // The root deliberately does not depend on web. Its scoped config hook survives
 // a WebRuntime rebuild and leaves a missing/unavailable Grok provider fail-closed.
 export function apply(ctx, configuration, { load = loadModule, checkContracts = checkRuntimeContracts,
   createState = createCompatibilityState, createStore = createProductStore,
-  createPreferences = createPrivatePreferences } = {}) {
+  createPreferences = createPrivatePreferences, retryDelay = defaultRetryDelay } = {}) {
   let store = null, coordinator = null, stateStore = null, appBoot = null;
   let destroyed = false, disabling = false, userStopped = false, releaseTask = null;
   let activeContext = null, lifecycleContext = null, lifecycleTask = null, generation = null;
   let pumping = null, repump = false, bootstrapReady = false, stateUnsubscribe = null;
-  let assessedToken = null, assessedChecks = null, startTask = null;
+  let assessedToken = null, assessedChecks = null, startTask = null, recheckTask = null;
+  let failureCount = 0, retrySequence = 0;
   let retiring = null, githubPreferences = null;
   const rootFiber = ctx.fiber, rootEntry = rootFiber.entry;
   const stateListeners = new Set(), pending = new Set();
-  const githubExecutions = new AsyncLocalStorage();
+  const webExecutions = new AsyncLocalStorage();
   const backgroundError = error => ctx.logger?.warn?.('dsh-grok-search: %s',
     typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code) ? error.code : 'COMPATIBILITY_BLOCKED');
   const track = task => {
@@ -73,8 +77,15 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   const assertSearchAllowed = operation => {
     if (destroyed || userStopped) throw unavailable('COMPATIBILITY_STOPPED');
     if (!coordinator) throw unavailable('COMPATIBILITY_CHECKING');
-    try { return coordinator.assertSearchAllowed(operation); }
+    try { coordinator.assertSearchAllowed(operation); }
     catch (error) { throw unavailable(error?.code ?? 'COMPATIBILITY_BLOCKED'); }
+    let routed = false;
+    try { routed = effectiveSearchProvider(webEntry(activeContext ?? ctx)) === PRODUCT_PROVIDER_ID; } catch {}
+    if (!routed) {
+      coordinator.block('COMPATIBILITY_ROUTE_UNCONFIRMED');
+      throw unavailable('COMPATIBILITY_ROUTE_UNCONFIRMED');
+    }
+    return true;
   };
   const preferences = () => {
     if (githubPreferences) return githubPreferences;
@@ -115,30 +126,61 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     if (!allowed) throw new GrokSearchError(fetch ? 'GITHUB_FETCH_UNAVAILABLE' : 'GITHUB_UNAVAILABLE',
       'GitHub runtime compatibility is unavailable; this request was not forwarded.');
   };
+  const retryCoreCheck = async (token, error) => {
+    if (!current(token)) return;
+    const code = typeof error?.code === 'string' ? error.code : null;
+    if (isConfirmedCoreCompatibilityFault(code)) {
+      retrySequence++;
+      coordinator.block(code);
+      return;
+    }
+    if (failureCount >= 2) {
+      retrySequence++;
+      coordinator.block('COMPATIBILITY_CORE_UNAVAILABLE');
+      return;
+    }
+    const waitMs = failureCount === 0 ? 1000 : 3000;
+    failureCount++;
+    const sequence = ++retrySequence;
+    try { await retryDelay(waitMs); } catch { /* A cancelled delay is resolved by the epoch check below. */ }
+    if (sequence !== retrySequence || !current(token) || disabling) return;
+    coordinator.beginEpoch();
+  };
   // Only post-install calls using the known host hooks are protected; pre-import host work is outside this boundary.
   ctx.on('tools/execute', (exec, next) => {
     let githubFetch = false;
-    if (exec?.name === 'web_search' && !searchReleased()) assertSearchAllowed('web_search');
+    const search = exec?.name === 'web_search' && !searchReleased();
+    if (search) assertSearchAllowed('web_search');
     if (exec?.name === 'github_read' && githubRequired()) assertGithubAllowed(false);
     if (exec?.name === 'web_fetch') {
       let known = false;
       try { parseGithubUrl(exec.arguments?.url); known = true; } catch {}
       if (known && githubRequired()) { assertGithubAllowed(true); githubFetch = true; }
     }
-    if (!githubFetch) return githubExecutions.run(null, () => callRoutes.run(exec, next));
-    const execution = { token: generation.token, active: true };
-    return githubExecutions.run(execution, async () => {
-      try { return await callRoutes.run(exec, next); }
-      finally { execution.active = false; }
+    if (!search && !githubFetch) return webExecutions.run(null, () => callRoutes.run(exec, next));
+    const execution = { token: coordinator.captureEpoch(), active: true, search };
+    return webExecutions.run(execution, () => {
+      try {
+        const result = callRoutes.run(exec, next);
+        if (result && typeof result.then === 'function') {
+          return Promise.resolve(result).finally(() => { execution.active = false; });
+        }
+        execution.active = false;
+        return result;
+      } catch (error) { execution.active = false; throw error; }
     });
   }, { global: true, prepend: true });
   // A paused tool body can outlive its child adapter; retain only its epoch at the root.
   ctx.on('internal/get', (caller, key, accessError, next) => {
-    const execution = githubExecutions.getStore();
+    const execution = webExecutions.getStore();
     if (key !== 'web' || !execution) return next();
     const fiber = caller?.fiber;
     if (fiber?.runtime?.name !== 'tool-web' || fiber.entry?.options?.name !== '@deepseek-ai/dsh-tool-web') return next();
     const assertActive = () => {
+      if (execution.search) {
+        if (!execution.active || !current(execution.token)) throw unavailable('COMPATIBILITY_STOPPED');
+        return assertSearchAllowed('web_search');
+      }
       if (!execution.active) throw new GrokSearchError('GITHUB_FETCH_UNAVAILABLE', 'The GitHub execution has ended.');
       assertGithubAllowed(true, execution.token);
     };
@@ -146,14 +188,14 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     const service = next();
     if (!service) return service;
     return new Proxy(service, { get(target, property, receiver) {
-      if (property !== 'fetch') return Reflect.get(target, property, receiver);
+      if (property !== (execution.search ? 'search' : 'fetch')) return Reflect.get(target, property, receiver);
       return function (...args) {
         assertActive();
         return Reflect.get(target, property, target).apply(target, args);
       };
     } });
   }, { global: true, prepend: true });
-  ctx.effect(() => () => githubExecutions.disable());
+  ctx.effect(() => () => webExecutions.disable());
   ctx.on('internal/config', createSearchConfigHook({ required, requireSchema: true }), { global: true, prepend: true });
 
   const searchLog = createSearchLog(), callRoutes = createToolRouteContext({ searchLog });
@@ -182,6 +224,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   const assertCurrent = token => { if (!current(token)) throw unavailable('COMPATIBILITY_STOPPED'); };
   const pause = () => {
     userStopped = true;
+    retrySequence++;
     coordinator.block('COMPATIBILITY_STOPPED');
     const task = suspendGeneration(generation);
     task.catch(backgroundError);
@@ -189,6 +232,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   };
   const compatibility = Object.freeze({
     ...coordinator, assertSearchAllowed,
+    recheck: () => recheckCapabilities(),
     async confirm(request) {
       if (destroyed || !stateStore) throw unavailable('COMPATIBILITY_IDENTITY_UNKNOWN');
       await stateStore.confirm(request);
@@ -211,6 +255,8 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       userStopped = true;
       coordinator.block('COMPATIBILITY_STOPPED');
       startTask = (async () => {
+        retrySequence++;
+        failureCount = 0;
         await suspendGeneration(generation);
         if (retiring) await retiring;
         if (releaseTask) await releaseTask;
@@ -326,8 +372,10 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       if (!current(token)) return;
       await work(module);
     } catch (error) {
+      const name = key === 'github' ? 'github' : 'settings';
+      const confirmedFailure = key === 'settings' || key === 'github' && readGithubIntent() === true;
       if (current(token)) coordinator.setOptional(key === 'github' ? 'github' : 'settings',
-        { token, available: false });
+        { token, available: false, code: error?.code ?? `COMPATIBILITY_${name.toUpperCase()}_UNAVAILABLE`, confirmedFailure });
       backgroundError(error);
     }
   }
@@ -336,14 +384,21 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       ['program', 'core', 'control', 'web'].map(load));
     assertCurrent(token);
     if (typeof host.WebError !== 'function') throw unavailable('COMPATIBILITY_CORE_SHAPE');
-    const privatePreferences = preferences();
+    const corePreferences = Object.freeze({
+      snapshot() {
+        try { return preferences().snapshot(); }
+        catch {
+          return { value: { grokEnabled: false, githubEnabled: false }, revision: 'unavailable' };
+        }
+      },
+    });
     const value = { token, parent, ctx: null, fiber: null, core: null, program: null, owner: null,
-      budgets: null, github: null, githubCapabilities: null, leaseArmed: false,
+      budgets: null, github: null, githubCapabilities: null, contractChecks, leaseArmed: false,
       abort: new AbortController(), suspended: false };
     generation = value;
     const fiber = parent.plugin({ name: 'dsh-grok-search-runtime', apply(child) {
       value.ctx = child;
-      child.provide('grokSearchPreferences', privatePreferences);
+      child.provide('grokSearchPreferences', corePreferences);
       child.provide('grokSearchHostAdapter', { WebError: host.WebError });
       value.budgets = createToolBudgetController({ ctx: child, budgetMs: configuration.budgetMs ?? 120_000,
         required, canLease: () => value.leaseArmed && current(token) && coordinator.canLeaseBudget(), onError: backgroundError });
@@ -385,15 +440,17 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       if (current(token)) coordinator.setOptional('settings', { token, available: true });
     }));
     track(optional('github', token, async github => {
+      const privatePreferences = preferences();
       const { createSharedConfigStore, resolveSharedConfigPath } = await load('sharedConfig');
       assertCurrent(token);
       value.githubCapabilities = () => {
         const available = current(token) && coordinator.report().coreReady;
+        const checks = value.contractChecks;
         return {
-          githubRead: available && contractChecks.toolExecution === true && contractChecks.toolResult === true
-            && contractChecks.toolGuards === true,
-          githubFetch: available && contractChecks.toolExecution === true && contractChecks.toolResult === true
-            && contractChecks.toolGuards === true && contractChecks.githubFetch === true,
+          githubRead: available && checks.toolExecution === true && checks.toolResult === true
+            && checks.toolGuards === true && checks.githubRead === true,
+          githubFetch: available && checks.toolExecution === true && checks.toolResult === true
+            && checks.toolGuards === true && checks.githubRead === true && checks.githubFetch === true,
         };
       };
       value.github = github.createGithubIntegration({ ctx: child, searchLog, callRoutes, WebError: host.WebError,
@@ -407,7 +464,13 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
           return { enabled, token: effective.github_token.value, identity: path };
         } });
       child.provide('grokSearchGithub', value.github);
-      coordinator.setOptional('github', { token, available: contractChecks.githubFetch === true && !value.github.snapshot?.().error });
+      const intent = privatePreferences.snapshot().value.githubReadEnabled === true;
+      const available = !intent || contractChecks.githubRead === true && contractChecks.toolExecution === true
+        && contractChecks.toolResult === true && contractChecks.toolGuards === true
+        && !value.github.snapshot?.().error;
+      coordinator.setOptional('github', { token, available,
+        code: intent && !available ? 'COMPATIBILITY_GITHUB_UNAVAILABLE' : undefined,
+        confirmedFailure: intent && !available });
     }));
     assertCurrent(token);
   }
@@ -423,11 +486,15 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
         assertCurrent(token);
         if (assessedToken !== token) {
           const shape = assessRuntimeCapabilities({ ctx: parent, token });
-          if (shape.shape !== 'passed') { coordinator.setCapabilities(shape); return; }
+          if (shape.transient) throw Object.assign(new Error(shape.code), { code: shape.code });
+          if (shape.shape === 'pending') { coordinator.setCapabilities(shape); return; }
+          if (shape.shape === 'failed') { coordinator.setCapabilities(shape); return; }
           const contractChecks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token) });
           assertCurrent(token);
           checkToolBudgetContracts(parent, configuration.budgetMs ?? 120_000);
-          coordinator.setCapabilities(assessRuntimeCapabilities({ ctx: parent, token, contractChecks }));
+          const assessed = assessRuntimeCapabilities({ ctx: parent, token, contractChecks });
+          if (assessed.transient) throw Object.assign(new Error(assessed.code), { code: assessed.code });
+          coordinator.setCapabilities(assessed);
           assertCurrent(token);
           assessedToken = token;
           assessedChecks = contractChecks;
@@ -446,8 +513,9 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
           assertCurrent(token);
         }
         await initialize(parent, token, assessedChecks);
+        if (current(token) && coordinator.report().coreReady) failureCount = 0;
       } catch (error) {
-        if (current(token)) coordinator.block(error?.code);
+        if (current(token)) await retryCoreCheck(token, error);
         backgroundError(error);
       }
     })).finally(() => {
@@ -455,6 +523,67 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       if (repump) { repump = false; schedule(); }
     });
     pumping.catch(backgroundError);
+  }
+  async function recheckCapabilities() {
+    if (destroyed || disabling || userStopped) throw unavailable('COMPATIBILITY_STOPPED');
+    if (recheckTask) return recheckTask;
+    recheckTask = performRecheck().finally(() => { recheckTask = null; });
+    return recheckTask;
+  }
+  async function performRecheck() {
+    if (destroyed || disabling || userStopped) throw unavailable('COMPATIBILITY_STOPPED');
+    const before = coordinator.report();
+    if (!before.coreReady) {
+      retrySequence++;
+      failureCount = 0;
+      const settled = new Promise(resolve => {
+        let timer;
+        const finish = value => {
+          clearTimeout(timer);
+          unsubscribe();
+          resolve(value);
+        };
+        const unsubscribe = coordinator.subscribe(value => {
+          if (['ready', 'degraded', 'stopped'].includes(value.phase)
+            || value.phase === 'blocked' && (value.code !== 'COMPATIBILITY_CORE_UNAVAILABLE' || failureCount >= 2)) {
+            finish(value);
+          }
+        });
+        timer = setTimeout(() => finish(coordinator.report()), 15_000);
+      });
+      coordinator.beginEpoch();
+      schedule();
+      await settled;
+      return coordinator.report();
+    }
+    const token = coordinator.captureEpoch(), parent = activeContext;
+    if (!parent) return coordinator.report();
+    try {
+      const shape = assessRuntimeCapabilities({ ctx: parent, token });
+      if (shape.transient || shape.shape !== 'passed') return coordinator.report();
+      const checks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token) });
+      assertCurrent(token);
+      const assessed = assessRuntimeCapabilities({ ctx: parent, token, contractChecks: checks });
+      if (assessed.transient || assessed.shape !== 'passed' || assessed.contract !== 'passed') return coordinator.report();
+      checkToolBudgetContracts(parent, configuration.budgetMs ?? 120_000);
+      if (generation?.token === token) {
+        generation.contractChecks = checks;
+        generation.github?.sync?.();
+        const intent = readGithubIntent();
+        const github = generation.github?.snapshot?.();
+        const githubUnavailable = intent === true && (checks.githubRead !== true
+          || checks.toolExecution !== true || checks.toolResult !== true || checks.toolGuards !== true
+          || Boolean(github?.error));
+        coordinator.setOptional('github', {
+          token, available: intent !== true || !githubUnavailable,
+          code: githubUnavailable ? 'COMPATIBILITY_GITHUB_UNAVAILABLE' : undefined,
+          confirmedFailure: githubUnavailable,
+        });
+      }
+    } catch (error) {
+      backgroundError(error);
+    }
+    return coordinator.report();
   }
   coordinator.subscribe(() => {
     if (generation && !coordinator.isCurrent(generation.token) && !userStopped && !destroyed) {
@@ -521,21 +650,26 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   });
   track(Promise.resolve().then(async () => {
     // Host packages are outside the synchronous spine, including version discovery.
-    const imported = await load('appBoot');
+    let hostVersion = null, imported = null;
+    try {
+      imported = await load('appBoot');
+      if (typeof imported?.getDshRuntimeVersion === 'function') {
+        hostVersion = await imported.getDshRuntimeVersion();
+      }
+    } catch (error) { backgroundError(error); }
     if (destroyed) return;
     appBoot = imported;
-    if (typeof appBoot.getDshRuntimeVersion !== 'function') throw unavailable('COMPATIBILITY_HOST_UNKNOWN');
-    const hostVersion = await appBoot.getDshRuntimeVersion();
-    if (destroyed) return;
-    stateStore = createState({ profileDir: ctx.profileContext.dir, hostVersion, pluginVersion });
-    stateUnsubscribe = stateStore.onChange(() => { for (const listener of stateListeners) listener(); });
+    try {
+      stateStore = createState({ profileDir: ctx.profileContext.dir, hostVersion, pluginVersion });
+      try { stateUnsubscribe = stateStore.onChange(() => { for (const listener of stateListeners) listener(); }); }
+      catch (error) { backgroundError(error); }
+    } catch (error) {
+      stateStore = null;
+      backgroundError(error);
+    }
     coordinator.setHostVersion(hostVersion);
     if (userStopped) coordinator.block('COMPATIBILITY_STOPPED');
     bootstrapReady = true;
-    const report = coordinator.report();
-    if (report.hostVersion && !report.notified && report.revision !== null) {
-      ctx.logger?.warn?.('dsh-grok-search: this host/plugin pair is unverified; search remains subject to runtime checks.');
-    }
     schedule();
   }).catch(error => { if (!destroyed) coordinator.block(error?.code); backgroundError(error); }));
   track(Promise.resolve().then(async () => {

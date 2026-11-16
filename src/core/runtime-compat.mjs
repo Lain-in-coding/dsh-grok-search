@@ -4,7 +4,7 @@ import { isCompatibilityVersion } from './compatibility-contract.mjs';
 export const MINIMUM_DSH_VERSION = '0.2.1-rc.2';
 export const CORE_CONTRACT_CHECKS = Object.freeze([
   'configHook', 'configCandidate', 'configUpdate', 'pluginDisposal',
-  'webSelection', 'toolExecution', 'toolResult', 'toolGuards', 'profileSelection',
+  'webSelection', 'toolExecution',
 ]);
 
 const codes = new Set([
@@ -12,7 +12,8 @@ const codes = new Set([
   'COMPATIBILITY_MINIMUM_REQUIRED', 'COMPATIBILITY_CONFIRMATION_REQUIRED',
   'COMPATIBILITY_CHECKING', 'COMPATIBILITY_CORE_PENDING', 'COMPATIBILITY_CORE_SHAPE',
   'COMPATIBILITY_ABI_UNSUPPORTED', 'COMPATIBILITY_CONTRACT_PENDING', 'COMPATIBILITY_CONTRACT_FAILED',
-  'COMPATIBILITY_PROBE_FAILED', 'COMPATIBILITY_PROBE_INVALID', 'COMPATIBILITY_ROUTE_UNCONFIRMED',
+  'COMPATIBILITY_PROBE_FAILED', 'COMPATIBILITY_PROBE_INVALID', 'COMPATIBILITY_CORE_UNAVAILABLE',
+  'COMPATIBILITY_ROUTE_UNCONFIRMED',
   'COMPATIBILITY_BUDGET_UNCONFIRMED', 'COMPATIBILITY_INITIALIZATION_PENDING',
   'COMPATIBILITY_OPTIONAL_PENDING', 'COMPATIBILITY_OPTIONAL_UNAVAILABLE',
   'COMPATIBILITY_SETTINGS_UNAVAILABLE', 'COMPATIBILITY_CHAT_UNAVAILABLE',
@@ -25,6 +26,13 @@ const codes = new Set([
   'COMPATIBILITY_STATE_COMMIT_UNCERTAIN', 'COMPATIBILITY_CONFLICT',
 ]);
 const optionalNames = Object.freeze(['settings', 'chat', 'github']);
+const coreFaultCodes = new Set([
+  'COMPATIBILITY_PLUGIN_INVALID', 'COMPATIBILITY_MINIMUM_REQUIRED',
+  'COMPATIBILITY_CORE_SHAPE', 'COMPATIBILITY_ABI_UNSUPPORTED',
+  'COMPATIBILITY_CONTRACT_FAILED', 'COMPATIBILITY_PROBE_INVALID',
+  'COMPATIBILITY_ROUTE_UNCONFIRMED', 'COMPATIBILITY_BUDGET_UNCONFIRMED',
+]);
+export const isConfirmedCoreCompatibilityFault = code => coreFaultCodes.has(code);
 const probeResults = new WeakSet();
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const method = (value, key) => typeof value?.[key] === 'function';
@@ -47,12 +55,9 @@ function channelOf(version) {
 export function evaluateRuntimeVersion(hostVersion) {
   const parsed = exactVersion(hostVersion);
   const channel = parsed ? channelOf(parsed) : 'unknown';
-  const minimumAdmitted = parsed !== null && semver.gte(parsed, MINIMUM_DSH_VERSION);
-  const confirmationRequired = minimumAdmitted && channel !== 'stable' && channel !== 'rc';
-  const code = !parsed
-    ? hostVersion === undefined || hostVersion === null ? 'COMPATIBILITY_HOST_UNKNOWN' : 'COMPATIBILITY_HOST_INVALID'
-    : !minimumAdmitted ? 'COMPATIBILITY_MINIMUM_REQUIRED'
-      : confirmationRequired ? 'COMPATIBILITY_CONFIRMATION_REQUIRED' : null;
+  const minimumAdmitted = parsed === null || semver.gte(parsed, MINIMUM_DSH_VERSION);
+  const confirmationRequired = false;
+  const code = parsed && !minimumAdmitted ? 'COMPATIBILITY_MINIMUM_REQUIRED' : null;
   return Object.freeze({
     hostVersion: parsed ? hostVersion : null,
     channel, minimumAdmitted, confirmationRequired, verification: 'unverified', code,
@@ -61,12 +66,12 @@ export function evaluateRuntimeVersion(hostVersion) {
 
 function featureDefaults() {
   return Object.fromEntries(optionalNames.map(name => [
-    name, Object.freeze({ available: false, code: 'COMPATIBILITY_OPTIONAL_PENDING' }),
+    name, Object.freeze({ available: false, code: 'COMPATIBILITY_OPTIONAL_PENDING', confirmedFailure: false }),
   ]));
 }
 
-function makeProbe(token, abi, shape, contract, code) {
-  const result = Object.freeze({ token, stage: 'core', abi, shape, contract, code });
+function makeProbe(token, abi, shape, contract, code, transient = false) {
+  const result = Object.freeze({ token, stage: 'core', abi, shape, contract, code, transient });
   probeResults.add(result);
   return result;
 }
@@ -87,14 +92,12 @@ export function assessRuntimeCapabilities({ ctx, token, contractChecks } = {}) {
     if (!record(ctx) || !['get', 'on', 'effect', 'plugin'].every(name => method(ctx, name))) {
       return makeProbe(token, null, 'failed', 'pending', 'COMPATIBILITY_CORE_SHAPE');
     }
-    const loader = ctx.get('loader'), profile = ctx.get('profileContext'), tools = ctx.get('tools');
-    if (!loader || !profile || !tools) {
+    const loader = ctx.get('loader'), profile = ctx.get('profileContext');
+    if (!loader || !profile) {
       return makeProbe(token, null, 'pending', 'pending', 'COMPATIBILITY_CORE_PENDING');
     }
     if (!method(loader, 'entries') || !method(ctx.registry, 'values')
-      || typeof profile.dir !== 'string' || !profile.dir
-      || !['register', 'get'].every(name => method(tools, name))
-      || !method(tools, 'checkGuards') && !method(tools, 'guardReason')) {
+      || typeof profile.dir !== 'string' || !profile.dir) {
       return makeProbe(token, null, 'failed', 'pending', 'COMPATIBILITY_CORE_SHAPE');
     }
     const matches = [];
@@ -123,15 +126,17 @@ export function assessRuntimeCapabilities({ ctx, token, contractChecks } = {}) {
     }
     const web = method(wrapper?.ctx, 'get') ? wrapper.ctx.get('web') : ctx.get('web');
     if (!web) return makeProbe(token, abi, 'pending', 'pending', 'COMPATIBILITY_CORE_PENDING');
-    if (!['registerSearchProvider', 'search', 'fetch'].every(name => method(web, name))) {
+    if (!['registerSearchProvider', 'search'].every(name => method(web, name))) {
       return makeProbe(token, abi, 'failed', 'pending', 'COMPATIBILITY_CORE_SHAPE');
     }
     for (const key of ['searchProvider', 'fetchProvider']) {
+      if (key === 'fetchProvider' && !Object.hasOwn(config, key)) continue;
       const field = config[key];
       if (modern && !method(field, 'get')) {
         return makeProbe(token, abi, 'failed', 'pending', 'COMPATIBILITY_ABI_UNSUPPORTED');
       }
       const value = method(field, 'get') ? field.get() : field;
+      if (key === 'fetchProvider' && value === undefined) continue;
       if (value !== undefined && (typeof value !== 'string' || !value)) {
         return makeProbe(token, abi, 'failed', 'pending', 'COMPATIBILITY_ABI_UNSUPPORTED');
       }
@@ -141,7 +146,7 @@ export function assessRuntimeCapabilities({ ctx, token, contractChecks } = {}) {
       contract === 'passed' ? null : contract === 'pending'
         ? 'COMPATIBILITY_CONTRACT_PENDING' : 'COMPATIBILITY_CONTRACT_FAILED');
   } catch {
-    return makeProbe(token, null, 'failed', 'pending', 'COMPATIBILITY_PROBE_FAILED');
+    return makeProbe(token, null, 'pending', 'pending', 'COMPATIBILITY_PROBE_FAILED', true);
   }
 }
 
@@ -173,17 +178,13 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
   };
   const identityCode = () => !plugin ? 'COMPATIBILITY_PLUGIN_INVALID'
     : !policy.minimumAdmitted ? policy.code : null;
-  // Consent metadata is diagnostic for automatic channels; pair identity is not.
-  const stateBlocks = code => code !== null && (policy.confirmationRequired
-    || code === 'COMPATIBILITY_PAIR_MISMATCH' || code === 'COMPATIBILITY_IDENTITY_UNKNOWN');
-  const admitted = () => !stopped && !identityCode() && !blocked && !stateBlocks(stateCode)
-    && (!policy.confirmationRequired || !statePending && confirmed);
+  const admitted = () => !stopped && !identityCode() && !blocked;
   const corePassed = () => core?.shape === 'passed' && core.contract === 'passed';
   const canAcquireRoute = () => admitted() && corePassed();
   const ready = () => canAcquireRoute() && route && budget && initialized;
   const optionalCode = () => {
     const unavailable = optionalNames.map(name => optional[name]).filter(feature => !feature.available);
-    if (unavailable.some(feature => feature.code !== 'COMPATIBILITY_OPTIONAL_PENDING')) {
+    if (unavailable.some(feature => feature.confirmedFailure)) {
       return 'COMPATIBILITY_OPTIONAL_UNAVAILABLE';
     }
     return unavailable.length ? 'COMPATIBILITY_OPTIONAL_PENDING' : null;
@@ -191,9 +192,8 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
   const currentCode = () => {
     if (stopped) return 'COMPATIBILITY_STOPPED';
     if (identityCode()) return identityCode();
-    if (blocked || stateBlocks(stateCode)) return blocked ?? stateCode;
-    if (policy.confirmationRequired && statePending) return 'COMPATIBILITY_CHECKING';
-    if (policy.confirmationRequired && !confirmed) return 'COMPATIBILITY_CONFIRMATION_REQUIRED';
+    if (blocked) return blocked;
+    if (statePending) return 'COMPATIBILITY_CHECKING';
     if (!corePassed()) return core?.code ?? 'COMPATIBILITY_CORE_PENDING';
     if (!route) return 'COMPATIBILITY_ROUTE_UNCONFIRMED';
     if (!budget) return 'COMPATIBILITY_BUDGET_UNCONFIRMED';
@@ -203,15 +203,15 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
   const report = () => {
     const coreReady = ready();
     const phase = stopped ? 'stopped'
-      : identityCode() || blocked || stateBlocks(stateCode) ? 'blocked'
-        : policy.confirmationRequired && !confirmed ? 'waiting-confirmation'
-          : coreReady ? stateCode || optionalCode() === 'COMPATIBILITY_OPTIONAL_UNAVAILABLE' ? 'degraded' : 'ready'
-            : checking || statePending ? 'checking' : 'initial';
+      : identityCode() || blocked ? 'blocked'
+        : coreReady ? optionalCode() === 'COMPATIBILITY_OPTIONAL_UNAVAILABLE' ? 'degraded' : 'ready'
+          : checking || statePending ? 'checking' : 'initial';
     return Object.freeze({
       schemaVersion: 1, hostVersion: policy.hostVersion, pluginVersion: plugin, channel: policy.channel,
       minimumAdmitted: policy.minimumAdmitted, verification: 'unverified', phase, revision,
-      confirmationRequired: policy.confirmationRequired, confirmed, notified, coreReady,
-      code: currentCode(), optionalFeatures: Object.freeze({ ...optional }),
+      confirmationRequired: false, confirmed, notified, coreReady, code: currentCode(),
+      optionalFeatures: Object.freeze(Object.fromEntries(optionalNames.map(name => [name,
+        Object.freeze({ available: optional[name].available, code: optional[name].code })]))),
     });
   };
   let lastReport = JSON.stringify(report()), lastToken = token;
@@ -245,7 +245,6 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     } else {
       nextConfirmed = value.confirmed; nextNotified = value.notified; nextRevision = value.revision;
     }
-    if (stateBlocks(nextCode) || policy.confirmationRequired && confirmed && !nextConfirmed) resetWork();
     confirmed = nextConfirmed; notified = nextNotified; revision = nextRevision; stateCode = nextCode;
     publish();
     return report();
@@ -337,6 +336,9 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
           readSequence++;
           statePending = false;
           resetWork();
+          checking = true;
+          publish();
+          return false;
         }
         checking = true;
         core = result;
@@ -363,8 +365,11 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
       if (stopped || !optionalNames.includes(name) || !record(value)
         || value.token !== undefined && !isCurrent(value.token)) return false;
       const available = value.available === true || value.available === undefined && value.state === 'ready';
-      optional[name] = Object.freeze({ available, code: available ? null
-        : safeCode(value.code, `COMPATIBILITY_${name.toUpperCase()}_UNAVAILABLE`) });
+      optional[name] = Object.freeze({
+        available,
+        code: available ? null : safeCode(value.code, `COMPATIBILITY_${name.toUpperCase()}_UNAVAILABLE`),
+        confirmedFailure: !available && value.confirmedFailure === true,
+      });
       publish();
       return true;
     },

@@ -92,13 +92,18 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
     };
     const stop = reason => {
       failed ??= reason;
+      if (settled || killTimer) return;
+      killTimer = setTimeout(() => finish(new GrokSearchError('GROK_PROGRAM_REAP_FAILED', '程序验证已停止，但验证进程未确认退出。')), 2_000);
       try { child.kill('SIGKILL'); } catch {}
-      killTimer ??= setTimeout(() => finish(new GrokSearchError('GROK_PROGRAM_REAP_FAILED', '程序验证已停止，但验证进程未确认退出。')), 2_000);
     };
     const abort = () => stop(signal.reason);
     signal?.addEventListener('abort', abort, { once: true });
     timer = setTimeout(() => stop(new GrokSearchError('GROK_PROGRAM_TIMEOUT', 'Grok 版本检查超时。')), timeoutMs);
-    child.once('error', () => finish(new GrokSearchError('GROK_PROGRAM_START_FAILED', '无法启动 Grok 版本检查。')));
+    child.on('error', () => {
+      const error = new GrokSearchError('GROK_PROGRAM_START_FAILED', '无法启动 Grok 版本检查。');
+      // A failed kill also emits error; only a missing pid proves spawn failed.
+      if (child.pid === undefined) finish(error); else stop(error);
+    });
     child.stdout.on('data', bytes => {
       if (output.length + bytes.length > 8192) { stop(new GrokSearchError('GROK_PROGRAM_OUTPUT_INVALID', '程序版本输出异常。')); return; }
       output += bytes.toString('utf8');

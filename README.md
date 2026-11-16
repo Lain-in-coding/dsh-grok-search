@@ -13,7 +13,7 @@
 
 [搜索日志与额度](#最近搜索与账户额度) · [共享配置](#共享配置) · [隐私与费用](#隐私与费用) · [常见问题](#常见问题)
 
-<a href="https://github.com/Lain-in-coding/dsh-grok-search"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-hero.png" alt="dsh-grok-search 项目封面：Grok 主搜索与四个补充来源，支持静默回退、最近搜索和停用后恢复原搜索" width="960"></a>
+<a href="https://github.com/Lain-in-coding/dsh-grok-search"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-hero.png" alt="dsh-grok-search 0.4.0 项目展示图：多来源回退、可视化日志、聊天搜索卡片与 GitHub 读取" width="960"></a>
 
 </div>
 
@@ -21,14 +21,16 @@
 
 `dsh-grok-search` 是 DeepSeek Harness（DSH）的可视化搜索插件，以 [Episkey-G](https://github.com/Episkey-G) 开发的 [grok-search-rs](https://github.com/Episkey-G/GrokSearch-rs) 为 MCP 核心后端，接入 DSH 原有的 `web_search`。照常在聊天里提问，由插件提供 Grok 主搜索与补充来源回退，安装一个 DSH 插件即可。
 
-- **来源自己选**：Grok 主搜索可开可关，Tavily、Exa、TinyFish、Firecrawl 按顺序回退。
-- **配置直接填**：在界面填写 Base URL 和 API Key，自动发现已有程序，缺少时下载经验证的版本。
-- **已有设置接着用**：共用 `grok-search-rs` 配置，Key 可查看、修改，升级后继续保留。
-- **搜索过程看得见**：查看实际结果来源、搜索日志、链路回放与账户额度。
-- **一个开关启停**：接管或恢复原搜索，保留网页抓取设置与普通聊天；宿主开启热重载时即时生效。
+- **自动接管官方搜索，告别 401 报错**：无需绑定或充值官方账号，接管 DSH 原生链路，消除未配 Key 引发的 `401` 报错。
+- **不消耗官方搜索次数，也不烧模型 Token**：绕开官方内置搜索模型，搭配任意第三方搜索模型独立联网，不再为搜索向官方付费。
+- **五源自动回退，绝不偷切官方**：Grok 主搜索搭配 Tavily、Exa、TinyFish、Firecrawl 自由排序（支持 Tavily 多 Key 轮换），故障顺次兜底、**全挂直接报错**，绝不偷切官方付费搜索。
+- **全程界面配置，零文件折腾**：免改 `config.toml` 或手动部署 MCP；页面填 Key、拖拽排序即生效，自动复用兼容后端或校验下载。
+- **启用即接管，停用即秒回落**：不影响普通聊天与网页抓取设置；关闭或卸载即恢复原官方搜索，已填 Key 与共享配置跨升级保留。
+- **全链路透明，告别搜索黑盒**：自带全来源逐 Key 连通性测试、最近记录、零消耗回放与实时额度，来源、耗时与实报消耗一目了然。
+- **聊天搜索看得见，直读 GitHub 链接**：对话内直接展示可追溯的执行路由卡片；开启 GitHub 抽取器后，发 GitHub Issue / PR / Release 链接即可直读正文、评论与发布说明，免去来回切屏。
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-intro.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-intro.png" alt="功能总览：以 grok-search-rs 为后端接管 DSH 搜索，提供多来源回退、共享配置、最近搜索、链路回放和账户额度" width="960"></a>
+  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-intro.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-intro.png" alt="0.4.0 功能总览展示图：以 grok-search-rs 为后端接管 DSH 搜索，提供多来源回退、共享配置、最近搜索、链路回放和账户额度" width="960"></a>
 </p>
 
 <details>
@@ -48,8 +50,8 @@
 DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵向排列。每行只有图标、名称和开关，点击图标或名称即可配置。
 
 <p align="center">
-  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-mockup.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-020-mockup.png" alt="0.2.0 深色界面效果图：搜索路由、供应商开关、共享配置入口与最近搜索位于同一详情页" width="960"></a>
-  <br><sub>深色界面效果图 · 点击查看大图</sub>
+  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-mockup.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-mockup.png" alt="0.4.0 深色界面展示图：搜索路由、共享配置、最近搜索与 Tavily 配置和账户额度" width="960"></a>
+  <br><sub>0.4.0 深色界面展示图 · 点击查看大图</sub>
 </p>
 
 <table>
@@ -241,28 +243,20 @@ DSH `0.2.2-rc.2` 需要插件 `0.3.0`，旧插件 `0.2.1` 不包含该宿主声�
 - **操作系统版本**：Windows 11 x64、macOS 15 Apple Silicon、WSL Ubuntu 22.04 是现有验证环境；DSH 版本兼容不等于所有操作系统版本已实测。Windows 10 与原生 Linux 桌面的文件打开尚无实机验证。
 - **运行时要求**：DSH `0.2.2-rc.1` / `rc.2` 需要 Node.js ≥ `24.9`；Desktop 自带运行时，CLI/Web 用户须自行满足此要求。插件没有自动升级全局 Node.js。
 - **复用已有后端**：已验证 `grok-search-rs` 程序版本为 `0.1.26`；优先复用兼容安装，缺少时准备私有缓存，不升级全局程序或自动采用未经验证的版本。
-- **升级 DSH 前核对兼容报告与包外证据**。表外版本可以尝试，不承诺已验证；插件无法加载时宿主可能按原设置搜索。
+- **兼容尝试不等于验收通过**：达到硬下限的表外版本会按实际能力检查尝试运行，但不代表已通过相应 DSH 版本、平台与入口的验收。
 
 原生 Linux、真实付费服务等验证边界见[常见问题](#常见问题)。
 
-### 实验通道确认（0.4.0 候选）
+### 兼容状态
 
-稳定版和标准 `rc.N` 不需要风险确认。alpha、beta 或其他预发布通道在插件页显示
-「实验版本需要确认」时，核对报告中的宿主与插件版本，勾选风险说明后确认。
-版本对发生变化须重新确认；确认不会把「未验证」改成「已验证」，也不会绕过能力检查。
+`engines.dsh` 保留 `>=0.2.1-rc.2` 的硬下限，不设未来版本上限。高于下限的稳定版、
+RC、alpha、beta 和其他预发布版本都先尝试运行；无法读取或解析 DSH 版本时，改由实际
+运行能力检查决定，不会仅因版本未知或未验证就判定不兼容。版本未验证不等于已通过实机验收。
 
-若可选设置界面不可用，可由本机维护者运行安装包内的 CLI。先确认实际 profile 和插件
-目录，使用满足宿主要求的 Node.js；以下版本仅为示例，必须换成当前精确版本：
-
-```text
-node "<plugin-dir>/src/core/compatibility-cli.mjs" inspect --profile-dir "<absolute-profile-dir>" --host-version 0.2.3-alpha.1 --plugin-version 0.4.0
-node "<plugin-dir>/src/core/compatibility-cli.mjs" confirm --profile-dir "<absolute-profile-dir>" --host-version 0.2.3-alpha.1 --plugin-version 0.4.0 --accept-risk
-node "<plugin-dir>/src/core/compatibility-cli.mjs" revoke --profile-dir "<absolute-profile-dir>" --host-version 0.2.3-alpha.1 --plugin-version 0.4.0
-```
-
-`inspect` 只读，`confirm` 授予指定版本对的实验许可，`revoke` 撤销该许可。
-状态只保存在该 profile 的 `grok-search/compatibility-state.json`，不改共享 Key、搜索偏好
-或宿主版本豁免。状态损坏、路径不可信或核心能力不成立时仍会阻断，不能靠重复确认强行运行。
+兼容提示只覆盖两种实际状态：核心搜索当前被阻断，或设置/GitHub 等可选功能确实不可用。
+可选功能异常不会停掉核心搜索；连续探测异常导致暂停时，只表示当前无法确认核心链路，
+不等同于判定 DSH 版本不兼容。核心搜索被阻断时不会自动转交给 DSH 官方付费搜索；
+普通可用状态不显示兼容提示，状态 RPC 失败本身也不会伪造不兼容结论。
 
 ## 来源与排序
 
@@ -432,6 +426,11 @@ DSH 的原始参数与结果检查。卡片动效不发起搜索、不消耗额�
 
 日常请只使用 DSH 已安装列表里的**插件开关**：关闭即恢复原搜索设置，重新开启由 `dsh-grok-search` 按当前来源设置接管。宿主没有启用热重载时，会提示需要重启。
 
+此前冻结的 0.4.0 候选在 macOS `0.2.1-rc.2` 首次安装后停用时，曾出现“不受插件列表管理的插件”
+重启提示。无业务夹具的官方宿主对照已确认：该次提示出现时实际释放和程序退出已完成，
+不重启也能重新启用并再次搜索。这不保证所有重启提示都可忽略；若操作未生效，按宿主提示
+完整退出再打开，不要删除配置或强行绕过保护。此历史观察不代替新候选或其他版本的完整验收。
+
 DSH 的插件开关与详情中的组件开关是两层独立设置。若插件已启用，但组件被单独关闭，请手动将组件重新打开；卸载重装不会清除这条组件设置。
 
 <details>
@@ -523,14 +522,16 @@ DSH `0.2.2-rc.1` 在宿主配置重建恰好与搜索派发重叠时，可能拒
 开发建议 **Node.js ≥ 24.9**，与最新支持宿主一致。按锁文件安装依赖，再构建、测试和打包：
 
 ```shell
-npm ci --ignore-scripts --legacy-peer-deps
+npm ci --ignore-scripts --legacy-peer-deps=false
 npm run build:client
 npm run test:all
 npm run pack:release
 ```
 
-`pack:release` 只打包，不会自动构建或测试；请先执行以上命令。
-完整浏览器验证、打包与供应链说明见源码仓库的 `docs/开发与验证.md`。
+`pack:release` 不会替你构建或运行完整测试；它会拒绝过期的生成客户端，并核对实际压缩包
+与当前源码逐文件一致，请先执行以上命令。完整离线浏览器验证使用 `npm run test:ui`，
+只访问回环合成服务，不等于真实宿主或付费上游验收。验收记录须匹配交付包的 SHA-256；
+内部开发记录不属于公开交付材料。
 
 反馈时请附系统、DSH 与插件版本、`grok-search-rs` 程序版本、模型名称（如有）、错误码及复现步骤；**不要附 Key、完整配置或未脱敏路径**。
 

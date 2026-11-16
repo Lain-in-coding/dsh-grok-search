@@ -11,6 +11,7 @@ let logView = null, quotaView = null;
 let controlRetrying = false;
 let secretEpoch = 0;
 let accessGeneration = 0;
+let stateGeneration = 0;
 const timers = new Set(), frames = new Set(), waits = new Set(), listeners = new Set();
 const setTimeout = (fn, ms) => {
   if (disposed) return 0;
@@ -303,11 +304,15 @@ async function refresh({ first = false, force = false, readLog = true } = {}) {
   if (disposed) return;
   if (readTask) return readTask;
   if (!force && (S.busy || S.testing || drag)) return;
-  const accessAtStart = accessGeneration;
+  const accessAtStart = accessGeneration, stateAtStart = stateGeneration;
   readTask = (async () => {
     try {
       const [snapshot, prefs] = await Promise.all([remote.snapshot(), remote.preferences()]);
-      if (!disposed && accessAtStart === accessGeneration) {
+      if (!disposed && accessAtStart === accessGeneration && stateAtStart !== stateGeneration
+        && snapshot.capabilities?.secretsAllowed === false) {
+        denyPrivateAccess({ code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+      }
+      if (!disposed && accessAtStart === accessGeneration && stateAtStart === stateGeneration) {
         const signature = JSON.stringify([snapshot, prefs]);
         if (first || force || S.rpcError || signature !== snapshotSignature) {
           acceptSnapshot(snapshot, prefs, { first });
@@ -317,7 +322,8 @@ async function refresh({ first = false, force = false, readLog = true } = {}) {
       }
     } catch (error) {
       if (disposed || accessAtStart !== accessGeneration) return;
-      denyPrivateAccess(error);
+      const denied = denyPrivateAccess(error);
+      if (stateAtStart !== stateGeneration && !denied) return;
       S.loading = false;
       S.rpcError = { code: error?.code || 'SETTINGS_UNAVAILABLE', message: error?.message || '设置服务暂不可用，请重试。' };
       syncAll(true);
@@ -333,6 +339,8 @@ function schedulePoll() {
   }, 3000);
 }
 function updateConfig(config, changedKeys) {
+  stateGeneration++;
+  snapshotSignature = null;
   if (Array.isArray(changedKeys)) {
     S.lastRoute = null;
     for (const [id, mapping] of Object.entries(CARD_FIELDS)) if (Object.values(mapping).some(key => changedKeys.includes(key))) {
@@ -402,12 +410,13 @@ function syncOpenCardBaseline() {
 }
 async function reloadDialogDraft() {
   if (!D || dialogBusy() || S.busy || disposed) return;
-  const mine = D, previous = clone(mine.base), draft = clone(mine.draft);
+  const mine = D, previous = clone(mine.base), draft = clone(mine.draft), accessAtStart = accessGeneration;
+  const stateAtStart = ++stateGeneration;
   const changed = Object.keys(draft).filter(key => JSON.stringify(draft[key]) !== JSON.stringify(previous[key]));
   mine.saving = true; S.busy = true; lockDialog();
   try {
     const [snapshot, prefs] = await Promise.all([remote.snapshot(), remote.preferences()]);
-    if (disposed || D !== mine) return;
+    if (disposed || D !== mine || accessAtStart !== accessGeneration || stateAtStart !== stateGeneration) return;
     if (snapshot.config.error) throw Object.assign(new Error(snapshot.config.error.message), { code: snapshot.config.error.code });
     acceptSnapshot(snapshot, prefs);
     mine.base = clone(mine.kind === 'card' ? S.prov[mine.id] : S.hub);
@@ -444,7 +453,8 @@ async function saveConfig(build, baseline = null) {
     const updates = typeof build === 'function' ? build(S.config.fields) : build;
     const revision = S.config.revision;
     if (!Object.keys(updates).length) return null;
-    if (baseline && baseline.revision !== revision && fieldChanged(baseline, S.config, updates)) {
+    if (baseline && (baseline.path !== S.config.path || baseline.revision !== revision
+      || baseline.quotaRevision !== S.config.quotaRevision) && fieldChanged(baseline, S.config, updates)) {
       throw Object.assign(new Error('配置已在别处修改，请核对草稿后再保存。'), { code: 'CONFIG_CONFLICT' });
     }
     try {
@@ -454,6 +464,7 @@ async function saveConfig(build, baseline = null) {
     } catch (error) {
       if (attempt || error?.code !== 'CONFIG_CONFLICT' || disposed) throw error;
       await refresh({ force: true });
+      if (disposed) return null;
       if (S.rpcError || !S.config || S.config.error) throw error;
       // Redacted snapshots cannot establish whether another writer replaced a
       // credential with a different same-length/same-count value. Never rebase
@@ -466,17 +477,24 @@ async function saveConfig(build, baseline = null) {
 async function savePreference(id, on) {
   const key = id === 'grok' ? 'grokEnabled' : 'githubReadEnabled';
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (disposed) return;
     try {
       const result = await remote.savePreferences({ expectedRevision: S.prefs.revision,
         value: { ...S.prefs.value, [key]: on } });
       if (!disposed) {
+        stateGeneration++;
+        snapshotSignature = null;
         S.prefs = result;
         S.prov[id].enabled = result.value[key] !== false;
       }
       return result;
     } catch (error) {
       if (attempt || error?.code !== 'PREFERENCES_CONFLICT' || disposed) throw error;
-      S.prefs = await remote.preferences();
+      const current = await remote.preferences();
+      if (disposed) return;
+      stateGeneration++;
+      snapshotSignature = null;
+      S.prefs = current;
     }
   }
 }
@@ -2397,20 +2415,20 @@ async function revealFor(k) {
   if (!D || D.closed || disposed || D.kind !== 'card') return false;
   if (!S.capabilities?.secretsAllowed) return false;
   const mine = D, keyName = k.startsWith('keys') ? 'keys' : k;
-  const epoch = secretEpoch;
+  const epoch = secretEpoch, baseline = mine.configBaseline;
   const current = () => !disposed && !mine.closed && D === mine && epoch === secretEpoch
-    && S.capabilities?.secretsAllowed === true;
+    && baseline === mine.configBaseline && S.capabilities?.secretsAllowed === true;
   const configured = keyName === 'keys' ? mine.draft.keys.some(hidden) : hidden(mine.draft[keyName]);
   if (!configured) return true;
   const pending = mine.revealing;
   const existing = pending.get(keyName);
-  if (existing?.epoch === epoch) {
+  if (existing?.epoch === epoch && existing.baseline === baseline) {
     return await existing.task === true && current();
   }
   const key = CARD_FIELDS[mine.id]?.[keyName];
   if (!key) return false;
   const focused = active(), selection = focused?.selectionStart;
-  const entry = { epoch, task: null };
+  const entry = { epoch, baseline, task: null };
   pending.set(keyName, entry);
   entry.task = (async () => {
     try {

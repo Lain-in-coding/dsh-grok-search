@@ -1,7 +1,33 @@
-import { existsSync, readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { join, basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { project, freshRun, writeJson, commandResult, receipt, npmCli, sha256, redact } from './lib/internal-candidate-utils.mjs';
+import { buildClient, checkClientArtifact } from './build-client.mjs';
+import { inspectPackage } from './lib/compatibility-smoke.mjs';
+
+export function inspectPackedSources(bytes, metadata, sourceRoot = project) {
+  const archive = inspectPackage(bytes), hash = value => createHash('sha256').update(value).digest('hex');
+  assert.equal(metadata.integrity, 'sha512-' + createHash('sha512').update(bytes).digest('base64'), 'PACK_ARCHIVE_INTEGRITY');
+  assert.equal(metadata.size, bytes.length, 'PACK_ARCHIVE_INTEGRITY');
+  assert.equal(archive.manifest.name, metadata.name, 'PACK_ARCHIVE_IDENTITY');
+  assert.equal(archive.manifest.version, metadata.version, 'PACK_ARCHIVE_IDENTITY');
+  const listed = metadata.files.map(row => row.path);
+  assert.equal(new Set(listed).size, listed.length, 'PACK_FILE_INVENTORY');
+  assert.deepEqual([...archive.files.keys()].sort(), [...listed].sort(), 'PACK_FILE_INVENTORY');
+  return metadata.files.map(({ path, size }) => {
+    const packed = archive.files.get(path), sourcePath = join(sourceRoot, path), before = lstatSync(sourcePath);
+    assert.ok(before.isFile() && !before.isSymbolicLink(), 'PACK_SOURCE_UNSAFE');
+    const current = readFileSync(sourcePath), after = lstatSync(sourcePath);
+    assert.ok(after.isFile() && !after.isSymbolicLink() && before.dev === after.dev && before.ino === after.ino
+      && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs,
+    'PACK_SOURCE_CHANGED');
+    assert.equal(packed.length, size, 'PACK_FILE_INVENTORY');
+    assert.ok(packed.equals(current), 'PACK_SOURCE_CHANGED: ' + path);
+    return { file: path, sha256: hash(packed) };
+  });
+}
 
 export function validatePackChannel(manifest, matrix, { alpha = false, beta = false, release = false } = {}) {
   if ([alpha, beta, release].filter(Boolean).length > 1) throw new Error('打包通道不能同时选择多个。');
@@ -35,6 +61,9 @@ export async function packInternal(directory, options = {}) {
   for (const file of ['support-matrix.json', 'README.md', 'src/index.mjs', 'cordis.patch.yml', 'LICENSE']) {
     if (!existsSync(join(project, file))) throw new Error('打包前缺少文件：' + file);
   }
+  // Check without rebuilding: packaging must not silently change the tested client.
+  checkClientArtifact((await buildClient()).code);
+  const identitiesBefore = new Map(['package.json', 'support-matrix.json', 'src/client.js'].map(file => [file, sha256(join(project, file))]));
   const record = await commandResult(process.execPath, [npmCli, 'pack', '--json', '--ignore-scripts', '--pack-destination', directory], {
     cwd: project, timeoutMs: 60_000, sanitize: value => redact(value),
   });
@@ -63,9 +92,13 @@ export async function packInternal(directory, options = {}) {
     if (!metadata.files.some(file => file.path === match[1])) throw new Error('压缩包内 README 链接缺少目标：' + match[1]);
   }
   const tarball = join(directory, metadata.filename);
+  const bytes = readFileSync(tarball);
+  const sourceHashes = inspectPackedSources(bytes, metadata);
+  for (const [file, expected] of identitiesBefore) assert.equal(sha256(join(project, file)), expected, 'PACK_SOURCE_CHANGED');
+  checkClientArtifact((await buildClient()).code);
   const packageReceipt = { name: metadata.name, version: metadata.version, filename: metadata.filename,
-    sha256: sha256(tarball), integrity: metadata.integrity, files: metadata.files, whiteListPassed: true,
-    sourceHashes: metadata.files.map(({ path }) => ({ file: path, sha256: sha256(join(project, path)) })),
+    sha256: createHash('sha256').update(bytes).digest('hex'), integrity: metadata.integrity, files: metadata.files, whiteListPassed: true,
+    sourceHashes, archiveSourcesVerified: true, generatedClientVerified: true,
     releaseChannel: channel, publicReleaseApproved: false, verification: '宿主结果另见本次验证索引；打包不表示已发布。' };
   writeJson(join(directory, 'package-receipt.json'), packageReceipt);
   return { tarball, packageReceipt };

@@ -53,7 +53,7 @@ test('Typert combines both pure contracts without host peers or a Service fallba
     assert.equal(compatibility.COMPATIBILITY_REMOTE_SERVICE, 'grokSearchCompatibilityRemote');
     assert.equal(compatibility.COMPATIBILITY_NAMESPACE, 'grokSearchCompatibility');
     assert.deepEqual(compatibility.COMPATIBILITY_DESCRIPTORS.map(row => row.method),
-      ['compatibilityReport', 'confirmCompatibility', 'acknowledgeCompatibilityNotice']);
+      ['compatibilityReport', 'recheckCompatibility', 'confirmCompatibility', 'acknowledgeCompatibilityNotice']);
     for (const descriptor of compatibility.COMPATIBILITY_DESCRIPTORS) {
       assert.equal(descriptor.service, compatibility.COMPATIBILITY_REMOTE_SERVICE);
       assert.equal(descriptor.namespace, compatibility.COMPATIBILITY_NAMESPACE);

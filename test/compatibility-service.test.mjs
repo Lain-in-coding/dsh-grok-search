@@ -42,9 +42,10 @@ function fixture(t) {
   const root = realpathSync(tmpdir()), profileDir = mkdtempSync(join(root, 'dsh-compatibility-service-'));
   const state = createCompatibilityState({ profileDir, hostVersion: HOST, pluginVersion: PLUGIN });
   const security = createConnectionSecurity(), effects = [];
-  let confirmations = 0, acknowledgements = 0;
+  let confirmations = 0, acknowledgements = 0, rechecks = 0;
   const coordinator = {
     report: () => report(state.snapshot()),
+    async recheck() { rechecks++; },
     confirm(request) { confirmations++; return state.confirm(request); },
     acknowledgeNotice(request) { acknowledgements++; return state.markNotified(request); },
   };
@@ -71,12 +72,12 @@ function fixture(t) {
     hostVersion: HOST, pluginVersion: PLUGIN, expectedRevision: state.revision, ...extra,
   });
   return { profileDir, state, coordinator, security, ctx, gateway, effects, request, noticeRequest,
-    confirmations: () => confirmations, acknowledgements: () => acknowledgements };
+    confirmations: () => confirmations, acknowledgements: () => acknowledgements, rechecks: () => rechecks };
 }
 
 test('additive descriptors have separate schemas, methods and a distinct service but one namespace', () => {
   assert.deepEqual(COMPATIBILITY_DESCRIPTORS.map(row => row.method),
-    ['compatibilityReport', 'confirmCompatibility', 'acknowledgeCompatibilityNotice']);
+    ['compatibilityReport', 'recheckCompatibility', 'confirmCompatibility', 'acknowledgeCompatibilityNotice']);
   assert.equal(COMPATIBILITY_REMOTE_SERVICE, 'grokSearchCompatibilityRemote');
   assert.equal(COMPATIBILITY_NAMESPACE, 'grokSearchCompatibility');
   for (const descriptor of COMPATIBILITY_DESCRIPTORS) {
@@ -89,6 +90,19 @@ test('additive descriptors have separate schemas, methods and a distinct service
   }
   assert.deepEqual(inject, ['grokSearchCompatibility', 'grokSearchConnectionSecurity']);
   assert.equal(Gateway.prototype['@deepseek-ai/dsh-typert-protocol/remote-methods'].version, 1);
+});
+
+test('recheck RPC requires the owner secure transport and invokes a fresh backend capability probe', async t => {
+  const { gateway, security, coordinator, rechecks } = fixture(t);
+  await assert.rejects(gateway.recheckCompatibility(), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+  assert.equal(rechecks(), 0);
+  const value = await security.run(loopback(), null, () => gateway.recheckCompatibility());
+  assert.equal(rechecks(), 1);
+  assert.deepEqual(value, await gateway.compatibilityReport());
+  coordinator.recheck = undefined;
+  await security.run(loopback(), null, () =>
+    assert.rejects(gateway.recheckCompatibility(), { code: 'COMPATIBILITY_UNAVAILABLE' }));
+  assert.equal(rechecks(), 1);
 });
 
 test('notice acknowledgement has its own strict request codec and cannot carry risk acceptance', () => {

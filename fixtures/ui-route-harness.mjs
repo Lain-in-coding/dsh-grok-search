@@ -350,6 +350,7 @@ window.harness = {
     };
     ctx.remote.grokSearchCompatibility = {
       async compatibilityReport() { compatibilityCalls.push({ method: 'compatibilityReport' }); return result(); },
+      async recheckCompatibility() { compatibilityCalls.push({ method: 'recheckCompatibility' }); return result(); },
       async confirmCompatibility(request) { return mutate('confirmCompatibility', request); },
       async acknowledgeCompatibilityNotice(request) { return mutate('acknowledgeCompatibilityNotice', request); },
     };

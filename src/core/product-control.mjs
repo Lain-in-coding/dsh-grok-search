@@ -72,7 +72,7 @@ export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, sel
       && selectedId(result.searchProvider) === PRODUCT_PROVIDER_ID;
   } finally { removeConfig?.(); }
   checks.configUpdate = typeof entry.update === 'function' && typeof fiber.update === 'function'
-    && current === effectiveConfig(fiber) && rawBefore === fiber.config && optionsBefore === entry.options.config
+    && isDeepStrictEqual(rawBefore, fiber.config) && isDeepStrictEqual(optionsBefore, entry.options.config)
     && isDeepStrictEqual(raw, rawConfig(effectiveConfig(fiber)));
   assertCurrent();
 
@@ -83,41 +83,51 @@ export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, sel
     arguments: {}, signal: new AbortController().signal, token: Object.freeze({}) };
   const denial = 'dsh-grok-search compatibility sentinel';
   let guardChecks = false, scopedTool = null;
-  const scope = ctx.plugin({ name: probeName, inject: ['web', 'tools'], apply(child) {
+  const scope = ctx.plugin({ name: probeName, inject: ['web'], apply(child) {
     child.effect(() => () => { cleaned = true; });
     const remove = child.on(event, (_value, next) => next(), { global: true, prepend: true });
     removed = typeof remove === 'function';
-    const scopedTools = child.get('tools'), guard = scopedTools?.checkGuards ?? scopedTools?.guardReason;
+    let scopedTools;
+    try { scopedTools = child.get('tools'); } catch { scopedTools = null; }
+    const guard = scopedTools?.checkGuards ?? scopedTools?.guardReason;
     if (typeof scopedTools?.guard === 'function' && typeof guard === 'function') {
-      const removeGuard = scopedTools.guard(exec => exec === execution ? denial : undefined);
       try {
-        const result = guard.call(scopedTools, execution);
-        guardChecks = typeof removeGuard === 'function' && (result === denial || result?.reason === denial);
-      } finally { removeGuard?.(); }
+        const removeGuard = scopedTools.guard(exec => exec === execution ? denial : undefined);
+        try {
+          const result = guard.call(scopedTools, execution);
+          guardChecks = typeof removeGuard === 'function' && (result === denial || result?.reason === denial);
+        } finally { removeGuard?.(); }
+      } catch { guardChecks = false; }
     }
-    scopedTool = {
-      name: probeName, description: 'Local compatibility sentinel; never performs a search.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false },
-      output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] },
-      execute: () => ({}),
-    };
-    const removeTool = scopedTools.register(scopedTool);
-    try { toolRemoved = typeof removeTool === 'function' && scopedTools.get(probeName) === scopedTool; }
-    finally { removeTool?.(); }
-    toolRemoved &&= scopedTools.get(probeName) === undefined;
-    const sentinelFetch = () => { throw new Error('Compatibility checks never fetch.'); };
-    let observedGet = false;
-    const removeGet = child.on('internal/get', (caller, key, _error, next) => {
-      const service = next();
-      if (key !== 'web' || caller?.fiber?.uid !== child.fiber.uid || !service) return service;
-      observedGet = true;
-      return new Proxy(service, { get(target, property, receiver) {
-        return property === 'fetch' ? sentinelFetch : Reflect.get(target, property, receiver);
-      } });
-    }, { global: true, prepend: true });
-    try { checks.githubFetch = child.web.fetch === sentinelFetch && observedGet; }
-    catch { checks.githubFetch = false; }
-    finally { removeGet?.(); }
+    if (typeof scopedTools?.register === 'function' && typeof scopedTools?.get === 'function') {
+      try {
+        scopedTool = {
+          name: probeName, description: 'Local compatibility sentinel; never performs a search.',
+          parameters: { type: 'object', properties: {}, additionalProperties: false },
+          output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] },
+          execute: () => ({}),
+        };
+        const removeTool = scopedTools.register(scopedTool);
+        try { toolRemoved = typeof removeTool === 'function' && scopedTools.get(probeName) === scopedTool; }
+        finally { removeTool?.(); }
+        toolRemoved &&= scopedTools.get(probeName) === undefined;
+      } catch { toolRemoved = false; }
+    }
+    if (typeof child.web?.fetch === 'function') {
+      const sentinelFetch = () => { throw new Error('Compatibility checks never fetch.'); };
+      let observedGet = false;
+      const removeGet = child.on('internal/get', (caller, key, _error, next) => {
+        const service = next();
+        if (key !== 'web' || caller?.fiber?.uid !== child.fiber.uid || !service) return service;
+        observedGet = true;
+        return new Proxy(service, { get(target, property, receiver) {
+          return property === 'fetch' ? sentinelFetch : Reflect.get(target, property, receiver);
+        } });
+      }, { global: true, prepend: true });
+      try { checks.githubFetch = child.web.fetch === sentinelFetch && observedGet; }
+      catch { checks.githubFetch = false; }
+      finally { removeGet?.(); }
+    } else checks.githubFetch = false;
     activated = true;
   } });
   try { await scope; assertCurrent(); }
@@ -131,16 +141,19 @@ export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, sel
   } catch (error) { blocked = /^COMPATIBILITY_/.test(error?.code ?? ''); }
   checks.toolExecution = blocked && !dispatched;
   let resultSeen = false;
-  const removeResult = ctx.on('tools/result', value => { if (value === execution) resultSeen = true; },
-    { global: true, prepend: true });
   try {
-    // Enumerate but never broadcast a fabricated result into other plugins' observers.
-    const callbacks = ctx.events?.dispatch?.('emit', ['tools/result', execution, { isError: true, content: [] }]);
-    if (Array.isArray(callbacks)) callbacks[0]?.(execution, { isError: true, content: [] });
-  }
-  finally { removeResult?.(); }
+    const removeResult = ctx.on('tools/result', value => { if (value === execution) resultSeen = true; },
+      { global: true, prepend: true });
+    try {
+      // Enumerate but never broadcast a fabricated result into other plugins' observers.
+      const callbacks = ctx.events?.dispatch?.('emit', ['tools/result', execution, { isError: true, content: [] }]);
+      if (Array.isArray(callbacks)) callbacks[0]?.(execution, { isError: true, content: [] });
+    }
+    finally { removeResult?.(); }
+  } catch { resultSeen = false; }
   checks.toolResult = resultSeen;
   checks.toolGuards = guardChecks && toolRemoved;
+    checks.githubRead = toolRemoved && guardChecks;
   const runtime = runtimeService(entry);
   checks.webSelection = runtime !== null
     && (raw.searchProvider === undefined
@@ -409,10 +422,13 @@ async function updateWebEntry(entry, next, preserveEntryConfig = false) {
   if (entry.options && effectiveConfig(entry.fiber)) {
     entry.options.config = { ...entryConfig, ...rawConfig(effectiveConfig(entry.fiber)) };
   }
+  const stagedConfig = preserveEntryConfig ? structuredClone(entry.options?.config) : null;
+  const appliedConfig = preserveEntryConfig ? structuredClone(next) : null;
   try {
     await entry.update({ config: next });
   } finally {
-    if (preserveEntryConfig && entry.options) entry.options.config = entryConfig;
+    if (preserveEntryConfig && entry.options && (isDeepStrictEqual(entry.options.config, stagedConfig)
+      || isDeepStrictEqual(entry.options.config, appliedConfig))) entry.options.config = entryConfig;
   }
   if (entry.fiber.state !== 2) throw new ControlRecordError('CONTROL_ROUTE_UPDATE_FAILED',
     'The web target is not active after the route update.');

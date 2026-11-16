@@ -192,6 +192,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       if (result.version !== record.version) throw new Error();
       return { ...result, source: 'private-cache', found: true };
     } catch (error) {
+      if (['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error?.code)) throw error;
       signal?.throwIfAborted();
       if (error instanceof GrokSearchError) throw error;
       if (['EACCES', 'EPERM'].includes(error.code)) fail('GROK_CACHE_ACCESS_DENIED', '没有读取程序缓存的权限，请检查目录权限。');
@@ -330,9 +331,9 @@ export async function resolveGrokProgram({ installer, signal, onProgress, repair
     const existing = await findExistingGrok({ ...discovery, signal });
     if (existing.found) return existing;
   } catch (error) {
+    if (['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error?.code)) throw error;
     signal?.throwIfAborted();
-    if (discovery.override || discovery.configured
-      || ['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error.code)) throw error;
+    if (discovery.override || discovery.configured) throw error;
     discoveryError = error;
   }
   if (repair) return installer.repair({ signal, onProgress });

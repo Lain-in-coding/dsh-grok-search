@@ -95,6 +95,16 @@ export const COMPATIBILITY_DESCRIPTORS = Object.freeze([
     result: COMPATIBILITY_REPORT,
   }),
   Object.freeze({
+    id: 'dsh-grok-search#grokSearchCompatibilityRemote/recheckCompatibility',
+    service: COMPATIBILITY_REMOTE_SERVICE,
+    namespace: COMPATIBILITY_NAMESPACE,
+    method: 'recheckCompatibility',
+    description: 'Run a fresh server-side compatibility capability check without changing user configuration.',
+    invocation: Object.freeze({ kind: 'direct' }),
+    parameters: Object.freeze([]),
+    result: COMPATIBILITY_REPORT,
+  }),
+  Object.freeze({
     id: 'dsh-grok-search#grokSearchCompatibilityRemote/confirmCompatibility',
     service: COMPATIBILITY_REMOTE_SERVICE,
     namespace: COMPATIBILITY_NAMESPACE,

@@ -113,12 +113,22 @@ test('confirmed core block has actionable text and never implies official search
   h.view.dispose();
 });
 
-test('exhausted transient probe reports a neutral core-block state rather than version blame', async () => {
+test('actual startup failure offers a retry without blaming the host version', async () => {
   const h = harness({ compatibilityReport: async () => blocked('COMPATIBILITY_CORE_UNAVAILABLE') });
   await settle();
-  assert.match(h.get('[data-compatibility-text]').textContent, /暂时无法确认搜索安全状态/);
-  assert.match(h.get('[data-compatibility-detail]').textContent, /可以重新检查/);
+  assert.match(h.get('[data-compatibility-text]').textContent, /搜索组件启动失败/);
+  assert.match(h.get('[data-compatibility-detail]').textContent, /配置仍可编辑。重新检查将重试/);
   assert.doesNotMatch(h.get('[data-compatibility-text]').textContent, /版本不兼容/);
+  h.view.dispose();
+});
+
+test('an actual in-session route selection change explains the conflict without an automatic fallback', async () => {
+  const h = harness({ compatibilityReport: async () => blocked('CONTROL_SEARCH_SELECTION_CONFLICT') });
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'blocked');
+  assert.match(h.get('[data-compatibility-text]').textContent, /搜索来源设置在接管期间发生变化/);
+  assert.match(h.get('[data-compatibility-text]').textContent, /未转交官方搜索/);
+  assert.match(h.get('[data-compatibility-detail]').textContent, /检查当前搜索来源设置/);
   h.view.dispose();
 });
 

@@ -91,30 +91,33 @@ test('开发通道拒绝latest、错误版本和混合通道，保留正式通�
   assert.equal(validatePackChannel(release, { ...matrix, packageVersion: release.version }, { release: true }), 'release');
 });
 
-test('0.4.0候选与已发布0.3.0入口分开，不把历史证据当作本次同包通过', () => {
+test('0.4.0发布文档固定目标版本并保留历史实录与验证范围', () => {
   const readme = read('README.md');
   const changelog = read('CHANGELOG.md');
-  assert.match(readme, /Version-0\.4\.0_candidate-/);
-  assert.match(readme, /安装已发布 \*\*0\.3\.0\*\*/);
-  assert.match(readme, /releases\/tag\/v0\.3\.0/);
-  assert.match(readme, /0\.4\.0 开发候选，尚未发布/);
-  assert.match(readme, /21 组同包验收/);
+  assert.match(readme, /Version-0\.4\.0-/);
+  assert.match(readme, /实际发布状态以/);
+  assert.match(readme, /releases\/tag\/v0\.4\.0/);
+  assert.match(readme, /历史操作实录：Windows Desktop 0\.2\.2-rc\.2 · 插件 0\.3\.0/);
+  assert.match(readme, /运行文件与该人工验收包逐字节一致/);
+  assert.match(readme, /尚未做 macOS 实机复验/);
   assert.match(readme, /npm run pack:release/);
   assert.doesNotMatch(readme, /npm run pack:alpha|0\.3\.0-alpha\.1/);
   assert.match(changelog, /## 0\.3\.0 - 2026-11-13/);
-  assert.match(changelog, /## 0\.4\.0 - 开发中，尚未发布/);
+  assert.match(changelog, /^## 0\.4\.0$/m);
   assert.doesNotMatch(changelog, /## 0\.3\.0-alpha/);
   assert.equal(matrix.packageVersion, manifest.version);
   assert.match(matrix.channel, /0\.4\.0/);
 });
 
-test('候选未发布时安装示例明确固定已发布版本，不声称registry已有候选', () => {
+test('发布安装示例固定0.4.0但不预先声称registry已经发布', () => {
   const readme = read('README.md');
   const install = readme.split('### 方式一：在 DSH 中按名称安装')[1]?.split('\n### ')[0];
-  const expected = `${manifest.name}@0.3.0`;
+  const expected = `${manifest.name}@${manifest.version}`;
   assert.equal(install?.match(/```text\s+([^\r\n]+)\s+```/)?.[1]?.trim(), expected);
   assert.equal(readme.match(/^dsh plugin --profile web add (\S+)$/m)?.[1], expected);
-  assert.match(readme, /测试 0\.4\.0 时使用维护者交付的冻结/);
+  assert.match(readme, /确认目标版本可下载后/);
+  assert.match(readme, /dsh-grok-search-0\.4\.0\.tgz/);
+  assert.doesNotMatch(readme, /安装已发布 \*\*0\.4\.0\*\*/);
   assert.equal(manifest.bin['dsh-grok-search-compatibility'], './src/core/compatibility-cli.mjs');
 });
 

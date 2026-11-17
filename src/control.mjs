@@ -171,8 +171,9 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
         const recorded = existing.intent.acquisition;
         const recordedPresent = recorded && Object.hasOwn(recorded, 'authorSearchProviderPresent')
           ? recorded.authorSearchProviderPresent : recorded?.authorSearchProvider !== null;
-        if (recorded?.authorSearchProvider !== currentAcquisition.authorSearchProvider
-          || recordedPresent !== currentAcquisition.authorSearchProviderPresent) {
+        // A fresh owner records current selectors; only its acquired lease constrains later changes.
+        if (acquired && (recorded?.authorSearchProvider !== currentAcquisition.authorSearchProvider
+          || recordedPresent !== currentAcquisition.authorSearchProviderPresent)) {
           state.phase = 'conflict';
           state.error = { code: 'CONTROL_SEARCH_SELECTION_CONFLICT',
             message: 'The current author search selection differs from the recorded ownership intent.' };

@@ -209,10 +209,28 @@ try {
     return note && !note.includes('载入') && text && text!=='读取配置…'
       ? {note, text, componentError: /共\\s*1\\s*个[·\\s]*1\\s*异常/.test(document.body.innerText)} : null;
   })()`), { timeoutMs: 30_000 });
+  let compatibility = null;
+  if (existsSync(join(product, 'src/core/runtime-compat.mjs'))) {
+    compatibility = await waitForRenderer(renderer, client => client.evaluate(`(async () => {
+      const method='grokSearchCompatibility/compatibilityReport';
+      const response=await fetch('/api/'+method,{method:'POST',credentials:'same-origin',
+        headers:{'content-type':'application/json'},signal:AbortSignal.timeout(10_000),
+        body:JSON.stringify({type:'client-request',rpcId:crypto.randomUUID(),method,payload:{args:{}}})});
+      const body=await response.json(), report=body.result?.ok ? body.result.value : null;
+      return report?.coreReady && report.optionalFeatures?.settings?.available ? report : null;
+    })()`), { timeoutMs: 30_000 });
+    assert.equal(compatibility.confirmationRequired, false, 'healthy services do not require compatibility consent');
+    assert.equal(compatibility.phase, 'ready', 'healthy first-use services do not report an optional compatibility fault');
+    const bannerHidden = await renderer.evaluate(`(() => {
+      const root=document.querySelector('[data-dsg-route]')?.shadowRoot;
+      return ![...(root?.querySelectorAll('.compatibility-banner') ?? [])].some(element=>!element.hidden);
+    })()`);
+    assert.equal(bannerHidden, true, 'the healthy first-use UI hides compatibility warnings');
+  }
   result = {
     root, port, version: JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version,
     ...(registryResolution ? { registryResolution, repositoryReadmeDiffers } : {}),
-    packageSha256: packageReceipt.sha256, fixtureBundle: false, snapshot, ui,
+    packageSha256: packageReceipt.sha256, fixtureBundle: false, snapshot, ui, compatibility,
     ...(upgradePackage ? { upgradeFrom: { version: upgradePackage.manifest.version, sha256: upgradePackage.receipt.sha256 } } : {}),
     log: await rpc('readSearchLog', { sessionId }),
     route: await rpc('toolCallRoute', { sessionId, callId: 'unknown' }),

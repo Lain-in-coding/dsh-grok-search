@@ -291,6 +291,65 @@ test('product control tolerates an older required acquisition without the new au
   assert.equal(ctx.get('web').searchProviderId, 'grok-search');
   ctx.dispose();
 });
+
+test('a fresh control owner adopts current author selectors but rejects changes after acquisition', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const store = createProductStore(ctx, { deferMaintenance: true });
+  const entry = ctx.loader.entries()[0], manifest = join(ctx.profileContext.dir, 'package.json');
+  try {
+    await entry.update({ config: { searchProvider: 'deepseek-official', fetchProvider: 'http' } });
+    const prior = createRequiredRecord(ctx, store, randomUUID());
+    const priorPath = join(store.directory, 'v000000000001.json');
+    const priorBytes = readFileSync(priorPath);
+    const currentAuthor = { searchProvider: 'ddg', fetchProvider: 'fs-quality-fetch' };
+    await entry.update({ config: currentAuthor });
+    writeProfile(ctx, [PRODUCT_SEARCH_BUNDLE, 'current-other-bundle']);
+    const manifestBytes = readFileSync(manifest);
+    const updates = [], update = entry.update;
+    entry.update = async options => { updates.push(structuredClone(options.config)); return update(options); };
+
+    await applyControl(ctx, { store });
+    const owner = ctx.get('grokSearchControl'), adopted = store.read();
+    assert.equal(owner.snapshot().phase, 'required');
+    assert.equal(owner.snapshot().error, null);
+    assert.equal(adopted.revision, prior.revision + 1);
+    assert.equal(adopted.intent.policy, 'required');
+    assert.equal(adopted.intent.release, null);
+    assert.equal(adopted.intent.releaseCompletion, undefined);
+    assert.equal(adopted.intent.pause, undefined);
+    assert.equal(adopted.intent.recovery, undefined);
+    assert.deepEqual(adopted.intent.priorIntent, prior.intent);
+    assert.equal(adopted.intent.acquisition.authorSearchProvider, currentAuthor.searchProvider);
+    assert.equal(adopted.intent.acquisition.authorSearchProviderPresent, true);
+    assert.equal(adopted.intent.acquisition.authorFetchProvider, currentAuthor.fetchProvider);
+    assert.deepEqual(adopted.intent.acquisition.selectedBundles, [PRODUCT_SEARCH_BUNDLE, 'current-other-bundle']);
+    assert.deepEqual(adopted.intent.acquiredSelection, adopted.intent.acquisition.selectedBundles);
+    assert.equal(adopted.intent.lease.hostId, PRODUCT_HOST_ID);
+    assert.equal(effectiveSearchProvider(entry), 'grok-search');
+    assert.equal(effectiveFetchProvider(entry), currentAuthor.fetchProvider);
+    assert.deepEqual(entry.options.config, currentAuthor);
+    assert.deepEqual(updates, [{ ...currentAuthor, searchProvider: 'grok-search' }]);
+    assert.deepEqual(readFileSync(priorPath), priorBytes);
+    assert.deepEqual(readFileSync(manifest), manifestBytes);
+    await owner.retry();
+    assert.deepEqual(store.read(), adopted);
+
+    const laterAuthor = { searchProvider: 'session-author', fetchProvider: 'session-fetch' };
+    await entry.update({ config: laterAuthor });
+    const conflicted = await owner.retry();
+    assert.equal(conflicted.phase, 'conflict');
+    assert.equal(conflicted.error.code, 'CONTROL_SEARCH_SELECTION_CONFLICT');
+    assert.equal(owner.publicSnapshot().completionCommitted, false);
+    assert.deepEqual(store.read(), adopted);
+    assert.equal(effectiveSearchProvider(entry), laterAuthor.searchProvider);
+    assert.equal(effectiveFetchProvider(entry), laterAuthor.fetchProvider);
+    assert.deepEqual(entry.options.config, laterAuthor);
+    assert.deepEqual(updates, [{ ...currentAuthor, searchProvider: 'grok-search' }, laterAuthor]);
+    assert.deepEqual(readFileSync(priorPath), priorBytes);
+    assert.deepEqual(readFileSync(manifest), manifestBytes);
+  } finally { ctx.dispose(); }
+});
+
 test('product owner explicit stop releases the route and records completion', async () => {
   const ctx = makeContext({ originalCalls: 0 });
   await applyControl(ctx);

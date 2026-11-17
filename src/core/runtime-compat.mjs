@@ -14,6 +14,7 @@ const codes = new Set([
   'COMPATIBILITY_ABI_UNSUPPORTED', 'COMPATIBILITY_CONTRACT_PENDING', 'COMPATIBILITY_CONTRACT_FAILED',
   'COMPATIBILITY_PROBE_FAILED', 'COMPATIBILITY_PROBE_INVALID', 'COMPATIBILITY_CORE_UNAVAILABLE',
   'COMPATIBILITY_ROUTE_UNCONFIRMED',
+  'CONTROL_SEARCH_SELECTION_CONFLICT',
   'COMPATIBILITY_BUDGET_UNCONFIRMED', 'COMPATIBILITY_INITIALIZATION_PENDING',
   'COMPATIBILITY_OPTIONAL_PENDING', 'COMPATIBILITY_OPTIONAL_UNAVAILABLE',
   'COMPATIBILITY_SETTINGS_UNAVAILABLE', 'COMPATIBILITY_CHAT_UNAVAILABLE',
@@ -31,6 +32,7 @@ const coreFaultCodes = new Set([
   'COMPATIBILITY_CORE_SHAPE', 'COMPATIBILITY_ABI_UNSUPPORTED',
   'COMPATIBILITY_CONTRACT_FAILED', 'COMPATIBILITY_PROBE_INVALID',
   'COMPATIBILITY_ROUTE_UNCONFIRMED', 'COMPATIBILITY_BUDGET_UNCONFIRMED',
+  'CONTROL_SEARCH_SELECTION_CONFLICT',
 ]);
 export const isConfirmedCoreCompatibilityFault = code => coreFaultCodes.has(code);
 const probeResults = new WeakSet();
@@ -84,8 +86,8 @@ function contractState(checks) {
 }
 
 /**
- * Read-only shape assessment. The adapter supplies results of its separate ABI
- * contract checks; method presence alone never grants route or search authority.
+ * Explicit diagnostics only. These observations do not grant or revoke runtime
+ * readiness; normal startup reports the outcome of actual initialization.
  */
 export function assessRuntimeCapabilities({ ctx, token, contractChecks } = {}) {
   try {
@@ -166,23 +168,23 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
   let policy = evaluateRuntimeVersion(hostVersion);
   const plugin = exactVersion(pluginVersion) ? pluginVersion : null;
   let token = Object.freeze({}), stopped = false, blocked = null, checking = false;
-  let core = null, route = false, budget = false, initialized = false;
-  let confirmed = false, notified = false, revision = null, stateCode = null, statePending = false;
+  let initialized = false;
+  let confirmed = false, notified = false, revision = null, stateCode = null;
   let optional = featureDefaults(), readSequence = 0, unsubscribeState = null;
   const listeners = new Set();
   if (typeof onChange === 'function') listeners.add(onChange);
   const isCurrent = candidate => !stopped && candidate === token;
   const resetWork = () => {
     token = Object.freeze({});
-    core = null; route = false; budget = false; initialized = false; checking = false;
+    initialized = false; checking = false;
     optional = featureDefaults();
   };
   const identityCode = () => !plugin ? 'COMPATIBILITY_PLUGIN_INVALID'
     : !policy.minimumAdmitted ? policy.code : null;
   const admitted = () => !stopped && !identityCode() && !blocked;
-  const corePassed = () => core?.shape === 'passed' && core.contract === 'passed';
-  const canAcquireRoute = () => admitted() && corePassed();
-  const ready = () => canAcquireRoute() && route && budget && initialized;
+  // Operation owners validate their actual route/config writes, not probe certificates.
+  const canAcquireRoute = admitted;
+  const ready = () => admitted() && initialized;
   const optionalCode = () => {
     const unavailable = optionalNames.map(name => optional[name]).filter(feature => !feature.available);
     if (unavailable.some(feature => feature.confirmedFailure)) {
@@ -196,10 +198,6 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     if (blocked) return blocked;
     const featureCode = optionalCode();
     if (ready() && featureCode === 'COMPATIBILITY_OPTIONAL_UNAVAILABLE') return featureCode;
-    if (statePending) return 'COMPATIBILITY_CHECKING';
-    if (!corePassed()) return core?.code ?? 'COMPATIBILITY_CORE_PENDING';
-    if (!route) return 'COMPATIBILITY_ROUTE_UNCONFIRMED';
-    if (!budget) return 'COMPATIBILITY_BUDGET_UNCONFIRMED';
     if (!initialized) return 'COMPATIBILITY_INITIALIZATION_PENDING';
     return stateCode ?? featureCode;
   };
@@ -208,7 +206,7 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     const phase = stopped ? 'stopped'
       : identityCode() || blocked ? 'blocked'
         : coreReady ? optionalCode() === 'COMPATIBILITY_OPTIONAL_UNAVAILABLE' ? 'degraded' : 'ready'
-          : checking || statePending ? 'checking' : 'initial';
+          : checking ? 'checking' : 'initial';
     return Object.freeze({
       schemaVersion: 1, hostVersion: policy.hostVersion, pluginVersion: plugin, channel: policy.channel,
       minimumAdmitted: policy.minimumAdmitted, verification: 'unverified', phase, revision,
@@ -232,7 +230,6 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
   };
   const applyConfirmation = (value, expectedToken, sequence) => {
     if (!isCurrent(expectedToken) || sequence !== readSequence) return report();
-    statePending = false;
     let nextCode = null;
     let nextConfirmed = false, nextNotified = false, nextRevision = null;
     if (!record(value)) nextCode = 'COMPATIBILITY_STATE_INVALID';
@@ -264,19 +261,16 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
         confirmed: false, notified: false, errorCode: null,
       } : stateStore.snapshot();
       if (isPromise(value)) {
-        statePending = true;
-        publish();
         return Promise.resolve(value).then(result => applyConfirmation(result, expectedToken, sequence), failed)
           .catch(failed);
       }
       return applyConfirmation(value, expectedToken, sequence);
     } catch { return failed(); }
   };
-  const block = code => {
-    if (stopped) return false;
+  const block = (code, expectedToken = token) => {
+    if (!isCurrent(expectedToken)) return false;
     blocked = safeCode(code, 'COMPATIBILITY_BLOCKED');
     readSequence++;
-    statePending = false;
     resetWork();
     publish();
     return true;
@@ -286,7 +280,6 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     stopped = true;
     readSequence++;
     resetWork();
-    statePending = false;
     try { unsubscribeState?.(); } catch { /* The stopped epoch remains authoritative. */ }
     unsubscribeState = null;
     publish();
@@ -299,7 +292,7 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     beginEpoch() {
       if (stopped) return null;
       readSequence++;
-      blocked = null; stateCode = null; statePending = false;
+      blocked = null; stateCode = null;
       resetWork();
       checking = true;
       refreshConfirmation();
@@ -320,7 +313,7 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
       if (stopped) return report();
       const next = evaluateRuntimeVersion(value);
       if (next.hostVersion === policy.hostVersion && next.code === policy.code) return report();
-      policy = next; blocked = null; stateCode = null; statePending = false;
+      policy = next; blocked = null; stateCode = null;
       confirmed = false; notified = false; revision = null;
       readSequence++;
       resetWork();
@@ -330,37 +323,23 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     },
     setCapabilities(result) {
       if (!isCurrent(result?.token)) return false;
-      if (result.stage === 'core') {
-        if (!probeResults.has(result)) return block('COMPATIBILITY_PROBE_INVALID');
-        if (result === core) return true;
-        // A second complete assessment replaces the authority of in-flight
-        // acquisition, even when it reports the same method/ABI shape.
-        if (corePassed()) {
-          readSequence++;
-          statePending = false;
-          resetWork();
-          checking = true;
-          publish();
-          return false;
-        }
-        checking = true;
-        core = result;
-        route = false; budget = false;
-        initialized = false;
-        if (result.shape === 'failed' || result.contract === 'failed') return block(result.code);
-      } else if (result.stage === 'route' || result.stage === 'budget') {
-        if (!canAcquireRoute()) return false;
-        if (result.confirmed !== true) return block(result.stage === 'route'
-          ? 'COMPATIBILITY_ROUTE_UNCONFIRMED' : 'COMPATIBILITY_BUDGET_UNCONFIRMED');
-        if (result.stage === 'route') route = true;
-        else budget = true;
-      } else return block('COMPATIBILITY_PROBE_INVALID');
+      if (result.stage === 'core') return probeResults.has(result);
+      if (result.stage === 'budget') return true;
+      if (result.stage !== 'route') return false;
+      if (result.confirmed === false) return block('COMPATIBILITY_ROUTE_UNCONFIRMED', result.token);
+      return result.confirmed === true && admitted();
+    },
+    markStarting(expectedToken) {
+      if (!isCurrent(expectedToken) || !admitted()) return false;
+      if (initialized) return true;
+      checking = true;
       publish();
       return true;
     },
     markReady(expectedToken) {
-      if (!isCurrent(expectedToken) || !canAcquireRoute() || !route || !budget) return false;
+      if (!isCurrent(expectedToken) || !admitted()) return false;
       initialized = true;
+      checking = false;
       publish();
       return ready();
     },
@@ -368,10 +347,12 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
       if (stopped || !optionalNames.includes(name) || !record(value)
         || value.token !== undefined && !isCurrent(value.token)) return false;
       const available = value.available === true || value.available === undefined && value.state === 'ready';
+      const confirmedFailure = !available && value.confirmedFailure === true;
       optional[name] = Object.freeze({
         available,
-        code: available ? null : safeCode(value.code, `COMPATIBILITY_${name.toUpperCase()}_UNAVAILABLE`),
-        confirmedFailure: !available && value.confirmedFailure === true,
+        code: available ? null : confirmedFailure
+          ? safeCode(value.code, `COMPATIBILITY_${name.toUpperCase()}_UNAVAILABLE`) : 'COMPATIBILITY_OPTIONAL_PENDING',
+        confirmedFailure,
       });
       publish();
       return true;

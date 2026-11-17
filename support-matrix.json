@@ -1,23 +1,25 @@
 {
   "schemaVersion": 2,
   "packageVersion": "0.4.0",
-  "channel": "0.4.0 单一完整发行候选；授权后使用 latest，不自动发布",
+  "channel": "0.4.0 正式版本发布准备；latest 上传及 Release 仍需授权",
   "admission": {
     "minimum": "0.2.1-rc.2",
     "includePrerelease": true,
     "upperBound": null,
     "verificationRequired": false,
-    "capabilityChecksRequired": true,
-    "automaticOfficialFallback": false
+    "capabilityChecksRequired": false,
+    "automaticOfficialFallback": false,
+    "runtimeInitializationRequired": true
   },
-  "verificationBaseline": "本包尚无 21 组合同包通过结论。包内仅计划与具名历史；当前兼容验证结果以包外精确 tgz 哈希绑定证据为准。",
-  "supportPolicy": "版本达到下限可进入能力检查；未来版本默认 unverified，关键能力缺失须阻断，可选能力可显式降级。未验证不等于已通过，禁止自动回退官方搜索。",
+  "verificationBaseline": "运行代码在 GitHub 局部修复后通过专项回归及 Windows rc.5 用户人工验收。各组合引用下列具名 0.4.0 基线；发布收尾仅改文档和元数据，不将旧包矩阵改写为新包完整实测。",
+  "supportPolicy": "达到硬下限直接初始化服务；未知或未来版本不要求确认，不运行主动兼容预检。实际故障按对应功能处理，可选异常不撤销已运行核心；未明确停用时禁止自动回退官方搜索。未测试不限制用户尝试，也不表示该版本已实测。",
   "verificationLevels": {
-    "planned": "本次发行验收计划，尚未执行。",
+    "planned": "保留的验收计划，不代表已经执行。",
     "unverified": "已准入但没有匹配当前包与宿主的证据。",
     "host-tested": "仅包外证据可声明：同一 tgz、宿主资产、平台入口与实际门禁均绑定哈希。",
     "source-reviewed": "历史源码审查，不替代本次真实宿主验收。",
-    "historical": "只描述指定旧包，不继承给本包。"
+    "historical": "只描述指定旧包，不继承给本包。",
+    "reference-reviewed": "已核对具名基线的宿主结果，包哈希与范围见 verificationReference；不声明当前文档收尾包重新执行了同一矩阵。"
   },
   "platforms": [
     {
@@ -65,180 +67,204 @@
       "host": "Desktop",
       "dsh": "0.2.1-rc.2",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-windows"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.2",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名早期0.4.0基线通过；后续取消预检和GitHub修复尚未在本平台复验。",
+      "verificationReference": "earlier-040-macos"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.2",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.3",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-windows"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.3",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名早期0.4.0基线通过；后续取消预检和GitHub修复尚未在本平台复验。",
+      "verificationReference": "earlier-040-macos"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.3",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.4",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "source-reviewed",
+      "verification": "关键宿主源码审查支持；不是对应Desktop发行包实测。",
+      "verificationReference": "rc4-critical-source-review"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.4",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "source-reviewed",
+      "verification": "关键宿主源码审查支持；不是对应Desktop发行包实测。",
+      "verificationReference": "rc4-critical-source-review"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.4",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.5",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-windows",
+      "followupReference": "github-fix-manual-acceptance"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.1-rc.5",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名早期0.4.0基线通过；后续取消预检和GitHub修复尚未在本平台复验。",
+      "verificationReference": "earlier-040-macos"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.1-rc.5",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.1",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-windows"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.1",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名早期0.4.0基线通过；后续取消预检和GitHub修复尚未在本平台复验。",
+      "verificationReference": "earlier-040-macos"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.2-rc.1",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.2",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-windows"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.2",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名早期0.4.0基线通过；后续取消预检和GitHub修复尚未在本平台复验。",
+      "verificationReference": "earlier-040-macos"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.2-rc.2",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     },
     {
       "platform": "win32-x64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.3",
       "environment": "windows",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-windows"
     },
     {
       "platform": "darwin-arm64",
       "host": "Desktop",
       "dsh": "0.2.2-rc.3",
       "environment": "macos",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名早期0.4.0基线通过；后续取消预检和GitHub修复尚未在本平台复验。",
+      "verificationReference": "earlier-040-macos"
     },
     {
       "platform": "linux-x64",
       "host": "CLI/Web",
       "dsh": "0.2.2-rc.3",
       "environment": "WSL Ubuntu 22.04",
-      "verificationLevel": "planned",
-      "verification": "等待冻结后的同一份 0.4.0 tgz 完整验收；计划不是已执行或通过的证据。"
+      "verificationLevel": "reference-reviewed",
+      "verification": "具名取消预检0.4.0基线通过；后续GitHub修复按专项及人工验收记录，不声称本行重新执行。",
+      "verificationReference": "runtime-no-preflight-wsl"
     }
   ],
   "evidencePolicy": {
     "authority": "external-exact-tgz",
     "manifest": "release-evidence.json",
     "samePackageRequired": true,
-    "embeddedResults": "planned-only",
-    "postFreezePackageEditsInvalidateAcceptance": true,
+    "embeddedResults": "named-baseline-references",
     "contentIdentityDoesNotProvePackageAcceptance": true,
     "liveServices": "separate-explicit-authorization",
     "watcherDefault": "released-npm-latest-exact-hash",
-    "candidateWatch": "manual-pinned-sha256-only"
+    "candidateWatch": "manual-pinned-sha256-only",
+    "postFreezePackageEditsChangePackageIdentity": true,
+    "documentationOnlyRepackRequiresRuntimeIdentityCheck": true,
+    "runtimeChangesRequireRelevantVerification": true
   },
   "historical": {
     "packageVersion": "0.3.0",
@@ -387,7 +413,7 @@
       "DSH 官方联网网页抓取及其费用预期"
     ]
   },
-  "versionPolicy": "运行时准入下限固定且无上限；开发工具执行候选须有官方元数据及哈希收据。新版本发现不是信任或通过证明。每六小时只读发现，隔离合成 smoke 与同包 21 格发行验收分别记录，不写回已冻结包。",
+  "versionPolicy": "运行准入保留硬下限、不设未来上限，不受维护者测试或发现任务限制。开发工具只执行已核验资产；每六小时发现仅在工作流部署后运行，不自动发布、改正式环境或写回冻结包。",
   "unsupported": [
     "macOS Intel（darwin-x64）",
     "Windows ARM（win32-arm64）",
@@ -395,10 +421,48 @@
     "Windows 与 macOS 独立 CLI/Web 不属于当前完整验收计划"
   ],
   "notTested": [
-    "本次 0.4.0 精确发行包的 21 个组合尚未执行。",
-    "原生 Linux smoke 不能替代 WSL Ubuntu 22.04 完整验收。",
-    "旧 rc.4 Desktop 原包缺失事实保留在 historical，不伪造同包实测。",
-    "真实付费接口不属于自动兼容 CI。",
-    "任意未来宿主缺少对应收据时为 unverified。"
-  ]
+    "发布收尾的新包没有重跑完整宿主矩阵；仅文档和元数据变化，运行文件须逐项匹配人工验收包。",
+    "取消主动兼容预检及后续GitHub边界修复尚未做macOS实机复验；较早六版结果只属于引用基线。",
+    "rc.4 Desktop按关键源码审查支持，不将该版本CLI/Web实测写成Windows或macOS发行包实测。",
+    "原生Linux烟测不能替代WSL Ubuntu 22.04完整验收；其他系统和真实付费接口见historical.notTested。",
+    "任意未来宿主没有相应实测证据时保持未测试，不因此阻止初始化或要求用户确认。"
+  ],
+  "verificationReferences": {
+    "runtime-no-preflight-windows": {
+      "packageVersion": "0.4.0",
+      "packageSha256": "2b21014373cf0cf5d013471f3594da0024ea2fd9696d463223c07ceb4db393cf",
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "scope": "六个宿主版本、18个子场景通过，使用合成上游。其后 GitHub 请求边界修复单独回归并人工验收，不混同为该基线原矩阵。"
+    },
+    "runtime-no-preflight-wsl": {
+      "packageVersion": "0.4.0",
+      "packageSha256": "2b21014373cf0cf5d013471f3594da0024ea2fd9696d463223c07ceb4db393cf",
+      "platform": "linux-x64",
+      "host": "CLI/Web",
+      "scope": "WSL Ubuntu 22.04 七个宿主版本、1373项完整Web检查及21项合同验证通过，使用合成上游。其后 GitHub 修复没有重跑WSL矩阵。"
+    },
+    "earlier-040-macos": {
+      "packageVersion": "0.4.0",
+      "packageSha256": "40a6354b4385274235de50e04b68d5c54c2a7081749cea57435dd850edcc9faf",
+      "platform": "darwin-arm64",
+      "host": "Desktop",
+      "scope": "较早0.4.0基线在六个官方宿主版本通过，使用合成上游。取消主动预检及后续GitHub修复未做macOS实机复验，旧结果不声明新代码已实测。"
+    },
+    "rc4-critical-source-review": {
+      "platform": "Windows/macOS Desktop",
+      "dsh": "0.2.1-rc.4",
+      "scope": "rc.4与rc.3/rc.5的11个关键宿主源码目录一致；纳入兼容支持，不标为实际Desktop发行包测试。"
+    },
+    "github-fix-manual-acceptance": {
+      "packageVersion": "0.4.0",
+      "packageSha256": "e7a368ced7470c340049e0be08bc212b6762e88d27eb0811e18920bdcab4e600",
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.5",
+      "date": "2026-11-17",
+      "userReportedPassed": true,
+      "scope": "GitHub及bootstrap专项158项通过，固定实例安装58文件核对、设置和核心就绪。用户确认人工验收通过、功能目前正常；未逐项报告的付费来源与故障组合不补写通过。"
+    }
+  }
 }

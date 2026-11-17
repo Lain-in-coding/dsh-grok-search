@@ -56,14 +56,13 @@ function memoryState(hostVersion, confirmed = false) {
 
 function prepare(compat, fixture = host(), checks = completeChecks()) {
   const token = compat.captureEpoch();
+  compat.markStarting(token);
   const result = assessRuntimeCapabilities({ ctx: fixture.ctx, token, contractChecks: checks });
   compat.setCapabilities(result);
   return { token, result, fixture };
 }
 
 function finish(compat, token) {
-  assert.equal(compat.setCapabilities({ token, stage: 'route', confirmed: true }), true);
-  assert.equal(compat.setCapabilities({ token, stage: 'budget', confirmed: true }), true);
   assert.equal(compat.markReady(token), true);
 }
 
@@ -75,6 +74,89 @@ function validReport(compat) {
   assert.equal(value.verification, 'unverified');
   return value;
 }
+
+test('direct lifecycle: actual initialization succeeds without any host probes', () => {
+  for (const version of [undefined, '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.5', '999.0.0']) {
+    const compat = createRuntimeCompatibility({ hostVersion: version, pluginVersion });
+    const token = compat.captureEpoch();
+    assert.equal(compat.canAcquireRoute(), true);
+    assert.equal(compat.markStarting(token), true);
+    assert.equal(validReport(compat).phase, 'checking');
+    assert.equal(validReport(compat).coreReady, false);
+    assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_INITIALIZATION_PENDING' });
+    assert.equal(compat.markReady(token), true);
+    assert.equal(compat.assertSearchAllowed(), true);
+    assert.equal(compat.markStarting(token), true);
+    assert.equal(validReport(compat).coreReady, true, 'an observation must not restart a ready engine');
+    assert.equal(compat.isCurrent(token), true);
+  }
+});
+
+test('direct lifecycle: diagnostic failures never grant or revoke readiness', () => {
+  const compat = createRuntimeCompatibility({ hostVersion: '0.2.1-rc.5', pluginVersion });
+  const token = compat.captureEpoch();
+  const failed = assessRuntimeCapabilities({ ctx: {}, token });
+  assert.equal(failed.shape, 'failed');
+  assert.equal(compat.setCapabilities(failed), true);
+  assert.equal(validReport(compat).phase, 'initial');
+  assert.equal(compat.isCurrent(token), true);
+  assert.equal(compat.markReady(token), true);
+  const ready = validReport(compat);
+  for (const result of [failed,
+    { token, stage: 'budget', confirmed: false },
+    { token, stage: 'core', shape: 'failed', code: 'COMPATIBILITY_CORE_SHAPE' }]) {
+    compat.setCapabilities(result);
+    assert.deepEqual(validReport(compat), ready);
+    assert.equal(compat.isCurrent(token), true);
+    assert.equal(compat.assertSearchAllowed(), true);
+  }
+});
+
+test('direct lifecycle: actual route failure revokes work but budget adaptation failure does not', () => {
+  const compat = createRuntimeCompatibility({ hostVersion: '0.2.1-rc.2', pluginVersion });
+  const token = compat.captureEpoch();
+  compat.markReady(token);
+  assert.equal(compat.setCapabilities({ token, stage: 'budget', confirmed: false }), true);
+  assert.equal(compat.assertSearchAllowed(), true);
+  assert.equal(compat.setCapabilities({ token, stage: 'route', confirmed: false }), true);
+  assert.equal(validReport(compat).code, 'COMPATIBILITY_ROUTE_UNCONFIRMED');
+  assert.equal(compat.isCurrent(token), false);
+  assert.equal(compat.markReady(token), false);
+  const fresh = compat.beginEpoch();
+  compat.markReady(fresh);
+  assert.equal(compat.setCapabilities({ token, stage: 'route', confirmed: false }), false);
+  assert.equal(compat.assertSearchAllowed(), true);
+});
+
+test('direct lifecycle: genuine failure and explicit stop reject stale initialization and failures', () => {
+  const compat = createRuntimeCompatibility({ hostVersion: '0.2.1-rc.2', pluginVersion });
+  const old = compat.captureEpoch();
+  assert.equal(compat.markStarting(old), true);
+  assert.equal(compat.block('COMPATIBILITY_CORE_UNAVAILABLE', old), true);
+  assert.equal(validReport(compat).phase, 'blocked');
+  assert.equal(compat.canAcquireRoute(), false);
+  assert.equal(compat.markReady(old), false);
+  const fresh = compat.beginEpoch();
+  assert.equal(compat.markReady(fresh), true);
+  assert.equal(compat.block('COMPATIBILITY_CORE_UNAVAILABLE', old), false);
+  assert.equal(compat.assertSearchAllowed(), true);
+  compat.stop();
+  assert.equal(compat.markStarting(fresh), false);
+  assert.equal(compat.markReady(fresh), false);
+  assert.equal(compat.beginEpoch(), null);
+  assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_STOPPED' });
+});
+
+test('direct lifecycle: unconfirmed optional observations use the canonical pending state', () => {
+  const compat = createRuntimeCompatibility({ hostVersion: '0.2.1-rc.3', pluginVersion });
+  const token = compat.captureEpoch();
+  compat.markReady(token);
+  compat.setOptional('settings', { token, available: false, code: 'COMPATIBILITY_SETTINGS_UNAVAILABLE' });
+  assert.deepEqual(validReport(compat).optionalFeatures.settings,
+    { available: false, code: 'COMPATIBILITY_OPTIONAL_PENDING' });
+  assert.equal(validReport(compat).phase, 'ready');
+  assert.equal(compat.assertSearchAllowed(), true);
+});
 
 test('compatibility regression: readable scalar fetch does not require the search selector wrapper ABI', () => {
   const fixture = host();
@@ -142,7 +224,7 @@ test('minimum is unbounded for canonical stable and standard rc versions', () =>
   }
 });
 
-test('unknown or malformed host versions defer to capability checks; old valid versions remain below the floor', () => {
+test('unknown or malformed host versions allow actual initialization; old valid versions remain below the floor', () => {
   for (const version of [undefined, null, '', ' v0.2.2-rc.3', 'v0.2.2-rc.3', '=0.2.2-rc.3',
     '0.2.2-rc.3 ', '0.2.2-rc.03', '0.02.2', '0.2', '1.0.0-', '1.0.0+', '1.0.0\n',
     1, {}, ['1.0.0'], '9007199254740992.0.0', '1.0.0+' + 'x'.repeat(130)]) {
@@ -153,11 +235,17 @@ test('unknown or malformed host versions defer to capability checks; old valid v
     assert.equal(value.code, null);
     const compat = createRuntimeCompatibility({ hostVersion: version, pluginVersion });
     assert.equal(validReport(compat).phase, 'initial');
-    assert.equal(validReport(compat).code, 'COMPATIBILITY_CORE_PENDING');
-    assert.equal(compat.canAcquireRoute(), false);
+    assert.equal(validReport(compat).code, 'COMPATIBILITY_INITIALIZATION_PENDING');
+    assert.equal(compat.canAcquireRoute(), true);
   }
   for (const version of ['0.2.1-rc.1', '0.2.1-beta.99', '0.2.0', '0.0.0']) {
     assert.equal(evaluateRuntimeVersion(version).code, 'COMPATIBILITY_MINIMUM_REQUIRED');
+    const compat = createRuntimeCompatibility({ hostVersion: version, pluginVersion });
+    const token = compat.captureEpoch();
+    assert.equal(compat.canAcquireRoute(), false);
+    assert.equal(compat.markStarting(token), false);
+    assert.equal(compat.markReady(token), false);
+    assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_MINIMUM_REQUIRED' });
   }
 });
 
@@ -178,11 +266,11 @@ test('all prerelease channels above the floor use the same capability admission;
   assert.equal(evaluateRuntimeVersion(version).confirmationRequired, false);
 });
 
-test('unknown bootstrap and malformed plugin identities never grant acquisition', () => {
+test('unknown host permits initialization while malformed product identity remains an actual failure', () => {
   const compat = createRuntimeCompatibility({ pluginVersion });
   const old = prepare(compat).token;
-  assert.equal(compat.markReady(old), false);
-  assert.equal(compat.canAcquireRoute(), true, 'missing host version defers to capabilities');
+  assert.equal(compat.markReady(old), true);
+  assert.equal(compat.canAcquireRoute(), true, 'missing host version does not prevent initialization');
   compat.setHostVersion('0.2.2-rc.3');
   assert.equal(compat.isCurrent(old), false);
   assert.equal(validReport(compat).phase, 'initial');
@@ -195,24 +283,25 @@ test('unknown bootstrap and malformed plugin identities never grant acquisition'
   }
 });
 
-test('shape-only probes and arbitrary ready objects cannot acquire or execute', () => {
+test('shape-only probes and arbitrary ready objects cannot report actual initialization', () => {
   const compat = createRuntimeCompatibility({ hostVersion: '0.2.2-rc.3', pluginVersion });
   const token = compat.captureEpoch();
   const shapeOnly = assessRuntimeCapabilities({ ctx: host().ctx, token });
   assert.equal(shapeOnly.shape, 'passed');
   assert.equal(shapeOnly.contract, 'pending');
   compat.setCapabilities(shapeOnly);
-  assert.equal(compat.canAcquireRoute(), false);
-  assert.equal(compat.canLeaseBudget(), false);
-  assert.equal(compat.markReady(token), false);
+  assert.equal(compat.canAcquireRoute(), true);
+  assert.equal(compat.canLeaseBudget(), true);
   assert.equal(validReport(compat).coreReady, false);
-  assert.equal(compat.setCapabilities({ token, stage: 'route', confirmed: true }), false);
-  compat.setCapabilities({ token, stage: 'core', shape: 'passed', contract: 'passed', ready: true });
-  assert.equal(validReport(compat).code, 'COMPATIBILITY_PROBE_INVALID');
-  assert.equal(compat.isCurrent(token), false);
+  assert.equal(compat.setCapabilities({ token, stage: 'route', confirmed: true }), true);
+  assert.equal(compat.setCapabilities({ token, stage: 'core', shape: 'passed', contract: 'passed', ready: true }), false);
+  assert.equal(validReport(compat).code, 'COMPATIBILITY_INITIALIZATION_PENDING');
+  assert.equal(compat.isCurrent(token), true);
+  assert.equal(validReport(compat).coreReady, false);
+  assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_INITIALIZATION_PENDING' });
 });
 
-test('adapted shapes remain distinct and require every ABI contract check', () => {
+test('adapted shape diagnostics remain distinct without being startup prerequisites', () => {
   for (const modern of [false, true]) {
     const fixture = host({ modern }), before = { ...fixture.fiber.config };
     const compat = createRuntimeCompatibility({ hostVersion: '0.2.2-rc.3', pluginVersion });
@@ -222,12 +311,6 @@ test('adapted shapes remain distinct and require every ABI contract check', () =
     assert.equal(result.contract, 'passed');
     assert.equal(compat.canAcquireRoute(), true);
     assert.equal(compat.canLeaseBudget(), true);
-    assert.equal(compat.markReady(token), false);
-    assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_ROUTE_UNCONFIRMED' });
-    compat.setCapabilities({ token, stage: 'route', confirmed: true });
-    assert.equal(compat.markReady(token), false);
-    assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_BUDGET_UNCONFIRMED' });
-    compat.setCapabilities({ token, stage: 'budget', confirmed: true });
     assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_INITIALIZATION_PENDING' });
     assert.equal(compat.markReady(token), true);
     assert.equal(compat.assertSearchAllowed(), true);
@@ -388,7 +471,8 @@ test('out-of-order confirmation reads cannot overwrite newer state', async () =>
   await first.promise;
   await Promise.resolve();
   assert.equal(validReport(compat).confirmed, false);
-  assert.equal(compat.canAcquireRoute(), false);
+  assert.equal(compat.canAcquireRoute(), true);
+  assert.equal(validReport(compat).coreReady, false);
 });
 
 test('host changes discard old work; foreign coordinator tokens never authorize', () => {
@@ -403,31 +487,29 @@ test('host changes discard old work; foreign coordinator tokens never authorize'
   assert.equal(validReport(compat).coreReady, false);
 });
 
-test('same-version reassessment revokes in-flight acquisition and requires fresh route and budget results', () => {
+test('same-version diagnostic reassessment preserves in-flight work and actual readiness', () => {
   const compat = createRuntimeCompatibility({ hostVersion: '0.2.2-rc.3', pluginVersion });
   const first = prepare(compat);
   finish(compat, first.token);
   assert.equal(compat.setCapabilities(first.result), true);
   assert.equal(compat.isCurrent(first.token), true);
   const next = assessRuntimeCapabilities({ ctx: host().ctx, token: first.token, contractChecks: completeChecks() });
-  assert.equal(compat.setCapabilities(next), false);
-  assert.equal(compat.isCurrent(first.token), false);
-  assert.equal(compat.markReady(first.token), false);
-  assert.equal(compat.setCapabilities({ token: first.token, stage: 'route', confirmed: true }), false);
-  assert.equal(validReport(compat).coreReady, false);
-  assert.equal(validReport(compat).code, 'COMPATIBILITY_CORE_PENDING');
-  finish(compat, prepare(compat).token);
+  assert.equal(compat.setCapabilities(next), true);
+  assert.equal(compat.isCurrent(first.token), true);
+  assert.equal(validReport(compat).coreReady, true);
+  assert.equal(compat.assertSearchAllowed(), true);
 });
 
 test('explicit retry starts a new epoch without granting consent or changing persistent policy', () => {
   const store = memoryState('0.2.2-rc.3');
   const compat = createRuntimeCompatibility({ hostVersion: '0.2.2-rc.3', pluginVersion, stateStore: store });
   const old = prepare(compat).token;
-  compat.block('COMPATIBILITY_CONTRACT_FAILED');
+  compat.block('COMPATIBILITY_CORE_UNAVAILABLE');
   const fresh = compat.beginEpoch();
   assert.equal(compat.isCurrent(old), false);
   assert.equal(compat.isCurrent(fresh), true);
-  assert.equal(compat.canAcquireRoute(), false);
+  assert.equal(compat.canAcquireRoute(), true);
+  assert.equal(validReport(compat).coreReady, false);
   finish(compat, prepare(compat).token);
   assert.deepEqual(store.writes, []);
   compat.stop();
@@ -446,9 +528,8 @@ test('a new epoch clears optional successes until current-epoch initialization r
   const reset = validReport(compat);
   assert.equal(reset.phase, 'checking');
   assert.equal(reset.coreReady, false);
-  assert.equal(compat.canAcquireRoute(), false);
-  assert.equal(compat.canLeaseBudget(), false);
-  assert.equal(compat.markReady(fresh), false);
+  assert.equal(compat.canAcquireRoute(), true);
+  assert.equal(compat.canLeaseBudget(), true);
   assert.equal(compat.isCurrent(old), false);
   assert.deepEqual(observed, [reset]);
   for (const name of names) {
@@ -471,15 +552,10 @@ test('a new epoch clears optional successes until current-epoch initialization r
 
 test('all work invalidation paths reset optional results and reject stale optional callbacks', () => {
   for (const invalidate of [
-    compat => compat.block('COMPATIBILITY_CONTRACT_FAILED'),
+    compat => compat.block('COMPATIBILITY_CORE_UNAVAILABLE'),
     compat => compat.stop(),
     compat => compat.setHostVersion('2.0.0'),
-    (compat, _store, token) => compat.setCapabilities(assessRuntimeCapabilities({
-      ctx: host().ctx, token, contractChecks: completeChecks(),
-    })),
-    (compat, _store, token) => compat.setCapabilities(assessRuntimeCapabilities({
-      ctx: host().ctx, token, contractChecks: { ...completeChecks(), configUpdate: false },
-    })),
+    (compat, _store, token) => compat.setCapabilities({ token, stage: 'route', confirmed: false }),
   ]) {
     const version = '1.0.0-alpha.1', store = memoryState(version, true);
     const compat = createRuntimeCompatibility({ hostVersion: version, pluginVersion, stateStore: store });
@@ -544,9 +620,8 @@ test('pending browser slots do not count as optional failure or claim chat avail
   const checking = validReport(compat);
   assert.equal(checking.coreReady, false);
   assert.equal(checking.phase, 'checking');
-  assert.equal(checking.code, 'COMPATIBILITY_ROUTE_UNCONFIRMED');
-  assert.equal(compat.markReady(token), false);
-  assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_ROUTE_UNCONFIRMED' });
+  assert.equal(checking.code, 'COMPATIBILITY_INITIALIZATION_PENDING');
+  assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_INITIALIZATION_PENDING' });
   finish(compat, token);
   const ready = validReport(compat);
   assert.equal(ready.coreReady, true);
@@ -594,7 +669,7 @@ test('actual optional failures take priority over pending features without revok
   }
 });
 
-test('state metadata errors neither grant nor block the actual capability checks', () => {
+test('state metadata errors neither grant nor block actual initialization', () => {
   for (const version of ['0.2.2', '0.2.2-rc.3']) {
     for (const code of [
       'COMPATIBILITY_STATE_INVALID', 'COMPATIBILITY_STATE_READ_FAILED',
@@ -610,15 +685,13 @@ test('state metadata errors neither grant nor block the actual capability checks
       assert.equal(initial.confirmed, false);
       assert.equal(initial.notified, false);
       assert.equal(initial.revision, null);
-      assert.equal(compat.canAcquireRoute(), false);
-      assert.equal(compat.canLeaseBudget(), false);
-      assert.equal(compat.markReady(compat.captureEpoch()), false);
-      assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_CORE_PENDING' });
+      assert.equal(compat.canAcquireRoute(), true);
+      assert.equal(compat.canLeaseBudget(), true);
+      assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_INITIALIZATION_PENDING' });
       const token = prepare(compat).token;
       assert.equal(compat.canAcquireRoute(), true);
       assert.equal(compat.canLeaseBudget(), true);
-      assert.equal(compat.markReady(token), false);
-      assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_ROUTE_UNCONFIRMED' });
+      assert.throws(() => compat.assertSearchAllowed(), { code: 'COMPATIBILITY_INITIALIZATION_PENDING' });
       finish(compat, token);
       const ready = validReport(compat);
       assert.equal(ready.coreReady, true);

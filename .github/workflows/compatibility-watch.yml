@@ -1,8 +1,7 @@
 name: Released Package Compatibility Watch
 
 on:
-  schedule:
-    - cron: "17 */6 * * *"
+  # A release does not authorize recurring validation; enable scheduling separately.
   workflow_dispatch:
     inputs:
       target:

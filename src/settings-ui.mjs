@@ -14,10 +14,6 @@ import { validateSearchQuery } from './core/search-query.mjs';
 
 export const name = 'dsh-grok-search-settings-ui';
 export const inject = [
-  'grokSearchControl',
-  'grokSearchCore',
-  'grokSearchProgram',
-  'grokSearchSourceRouter',
   'profileContext',
   'grokSearchConnectionSecurity',
 ];
@@ -67,7 +63,7 @@ const jsonDetails = value => {
   } catch { return {}; }
 };
 
-export function createSettingsGateway({ Service, RemoteError } = {}) {
+export function createSettingsGateway({ Service, RemoteError, configPath = '' } = {}) {
   if (typeof Service !== 'function' || typeof RemoteError !== 'function') {
     throw new TypeError('Real host Service and RemoteError constructors are required.');
   }
@@ -78,12 +74,6 @@ class GrokSearchSettingsGateway extends Service {
   constructor(ctx) {
     super(ctx, REMOTE_SERVICE);
     this.typertRemote = Object.freeze({ service: this, serviceKey: REMOTE_SERVICE, namespace: REMOTE_SERVICE });
-    this.control = ctx.get?.('grokSearchControl') ?? null;
-    this.core = ctx.get?.('grokSearchCore') ?? null;
-    this.searchLog = ctx.get?.('grokSearchLog') ?? this.core?.searchLog ?? null;
-    this.callRoutes = ctx.get?.('grokSearchCallRoutes') ?? null;
-    this.program = ctx.get?.('grokSearchProgram') ?? null;
-    this.sourceRouter = ctx.get?.('grokSearchSourceRouter') ?? null;
     this.profileContext = ctx.get?.('profileContext') ?? ctx.profileContext ?? { dir: process.cwd() };
     this.security = ctx.get?.('grokSearchConnectionSecurity') ?? null;
     this.preferenceStore = createPrivatePreferences({
@@ -99,16 +89,19 @@ class GrokSearchSettingsGateway extends Service {
         controller.abort(new GrokSearchError('SETTINGS_DIAGNOSIS_CANCELLED', '插件已卸载，测试已取消。'));
       }
     };
-    // Native stop invalidates/drains core before the settings child fiber is
-    // necessarily disposed. Register at that boundary too; not just on UI exit.
-    const unregister = this.core?.registerDiagnosticCancellation?.(cancel);
     ctx.effect?.(() => () => {
-      unregister?.();
       cancel();
       this.configOpener.dispose();
       this.cancelledDiagnostics.clear();
     });
   }
+
+  get control() { return this.ctx.get?.('grokSearchControl') ?? null; }
+  get core() { return this.ctx.get?.('grokSearchCore') ?? null; }
+  get program() { return this.ctx.get?.('grokSearchProgram') ?? null; }
+  get sourceRouter() { return this.ctx.get?.('grokSearchSourceRouter') ?? null; }
+  get searchLog() { return this.ctx.get?.('grokSearchLog') ?? this.core?.searchLog ?? null; }
+  get callRoutes() { return this.ctx.get?.('grokSearchCallRoutes') ?? null; }
 
   _owner() {
     if (!this.security) throw new GrokSearchError('SETTINGS_SECURE_CONNECTION_REQUIRED', '设置安全服务未加载，请重新加载插件。');
@@ -117,7 +110,7 @@ class GrokSearchSettingsGateway extends Service {
 
   // The path never depends on parsing the file: a broken file must still open.
   _configPath() {
-    return resolveSharedConfigPath({ override: this.program?.snapshot?.()?.configPath });
+    return resolveSharedConfigPath({ override: this.program?.snapshot?.()?.configPath || configPath });
   }
 
   _store(path = this._configPath()) {
@@ -176,7 +169,7 @@ class GrokSearchSettingsGateway extends Service {
       plugin: {
         budgetMs: typeof this.core?.budgetMs === 'number' ? this.core.budgetMs : null,
         programConfigured: program?.configuration?.executable === true,
-        configSource: program?.configuration?.configPath === true ? 'plugin'
+        configSource: program?.configuration?.configPath === true || configPath ? 'plugin'
           : envSet('GROK_SEARCH_CONFIG') ? 'environment' : 'default',
       },
     };
@@ -272,8 +265,9 @@ class GrokSearchSettingsGateway extends Service {
 
   async diagnose() {
     this._owner();
-    if (!this.sourceRouter?.diagnose) return [];
-    return this._diagnosisWork({}, signal => this.sourceRouter.diagnose({ signal }));
+    const sourceRouter = this.sourceRouter;
+    if (!sourceRouter?.diagnose) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
+    return this._diagnosisWork({}, signal => sourceRouter.diagnose({ signal }));
   }
 
   async diagnoseProvider(request = {}) {
@@ -288,15 +282,16 @@ class GrokSearchSettingsGateway extends Service {
     const conflict = () => new GrokSearchError('CONFIG_CONFLICT', '配置已更新，本次结果不再用于当前配置；请重新测试。');
     if (request.expectedRevision !== undefined && request.expectedRevision !== captured.snapshot.revision
       || request.configIdentity !== undefined && request.configIdentity !== identity) throw conflict();
-    if (this.program?.execution && this.program.snapshot()?.phase === 'ready') captured.execution = this.program.execution();
-    return this._diagnosisWork(request, async signal => {
-      if (provider !== 'grok' && provider !== 'github' && !this.sourceRouter?.diagnoseProvider) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
+    const program = this.program, sourceRouter = this.sourceRouter;
+    if (program?.execution && program.snapshot()?.phase === 'ready') captured.execution = program.execution();
+    return this._diagnosisWork(request, async (signal, core) => {
+      if (provider !== 'grok' && provider !== 'github' && !sourceRouter?.diagnoseProvider) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
       const result = provider === 'github' ? preferences.value.githubReadEnabled !== true
         ? { provider, status: 'disabled', code: 'DISABLED', message: 'GitHub 读取未开启，测试时跳过。', keys: [], elapsedMs: 0 }
         : await this._githubTest({ token: captured.effective.github_token.value, signal })
-        : provider === 'grok' ? await this._diagnoseGrok(signal, captured)
-        : await this.sourceRouter.diagnoseProvider(provider, { signal, configuration: captured.effective,
-          schedule: this.core?.scheduleDiagnosis });
+        : provider === 'grok' ? await this._diagnoseGrok(signal, captured, core)
+        : await sourceRouter.diagnoseProvider(provider, { signal, configuration: captured.effective,
+          schedule: core?.scheduleDiagnosis });
       const current = this._store().readSnapshot();
       if (current.snapshot.revision !== captured.snapshot.revision || this._quotaRevision(current) !== identity
         || this.preferenceStore.snapshot().revision !== preferences.revision) throw conflict();
@@ -333,8 +328,6 @@ class GrokSearchSettingsGateway extends Service {
   }
 
   async _diagnosisWork(request, work) {
-    const admission = this.ctx.get?.('grokSearchCompatibility')?.assertSearchAllowed('diagnosis');
-    if (typeof admission?.then === 'function') { await admission; this._owner(); }
     const operationId = request.operationId ?? randomUUID();
     this._diagnosisId(operationId);
     if (this.cancelledDiagnostics.has(operationId)) throw new GrokSearchError('SETTINGS_DIAGNOSIS_CANCELLED', '测试已取消。');
@@ -344,22 +337,34 @@ class GrokSearchSettingsGateway extends Service {
     const controller = new AbortController();
     const invocationSignal = this.ctx.invocation?.signal;
     const signal = invocationSignal ? AbortSignal.any([invocationSignal, controller.signal]) : controller.signal;
+    const core = this.core, barrier = core?.releaseBarrier;
     this.diagnostics.set(operationId, controller);
-    let tracked = false;
+    let tracked = false, unregister;
     try {
+      // A diagnostic belongs to the core generation that admitted it, even
+      // when the root settings service survives a core stop or replacement.
+      unregister = core?.registerDiagnosticCancellation?.(() => {
+        controller.abort(new GrokSearchError('SETTINGS_DIAGNOSIS_CANCELLED', '插件已停止，测试已取消。'));
+      });
       // Source diagnostics are direct HTTP requests, not core.testGrok. They
       // must still participate in the same release barrier and bounded drain.
-      if (this.core?.releaseBarrier) {
-        try { this.core.releaseBarrier.begin({ operationId }); tracked = true; }
-        catch { throw new GrokSearchError('GROK_SEARCH_STOPPING', '插件正在停止，暂不能测试。'); }
+      if (barrier) {
+        try { barrier.begin({ operationId }); tracked = true; }
+        catch (error) {
+          if (error?.code === 'CONTROL_RELEASE_BARRIER_INACTIVE') {
+            throw new GrokSearchError('GROK_SEARCH_STOPPING', '插件正在停止，暂不能测试。');
+          }
+          throw error;
+        }
       }
       signal.throwIfAborted();
-      const result = await work(signal);
+      const result = await work(signal, core);
       signal.throwIfAborted();
       return result;
     } finally {
-      if (tracked) this.core.releaseBarrier.settle({ operationId });
       this.diagnostics.delete(operationId);
+      try { if (tracked) barrier.settle({ operationId }); }
+      finally { unregister?.(); }
     }
   }
 
@@ -386,17 +391,17 @@ class GrokSearchSettingsGateway extends Service {
     return { cancelled: Boolean(controller) };
   }
 
-  async _diagnoseGrok(signal, captured) {
+  async _diagnoseGrok(signal, captured, core) {
     const base = { provider: 'grok', keys: [] };
     if (this.preferenceStore.snapshot().value?.grokEnabled === false) {
       return { ...base, status: 'disabled', code: 'DISABLED', message: '已关闭，搜索直接走补充来源。', elapsedMs: 0 };
     }
-    if (!this.core?.testGrok) throw new GrokSearchError('GROK_UNAVAILABLE', 'Grok 查询核心当前未加载。');
+    if (!core?.testGrok) throw new GrokSearchError('GROK_UNAVAILABLE', 'Grok 查询核心当前未加载。');
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
     try {
       // The core owns queue + work + cleanup budgets. No unrelated 60s timer.
-      const result = await this.core.testGrok({ query: 'DeepSeek Harness', maxResults: 3, [SEARCH_SNAPSHOT]: captured }, signal);
+      const result = await core.testGrok({ query: 'DeepSeek Harness', maxResults: 3, [SEARCH_SNAPSHOT]: captured }, signal);
       const diagnostic = result?.diagnostic ?? {};
       // grok-search-rs falls back to its own sources when Grok itself fails;
       // that answer is not evidence that the Grok key or model works.
@@ -420,18 +425,17 @@ class GrokSearchSettingsGateway extends Service {
   async testSearch(request = {}) {
     this._owner();
     validateSearchQuery(request.query);
-    const admission = this.ctx.get?.('grokSearchCompatibility')?.assertSearchAllowed('diagnosis');
-    if (typeof admission?.then === 'function') { await admission; this._owner(); }
-    if (!this.core?.testSearch && !this.sourceRouter?.search) {
+    const core = this.core, sourceRouter = this.sourceRouter;
+    if (!core?.testSearch && !sourceRouter?.search) {
       throw new GrokSearchError('SOURCE_UNAVAILABLE', '搜索测试当前不可用。');
     }
     const signal = this.ctx.invocation?.signal;
     // The routed search already falls back through the shared source chain and
     // honours the release barrier; retrying the sources here would spend their
     // quota twice, hide the Grok failure and bypass a stopping barrier.
-    const result = this.core?.testSearch
-      ? await this.core.testSearch({ query: request.query, maxResults: 5 }, signal)
-      : await this.sourceRouter.search({ query: request.query, maxResults: 5, signal });
+    const result = core?.testSearch
+      ? await core.testSearch({ query: request.query, maxResults: 5 }, signal)
+      : await sourceRouter.search({ query: request.query, maxResults: 5, signal });
     return {
       sources: result.sources,
       fallbackUsed: result.fallback_used === true,
@@ -610,9 +614,9 @@ Object.defineProperty(GrokSearchSettingsGateway.prototype, REMOTE_METHOD_DESCRIP
 
 export { descriptors as SETTINGS_DESCRIPTORS };
 
-export async function apply(ctx) {
+export async function apply(ctx, configuration = {}) {
   // Missing peers fail only this optional gateway; never replace the host tracker.
   const { Service } = await import('@deepseek-ai/cordis');
   const { RemoteError } = await import('@deepseek-ai/dsh-typert-protocol');
-  await ctx.plugin(createSettingsGateway({ Service, RemoteError }));
+  await ctx.plugin(createSettingsGateway({ Service, RemoteError, configPath: configuration.configPath }));
 }

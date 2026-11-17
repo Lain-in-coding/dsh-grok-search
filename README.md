@@ -7,7 +7,7 @@
 
 可视化配置 · 自动回退 · 日志回放 · 账户额度 · GitHub 分段读取
 
-[![Version](https://img.shields.io/badge/Version-0.4.0_candidate-5264FF?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/releases) [![DSH](https://img.shields.io/badge/DSH-%3E%3D0.2.1--rc.2-24292f?style=flat-square)](#支持范围) [![MIT](https://img.shields.io/badge/License-MIT-24292f?style=flat-square)](./LICENSE) [![Stars](https://img.shields.io/github/stars/Lain-in-coding/dsh-grok-search?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/stargazers)
+[![Version](https://img.shields.io/badge/Version-0.4.0-5264FF?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/releases) [![DSH](https://img.shields.io/badge/DSH-%3E%3D0.2.1--rc.2-24292f?style=flat-square)](#支持范围) [![MIT](https://img.shields.io/badge/License-MIT-24292f?style=flat-square)](./LICENSE) [![Stars](https://img.shields.io/github/stars/Lain-in-coding/dsh-grok-search?style=flat-square)](https://github.com/Lain-in-coding/dsh-grok-search/stargazers)
 
 [快速开始](#快速开始) · [更新已有版本](#更新已有版本) · [支持范围](#支持范围) · [来源与排序](#来源与排序)
 
@@ -17,7 +17,7 @@
 
 </div>
 
-> **0.4.0 开发候选，尚未发布**：不再逐个枚举 DSH 版本，改为最低版本准入、实际能力检查与可选功能隔离。正式下载入口仍为已发布 **0.3.0**；不要按包名安装尚未发布的 0.4.0，也不要把旧安装实录当作新包验收。
+> **0.4.0：放宽 DSH 版本限制，直接加载服务。** 保留 `0.2.1-rc.2` 最低版本要求，不设未来版本上限；可选功能故障独立处理，正常使用不显示兼容提示。
 
 `dsh-grok-search` 是 DeepSeek Harness（DSH）的可视化搜索插件，以 [Episkey-G](https://github.com/Episkey-G) 开发的 [grok-search-rs](https://github.com/Episkey-G/GrokSearch-rs) 为 MCP 核心后端，接入 DSH 原有的 `web_search`。照常在聊天里提问，由插件提供 Grok 主搜索与补充来源回退，安装一个 DSH 插件即可。
 
@@ -69,15 +69,13 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 ## 准备工作
 
-- **DSH**：0.4.0 候选声明最低 `0.2.1-rc.2`，不设未来版本上界；实际运行还须满足核心能力。已发布 0.3.0 的旧范围仍为 `0.2.1-rc.2` ～ `rc.5`、`0.2.2-rc.1` ～ `rc.2`，不包含 rc.3。系统与证据见[支持范围](#支持范围)。
+- **DSH**：最低 `0.2.1-rc.2`，不设未来版本上界；达到下限直接尝试运行，无需等待插件逐个增加版本声明。系统与验证范围见[支持范围](#支持范围)。
 - **至少一个搜索 Key**：Grok 或任一补充来源的 API Key；无需全部配置。
 - **网络连接**：首次安装要下载依赖；没有兼容的 `grok-search-rs` 时，插件会自动准备程序。
 
 ## 快速开始
 
-安装已发布 **0.3.0**：从 [npm](https://www.npmjs.com/package/dsh-grok-search?activeTab=versions) 或 [GitHub Release](https://github.com/Lain-in-coding/dsh-grok-search/releases/tag/v0.3.0) 获取，两种方式任选其一；已安装的用户可直接看[更新已有版本](#更新已有版本)。
-
-测试 0.4.0 时使用维护者交付的冻结 `.tgz`，按下文「本地导入」安装到隔离环境；包旁证据必须匹配该包哈希。不要在正式 profile 上用候选包试错。
+本说明对应 **0.4.0**，实际发布状态以 [npm 版本列表](https://www.npmjs.com/package/dsh-grok-search?activeTab=versions) 和 [GitHub Release](https://github.com/Lain-in-coding/dsh-grok-search/releases/tag/v0.4.0) 为准。确认目标版本可下载后，两种安装方式任选其一；已安装的用户可直接看[更新已有版本](#更新已有版本)。
 
 ### 方式一：在 DSH 中按名称安装
 
@@ -85,20 +83,20 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 2. 在 **「包名或地址」** 填写下面的包名和版本，阅读来源提示后点击 **「安装」**：
 
    ```text
-   dsh-grok-search@0.3.0
+   dsh-grok-search@0.4.0
    ```
 
-3. 等待显示 **「已安装」**，确认版本为 **0.3.0** 后进入[首次配置](#首次配置)。下载进度可在「查看安装详情」中查看。
+3. 等待显示 **「已安装」**，确认版本为 **0.4.0** 后进入[首次配置](#首次配置)。下载进度可在「查看安装详情」中查看。
 
 若提示已经安装，返回已安装列表；旧版请按[更新已有版本](#更新已有版本)操作，无需先卸载。
 
-**预览新版却报旧版不兼容？** 新版本刚发布时，DSH 的发布时间策略可能让只填名称的安装请求选到旧版。若预览为 **0.3.0**，报错却针对 **0.2.1**，返回输入页填写上面的完整名称，不要重复提交裸包名。
+**预览新版却报旧版不兼容？** 新版本刚发布时，DSH 的发布时间策略可能让只填名称的安装请求选到旧版。先核对报错中的实际插件版本，再返回输入页填写上面的完整名称，不要重复提交裸包名。
 
 明确指定版本时，pnpm 可能记录仅针对该版本的发布时间例外。严格策略可能要求确认或拒绝；可等待观察期结束，或按[方式二](#方式二下载-release-压缩包后本地导入)导入，仍以宿主策略为准，无需关闭全局安全检查。
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-by-name-030-hd.mp4"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-by-name-030-hd.png" alt="0.3.0 按名称安装实录：进入 DSH 插件页，添加插件，输入 dsh-grok-search@0.3.0，点击安装，最后显示已安装和版本 0.3.0，不点击启用" width="960"></a>
-  <br><sub>Windows Desktop 0.2.2-rc.2 · 已发布插件 0.3.0 · 约 15 秒，安装等待标注 ×8，安装成功即结束。</sub>
+  <br><sub>历史操作实录：Windows Desktop 0.2.2-rc.2 · 插件 0.3.0 · 约 15 秒，安装等待标注 ×8；安装当前版本请使用上文 0.4.0 包名。</sub>
   <br><sub>点击动态图观看 1920 像素宽高清 MP4。</sub>
 </p>
 
@@ -106,7 +104,7 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 适合安装指定版本或安装源尚未同步的情况，**直接导入 `.tgz` 即可，无需解压**。
 
-1. 打开 [v0.3.0 Release](https://github.com/Lain-in-coding/dsh-grok-search/releases/tag/v0.3.0)，在 **Assets（附件）** 下载 `dsh-grok-search-0.3.0.tgz`。请选择插件包，`Source code` 是源码归档。
+1. 打开 [v0.4.0 Release](https://github.com/Lain-in-coding/dsh-grok-search/releases/tag/v0.4.0)，在 **Assets（附件）** 下载 `dsh-grok-search-0.4.0.tgz`。请选择插件包，`Source code` 是源码归档。
 2. 复制下载文件的绝对路径。
 3. 打开 **「插件 → 添加插件」**，在 **「包名或地址」** 粘贴该路径，不加引号。路径格式如下，`<版本>` 必须换成下载文件的实际版本：
 
@@ -118,7 +116,7 @@ DeepSeek Harness 与「Grok Search Rs」横向相连，搜索来源在右侧纵�
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-030-hd.mp4"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/install-030-hd.png" alt="0.3.0 Release 下载与本地导入实录：打开 GitHub Release，在 Assets 下载 dsh-grok-search-0.3.0.tgz，切回 DSH 插件页，填写下载文件的绝对路径并安装，最后显示已安装和版本 0.3.0，不点击启用" width="960"></a>
-  <br><sub>Windows Desktop 0.2.2-rc.2 · 已发布插件 0.3.0 · 约 18 秒，下载与安装等待标注 ×8，安装成功即结束。</sub>
+  <br><sub>历史操作实录：Windows Desktop 0.2.2-rc.2 · 插件 0.3.0 · 约 18 秒，下载与安装等待标注 ×8；安装当前版本请下载上文 0.4.0 附件。</sub>
   <br><sub>点击动态图观看 1920 像素宽高清 MP4，包含真实 Release 下载与本地导入。</sub>
 </p>
 
@@ -170,10 +168,10 @@ Windows 可在该文件夹按 `Alt+D`、`Ctrl+C` 复制地址。目录前的 `fi
 支持范围内的 Linux CLI/Web 可执行：
 
 ```shell
-dsh plugin --profile web add dsh-grok-search@0.3.0
+dsh plugin --profile web add dsh-grok-search@0.4.0
 ```
 
-以上命令指定 **0.3.0**；只填包名时从 npm 的 `latest` 入口解析，实际版本仍受宿主安装策略约束。`next` 可能仍指向旧版，不作为更新入口。若镜像尚未同步，在安装弹窗的 **「安装源」** 选择 npm 官方源，或改用 Release 包，无需修改全局 npm 源。「自定义安装源」填写 npm registry（如 `https://registry.npmjs.org/`），不要填写项目的 GitHub 地址。
+以上命令指定 **0.4.0**；只填包名时从 npm 的 `latest` 入口解析，实际版本仍受宿主安装策略约束。`next` 可能仍指向旧版，不作为更新入口。若镜像尚未同步，在安装弹窗的 **「安装源」** 选择 npm 官方源，或改用 Release 包，无需修改全局 npm 源。「自定义安装源」填写 npm registry（如 `https://registry.npmjs.org/`），不要填写项目的 GitHub 地址。
 
 若只填名称却提示旧版不兼容，先看报错中的**实际解析版本**，再使用上面的精确版本命令；发布时间例外与严格策略说明见[方式一](#方式一在-dsh-中按名称安装)。无需清缓存或卸载现有插件。
 
@@ -183,17 +181,19 @@ dsh plugin --profile web add dsh-grok-search@0.3.0
 
 **正常更新不用重填 Key、不用清缓存，也不用重新安装兼容的 `grok-search-rs`。** 配置和程序缓存与插件包分开保存；请继续使用原来的 DSH 配置环境，不要清空应用数据。
 
-`0.3.0` 新增控制历史检查点。**降级到旧插件前，须关闭 DSH 并执行当前包提供的离线账本转换**；已生成检查点时，直接安装旧包无法读取新布局。维护工具位于 `src/core/storage-maintenance.mjs`，先 `inspect`，再按返回修订执行 `prepare-downgrade` 和 `activate-downgrade`；中断后用 `recover-downgrade` 恢复。转换不重填 Key、不清程序缓存，原账本会封存保留。该限制不适用于下文已发布的 `0.2.x` 正常更新。回到 `0.2.1` 后若保存插件偏好，再升级到 `0.3.0` 时可能需要重新主动开启 GitHub 读取；共享 Token 不因此删除。
+`0.3.0` 起使用控制历史检查点。**降级到不支持检查点的旧插件（如 `0.2.1`）前，须关闭 DSH 并执行当前包提供的离线账本转换**；已生成检查点时，直接安装旧包无法读取新布局。维护工具位于 `src/core/storage-maintenance.mjs`，先 `inspect`，再按返回修订执行 `prepare-downgrade` 和 `activate-downgrade`；中断后用 `recover-downgrade` 恢复。转换不重填 Key、不清程序缓存，原账本会封存保留。正常升级到 `0.4.0` 不需要这项降级转换。回到 `0.2.1` 后若保存插件偏好，再升级到新版时可能需要重新主动开启 GitHub 读取；共享 Token 不因此删除。
 
-**升级 DSH 前，先确认插件版本支持[目标宿主](#支持范围)。**
+**旧插件因 DSH 升级报版本不兼容时，更新到 0.4.0。**
 
-已发布的 `0.3.0` 仍使用精确版本清单，不能在 `0.2.2-rc.3` 自动加载。
-本分支的 `0.4.0` 候选修复这一准入限制，但尚未发布；不要把下方 `0.3.0` 安装示例
-当成 rc.3 的修复方法，也不要通过删除配置、清缓存或关闭宿主安全检查解决拒载。
+`0.3.0` 使用精确版本清单，不能在 `0.2.2-rc.3` 自动加载；`0.4.0` 改为最低版本
+约束。使用 `dsh-grok-search@0.4.0` 或对应 Release 包原地更新，无需先卸载，
+也无需删除配置、清缓存或关闭宿主安全检查。安装与更新仍遵守宿主的来源和发布时间策略。
 
-DSH `0.2.2-rc.2` 需要插件 `0.3.0`，旧插件 `0.2.1` 不包含该宿主声明。**务必先在兼容的旧宿主把插件更新至 `0.3.0`，再升级 DSH**。若已在 `rc.2` 上仍装着 `0.2.1`，宿主会跳过旧插件；此时更新下载失败，PluginManager 也无法把不兼容的 `0.2.1` 回装为可运行插件。网络恢复后从「添加插件」重新安装兼容的 `0.3.0`；共享 Key、配置和程序缓存不因此清除。**宿主降级与插件降级不同**：rc.2 新写入的具名子代理/团队会话数据可能无法由旧 DSH 读取，插件的账本转换不能转换宿主聊天数据。
+若宿主已跳过不兼容的旧插件，仍可从「添加插件」安装兼容的新版；旧版不能运行不代表
+已有共享 Key、配置或程序缓存丢失。**宿主降级与插件降级不同**：新版 DSH 写入的
+会话数据可能无法由旧 DSH 读取，插件的账本转换不能转换宿主聊天数据。
 
-**DSH `0.2.2-rc.1` / `rc.2`：优先在插件面板内更新。** 从 npm 按包名安装的用户：
+**有版本更新入口的 DSH：优先在插件面板内更新。** 从 npm 按包名安装的用户：
 
 1. 打开 **「插件 → 已安装 → dsh-grok-search」**，**「版本」** 区域会自动检查；需要时点击 **「重新检查」**。
 2. 选择兼容版本，点击 **「更新到 …」**，等待更新完成；**不需要手动卸载再安装**。
@@ -219,23 +219,22 @@ DSH `0.2.2-rc.2` 需要插件 `0.3.0`，旧插件 `0.2.1` 不包含该宿主声�
 ## 支持范围
 
 **0.4.0 的版本准入与实测承诺分开。** 声明接受 `>=0.2.1-rc.2`，不设未来上界，
-但仅在必要接口和保护合同成立后执行搜索；正式版与 RC 自动尝试，alpha、beta 等实验版
-须确认精确宿主/插件版本对。未验证不等于不允许运行，允许加载也不等于已经实测。
+达到最低版本即可尝试运行，正式版、RC、alpha、beta均不要求确认精确版本对，
+也不需要等待维护者为该宿主补充测试结果。允许运行不等于已经实测。
 
-核心不兼容时明确阻断，不自动切回官方搜索；设置页、聊天卡片或 GitHub 能力缺失时
-可以受限可用。若宿主根本无法加载插件或改变基础保护合同，插件自身无法保证阻止
-宿主调用；出现“保护状态无法确认”时请暂停搜索并检查宿主/插件版本，不要把它当作
-安全阻断成功。
+插件直接初始化真实服务；诊断失败不会关闭已正常运行的搜索。实际搜索接管失败时
+明确报错，不自动切回官方搜索。设置页独立加载，聊天卡片或GitHub功能异常不影响核心搜索。
 
-本次候选目标为七版本乘三入口，共 **21 组同包验收**，尚未全部完成。
-逐组结果必须绑定冻结包哈希，见[支持矩阵](./support-matrix.json)和维护者交付的包外证据。
-以下仅保留 **0.3.0 历史范围**，不继承为新实现通过：
+0.4.0 开发过程中完成了下列宿主验证。其后 GitHub 请求边界修复通过 158 项相关回归，
+并于 2026-11-17 通过固定 Windows rc.5 实例的用户人工验收。发布收尾仅调整文档和
+元数据，运行文件与该人工验收包逐字节一致；没有因此重跑完整矩阵。
+不同阶段的包身份与验证范围见[支持矩阵](./support-matrix.json)。
 
-| 系统 | 入口 | 兼容的 DSH 版本 | 验证情况 |
+| 系统 | 入口 | 已覆盖的 DSH 版本 | 验证情况 |
 | --- | --- | --- | --- |
-| Windows x64 | Desktop | `0.2.1-rc.2` ～ `rc.5`、`0.2.2-rc.1` ～ `rc.2` | 0.3.0 已有 rc.5、rc.2 官方 ASAR/Electron 同包记录；0.2.1-rc.4 为源码审查支持 |
-| macOS Apple Silicon | Desktop | `0.2.1-rc.2` ～ `rc.5`、`0.2.2-rc.1` ～ `rc.2` | 0.3.0 已有 GitHub 托管 macOS 15 同包记录；0.2.1-rc.4 为源码审查支持 |
-| Linux x64（WSL Ubuntu 22.04） | CLI/Web | `0.2.1-rc.2` ～ `rc.5`、`0.2.2-rc.1` ～ `rc.2` | 0.3.0 已有 rc.2 隔离安装与首次下载记录；旧范围按原证据 |
+| Windows x64 | Desktop | `0.2.1-rc.2`、`rc.3`、`rc.5`，`0.2.2-rc.1` ～ `rc.3` | 取消预检后的基线六版 18 场景通过；后续 GitHub 修复包在 rc.5 人工验收通过 |
+| macOS Apple Silicon | Desktop | `0.2.1-rc.2`、`rc.3`、`rc.5`，`0.2.2-rc.1` ～ `rc.3` | 较早 0.4.0 基线六版通过；取消预检及后续修复尚未做 macOS 实机复验 |
+| Linux x64（WSL Ubuntu 22.04） | CLI/Web | `0.2.1-rc.2` ～ `rc.5`，`0.2.2-rc.1` ～ `rc.3` | 取消预检后的基线七版 1373 项 Web 检查及 21 项合同验证通过 |
 
 - **共用一个安装包**。rc.4 Desktop 的关键宿主源码与已测 rc.3 / rc.5 一致，未单独实测官方 rc.4 桌面发行包。
 - **版本分别看**：DSH、DSH Plugin Hub 和 `dsh-grok-search` 各自独立编号；真正的 DSH `0.1.0` 低于本项目准入下限。
@@ -243,19 +242,19 @@ DSH `0.2.2-rc.2` 需要插件 `0.3.0`，旧插件 `0.2.1` 不包含该宿主声�
 - **操作系统版本**：Windows 11 x64、macOS 15 Apple Silicon、WSL Ubuntu 22.04 是现有验证环境；DSH 版本兼容不等于所有操作系统版本已实测。Windows 10 与原生 Linux 桌面的文件打开尚无实机验证。
 - **运行时要求**：DSH `0.2.2-rc.1` / `rc.2` 需要 Node.js ≥ `24.9`；Desktop 自带运行时，CLI/Web 用户须自行满足此要求。插件没有自动升级全局 Node.js。
 - **复用已有后端**：已验证 `grok-search-rs` 程序版本为 `0.1.26`；优先复用兼容安装，缺少时准备私有缓存，不升级全局程序或自动采用未经验证的版本。
-- **兼容尝试不等于验收通过**：达到硬下限的表外版本会按实际能力检查尝试运行，但不代表已通过相应 DSH 版本、平台与入口的验收。
+- **兼容尝试不等于验收通过**：达到硬下限的表外版本会直接尝试运行，但不代表已通过相应 DSH 版本、平台与入口的验收。
 
 原生 Linux、真实付费服务等验证边界见[常见问题](#常见问题)。
 
 ### 兼容状态
 
 `engines.dsh` 保留 `>=0.2.1-rc.2` 的硬下限，不设未来版本上限。高于下限的稳定版、
-RC、alpha、beta 和其他预发布版本都先尝试运行；无法读取或解析 DSH 版本时，改由实际
-运行能力检查决定，不会仅因版本未知或未验证就判定不兼容。版本未验证不等于已通过实机验收。
+RC、alpha、beta 和其他预发布版本都直接尝试运行；无法读取或解析 DSH 版本时继续加载，
+不会仅因版本未知或未验证就判定不兼容。版本未验证不等于已通过实机验收。
 
 兼容提示只覆盖两种实际状态：核心搜索当前被阻断，或设置/GitHub 等可选功能确实不可用。
-可选功能异常不会停掉核心搜索；连续探测异常导致暂停时，只表示当前无法确认核心链路，
-不等同于判定 DSH 版本不兼容。核心搜索被阻断时不会自动转交给 DSH 官方付费搜索；
+可选功能异常不会停掉核心搜索，也不会因启动诊断未通过而关闭插件。实际启动或接管失败时
+可以重新尝试，设置页仍可读取和修改配置。失败搜索不会自动转交给 DSH 官方付费搜索；
 普通可用状态不显示兼容提示，状态 RPC 失败本身也不会伪造不兼容结论。
 
 ## 来源与排序
@@ -426,7 +425,7 @@ DSH 的原始参数与结果检查。卡片动效不发起搜索、不消耗额�
 
 日常请只使用 DSH 已安装列表里的**插件开关**：关闭即恢复原搜索设置，重新开启由 `dsh-grok-search` 按当前来源设置接管。宿主没有启用热重载时，会提示需要重启。
 
-此前冻结的 0.4.0 候选在 macOS `0.2.1-rc.2` 首次安装后停用时，曾出现“不受插件列表管理的插件”
+较早 0.4.0 冻结包在 macOS `0.2.1-rc.2` 首次安装后停用时，曾出现“不受插件列表管理的插件”
 重启提示。无业务夹具的官方宿主对照已确认：该次提示出现时实际释放和程序退出已完成，
 不重启也能重新启用并再次搜索。这不保证所有重启提示都可忽略；若操作未生效，按宿主提示
 完整退出再打开，不要删除配置或强行绕过保护。此历史观察不代替新候选或其他版本的完整验收。
@@ -468,7 +467,7 @@ DSH 的插件开关与详情中的组件开关是两层独立设置。若插件�
 
 先看报错发生在哪一步：
 
-- **预览新版，报错却针对旧版**：例如预览 **0.3.0**，错误却写 **0.2.1 不兼容**，说明实际选择的是旧包。返回 **DSH 原生「添加插件」**，填写 `dsh-grok-search@0.3.0`；不要只重复点击原请求的重试。Hub 或市场目录也可能滞后，不要将带版本的名称填进只接受裸包名的输入框。策略说明见[方式一](#方式一在-dsh-中按名称安装)，不通过兼容性豁免强行加载旧版。
+- **预览新版，报错却针对旧版**：先核对报错中的实际插件版本，再返回 **DSH 原生「添加插件」**，填写 `dsh-grok-search@0.4.0`；不要只重复点击原请求的重试。Hub 或市场目录也可能滞后，不要将带版本的名称填进只接受裸包名的输入框。策略说明见[方式一](#方式一在-dsh-中按名称安装)，不通过兼容性豁免强行加载旧版。
 - **`Cannot find module ...pnpm/bin/pnpm.mjs`**：DSH 自带安装工具缺失或其路径失效，尚未执行插件代码；改用 Hub、本地目录或 `.tgz` 也依赖它。完整退出 DSH，通过[官方发行页](https://github.com/deepseek-ai/deepseek-harness/releases)修复或重新安装**完整应用程序**，保留现有用户数据目录与 `grok-search-rs` 共享配置。不要仅复制一个 `pnpm.mjs`、清空 `.dsh` 或重配 Key；全局安装 pnpm 也不能补齐该应用内路径。
 
 安装器恢复正常后再重试；仍失败时附上 DSH、Hub、实际插件版本及脱敏错误日志。安装结果以宿主提示为准。
@@ -495,7 +494,7 @@ DSH 的插件开关与详情中的组件开关是两层独立设置。若插件�
 | --- | --- |
 | `grok-search/runtime-cache/` | 下载的 `grok-search-rs` 程序与校验记录 |
 | `grok-search/preferences.json` | DSH 主搜索与 GitHub 读取授权，不保存 Key |
-| `grok-search/compatibility-state.json` | 0.4.0 的实验通道精确确认与提醒去重，不保存 Key |
+| `grok-search/compatibility-state.json` | 兼容状态及历史确认/提醒元数据；不决定运行许可，不保存 Key |
 | `grok-search/config-history/` | 保存前的完整配置历史，**可能包含明文 Key/Token** |
 | `control-intent.records/` | 接管与恢复记录 |
 

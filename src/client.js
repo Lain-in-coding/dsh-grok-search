@@ -6308,7 +6308,8 @@ ${dots.map((d) => d.tip).join("\n")}
     "COMPATIBILITY_PROBE_INVALID",
     "COMPATIBILITY_ROUTE_UNCONFIRMED",
     "COMPATIBILITY_BUDGET_UNCONFIRMED",
-    "COMPATIBILITY_CORE_UNAVAILABLE"
+    "COMPATIBILITY_CORE_UNAVAILABLE",
+    "CONTROL_SEARCH_SELECTION_CONFLICT"
   ]);
   var OPTIONAL_LABELS = Object.freeze({
     settings: "完整设置界面",
@@ -6349,8 +6350,8 @@ ${dots.map((d) => d.tip).join("\n")}
         kind: "blocked",
         tone: "err",
         title: "核心搜索暂不可用",
-        text: transient ? "暂时无法确认搜索安全状态，插件已暂停接管；不会转交官方搜索。" : belowMinimum ? `当前 DSH 低于插件最低版本 ${report.minimumVersion || "0.2.1-rc.2"}，搜索已暂停；不会转交官方搜索。` : "搜索已暂停，当前不会转交官方搜索。",
-        detail: transient ? "可以重新检查；状态确认前，搜索保持暂停。" : belowMinimum ? `宿主版本：${report.hostVersion || "无法识别"} · 插件版本：${report.pluginVersion || "无法识别"}` : "只有确认搜索接管链路可安全运行后，插件才会恢复搜索。"
+        text: transient ? "搜索组件启动失败，可以重新尝试；不会转交官方搜索。" : code === "CONTROL_SEARCH_SELECTION_CONFLICT" ? "搜索来源设置在接管期间发生变化；插件未覆盖当前配置，也未转交官方搜索。" : belowMinimum ? `当前 DSH 低于插件最低版本 ${report.minimumVersion || "0.2.1-rc.2"}，搜索已暂停；不会转交官方搜索。` : "搜索已暂停，当前不会转交官方搜索。",
+        detail: transient ? "配置仍可编辑。重新检查将重试未完成的启动步骤。" : code === "CONTROL_SEARCH_SELECTION_CONFLICT" ? "请检查当前搜索来源设置，再重新检查并接管。" : belowMinimum ? `宿主版本：${report.hostVersion || "无法识别"} · 插件版本：${report.pluginVersion || "无法识别"}` : "搜索接管未完成，可以重新检查；已有配置会保留。"
       };
     }
     if (report?.phase === "degraded" && code === "COMPATIBILITY_OPTIONAL_UNAVAILABLE") {

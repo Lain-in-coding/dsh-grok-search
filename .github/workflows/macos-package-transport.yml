@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 20
     env:
       SOURCE_COMMIT: ${{ inputs.source_commit }}
-      EXPECTED_PACKAGE_SHA256: 40a6354b4385274235de50e04b68d5c54c2a7081749cea57435dd850edcc9faf
+      EXPECTED_PACKAGE_SHA256: 51e777c14d75f87ef6a3bbf2bae75a3fd316fbec897f3f60fde05c720f24e12b
     steps:
       - name: Require an explicitly reviewed immutable source commit
         shell: pwsh
@@ -89,7 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Frozen-package reproduction or transport validation failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: macos-frozen-package-40a6354b4385
+          name: macos-frozen-package-51e777c14d75
           path: |
             ${{ runner.temp }}/macos-package-transport/dsh-grok-search-0.4.0.tgz
             ${{ runner.temp }}/macos-package-transport/package-receipt.json

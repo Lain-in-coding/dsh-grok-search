@@ -104,7 +104,7 @@ jobs:
     with:
       confirm_public_standard_runner: ${{ inputs.confirm_public_compatibility }}
       package_run_id: ${{ inputs.package_run_id }}
-      package_artifact: macos-frozen-package-40a6354b4385
+      package_artifact: macos-frozen-package-51e777c14d75
       old_package_run_id: ${{ inputs.old_package_run_id }}
       old_package_artifact: macos-old-package-24ab92c59221
       old_package_sha256: 24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48

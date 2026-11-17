@@ -5,13 +5,14 @@ import { homedir, tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
+import { createSettingsGateway, SETTINGS_DESCRIPTORS, inject } from '../src/settings-ui.mjs';
 import { SETTINGS_DESCRIPTORS as PURE_SETTINGS_DESCRIPTORS } from '../src/core/settings-contract.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { createConnectionSecurity } from '../src/core/connection-security.mjs';
 import { createConfigLocationOpener } from '../src/core/config-opener.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
 import { createToolRouteContext } from '../src/core/tool-route-context.mjs';
+import { createReleaseBarrier } from '../src/core/release-transaction.mjs';
 
 // Explicit unit fixtures; production apply must resolve the host constructors.
 class TestService {
@@ -23,6 +24,19 @@ class TestRemoteError extends Error {
   }
 }
 const Gateway = createSettingsGateway({ Service: TestService, RemoteError: TestRemoteError });
+
+test('settings mounts without resolving optional runtime services', () => {
+  assert.deepEqual(inject, ['profileContext', 'grokSearchConnectionSecurity']);
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-independent-'));
+  const reads = [];
+  new Gateway({ get(key) {
+    reads.push(key);
+    if (key === 'profileContext') return { dir: directory };
+    if (key === 'grokSearchConnectionSecurity') return {};
+    assert.fail(`Settings construction must not resolve ${key}`);
+  }, provide() {} });
+  assert.deepEqual(reads, ['profileContext', 'grokSearchConnectionSecurity']);
+});
 
 test('settings factory requires explicit constructors and retains the injected error protocol', async () => {
   for (const peers of [undefined, {}, { Service: TestService }, { RemoteError: TestRemoteError },
@@ -113,6 +127,16 @@ test('production settings apply waits for registration and propagates child star
     await assert.rejects(gateway.snapshot(), error => error instanceof RemoteError && error.isDSHRemoteError === true);
     const failure = new Error('Synthetic gateway startup failure');
     await assert.rejects(apply({ plugin() { return Promise.reject(failure); } }), error => error === failure);
+  `);
+});
+
+test('production settings apply retains the explicit config path without a program service', () => {
+  peerFixture('available', `
+    const configPath = process.platform === 'win32' ? 'C:/synthetic-settings/shared.toml' : '/synthetic-settings/shared.toml';
+    let registered;
+    await apply({ plugin(Plugin) { registered = Plugin; } }, { configPath });
+    const gateway = new registered({ get() {}, provide() {} });
+    assert.equal(gateway._configPath().replaceAll('\\\\', '/'), configPath);
   `);
 });
 
@@ -297,13 +321,13 @@ test('direct dispatch validates missing requests while optional config opening k
 });
 
 test('owner RPCs fail closed when connection security is absent', async () => {
-  const { gateway } = viewGateway();
+  const { gateway, services } = viewGateway();
   gateway.security = null;
   let effects = 0;
   gateway._store = () => { effects++; throw new Error('must not read or save'); };
   gateway.preferenceStore = { snapshot() { effects++; }, save() { effects++; } };
-  gateway.program = { prepare() { effects++; }, repair() { effects++; } };
-  gateway.control = { stop() { effects++; } };
+  services.set('grokSearchProgram', { prepare() { effects++; }, repair() { effects++; } });
+  services.set('grokSearchControl', { stop() { effects++; } });
   for (const [method, request] of [
     ['snapshot'], ['preferences'], ['prepareProgram'], ['repairProgram'], ['stop'],
     ['save', { expectedRevision: 'missing', updates: { grok_model: 'new' } }],
@@ -333,8 +357,8 @@ test('search history uses separate secure owner RPCs; ordinary snapshot stays re
 
 test('clearing private search history preserves independent chat routes and traces', async () => {
   const log = createSearchLog(), routes = createToolRouteContext(), sessionId = randomUUID();
-  const { gateway } = viewGateway({ core: { searchLog: log } });
-  gateway.callRoutes = routes;
+  const { gateway, services } = viewGateway({ core: { searchLog: log } });
+  services.set('grokSearchCallRoutes', routes);
   try {
     await gateway.readSearchLog({ sessionId });
     const token = log.begin('private-history');
@@ -357,8 +381,8 @@ test('chat route RPC requires owner and exact session/call identity without expo
   await routes.run({ name: 'web_search', callId: 'native-call', agent: { session: { id: sessionId } } }, async () => {
     routes.capture().finish({ outcome: 'ok', served: 'tavily', grokCode: 'DISABLED', fallbackUsed: true });
   });
-  const { gateway } = viewGateway();
-  gateway.callRoutes = routes;
+  const { gateway, services } = viewGateway();
+  services.set('grokSearchCallRoutes', routes);
   const value = await gateway.toolCallRoute({ sessionId, callId: 'native-call' });
   const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'toolCallRoute');
   assert.deepEqual(descriptor.result.create().parse(value), value);
@@ -509,13 +533,14 @@ test('settings gateway declares the host Remote error protocol it imports', () =
     manifest.peerDependencies['@deepseek-ai/dsh']);
 });
 
-function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github = null, compatibility } = {}) {
+function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github = null, compatibility,
+  services = new Map(), effect } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-diagnose-'));
   if (preferences) {
     mkdirSync(join(directory, 'grok-search'), { recursive: true });
     writeFileSync(join(directory, 'grok-search', 'preferences.json'), JSON.stringify(preferences));
   }
-  const services = new Map([
+  for (const [key, value] of [
     ['grokSearchProgram', { snapshot: () => ({ configPath: join(directory, 'config.toml') }) }],
     ['grokSearchCore', core],
     ['grokSearchSourceRouter', sourceRouter],
@@ -523,21 +548,22 @@ function diagnosticGateway({ core = {}, sourceRouter = {}, preferences, github =
     ['grokSearchCompatibility', compatibility],
     ['grokSearchConnectionSecurity', { requireOwner() {}, requireSecret() {},
       capabilities: () => ({ secretsAllowed: true, transport: 'loopback', reason: null }) }],
-  ]);
-  return new Gateway({ profileContext: { dir: directory }, get: name => services.get(name), provide: () => {} });
+  ]) if (!services.has(key)) services.set(key, value);
+  return new Gateway({ profileContext: { dir: directory }, get: name => services.get(name),
+    provide: () => {}, effect });
 }
 
-test('compatibility blocks every direct diagnosis and search-test path before dispatch or release tracking', async () => {
-  const operations = [];
-  const forbidden = () => assert.fail('Blocked diagnostics must not reach providers or release tracking');
+test('settings operations use actual dependencies without the runtime compatibility preflight', async () => {
+  const calls = [];
+  const result = { sources: [{ url: 'https://synthetic.test' }], search_provider: 'tavily' };
   const gateway = diagnosticGateway({
-    compatibility: { assertSearchAllowed(operation) {
-      operations.push(operation);
-      throw new GrokSearchError('HOST_COMPATIBILITY_BLOCKED', 'Search is unavailable.');
-    } },
-    core: { testGrok: forbidden, testSearch: forbidden, releaseBarrier: { begin: forbidden, settle: forbidden } },
-    sourceRouter: { diagnose: forbidden, diagnoseProvider: forbidden, search: forbidden },
-    github: { test: forbidden, sync() {} },
+    compatibility: { assertSearchAllowed() { assert.fail('Obsolete runtime preflight must not run'); } },
+    core: { testGrok: async () => { calls.push('grok'); return result; },
+      testSearch: async () => { calls.push('search'); return result; }, releaseBarrier: createReleaseBarrier() },
+    sourceRouter: { diagnose: async () => { calls.push('all'); return []; },
+      diagnoseProvider: async provider => { calls.push(provider); return { provider, status: 'ok' }; },
+      search() { assert.fail('A successful core test must not dispatch another search'); } },
+    github: { test: async () => { calls.push('github'); return { provider: 'github', status: 'ok' }; }, sync() {} },
   });
   const preferences = await gateway.preferences();
   await gateway.savePreferences({ expectedRevision: preferences.revision, value: { ...preferences.value, githubReadEnabled: true } });
@@ -549,48 +575,39 @@ test('compatibility blocks every direct diagnosis and search-test path before di
     () => gateway.diagnoseProvider({ provider: 'github' }),
     () => gateway.previewGithubConnection({ expectedRevision: snapshot.config.revision,
       configIdentity: snapshot.config.quotaRevision, operationId: randomUUID() }),
-    () => gateway.testSearch({ query: 'blocked test' }),
+    () => gateway.testSearch({ query: 'synthetic test' }),
   ];
-  for (const request of requests) await assert.rejects(request(), { code: 'HOST_COMPATIBILITY_BLOCKED' });
-  gateway.core = {};
-  await assert.rejects(gateway.testSearch({ query: 'blocked source-only test' }), { code: 'HOST_COMPATIBILITY_BLOCKED' });
-  assert.deepEqual(operations, Array(7).fill('diagnosis'));
+  for (const request of requests) await request();
+  assert.deepEqual(calls, ['all', 'tavily', 'grok', 'github', 'github', 'search']);
   assert.equal(gateway.diagnostics.size, 0);
 });
 
-test('diagnosis capability is rechecked without weakening owner checks or the legacy absent-service fixture', async () => {
-  const operations = [];
-  let allowed = true, requests = 0;
-  const compatibility = { assertSearchAllowed(operation) {
-    operations.push(operation);
-    if (!allowed) throw new GrokSearchError('HOST_COMPATIBILITY_BLOCKED', 'Search is unavailable.');
-  } };
-  const gateway = diagnosticGateway({ compatibility, sourceRouter: {
+test('removing runtime preflight retains owner checks and actual operation errors', async () => {
+  let requests = 0;
+  const gateway = diagnosticGateway({ core: {
+    testSearch: async () => { throw new GrokSearchError('GROK_SEARCH_STOPPING', 'Stopping.'); },
+  }, sourceRouter: {
     diagnose: async () => { requests++; return []; },
-    search: async () => { requests++; return { sources: [], search_provider: 'tavily' }; },
+    search: async () => { assert.fail('A real core error must not trigger another source'); },
   } });
   assert.deepEqual(await gateway.diagnose(), []);
-  assert.equal((await gateway.testSearch({ query: 'allowed test' })).provider, 'tavily');
-  allowed = false;
-  await assert.rejects(gateway.diagnose(), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+  await assert.rejects(gateway.testSearch({ query: 'synthetic test' }), { code: 'GROK_SEARCH_STOPPING' });
   gateway.security.requireOwner = () => { throw new GrokSearchError('SETTINGS_AUTH_REQUIRED', 'Denied.'); };
   await assert.rejects(gateway.diagnose(), { code: 'SETTINGS_AUTH_REQUIRED' });
-  assert.deepEqual(operations, ['diagnosis', 'diagnosis', 'diagnosis']);
-  assert.equal(requests, 2);
-  const legacy = diagnosticGateway({ sourceRouter: { diagnose: async () => [] } });
-  assert.deepEqual(await legacy.diagnose(), []);
+  assert.equal(requests, 1);
 });
 
-test('an asynchronous compatibility denial is awaited before any diagnostic or routed test request', async () => {
-  const forbidden = () => assert.fail('An asynchronous denial must not dispatch a request');
-  const gateway = diagnosticGateway({
-    compatibility: { async assertSearchAllowed() {
-      throw new GrokSearchError('HOST_COMPATIBILITY_BLOCKED', 'Search is unavailable.');
-    } },
-    sourceRouter: { diagnose: forbidden, search: forbidden },
-  });
-  await assert.rejects(gateway.diagnose(), { code: 'HOST_COMPATIBILITY_BLOCKED' });
-  await assert.rejects(gateway.testSearch({ query: 'blocked test' }), { code: 'HOST_COMPATIBILITY_BLOCKED' });
+test('missing runtime operations fail explicitly without consulting official search', async () => {
+  const gateway = diagnosticGateway({ core: null, sourceRouter: null });
+  const get = gateway.ctx.get;
+  gateway.ctx.get = key => {
+    if (key === 'web') assert.fail('Settings must never use official search as a fallback');
+    return get(key);
+  };
+  await assert.rejects(gateway.diagnose(), { code: 'SOURCE_UNAVAILABLE' });
+  await assert.rejects(gateway.diagnoseProvider({ provider: 'exa' }), { code: 'SOURCE_UNAVAILABLE' });
+  await assert.rejects(gateway.diagnoseProvider({ provider: 'grok' }), { code: 'GROK_UNAVAILABLE' });
+  await assert.rejects(gateway.testSearch({ query: 'synthetic test' }), { code: 'SOURCE_UNAVAILABLE' });
   assert.equal(gateway.diagnostics.size, 0);
 });
 
@@ -628,10 +645,11 @@ test('provider diagnosis pairs revision and effective identity in one read at ea
 });
 
 test('diagnostic completion rejects a new configuration path even if both files have identical content', async () => {
-  const gateway = diagnosticGateway({ sourceRouter: {
+  const services = new Map();
+  const gateway = diagnosticGateway({ services, sourceRouter: {
     diagnoseProvider: async provider => {
       const next = join(gateway.profileContext.dir, 'other.toml');
-      gateway.program = { snapshot: () => ({ configPath: next }) };
+      services.set('grokSearchProgram', { snapshot: () => ({ configPath: next }) });
       return { provider, status: 'ok', code: 'OK', message: 'ok' };
     },
   } });
@@ -706,9 +724,10 @@ test('cancel-before-dispatch tombstone rejects late diagnostics without sending 
 
 test('source diagnostics fail closed after release barrier invalidation', async () => {
   let count = 0;
-  const gateway = diagnosticGateway({ core: { releaseBarrier: {
-    begin() { throw new Error('stopping'); }, settle() { throw new Error('must not settle untracked operation'); },
-  } }, sourceRouter: { diagnoseProvider: async () => { count++; } } });
+  const releaseBarrier = createReleaseBarrier();
+  releaseBarrier.invalidate({ reason: 'test-stop' });
+  const gateway = diagnosticGateway({ core: { releaseBarrier },
+    sourceRouter: { diagnoseProvider: async () => { count++; } } });
   await assert.rejects(gateway.diagnoseProvider({ provider: 'exa' }), { code: 'GROK_SEARCH_STOPPING' });
   assert.equal(count, 0);
   assert.equal(gateway.diagnostics.size, 0);
@@ -735,11 +754,85 @@ test('core stop aborts registered diagnoses before the settings fiber leaves', a
 
 test('legacy full diagnosis also respects a stopping release barrier', async () => {
   let calls = 0;
-  const gateway = diagnosticGateway({ core: { releaseBarrier: {
-    begin() { throw new Error('stopping'); },
-  } }, sourceRouter: { diagnose: async () => { calls++; return []; } } });
+  const releaseBarrier = createReleaseBarrier();
+  releaseBarrier.invalidate({ reason: 'test-stop' });
+  const gateway = diagnosticGateway({ core: { releaseBarrier },
+    sourceRouter: { diagnose: async () => { calls++; return []; } } });
   await assert.rejects(gateway.diagnose(), { code: 'GROK_SEARCH_STOPPING' });
   assert.equal(calls, 0);
+  assert.equal(gateway.diagnostics.size, 0);
+});
+
+test('diagnostics capture their core generation, drain its barrier and unregister cancellation', async () => {
+  const services = new Map();
+  const completions = [];
+  const makeCore = () => {
+    const cancellations = new Set(), releaseBarrier = createReleaseBarrier();
+    return { cancellations, releaseBarrier,
+      registerDiagnosticCancellation(cancel) {
+        cancellations.add(cancel);
+        return () => cancellations.delete(cancel);
+      },
+    };
+  };
+  const oldCore = makeCore(), nextCore = makeCore();
+  const gateway = diagnosticGateway({ core: null, services, sourceRouter: {
+    diagnoseProvider: (provider, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      completions.push(() => resolve({ provider, status: 'ok' }));
+    }),
+  } });
+  services.set('grokSearchCore', oldCore);
+  const oldId = randomUUID();
+  const oldTask = gateway.diagnoseProvider({ provider: 'tavily', operationId: oldId });
+  const oldRejected = assert.rejects(oldTask, { code: 'SETTINGS_DIAGNOSIS_CANCELLED' });
+  assert.deepEqual(oldCore.releaseBarrier.snapshot().activeOperationIds, [oldId]);
+  assert.equal(oldCore.cancellations.size, 1);
+
+  services.set('grokSearchCore', nextCore);
+  const nextId = randomUUID();
+  const nextTask = gateway.diagnoseProvider({ provider: 'exa', operationId: nextId });
+  assert.equal(nextCore.cancellations.size, 1);
+  const oldBarrier = oldCore.releaseBarrier;
+  oldCore.releaseBarrier = nextCore.releaseBarrier;
+  oldBarrier.invalidate({ reason: 'replace-core' });
+  for (const cancel of oldCore.cancellations) cancel();
+  await oldRejected;
+  await oldBarrier.drain();
+  assert.equal(oldCore.cancellations.size, 0);
+  assert.deepEqual(nextCore.releaseBarrier.snapshot().activeOperationIds, [nextId]);
+  assert.equal(nextCore.cancellations.size, 1, 'old cancellation must not abort the new operation');
+  completions[1]();
+  assert.equal((await nextTask).status, 'ok');
+  assert.deepEqual(nextCore.releaseBarrier.snapshot().activeOperationIds, []);
+  assert.equal(nextCore.cancellations.size, 0);
+  assert.equal(gateway.diagnostics.size, 0);
+});
+
+test('settings disposal cancels work even when no core supplied a cancellation registry', async () => {
+  let dispose, aborted = false;
+  const gateway = diagnosticGateway({ core: null, effect: setup => { dispose = setup(); }, sourceRouter: {
+    diagnoseProvider: (provider, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => { aborted = true; reject(signal.reason); }, { once: true });
+    }),
+  } });
+  const task = gateway.diagnoseProvider({ provider: 'exa' });
+  const rejected = assert.rejects(task, { code: 'SETTINGS_DIAGNOSIS_CANCELLED' });
+  dispose();
+  await rejected;
+  assert.equal(aborted, true);
+  assert.equal(gateway.diagnostics.size, 0);
+});
+
+test('unexpected diagnostic dependency errors fail rather than becoming a stopping result', async () => {
+  let unregistered = 0, dispatched = 0;
+  const gateway = diagnosticGateway({ core: {
+    registerDiagnosticCancellation() { return () => { unregistered++; }; },
+    releaseBarrier: { begin() { throw new Error('synthetic unexpected failure'); } },
+  }, sourceRouter: { diagnoseProvider() { dispatched++; } } });
+  await assert.rejects(gateway.diagnoseProvider({ provider: 'exa' }), { code: 'SETTINGS_OPERATION_FAILED' });
+  assert.equal(unregistered, 1);
+  assert.equal(dispatched, 0);
   assert.equal(gateway.diagnostics.size, 0);
 });
 
@@ -862,7 +955,8 @@ test('GitHub draft connection tests do not save token or enable reading; cancell
   assert.equal(tokens.length, 1);
 });
 
-function viewGateway({ configPath, transport = 'loopback', core = {}, configuration, preferences, withProgram = true } = {}) {
+function viewGateway({ configPath, settingsConfigPath, transport = 'loopback', core = {}, configuration,
+  preferences, withProgram = true } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-settings-view-'));
   if (preferences) {
     mkdirSync(join(directory, 'grok-search'), { recursive: true });
@@ -878,8 +972,10 @@ function viewGateway({ configPath, transport = 'loopback', core = {}, configurat
       capabilities: () => ({ secretsAllowed: transport !== 'restricted', transport, reason: null }) }],
     ...(withProgram ? [['grokSearchProgram', { snapshot: () => structuredClone(program) }]] : []),
   ]);
-  const gateway = new Gateway({ profileContext: { dir: directory }, get: name => services.get(name), provide: () => {} });
-  return { gateway, directory, path };
+  const Settings = settingsConfigPath === undefined ? Gateway
+    : createSettingsGateway({ Service: TestService, RemoteError: TestRemoteError, configPath: settingsConfigPath });
+  const gateway = new Settings({ profileContext: { dir: directory }, get: name => services.get(name), provide: () => {} });
+  return { gateway, directory, path, services };
 }
 const withoutConfigEnv = async work => {
   const names = Object.keys(process.env).filter(name => name.toUpperCase() === 'GROK_SEARCH_CONFIG');
@@ -902,6 +998,131 @@ const withIsolatedHome = async work => {
   }
 };
 const snapshotCodec = () => SETTINGS_DESCRIPTORS.find(row => row.method === 'snapshot').result.create();
+
+test('explicit settings config path survives missing, pending and removed program services without writing defaults', async () => withIsolatedHome(async home => {
+  const customPath = join(home, 'custom-shared.toml');
+  const defaultDirectory = join(home, '.config', 'grok-search-rs');
+  const defaultPath = join(defaultDirectory, 'config.toml');
+  const defaultText = 'grok_model = "untouched-default"\n';
+  mkdirSync(defaultDirectory, { recursive: true });
+  writeFileSync(defaultPath, defaultText);
+  writeFileSync(customPath, 'grok_model = "custom-original"\n');
+  const { gateway, services } = viewGateway({ settingsConfigPath: customPath, core: null, withProgram: false });
+  for (const phase of ['missing', 'pending', 'ready', 'removed']) {
+    if (phase === 'pending' || phase === 'ready') {
+      services.set('grokSearchProgram', { snapshot: () => ({
+        phase: phase === 'pending' ? 'discovering' : 'ready', configPath: phase === 'pending' ? null : customPath,
+        program: null, error: null, configuration: { configPath: true, executable: false },
+      }) });
+    } else services.delete('grokSearchProgram');
+    const snapshot = await gateway.snapshot();
+    assert.equal(snapshot.config.path, customPath, phase);
+    assert.equal(snapshot.plugin.configSource, 'plugin', phase);
+    assert.equal(snapshot.plugin.programConfigured, false, phase);
+    assert.equal(snapshot.config.error, null, phase);
+    const saved = await gateway.save({ expectedRevision: snapshot.config.revision, updates: { grok_model: `custom-${phase}` } });
+    assert.equal(saved.config.path, customPath, phase);
+    assert.match(readFileSync(customPath, 'utf8'), new RegExp(`custom-${phase}`), phase);
+    assert.equal(readFileSync(defaultPath, 'utf8'), defaultText, phase);
+  }
+}));
+
+test('empty settings config override preserves environment and default path precedence', async () => withIsolatedHome(async home => {
+  const { gateway } = viewGateway({ settingsConfigPath: '', core: null, withProgram: false });
+  const first = await gateway.snapshot();
+  assert.equal(first.config.path, join(home, '.config', 'grok-search-rs', 'config.toml'));
+  assert.equal(first.plugin.configSource, 'default');
+  const environmentPath = join(home, 'environment-shared.toml');
+  process.env.GROK_SEARCH_CONFIG = environmentPath;
+  try {
+    const next = await gateway.snapshot();
+    assert.equal(next.config.path, environmentPath);
+    assert.equal(next.plugin.configSource, 'environment');
+  } finally { delete process.env.GROK_SEARCH_CONFIG; }
+}));
+
+test('invalid explicit settings paths fail without falling back or writing another config', async () => withIsolatedHome(async home => {
+  const environmentPath = join(home, 'environment-shared.toml');
+  process.env.GROK_SEARCH_CONFIG = environmentPath;
+  try {
+    for (const settingsConfigPath of ['relative/shared.toml', join(home, 'invalid\0.toml')]) {
+      const { gateway } = viewGateway({ settingsConfigPath, core: null, withProgram: false });
+      const snapshot = await gateway.snapshot();
+      assert.equal(snapshot.config.error?.code, 'CONFIG_PATH_INVALID');
+      assert.equal(snapshot.config.path, '');
+      assert.equal(snapshot.plugin.configSource, 'plugin');
+      await assert.rejects(gateway.save({ expectedRevision: 'missing', updates: { grok_model: 'must-not-save' } }),
+        { code: 'CONFIG_PATH_INVALID' });
+    }
+    assert.equal(existsSync(environmentPath), false);
+    assert.equal(existsSync(join(home, '.config', 'grok-search-rs', 'config.toml')), false);
+  } finally { delete process.env.GROK_SEARCH_CONFIG; }
+}));
+
+test('core absence leaves config, preferences, history and independent logs available', async () => withIsolatedHome(async () => {
+  const { gateway, services } = viewGateway({ core: null, withProgram: false });
+  services.delete('grokSearchSourceRouter');
+  const before = await gateway.snapshot();
+  assert.equal(before.program, null);
+  assert.equal(before.control.error.code, 'CONTROL_SETTINGS_UNAVAILABLE');
+  assert.deepEqual(snapshotCodec().parse(before), before);
+  const saved = await gateway.save({ expectedRevision: before.config.revision, updates: {
+    grok_api_key: 'synthetic-only', grok_model: 'first-model',
+  } });
+  assert.equal((await gateway.reveal({ key: 'grok_api_key' })).value, 'synthetic-only');
+  const changed = await gateway.save({ expectedRevision: saved.config.revision, updates: { grok_model: 'second-model' } });
+  const restored = await gateway.restoreConfig({ expectedRevision: changed.config.revision, revision: saved.config.revision });
+  assert.equal(restored.config.fields.grok_model.value, 'first-model');
+  const preferences = await gateway.preferences();
+  const updated = await gateway.savePreferences({ expectedRevision: preferences.revision,
+    value: { ...preferences.value, grokEnabled: false } });
+  assert.equal(updated.value.grokEnabled, false);
+  const log = createSearchLog();
+  services.set('grokSearchLog', log);
+  try {
+    const { sessionId } = await gateway.openSearchLog();
+    const token = log.begin('synthetic local history');
+    log.finish(token, { outcome: 'ok', served: 'tavily' });
+    assert.equal((await gateway.readSearchLog({ sessionId })).records.length, 1);
+    assert.deepEqual(await gateway.clearSearchLog({ sessionId }), { records: [] });
+    await gateway.closeSearchLog({ sessionId });
+  } finally { log.dispose(); }
+  for (const method of ['prepareProgram', 'repairProgram']) {
+    await assert.rejects(gateway[method](), { code: 'GROK_PROGRAM_UNAVAILABLE' });
+  }
+  await assert.rejects(gateway.stop(), { code: 'CONTROL_SETTINGS_UNAVAILABLE' });
+}));
+
+test('the same settings instance sees runtime services appearing and disappearing', async () => withIsolatedHome(async () => {
+  const { gateway, services, path } = viewGateway({ core: null, withProgram: false });
+  const initial = await gateway.snapshot();
+  let prepared = 0, searches = 0, stopped = 0;
+  const program = { phase: 'ready', program: { version: '0.1.26', source: 'private-cache' },
+    configPath: path, error: null, configuration: { executable: false, configPath: true } };
+  services.set('grokSearchProgram', { snapshot: () => program, prepare: async () => { prepared++; return program; } });
+  services.set('grokSearchControl', {
+    publicSnapshot: () => ({ ...initial.control, available: true, phase: 'required', error: null }),
+    stop: async () => { stopped++; return { kind: 'released' }; },
+  });
+  services.set('grokSearchCore', { budgetMs: 15000, testSearch: async () => {
+    searches++;
+    return { sources: [{ url: 'https://synthetic.test' }], search_provider: 'tavily' };
+  } });
+  services.set('grokSearchSourceRouter', { diagnose: async () => [{ provider: 'exa', status: 'ok' }] });
+  assert.equal((await gateway.snapshot()).program.configPath, path);
+  assert.equal((await gateway.snapshot()).plugin.budgetMs, 15000);
+  assert.equal((await gateway.snapshot()).control.available, true);
+  assert.equal((await gateway.prepareProgram()).phase, 'ready');
+  assert.equal((await gateway.testSearch({ query: 'synthetic test' })).provider, 'tavily');
+  assert.equal((await gateway.diagnose())[0].provider, 'exa');
+  await gateway.stop();
+  assert.deepEqual([prepared, searches, stopped], [1, 1, 1]);
+  for (const key of ['grokSearchCore', 'grokSearchSourceRouter', 'grokSearchControl', 'grokSearchProgram']) services.delete(key);
+  assert.equal((await gateway.snapshot()).program, null);
+  assert.equal((await gateway.snapshot()).control.available, false);
+  await assert.rejects(gateway.testSearch({ query: 'synthetic test' }), { code: 'SOURCE_UNAVAILABLE' });
+  assert.equal(searches, 1);
+}));
 
 test('snapshot carries the last route and plugin facts through the strict codec', async () => withIsolatedHome(async home => {
   const route = { at: 1, origin: 'search', outcome: 'ok', served: 'tavily', grokCode: 'grok_auth_error',

@@ -52,6 +52,8 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
         'GitHub 兼容能力尚未通过检查，本次请求未转交其他抓取服务。');
     }
   };
+  const fetchUnavailable = () => new GrokSearchError('GITHUB_FETCH_UNAVAILABLE',
+    '本次 GitHub 链接未由插件读取器接管，请使用 github_read 重试。');
   const perform = async (args, exec, options = {}) => {
     exec.signal?.throwIfAborted();
     assertCapability(exec, exec.name === 'web_fetch');
@@ -130,18 +132,23 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
   configTimer.unref?.();
   ctx.on('tools/execute', (exec, next) => {
     if (disposed || !['web_fetch', 'github_read'].includes(exec?.name)) return storage.run(null, next);
-    let githubRequested = false;
+    let githubUrl = null;
     if (exec.name === 'web_fetch' && enabled()) {
-      try { parseGithubUrl(exec.arguments?.url); githubRequested = true; } catch { /* Other URLs keep their original route. */ }
+      try { githubUrl = parseGithubUrl(exec.arguments?.url).url; } catch { /* Other URLs keep their original route. */ }
     }
-    const current = { exec, active: true, githubRequested };
+    const current = { exec, active: true, githubUrl, readerCompleted: false };
     return storage.run(current, async () => {
       try {
-        if (githubRequested) {
+        if (githubUrl) {
           exec.signal?.throwIfAborted();
           assertCapability(exec, true);
         }
-        return await next();
+        const result = await next();
+        if (githubUrl) {
+          exec.signal?.throwIfAborted();
+          if (!current.readerCompleted) throw fetchUnavailable();
+        }
+        return result;
       } catch (failure) { throw hostFailure(failure, exec.signal, WebError); }
       finally { current.active = false; }
     });
@@ -165,26 +172,29 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
   }, { global: true });
   ctx.on('internal/get', (caller, key, accessError, next) => {
     const service = next(), current = storage.getStore();
-    if (key !== 'web' || !service || !current?.active || current.exec.name !== 'web_fetch' || !current.githubRequested) return service;
-    const fiber = caller?.fiber;
-    if (!fiber || fiber.uid === null || fiber.runtime?.name !== 'tool-web'
-      || fiber.entry?.options?.name !== '@deepseek-ai/dsh-tool-web' || fiber.entry.options.disabled === true) return service;
-    const config = effectiveConfig(fiber);
-    if (config?.fetch === false) return service;
-    if (!enabled()) throw hostFailure(new GrokSearchError('GITHUB_DISABLED', 'GitHub 读取已停用，本次请求未转交其他抓取服务。'),
-      current.exec.signal, WebError);
-    // Only the official tool body can access this scoped service. Its parameter
-    // validation and original pre-execute/permission checks have already run.
+    if (key !== 'web' || current?.exec.name !== 'web_fetch' || !current.githubUrl) return service;
+    if (!service) throw hostFailure(fetchUnavailable(), current.exec.signal, WebError);
+    // Leave control/recovery observations untouched, but never expose the
+    // original fetch method inside a request that selected the GitHub reader.
     return new Proxy(service, { get(target, property, receiver) {
       if (property !== 'fetch') return Reflect.get(target, property, receiver);
       return async (request, signal) => {
         try {
+          const exec = current.exec;
+          exec.signal?.throwIfAborted();
+          signal?.throwIfAborted();
           if (disposed || !enabled()) throw new GrokSearchError('GITHUB_DISABLED', 'GitHub 读取已停用，请重新发起请求。');
           assertCapability(current.exec, true);
-          try { parseGithubUrl(request?.url); }
-          catch { return Reflect.get(target, property, target).call(target, request, signal); }
-          const exec = current.exec;
           if (!current.active || storage.getStore() !== current) throw new GrokSearchError('GITHUB_SCOPE_REQUIRED', 'GitHub 调用上下文已失效。');
+          const fiber = caller?.fiber;
+          if (!fiber || fiber.uid == null || fiber.runtime?.name !== 'tool-web'
+            || fiber.entry?.options?.name !== '@deepseek-ai/dsh-tool-web'
+            || fiber.entry.options.disabled === true) throw fetchUnavailable();
+          const config = effectiveConfig(fiber);
+          if (config?.fetch === false) throw new GrokSearchError('GITHUB_PERMISSION', '网页读取工具已关闭。');
+          let targetUrl;
+          try { targetUrl = parseGithubUrl(request?.url).url; } catch { throw fetchUnavailable(); }
+          if (targetUrl !== current.githubUrl) throw fetchUnavailable();
           const resolved = caller.tools.get('web_fetch', exec.agent, exec.toolSet);
           if (!resolved) {
             invalidateScope(exec);
@@ -201,6 +211,7 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
           const result = await perform({ url: request.url }, { ...exec, signal }, {
             limitChars: Math.min(16000, cap - 1200), timeoutMs: Math.min(30_000, resolved.timeoutMs ?? 30_000),
           });
+          current.readerCompleted = true;
           return { url: result.url, statusCode: 200, body: { kind: 'text', content: formatGithubRead(result) },
             // This segment is complete. Our text explains remaining segments;
             // the official truncation footer would incorrectly recommend a new URL.

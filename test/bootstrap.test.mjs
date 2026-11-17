@@ -12,6 +12,9 @@ import { apply as applyControl } from '../src/control.mjs';
 import { apply as applyRouteVerifier } from '../src/route-verifier.mjs';
 import { createGithubIntegration } from '../src/core/github-host.mjs';
 import { createProgramController } from '../src/program.mjs';
+import { createGrokProvider } from '../src/provider.mjs';
+import { createRoutedSearch } from '../src/core/routed-search.mjs';
+import { createReleaseBarrier } from '../src/core/release-transaction.mjs';
 
 const defaults = { executable: '', executableArgs: [], configPath: '', budgetMs: 120_000 };
 const validate = value => Config['~standard'].validate(value);
@@ -61,12 +64,20 @@ const deferred = () => {
 };
 
 // The root is real product code; only the host and network-capable child plugins are synthetic.
-function bootstrapHost({ modern = true, ready = true } = {}) {
+function bootstrapHost({ modern = true, ready = true, trackedServices = [] } = {}) {
   const services = new Map(), hooks = new Map(), scopes = new Set(), injections = [];
   const definitions = new Map(), guards = [];
+  const tracked = new Set(trackedServices), cordisOriginal = Symbol.for('cordis.original');
   let nextUid = 1;
   const raw = { searchProvider: 'author', fetchProvider: 'fetch' };
   const wrap = value => ({ get: () => value });
+  const expose = (key, value) => !tracked.has(key) || value == null ? value : new Proxy(value, {
+    get(target, property) {
+      if (property === cordisOriginal) return target;
+      const member = Reflect.get(target, property, target);
+      return typeof member === 'function' ? member.bind(target) : member;
+    },
+  });
   const hostSchema = { '~standard': { version: 1, validate(value) {
     if (typeof value.searchProvider !== 'string') return { issues: [{ message: 'invalid searchProvider' }] };
     return { value: modern ? { searchProvider: wrap(value.searchProvider), fetchProvider: wrap(value.fetchProvider) }
@@ -89,7 +100,12 @@ function bootstrapHost({ modern = true, ready = true } = {}) {
     const ctx = {
       fiber, registry: new Map(), profileContext: parent?.profileContext ?? { dir: 'C:/synthetic-profile' },
       logger: { warn() {}, error() {} },
-      get: key => provided.has(key) ? provided.get(key) : parent?.get(key) ?? services.get(key),
+      get(key) {
+        const value = provided.has(key) ? provided.get(key) : parent?.get(key) ?? services.get(key);
+        if (!tracked.has(key) || value == null) return value;
+        const original = value[cordisOriginal] ?? value;
+        return expose(key, original);
+      },
       provide(key, value) {
         const previous = services.get(key);
         provided.set(key, value);
@@ -217,8 +233,8 @@ function bootstrapHost({ modern = true, ready = true } = {}) {
 
 function bootstrapFixture({ hostVersion = '0.2.1-rc.2', ready = true, overrides = {}, contractChecks,
   initialRecord = null, readError = null, githubEnabled = false, preferencesFactory = null,
-  stateFactory = null, storeFactory = null, retryDelay = async () => {} } = {}) {
-  const h = bootstrapHost({ ready }), calls = [], stateListeners = new Set();
+  stateFactory = null, storeFactory = null, retryDelay = async () => {}, trackedServices = [] } = {}) {
+  const h = bootstrapHost({ ready, trackedServices }), calls = [], stateListeners = new Set();
   let record = initialRecord, confirmation = false, notified = false, confirmationError = null;
   const createPreferences = preferencesFactory ?? (() => ({
     snapshot: () => ({ value: { githubReadEnabled: githubEnabled } }),
@@ -295,8 +311,10 @@ function bootstrapFixture({ hostVersion = '0.2.1-rc.2', ready = true, overrides 
     configHook: true, configCandidate: true, configUpdate: true, pluginDisposal: true, webSelection: true,
     toolExecution: true, toolResult: true, toolGuards: true, profileSelection: true,
   }));
-  const start = () => applyBundle(h.ctx, defaults, {
-    load, checkContracts: checks, createState: stateFactory ?? makeState,
+  let contractCheckCalls = 0;
+  const start = (configuration = defaults) => applyBundle(h.ctx, configuration, {
+    load, checkContracts: (...args) => { contractCheckCalls++; return checks(...args); },
+    createState: stateFactory ?? makeState,
     createStore: storeFactory ?? (() => store), createPreferences, retryDelay,
   });
   return { ...h, calls, start, store,
@@ -305,17 +323,18 @@ function bootstrapFixture({ hostVersion = '0.2.1-rc.2', ready = true, overrides 
       for (const listener of stateListeners) listener();
     },
     coordinator: () => h.ctx.get('grokSearchCompatibility'),
+    contractCheckCalls: () => contractCheckCalls,
     settle: () => h.ctx.get('grokSearchBootstrap').settled() };
 }
 
-for (const mode of ['scalar selector', 'throwing optional API']) test(
-  `compatibility regression: ${mode} survives production core, acquisition, takeover and explicit release`, async () => {
+test('compatibility regression: scalar fetch selectors survive production core, acquisition, takeover and explicit release', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-compat-fetch-release-'));
   writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
   const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
     trustedRoot: directory, governance: true, autoMaintain: false });
-  let updates = 0, apiReads = 0, upstreamCalls = 0, provider;
+  let updates = 0, upstreamCalls = 0, provider;
   const f = bootstrapFixture({
+    trackedServices: ['grokSearchSettings'],
     githubEnabled: true,
     storeFactory: () => ({ ...store, startMaintenance() {} }),
     contractChecks: checkRuntimeContracts,
@@ -330,23 +349,17 @@ for (const mode of ['scalar selector', 'throwing optional API']) test(
   });
   f.ctx.profileContext.dir = directory;
   f.web.registerSearchProvider = value => { provider = value; };
-  f.webFiber.effectiveConfig.fetchProvider = mode === 'scalar selector' ? 'author-fetch' : { get: () => 'author-fetch' };
+  f.webFiber.effectiveConfig.fetchProvider = 'author-fetch';
   f.web.fetchProviderId = 'author-fetch';
   f.entry.options.config.fetchProvider = 'author-fetch';
   f.webFiber.config.fetchProvider = 'author-fetch';
   f.entry.options.inject = { authorDependency: { required: true } };
-  if (mode === 'scalar selector') {
-    const schema = f.webFiber.runtime.Config['~standard'], validate = schema.validate;
-    schema.validate = value => {
-      const result = validate(value);
-      if (result.value) result.value.fetchProvider = value.fetchProvider;
-      return result;
-    };
-  }
-  if (mode === 'throwing optional API') Object.defineProperty(f.web, 'fetch', { get() {
-    apiReads++;
-    throw new Error('optional fetch API unavailable');
-  } });
+  const schema = f.webFiber.runtime.Config['~standard'], validateSchema = schema.validate;
+  schema.validate = value => {
+    const result = validateSchema(value);
+    if (result.value) result.value.fetchProvider = value.fetchProvider;
+    return result;
+  };
   f.entry.update = async ({ config }) => {
     updates++;
     f.entry.options.config = structuredClone(config);
@@ -379,14 +392,17 @@ for (const mode of ['scalar selector', 'throwing optional API']) test(
     let dispatched = false;
     f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { dispatched = true; });
     assert.equal(dispatched, true);
-    if (mode === 'throwing optional API') {
-      assert.ok(apiReads > 0);
-      await assert.rejects(async () => f.ctx.waterfall('tools/execute',
-        { name: 'web_fetch', arguments: { url: 'https://github.com/example/project/issues/1' } },
-        () => { throw new Error('Unavailable fetch must never dispatch'); }),
-      error => error.code === 'GITHUB_FETCH_UNAVAILABLE');
-      assert.equal(f.coordinator().report().coreReady, true);
-    }
+    assert.equal(f.contractCheckCalls(), 0, 'startup does not run a runtime contract probe');
+    const providerBeforeRecheck = provider;
+    const settingsBeforeRecheck = f.ctx.get('grokSearchSettings');
+    const canonicalSettings = settingsBeforeRecheck?.[Symbol.for('cordis.original')] ?? settingsBeforeRecheck;
+    await f.coordinator().recheck();
+    assert.equal(f.contractCheckCalls(), 0, 'recheck does not run a runtime contract probe');
+    assert.equal(provider, providerBeforeRecheck);
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.web.searchProviderId, 'grok-search');
+    assert.equal((f.ctx.get('grokSearchSettings')?.[Symbol.for('cordis.original')]
+      ?? f.ctx.get('grokSearchSettings')), canonicalSettings);
     const outcome = await control.stop('explicit-user-release');
     assert.equal(outcome.kind, 'released', JSON.stringify(outcome.error));
     assert.equal(outcome.completionCommitted, true);
@@ -409,7 +425,7 @@ for (const mode of ['scalar selector', 'throwing optional API']) test(
   } finally { await f.ctx.dispose(); }
 });
 
-test('compatibility regression: lifecycle retry retires partial effects before mounting a fresh attempt', async () => {
+test('compatibility regression: lifecycle failure leaves core ready and manual retry retires partial effects', async () => {
   let attempts = 0, active = 0, peak = 0;
   const waits = [];
   const f = bootstrapFixture({
@@ -432,10 +448,21 @@ test('compatibility regression: lifecycle retry retires partial effects before m
     f.start();
     await f.settle();
     assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(attempts, 1);
+    assert.equal(active, 0);
+    assert.deepEqual(waits, []);
+    const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch();
+    await f.coordinator().recheck();
+    await f.settle();
     assert.equal(attempts, 2);
     assert.equal(active, 1);
     assert.equal(peak, 1);
-    assert.deepEqual(waits, [1000]);
+    assert.deepEqual(waits, []);
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.calls.filter(call => call === 'program').length, 1);
+    assert.equal(f.contractCheckCalls(), 0);
   } finally { await f.ctx.dispose(); }
   assert.equal(active, 0);
 });
@@ -444,15 +471,19 @@ test('compatibility limitation: unreadable author fetch values never authorize a
   const scenarios = ['effective field', 'effective selector', 'normalized field', 'normalized selector'];
   for (const scenario of scenarios) await t.test(scenario, async () => {
     const [stage, failure] = scenario.split(' ');
-    let updates = 0;
-    const f = bootstrapFixture({
-      contractChecks: ctx => checkRuntimeContracts(ctx, { selection: () => ({ bundles: ['dsh-grok-search'] }) }),
-    });
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-unreadable-route-'));
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+    const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+      trustedRoot: directory, governance: true, autoMaintain: false });
+    let updates = 0, reads = 0;
+    const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }),
+      overrides: { control: { name: 'control', apply: applyControl } } });
+    f.ctx.profileContext.dir = directory;
     // Neither readable fallback proves the unreadable effective/normalized selection.
     f.entry.options.config.fetchProvider = 'author-raw-fetch';
     f.webFiber.config.fetchProvider = 'author-raw-fetch';
     f.web.fetchProviderId = 'runtime-fetch';
-    const unreadable = () => { throw new Error('author fetch choice cannot be read'); };
+    const unreadable = () => { reads++; throw new Error('author fetch choice cannot be read'); };
     const breakSelector = config => {
       if (failure === 'field') Object.defineProperty(config, 'fetchProvider', { enumerable: true, get: unreadable });
       else config.fetchProvider = { get: unreadable };
@@ -466,19 +497,28 @@ test('compatibility limitation: unreadable author fetch values never authorize a
         return result;
       };
     }
-    f.entry.update = async () => { updates++; };
+    f.entry.update = async ({ config }) => {
+      const effective = f.webFiber.resolveConfig(config);
+      selectedId(effective.fetchProvider);
+      updates++;
+      assert.fail('An unreadable fetch selection must not be applied');
+    };
     try {
       f.start();
       await f.settle();
       const report = f.coordinator().report();
+      assert.equal(report.minimumAdmitted, true);
       assert.equal(report.coreReady, false);
       assert.equal(report.phase, 'blocked');
-      assert.equal(report.code, 'COMPATIBILITY_CORE_UNAVAILABLE');
-      assert.equal(report.minimumAdmitted, true);
+      assert.ok(reads > 0, 'the real acquisition or route update must encounter the unreadable selector');
       assert.equal(updates, 0);
-      assert.equal(f.calls.includes('control'), false);
-      assert.equal(f.store.read(), null);
+      assert.equal(f.calls.includes('load:control'), true);
       assert.equal(f.web.searchProviderId, 'author');
+      assert.equal(f.contractCheckCalls(), 0);
+      let dispatched = false;
+      assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { dispatched = true; }),
+        { code: report.code });
+      assert.equal(dispatched, false, 'an unreadable author fetch selection must not authorize takeover');
       assert.equal(f.entry.options.config.searchProvider, 'author');
       assert.equal(f.web.fetchProviderId, 'runtime-fetch');
       assert.equal(f.entry.options.config.fetchProvider, 'author-raw-fetch');
@@ -507,12 +547,22 @@ test('compatibility regression: lifecycle cleanup finishes before a retry can re
     await turn();
     assert.equal(attempts, 1);
     assert.equal(active, 1);
+    assert.equal(f.coordinator().report().coreReady, true, 'core must not wait for lifecycle cleanup');
+    const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch();
+    await f.coordinator().recheck();
+    assert.equal(attempts, 1, 'a pending cleanup must not allow a replacement scope');
     release.resolve();
+    await f.settle();
+    assert.equal(attempts, 1);
+    assert.equal(active, 0);
+    await f.coordinator().recheck();
     await f.settle();
     assert.equal(attempts, 2);
     assert.equal(active, 1);
     assert.equal(peak, 1);
     assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
   } finally { release.resolve(); await f.ctx.dispose(); }
 });
 
@@ -526,13 +576,17 @@ test('compatibility regression: manual retry reloads a failed lifecycle without 
   try {
     f.start();
     await f.settle();
-    assert.equal(f.coordinator().report().code, 'COMPATIBILITY_CORE_UNAVAILABLE');
-    assert.equal(loads, 3);
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.coordinator().report().phase, 'ready');
+    assert.equal(loads, 1);
+    const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch();
     failing = false;
     await f.coordinator().recheck();
     await f.settle();
     assert.equal(f.coordinator().report().coreReady, true);
-    assert.equal(loads, 4);
+    assert.equal(loads, 2);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
     assert.equal(f.calls.filter(call => call === 'program').length, 1);
   } finally { await f.ctx.dispose(); }
 });
@@ -550,24 +604,21 @@ test('compatibility regression: failed lifecycle cleanup never permits a duplica
   try {
     f.start();
     await f.settle();
-    assert.equal(f.coordinator().report().code, 'COMPATIBILITY_CORE_UNAVAILABLE');
+    assert.equal(f.coordinator().report().coreReady, true);
+    const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch();
     await f.coordinator().recheck();
     await f.settle();
-    assert.equal(f.coordinator().report().coreReady, false);
+    assert.equal(f.coordinator().report().coreReady, true);
     assert.equal(attempts, 1);
-    assert.equal(f.calls.includes('program'), false);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.calls.filter(call => call === 'program').length, 1);
   } finally { await f.ctx.dispose(); }
-});
-
-const optionalChecks = () => ({
-  configHook: true, configCandidate: true, configUpdate: true, pluginDisposal: true,
-  webSelection: true, toolExecution: true, toolResult: true, toolGuards: true,
-  githubRead: true, githubFetch: true,
 });
 
 test('compatibility regression: recheck retries optional imports and reports only actual ready instances', async () => {
   let repaired = false, settingsLoads = 0, githubLoads = 0, active = 0;
-  const f = bootstrapFixture({ githubEnabled: true, contractChecks: optionalChecks, overrides: {
+  const f = bootstrapFixture({ githubEnabled: true, overrides: {
     settings: () => {
       settingsLoads++;
       if (!repaired) throw new Error('optional settings import failure');
@@ -589,9 +640,16 @@ test('compatibility regression: recheck retries optional imports and reports onl
     await f.settle();
     const epoch = f.coordinator().captureEpoch();
     assert.equal(f.coordinator().report().coreReady, true);
-    await f.coordinator().recheck();
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, false);
     assert.equal(f.coordinator().report().optionalFeatures.github.available, false);
-    assert.equal(f.ctx.get('grokSearchGithub'), undefined);
+    assert.equal(f.coordinator().report().optionalFeatures.github.code, 'COMPATIBILITY_GITHUB_UNAVAILABLE');
+    assert.equal(settingsLoads, 1);
+    assert.equal(githubLoads, 1);
+    await f.coordinator().recheck();
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, false);
+    assert.equal(f.coordinator().report().optionalFeatures.github.available, false);
+    assert.equal(settingsLoads, 2);
+    assert.equal(githubLoads, 2);
     repaired = true;
     await Promise.all([f.coordinator().recheck(), f.coordinator().recheck()]);
     await f.settle();
@@ -604,6 +662,7 @@ test('compatibility regression: recheck retries optional imports and reports onl
     assert.equal(githubLoads, 3);
     assert.equal(active, 1);
     assert.equal(f.calls.filter(call => call === 'program').length, 1);
+    assert.equal(f.contractCheckCalls(), 0);
   } finally { await f.ctx.dispose(); }
   assert.equal(active, 0);
 });
@@ -612,7 +671,6 @@ test('compatibility regression: optional report follows real GitHub registration
   let enabled = false;
   const f = bootstrapFixture({
     preferencesFactory: () => ({ snapshot: () => ({ value: { githubReadEnabled: enabled } }) }),
-    contractChecks: () => ({ ...optionalChecks(), githubRead: false, githubFetch: false }),
     overrides: { github: { createGithubIntegration: options => createGithubIntegration(options) } },
   });
   try {
@@ -621,19 +679,21 @@ test('compatibility regression: optional report follows real GitHub registration
     const github = f.ctx.get('grokSearchGithub'), epoch = f.coordinator().captureEpoch();
     enabled = true;
     github.sync();
-    assert.equal(f.coordinator().report().phase, 'degraded');
-    assert.equal(f.coordinator().report().optionalFeatures.github.available, false);
+    assert.equal(f.coordinator().report().phase, 'ready');
+    assert.equal(f.coordinator().report().optionalFeatures.github.available, true);
     assert.equal(f.coordinator().report().coreReady, true);
     enabled = false;
     github.sync();
     assert.equal(f.coordinator().report().phase, 'ready');
+    assert.equal(f.coordinator().report().optionalFeatures.github.available, true);
     assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.contractCheckCalls(), 0);
   } finally { await f.ctx.dispose(); }
 });
 
 test('compatibility regression: GitHub registration can recover in place without replacing its live instance', async () => {
   let conflict = true;
-  const f = bootstrapFixture({ githubEnabled: true, contractChecks: optionalChecks, overrides: {
+  const f = bootstrapFixture({ githubEnabled: true, overrides: {
     github: { createGithubIntegration: options => createGithubIntegration(options) },
   } });
   const tools = f.ctx.get('tools'), register = tools.register;
@@ -654,6 +714,7 @@ test('compatibility regression: GitHub registration can recover in place without
     assert.equal(f.coordinator().report().optionalFeatures.github.available, true);
     assert.equal(f.coordinator().captureEpoch(), epoch);
     assert.equal(f.calls.filter(call => call === 'load:github').length, 1);
+    assert.equal(f.contractCheckCalls(), 0);
   } finally { await f.ctx.dispose(); }
 });
 
@@ -675,6 +736,7 @@ test('compatibility regression: failed optional initialization disposes partial 
     assert.equal(f.ctx.get('grokSearchSettings'), undefined);
     assert.equal(f.coordinator().report().coreReady, true);
     await f.coordinator().recheck();
+    await f.settle();
     assert.equal(active, 1);
     assert.equal(peak, 1);
     assert.equal(attempts, 2);
@@ -683,12 +745,9 @@ test('compatibility regression: failed optional initialization disposes partial 
   assert.equal(active, 0);
 });
 
-test('compatibility regression: real contract recheck recovers settings without revoking live searches', async () => {
+test('compatibility regression: settings recheck recovers its optional mount without revoking live routes', async () => {
   let loads = 0;
   const f = bootstrapFixture({
-    contractChecks: (ctx, options) => checkRuntimeContracts(ctx, {
-      ...options, selection: () => ({ bundles: ['dsh-grok-search'] }),
-    }),
     overrides: { settings: () => {
       if (++loads === 1) throw new Error('temporary settings import failure');
       return { name: 'settings', apply(child) { child.provide('grokSearchSettings', { snapshot() {} }); } };
@@ -704,45 +763,250 @@ test('compatibility regression: real contract recheck recovers settings without 
     assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
     assert.equal(f.coordinator().captureEpoch(), epoch);
     assert.equal(phases.every(Boolean), true);
+    assert.equal(f.contractCheckCalls(), 0);
     let dispatched = false;
     f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { dispatched = true; });
     assert.equal(dispatched, true);
   } finally { await f.ctx.dispose(); }
 });
 
-test('compatibility regression: a lost optional service is rebuilt and an obsolete import cannot resurrect it', async () => {
-  const importing = deferred(), called = deferred();
-  let attempts = 0, mounted;
-  const settings = { name: 'settings', apply(child) {
-    mounted = child;
-    child.provide('grokSearchSettings', { snapshot() {} });
-  } };
-  const f = bootstrapFixture({ overrides: { settings: () => {
-    if (++attempts === 1) { called.resolve(); return importing.promise; }
-    return settings;
-  } } });
+test('compatibility regression: an in-flight search and canonical settings survive probe-free recheck', { timeout: 10_000 }, async () => {
+  const dispatched = deferred(), finish = deferred(), caller = new AbortController();
+  let settingsLoads = 0, settingsActive = 0, settingsMounts = 0;
+  let provider, pending, settled = false, dispatches = 0, aborts = 0, officialCalls = 0, coreDisposals = 0;
+  const f = bootstrapFixture({ trackedServices: ['grokSearchSettings'],
+    overrides: {
+      core: { name: 'core', apply(child, config, admission) {
+        const primary = createGrokProvider({ configuration: { ...config, executable: process.execPath },
+          // Keep the production queues, admission and cancellation path; only MCP I/O is synthetic.
+          runQuery: async input => {
+            dispatches++;
+            const aborted = () => { aborts++; finish.reject(input.signal.reason); };
+            input.signal.addEventListener('abort', aborted, { once: true });
+            dispatched.resolve(input);
+            try {
+              await finish.promise;
+              input.signal.throwIfAborted();
+              return { content: `${input.queryId}:${input.request.query}`, sources: [{ url: 'https://recheck.test/result' }] };
+            } finally { input.signal.removeEventListener('abort', aborted); }
+          },
+        });
+        const releaseBarrier = createReleaseBarrier();
+        const routed = createRoutedSearch({ grok: primary.provider, releaseBarrier,
+          preferences: child.get('grokSearchPreferences'), ...admission,
+          sourceRouter: { snapshot: () => ({ available: false }),
+            search: async () => assert.fail('This request must finish through its original primary dispatch') },
+        });
+        const dispose = async () => { coreDisposals++; await Promise.all([routed.dispose(), primary.dispose()]); };
+        child.effect(() => dispose);
+        child.provide('grokSearchCore', { releaseBarrier, dispose,
+          snapshot: () => ({ ...primary.snapshot(), routeExecutor: routed.snapshot() }) });
+        child.web.registerSearchProvider({ ...primary.provider, search: routed.search });
+      } },
+      settings: () => {
+        settingsLoads++;
+        return { name: 'settings', apply(child) {
+          settingsMounts++; settingsActive++;
+          child.effect(() => () => { settingsActive--; });
+          child.provide('grokSearchSettings', { snapshot() {} });
+        } };
+      },
+    },
+  });
+  f.web.registerSearchProvider = value => { provider = value; };
+  f.web.search = (request, signal) => {
+    if (f.web.searchProviderId !== 'grok-search') {
+      officialCalls++;
+      assert.fail('The host must not dispatch to its official search provider');
+    }
+    return provider.search(request, signal);
+  };
   try {
     f.start();
-    await called.promise;
-    const oldEpoch = f.coordinator().captureEpoch();
-    f.coordinator().beginEpoch();
-    await turn();
-    importing.resolve(settings);
     await f.settle();
-    assert.notEqual(f.coordinator().captureEpoch(), oldEpoch);
-    assert.equal(attempts, 2);
+    assert.equal(f.coordinator().report().coreReady, true);
     assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
-    mounted.provide('grokSearchSettings', undefined);
-    assert.equal(f.coordinator().report().optionalFeatures.settings.available, false);
+    const settingsProxy = f.ctx.get('grokSearchSettings'), settingsInstance = settingsProxy[Symbol.for('cordis.original')];
+    const epoch = f.coordinator().captureEpoch(), registered = provider;
+    const names = ['grokSearchCore', 'grokSearchProgram', 'grokSearchControl', 'grokSearchRecovery', 'grokSearchRouteVerifier'];
+    const instances = names.map(name => f.service(name)), core = instances[0];
+    const request = { query: 'same-request-across-recheck', maxResults: 1 };
+    pending = f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => f.web.search(request, caller.signal));
+    pending.then(() => { settled = true; }, () => { settled = true; });
+    const active = await Promise.race([dispatched.promise, pending.then(() => assert.fail('Search completed before dispatch'))]);
+    assert.equal(active.request.query, request.query);
+    assert.equal(dispatches, 1);
+    assert.equal(settled, false);
+    assert.equal(core.snapshot().running, 1);
+    assert.equal(core.snapshot().routeExecutor.running, 1);
+    const operations = core.releaseBarrier.snapshot().activeOperationIds;
+    assert.equal(operations.length, 1);
+
+    await Promise.all([f.coordinator().recheck(), f.coordinator().recheck()]);
+    await f.settle();
+    const settingsAfterRecheck = f.ctx.get('grokSearchSettings');
+    assert.notEqual(settingsAfterRecheck, settingsProxy, 'Cordis may return a fresh caller-bound proxy');
+    assert.equal(settingsAfterRecheck[Symbol.for('cordis.original')], settingsInstance);
+    assert.equal(f.contractCheckCalls(), 0);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
+    assert.equal(settingsLoads, 1);
+    assert.equal(settingsMounts, 1);
+    assert.equal(settingsActive, 1);
+    for (const [index, name] of names.entries()) {
+      assert.ok(instances[index], name);
+      assert.equal(f.service(name), instances[index], name);
+    }
+    for (const name of ['core', 'program', 'control', 'recovery', 'routeVerifier']) {
+      assert.equal(f.calls.filter(call => call === `load:${name}`).length, 1, name);
+    }
+    assert.equal(provider, registered);
+    assert.equal(coreDisposals, 0);
+    assert.equal(f.web.searchProviderId, 'grok-search');
+    assert.deepEqual(core.releaseBarrier.snapshot().activeOperationIds, operations);
+    assert.equal(core.snapshot().running, 1);
+    assert.equal(core.snapshot().routeExecutor.running, 1);
+    assert.equal(settled, false);
+    assert.equal(active.signal.aborted, false);
+    assert.equal(caller.signal.aborted, false);
+    assert.equal(aborts, 0);
+    finish.resolve();
+    const result = await pending;
+    assert.equal(result.content, `${active.queryId}:${request.query}`);
+    assert.equal(result.sources[0].url, 'https://recheck.test/result');
+    assert.equal(dispatches, 1);
+    assert.equal(aborts, 0);
+    assert.equal(officialCalls, 0);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(core.snapshot().running, 0);
+    assert.equal(core.snapshot().routeExecutor.running, 0);
+    assert.deepEqual(core.releaseBarrier.snapshot().activeOperationIds, []);
+  } finally {
+    finish.resolve();
+    await pending?.catch(() => {});
+    await f.ctx.dispose();
+  }
+  assert.equal(settingsActive, 0);
+});
+
+test('settings mount once at root and accept a healthy service replacement across recheck', async () => {
+  let loads = 0, mounts = 0, active = 0;
+  let mounted, unsubscribe;
+  const f = bootstrapFixture({ trackedServices: ['grokSearchSettings'], overrides: {
+    settings: { name: 'settings', apply(child) {
+      loads++; mounts++; active++;
+      mounted = child;
+      child.effect(() => () => { active--; });
+      child.provide('grokSearchSettings', { snapshot: () => ({ ready: true }) });
+    } },
+  } });
+  try {
+    f.start();
+    await f.settle();
+    const before = f.ctx.get('grokSearchSettings'), canonical = before[Symbol.for('cordis.original')];
+    assert.notEqual(before, f.ctx.get('grokSearchSettings'));
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
+    assert.equal(canonical.snapshot().ready, true);
+    assert.equal(f.coordinator().report().coreReady, true);
+    const providerId = f.web.searchProviderId, epoch = f.coordinator().captureEpoch(), core = f.service('grokSearchCore');
     await f.coordinator().recheck();
-    assert.equal(attempts, 3);
+    assert.equal(loads, 1);
+    assert.equal(mounts, 1);
+    assert.equal(active, 1);
+    assert.equal(f.ctx.get('grokSearchSettings')[Symbol.for('cordis.original')], canonical);
     assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
-  } finally { importing.resolve(settings); await f.ctx.dispose(); }
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.web.searchProviderId, providerId);
+    const reports = [];
+    unsubscribe = f.coordinator().subscribe(report => { reports.push(report); });
+    const replacement = { snapshot: () => ({ ready: true, revision: 'replacement' }) };
+    mounted.provide('grokSearchSettings', replacement);
+    const current = f.ctx.get('grokSearchSettings');
+    assert.notEqual(current[Symbol.for('cordis.original')], canonical);
+    assert.equal(current[Symbol.for('cordis.original')], replacement);
+    assert.deepEqual(current.snapshot(), { ready: true, revision: 'replacement' });
+    assert.equal(f.coordinator().report().phase, 'ready');
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
+    await Promise.all([f.coordinator().recheck(), f.coordinator().recheck()]);
+    await f.settle();
+    assert.equal(f.ctx.get('grokSearchSettings')[Symbol.for('cordis.original')], replacement);
+    assert.deepEqual(f.coordinator().report().optionalFeatures.settings, { available: true, code: null });
+    assert.equal(f.coordinator().report().phase, 'ready');
+    assert.equal(reports.every(report => report.coreReady && report.phase === 'ready'
+      && report.optionalFeatures.settings.available), true);
+    assert.equal(loads, 1);
+    assert.equal(mounts, 1);
+    assert.equal(active, 1);
+    assert.notEqual(mounted.fiber.uid, null);
+    assert.equal(f.calls.filter(call => call === 'load:settings').length, 1);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.web.searchProviderId, providerId);
+    assert.equal(f.calls.filter(call => call === 'program').length, 1);
+    assert.equal(f.contractCheckCalls(), 0);
+  } finally { unsubscribe?.(); await f.ctx.dispose(); }
+  assert.equal(active, 0);
+});
+
+test('settings report real service or mount loss and repair it without replacing the core', async t => {
+  for (const failure of ['missing service', 'missing snapshot', 'disposed mount']) await t.test(failure, async () => {
+    let mounted, mounts = 0, active = 0, peak = 0;
+    const f = bootstrapFixture({ trackedServices: ['grokSearchSettings'], overrides: {
+      settings: { name: 'settings', apply(child) {
+        mounted = child;
+        mounts++;
+        peak = Math.max(peak, ++active);
+        child.effect(() => () => { active--; });
+        child.provide('grokSearchSettings', { snapshot: () => ({ ready: true }) });
+      } },
+    } });
+    try {
+      f.start();
+      await f.settle();
+      const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch(), oldMount = mounted;
+      assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
+      if (failure === 'disposed mount') {
+        await mounted.dispose();
+        // A readable replacement alone cannot make a disposed settings mount healthy.
+        await f.ctx.plugin({ name: 'replacement', apply(child) {
+          child.provide('grokSearchSettings', { snapshot: () => ({ ready: true }) });
+        } });
+        assert.equal(typeof f.ctx.get('grokSearchSettings').snapshot, 'function');
+      } else {
+        mounted.provide('grokSearchSettings', failure === 'missing service' ? undefined : {});
+      }
+      const report = f.coordinator().report();
+      assert.deepEqual(report.optionalFeatures.settings, { available: false, code: 'COMPATIBILITY_SETTINGS_UNAVAILABLE' });
+      assert.equal(report.phase, 'degraded');
+      assert.equal(report.coreReady, true);
+      assert.equal(mounts, 1, 'observing a missing service must not mount a replacement');
+      await f.coordinator().recheck();
+      await f.settle();
+      assert.equal(mounts, 2);
+      assert.equal(active, 1);
+      assert.equal(peak, 1);
+      assert.equal(oldMount.fiber.uid, null);
+      assert.notEqual(mounted, oldMount);
+      assert.equal(f.ctx.get('grokSearchSettings').snapshot().ready, true);
+      assert.deepEqual(f.coordinator().report().optionalFeatures.settings, { available: true, code: null });
+      assert.equal(f.coordinator().report().coreReady, true);
+      assert.equal(f.coordinator().captureEpoch(), epoch);
+      assert.equal(f.service('grokSearchCore'), core);
+      assert.equal(f.calls.filter(call => call === 'program').length, 1);
+      assert.equal(f.contractCheckCalls(), 0);
+    } finally { await f.ctx.dispose(); }
+    assert.equal(active, 0);
+  });
 });
 
 test('root protects the import gap synchronously and a missing optional module does not block core', async () => {
   const gate = deferred();
-  const f = bootstrapFixture({ overrides: {
+  let githubEnabled = false;
+  const f = bootstrapFixture({ preferencesFactory: () => ({
+    snapshot: () => ({ value: { githubReadEnabled: githubEnabled } }),
+  }), overrides: {
     appBoot: () => gate.promise, settings: new Error('optional settings import failed'), github: new Error('optional github import failed'),
   } });
   try {
@@ -759,14 +1023,25 @@ test('root protects the import gap synchronously and a missing optional module d
     assert.equal(f.coordinator().report().coreReady, true);
     assert.equal(f.coordinator().report().phase, 'degraded');
     assert.equal(f.coordinator().report().optionalFeatures.settings.code, 'COMPATIBILITY_SETTINGS_UNAVAILABLE');
-    assert.equal(f.coordinator().report().optionalFeatures.github.code, 'COMPATIBILITY_GITHUB_UNAVAILABLE');
+    assert.equal(f.coordinator().report().optionalFeatures.github.code, 'COMPATIBILITY_OPTIONAL_PENDING');
+    assert.equal(f.coordinator().report().optionalFeatures.github.available, false);
     assert.equal(f.coordinator().report().verification, 'unverified');
     assert.equal(f.coordinator().report().notified, false, 'a boot log is not an acknowledged UI notice');
     await f.coordinator().acknowledgeNotice({});
     assert.equal(f.coordinator().report().notified, true);
     f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { ran = true; });
     assert.equal(ran, true);
-    assert.ok(f.calls.indexOf('recovery') < f.calls.indexOf('program'));
+    assert.equal(f.calls.includes('recovery'), true);
+    assert.equal(f.calls.includes('program'), true);
+    const epoch = f.coordinator().captureEpoch(), core = f.service('grokSearchCore');
+    githubEnabled = true;
+    await f.coordinator().recheck();
+    assert.equal(f.coordinator().report().optionalFeatures.github.code, 'COMPATIBILITY_GITHUB_UNAVAILABLE');
+    assert.equal(f.coordinator().report().optionalFeatures.github.available, false);
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.contractCheckCalls(), 0);
   } finally { await f.ctx.dispose(); }
 });
 
@@ -879,10 +1154,32 @@ test('early GitHub intent survives appBoot, preferences, core-import and prerele
       const overrides = gap === 'core-import' ? { core: new Error('first core import failed') }
         : ['appBoot', 'preferences'].includes(gap) ? { [gap]: () => gate.promise } : {};
       const initialRecord = { intent: { policy: 'required' } };
-      const f = bootstrapFixture({ hostVersion, overrides, initialRecord, githubEnabled: enabled });
-      let originalFetches = 0;
-      const execute = url => f.ctx.waterfall('tools/execute', { name: 'web_fetch', arguments: { url } },
-        () => { originalFetches++; return {}; });
+      let originalFetches = 0, githubFetches = 0;
+      const f = bootstrapFixture({ hostVersion, initialRecord, githubEnabled: enabled, overrides: {
+        ...overrides,
+        github: { createGithubIntegration: options => createGithubIntegration({ ...options,
+          readerOptions: { fetchImpl: async input => {
+            githubFetches++;
+            const body = new URL(input).pathname.endsWith('/comments') ? [] : {
+              id: 1, title: 'Issue', body: 'offline fixture', user: { login: 'fixture' },
+            };
+            return new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+          } },
+        }) },
+      } });
+      const original = { fetch: async () => { originalFetches++; return {}; } };
+      const execute = url => {
+        const tools = f.ctx.get('tools');
+        tools.register({ name: 'web_fetch', timeoutMs: 30_000 });
+        const caller = { tools, fiber: { uid: 910, runtime: { name: 'tool-web' }, config: { fetch: true },
+          entry: { options: { name: '@deepseek-ai/dsh-tool-web' } } } };
+        const request = { name: 'web_fetch', arguments: { url }, callId: `early-${gap}-${url}`,
+          signal: new AbortController().signal, agent: { session: { id: 'early-github' } } };
+        return f.ctx.waterfall('tools/execute', request, () => {
+          const web = f.ctx.waterfall('internal/get', caller, 'web', null, () => original);
+          return web.fetch({ url }, request.signal);
+        });
+      };
       try {
         f.start();
         await turn();
@@ -890,9 +1187,19 @@ test('early GitHub intent survives appBoot, preferences, core-import and prerele
         if (gap === 'core-import') assert.equal(f.coordinator().report().phase, 'blocked');
         if (gap === 'preferences') assert.equal(f.calls.includes('load:preferences'), false,
           'private preferences no longer wait for dynamic module resolution');
-        if (enabled) await assert.rejects(async () => execute('https://github.com/example/project/issues/1'),
+        const coreReady = ['preferences', 'prerelease'].includes(gap);
+        assert.equal(f.coordinator().report().coreReady, coreReady);
+        if (enabled && !coreReady) await assert.rejects(async () => execute('https://github.com/example/project/issues/1'),
           error => error.code === 'GITHUB_FETCH_UNAVAILABLE');
-        else await execute('https://github.com/example/project/issues/1');
+        else {
+          const result = await execute('https://github.com/example/project/issues/1');
+          if (enabled) {
+            assert.equal(result.statusCode, 200);
+            assert.match(result.body.content, /offline fixture/);
+          }
+        }
+        assert.equal(originalFetches, enabled ? 0 : 1);
+        assert.equal(githubFetches > 0, enabled && coreReady);
         await execute('https://example.org/page');
         assert.equal(originalFetches, enabled ? 1 : 2);
         assert.equal(f.store.read().intent.policy, 'required');
@@ -983,16 +1290,21 @@ test('config capability checks compare effective values rather than host object 
   } finally { await h.ctx.dispose(); }
 });
 
-test('a failed production contract cannot be replaced by a successful import or version admission', async () => {
+test('a false injected contract result is never called and cannot block actual initialization', async () => {
   const f = bootstrapFixture({ contractChecks: () => ({ configHook: false }) });
   try {
     f.start();
     await f.settle();
-    assert.equal(f.coordinator().report().phase, 'blocked');
-    assert.equal(f.coordinator().report().coreReady, false);
-    assert.equal(f.calls.includes('program'), false);
-    assert.equal(f.web.searchProviderId, 'author');
-    assert.equal(f.store.read(), null);
+    assert.equal(f.contractCheckCalls(), 0);
+    assert.equal(f.coordinator().report().phase, 'ready');
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.calls.includes('program'), true);
+    assert.equal(f.calls.includes('control'), true);
+    assert.equal(f.web.searchProviderId, 'grok-search');
+    assert.equal(f.store.read().intent.policy, 'required');
+    let dispatched = false;
+    f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { dispatched = true; });
+    assert.equal(dispatched, true);
   } finally { await f.ctx.dispose(); }
 });
 
@@ -1002,19 +1314,38 @@ test('unreadable required intent preserves both early protection hooks without i
     f.start();
     await f.settle();
     assert.equal(f.coordinator().report().phase, 'blocked');
-    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.calls, ['load:settings', 'settings']);
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
+    assert.equal(typeof f.ctx.get('grokSearchSettings').snapshot, 'function');
+    assert.equal(f.contractCheckCalls(), 0);
     assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => true),
       error => error.code.startsWith('COMPATIBILITY_'));
     assert.equal(f.webFiber.resolveConfig({ searchProvider: 'author', fetchProvider: 'fetch' }).searchProvider.get(), 'grok-search');
   } finally { await f.ctx.dispose(); }
 });
 
-test('missing core imports leave the root protection and recovery alive without automatic official fallback', async () => {
-  const f = bootstrapFixture({ overrides: { core: new Error('core import failed') } });
+test('missing core imports preserve the root settings configPath and recovery without official fallback', async () => {
+  const configPath = 'C:/synthetic-profile/explicit-grok-search.json';
+  let settingsConfig;
+  const f = bootstrapFixture({ overrides: {
+    core: new Error('core import failed'),
+    settings: { name: 'settings', apply(child, config) {
+      settingsConfig = config;
+      child.provide('grokSearchSettings', { snapshot: () => ({ configPath: config.configPath }) });
+    } },
+  } });
   try {
-    f.start();
+    f.start({ ...defaults, configPath });
     await f.settle();
     assert.equal(f.coordinator().report().phase, 'blocked');
+    assert.equal(f.coordinator().report().coreReady, false);
+    assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
+    assert.equal(typeof f.ctx.get('grokSearchSettings').snapshot, 'function');
+    assert.equal(settingsConfig.configPath, configPath);
+    assert.equal(f.ctx.get('grokSearchSettings').snapshot().configPath, configPath);
+    assert.equal(f.service('grokSearchCore'), undefined);
+    assert.equal(f.service('grokSearchProgram'), undefined);
+    assert.equal(f.calls.filter(call => call === 'load:settings').length, 1);
     assert.equal(f.calls.includes('recovery'), true);
     assert.equal(f.calls.includes('program'), false);
     assert.equal(f.store.read(), null);
@@ -1054,6 +1385,77 @@ test('transient bootstrap failures retry twice, then report a neutral block; man
   } finally { await f.ctx.dispose(); }
 });
 
+test('pending settings and lifecycle retries do not delay a failed core recovering on recheck', async t => {
+  for (const optional of ['settings', 'lifecycle']) await t.test(optional, async () => {
+    const release = deferred();
+    let repaired = false, coreLoads = 0, optionalAttempts = 0, optionalReady = false, recheckDone = false, recheck;
+    const settings = { name: 'settings', apply(child) {
+      optionalReady = true;
+      child.provide('grokSearchSettings', { snapshot() {} });
+    } };
+    const pendingOptional = optional === 'settings' ? {
+      settings: () => {
+        if (++optionalAttempts === 1) throw new Error('temporary settings import failure');
+        return release.promise;
+      },
+    } : {
+      recovery: { name: 'recovery', apply(child) {
+        child.provide('grokSearchRecovery', { retry: async () => {
+          if (++optionalAttempts === 1) throw new Error('temporary recovery initialization failure');
+          await release.promise;
+          optionalReady = true;
+        } });
+      } },
+    };
+    const f = bootstrapFixture({ overrides: {
+      ...pendingOptional,
+      core: () => {
+        coreLoads++;
+        if (!repaired) throw new Error('temporary core import failure');
+        return { name: 'core', apply(child) {
+          child.provide('grokSearchCore', { dispose: async () => {} });
+        } };
+      },
+    } });
+    try {
+      f.start();
+      await f.settle();
+      assert.equal(f.coordinator().report().coreReady, false);
+      assert.equal(f.coordinator().report().code, 'COMPATIBILITY_CORE_UNAVAILABLE');
+      assert.equal(coreLoads, 3);
+      assert.equal(optionalAttempts, 1);
+      const blockedEpoch = f.coordinator().captureEpoch();
+      repaired = true;
+      recheck = f.coordinator().recheck();
+      recheck.then(() => { recheckDone = true; }, () => {});
+      await turn();
+      assert.equal(optionalAttempts, 2, 'the optional retry must have entered its unresolved work');
+      assert.equal(optionalReady, false);
+      if (optional === 'settings') assert.equal(f.ctx.get('grokSearchSettings'), undefined);
+      assert.equal(f.coordinator().report().coreReady, true, 'core must recover before the optional work resolves');
+      assert.equal(recheckDone, true, 'recheck must not await settings load or recovery retry');
+      assert.notEqual(f.coordinator().captureEpoch(), blockedEpoch);
+      assert.equal(f.web.searchProviderId, 'grok-search');
+      assert.equal(coreLoads, 4);
+      assert.equal(f.calls.filter(call => call === 'program').length, 1);
+      assert.equal(f.contractCheckCalls(), 0);
+      const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch();
+      release.resolve(settings);
+      await recheck;
+      await f.settle();
+      assert.equal(optionalReady, true);
+      assert.equal(f.service('grokSearchCore'), core);
+      assert.equal(f.coordinator().captureEpoch(), epoch);
+      assert.equal(f.coordinator().report().coreReady, true);
+      assert.equal(optionalAttempts, 2);
+    } finally {
+      release.resolve(settings);
+      await recheck?.catch(() => {});
+      await f.ctx.dispose();
+    }
+  });
+});
+
 test('a transient core import failure recovers without ever entering a blocked compatibility state', async () => {
   let failures = 1;
   const f = bootstrapFixture({ retryDelay: async () => {}, overrides: {
@@ -1083,18 +1485,17 @@ test('compatibility metadata storage failures do not block a valid core search r
   } finally { await f.ctx.dispose(); }
 });
 
-test('a false-negative manual recheck cannot revoke an already working core search route', async () => {
-  let checks = 0;
-  const f = bootstrapFixture({ contractChecks: () => {
-    checks++;
-    return { configHook: checks === 1, configCandidate: true, configUpdate: true, pluginDisposal: true,
-      webSelection: true, toolExecution: true, toolResult: true, toolGuards: true, githubRead: true };
-  } });
+test('startup and manual recheck ignore a throwing probe and preserve the working core search route', async () => {
+  const f = bootstrapFixture({ contractChecks: () => { throw new Error('A runtime probe must never run'); } });
   try {
     f.start();
     await f.settle();
     assert.equal(f.coordinator().report().coreReady, true);
+    const core = f.service('grokSearchCore'), epoch = f.coordinator().captureEpoch();
     await f.coordinator().recheck();
+    assert.equal(f.contractCheckCalls(), 0);
+    assert.equal(f.service('grokSearchCore'), core);
+    assert.equal(f.coordinator().captureEpoch(), epoch);
     assert.equal(f.coordinator().report().coreReady, true);
     assert.equal(f.coordinator().report().phase, 'ready');
     let dispatched = false;
@@ -1120,31 +1521,71 @@ test('preference read failures never override the stored choice by enabling Grok
   } finally { await f.ctx.dispose(); }
 });
 
-test('missing and malformed host versions defer admission to the real core capability probe', async t => {
-  for (const hostVersion of [null, 'not-a-semver']) await t.test(String(hostVersion), async () => {
+test('host version admission keeps the hard minimum without an active compatibility probe', async t => {
+  for (const hostVersion of [null, 'not-a-semver', '0.2.1-rc.1']) await t.test(String(hostVersion), async () => {
     const f = bootstrapFixture({ hostVersion });
     try {
       f.start();
       await f.settle();
       const current = f.coordinator().report();
-      assert.equal(current.hostVersion, null);
-      assert.equal(current.minimumAdmitted, true);
+      const belowMinimum = hostVersion === '0.2.1-rc.1';
+      assert.equal(current.hostVersion, belowMinimum ? hostVersion : null);
+      assert.equal(current.minimumAdmitted, !belowMinimum);
       assert.equal(current.confirmationRequired, false);
-      assert.equal(current.coreReady, true);
-      assert.equal(f.web.searchProviderId, 'grok-search');
+      assert.equal(current.coreReady, !belowMinimum);
+      assert.equal(current.optionalFeatures.settings.available, true);
+      assert.equal(f.contractCheckCalls(), 0);
+      assert.equal(f.web.searchProviderId, belowMinimum ? 'author' : 'grok-search');
+      if (belowMinimum) {
+        assert.equal(current.code, 'COMPATIBILITY_MINIMUM_REQUIRED');
+        assert.equal(f.calls.includes('load:program'), false);
+        assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' },
+          () => assert.fail('A host below the minimum must not dispatch search')),
+        { code: 'COMPATIBILITY_MINIMUM_REQUIRED' });
+      }
     } finally { await f.ctx.dispose(); }
   });
 });
 
-test('the early config hook rejects a missing host schema instead of presenting an unvalidated route', async () => {
-  const f = bootstrapFixture({ ready: false });
+test('a schema-free config hook protects startup but an actual route update failure never authorizes search', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-route-update-'));
+  writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+  const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+    trustedRoot: directory, governance: true, autoMaintain: false });
+  const f = bootstrapFixture({ ready: false, storeFactory: () => ({ ...store, startMaintenance() {} }),
+    overrides: { control: { name: 'control', apply: applyControl } } });
+  f.ctx.profileContext.dir = directory;
+  let updates = 0;
+  f.entry.update = async ({ config }) => {
+    updates++;
+    assert.equal(config.searchProvider, 'grok-search');
+    assert.equal(config.fetchProvider, 'fetch');
+    throw Object.assign(new Error('host cannot apply this route'), { code: 'CONTROL_ROUTE_UPDATE_FAILED' });
+  };
   let bootstrap;
   try {
     f.start();
     bootstrap = f.ctx.get('grokSearchBootstrap');
     f.webFiber.runtime.Config = null;
-    assert.throws(() => f.webFiber.resolveConfig({ searchProvider: 'author', fetchProvider: 'fetch' }),
-      { code: 'COMPATIBILITY_ABI_UNSUPPORTED' });
+    const resolved = f.webFiber.resolveConfig({ searchProvider: 'author', fetchProvider: 'fetch' });
+    assert.equal(selectedId(resolved.searchProvider), 'grok-search');
+    assert.equal(selectedId(resolved.fetchProvider), 'fetch');
+    assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' },
+      () => assert.fail('A route config hook alone must not authorize search')),
+    error => error.code.startsWith('COMPATIBILITY_'));
+    f.activateHost();
+    await f.settle();
+    assert.ok(updates > 0, 'the real controller must attempt the host route update');
+    assert.equal(f.coordinator().report().coreReady, false);
+    assert.equal(f.coordinator().report().phase, 'blocked');
+    assert.equal(f.web.searchProviderId, 'author');
+    assert.equal(f.web.fetchProviderId, 'fetch');
+    assert.equal(f.entry.options.config.searchProvider, 'author');
+    assert.equal(store.read().intent.policy, 'required');
+    assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' },
+      () => assert.fail('A failed route update must not dispatch to the author provider')),
+    { code: f.coordinator().report().code });
+    assert.equal(f.contractCheckCalls(), 0);
   } finally { await f.ctx.dispose(); await bootstrap?.settled(); }
 });
 
@@ -1289,7 +1730,7 @@ test('a fresh capability epoch waits for retirement and an explicit release wins
   });
 });
 
-test('web and tools detach/reprovide drains the old generation and automatically rebuilds once', async () => {
+test('web detach drains and rebuilds the core while optional tools detach preserves its generation', async () => {
   for (const missing of [['web'], ['tools'], ['web', 'tools']]) {
     const f = bootstrapFixture();
     try {
@@ -1299,16 +1740,27 @@ test('web and tools detach/reprovide drains the old generation and automatically
       const required = f.store.read();
       await f.deactivateHost(missing);
       await f.settle();
-      assert.equal(f.coordinator().report().coreReady, false);
+      const coreDetached = missing.includes('web');
+      assert.equal(f.coordinator().report().coreReady, !coreDetached);
       assert.deepEqual(f.store.read(), required, 'dependency loss must not release persistent intent');
-      assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => true),
-        error => error.code.startsWith('COMPATIBILITY_'));
+      if (coreDetached) {
+        assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => true),
+          error => error.code.startsWith('COMPATIBILITY_'));
+      } else {
+        assert.equal(f.coordinator().captureEpoch(), oldEpoch);
+        assert.equal(f.service('grokSearchControl'), owner);
+      }
       f.activateHost();
       await f.settle();
       assert.equal(f.coordinator().report().coreReady, true, `services ${missing.join(',')} should rebuild`);
-      assert.notEqual(f.coordinator().captureEpoch(), oldEpoch);
-      assert.notEqual(f.service('grokSearchControl'), owner);
-      assert.equal(f.calls.filter(call => call === 'program').length, 2);
+      if (coreDetached) {
+        assert.notEqual(f.coordinator().captureEpoch(), oldEpoch);
+        assert.notEqual(f.service('grokSearchControl'), owner);
+      } else {
+        assert.equal(f.coordinator().captureEpoch(), oldEpoch);
+        assert.equal(f.service('grokSearchControl'), owner);
+      }
+      assert.equal(f.calls.filter(call => call === 'program').length, coreDetached ? 2 : 1);
     } finally { await f.ctx.dispose(); }
   }
 });
@@ -1328,7 +1780,7 @@ test('reprovided services cannot start another program before the detached gener
   try {
     f.start();
     await f.settle();
-    detached = f.deactivateHost(['tools']);
+    detached = f.deactivateHost(['web']);
     await draining.promise;
     f.activateHost();
     await turn();
@@ -1425,7 +1877,7 @@ test('an admitted GitHub fetch cannot resume through the original provider after
       });
       pending.catch(() => {});
       await entered.promise;
-      await f.deactivateHost(['tools']);
+      await f.deactivateHost(['web']);
       if (rebuild) {
         f.activateHost();
         await f.settle();
@@ -1456,7 +1908,7 @@ test('the root GitHub epoch guard preserves admitted fetches and does not interc
   });
   const request = { name: 'web_fetch', arguments: { url: 'https://github.com/example/project/issues/1' },
     callId: 'github-admitted', signal: new AbortController().signal, agent: { session: { id: 'session' } } };
-  const original = { fetch: async () => { originalFetches++; return {}; } };
+  const original = { searchProviderId: 'author', fetch: async () => { originalFetches++; return {}; } };
   try {
     f.start();
     await f.settle();
@@ -1472,13 +1924,18 @@ test('the root GitHub epoch guard preserves admitted fetches and does not interc
     assert.match(result.body.content, /fixture content/);
     assert.ok(upstreamCalls > 0);
     assert.equal(originalFetches, 0);
-    await f.ctx.waterfall('tools/execute', { ...request, callId: 'github-revoked' }, () => {
+    await assert.rejects(f.ctx.waterfall('tools/execute', { ...request, callId: 'github-revoked' }, async () => {
       f.coordinator().block('COMPATIBILITY_CONTRACT_FAILED');
-      assert.equal(f.ctx.waterfall('internal/get', f.ctx, 'web', null, () => original), original,
-        'recovery and control are not execution-gated');
+      const observed = f.ctx.waterfall('internal/get', f.ctx, 'web', null, () => original);
+      assert.equal(observed.searchProviderId, original.searchProviderId,
+        'recovery and control can still observe service state');
+      await assert.rejects(observed.fetch({ url: request.arguments.url }, request.signal),
+        error => error.code === 'GITHUB_FETCH_UNAVAILABLE');
       assert.throws(() => f.ctx.waterfall('internal/get', caller, 'web', null, () => original),
         error => error.code === 'GITHUB_FETCH_UNAVAILABLE');
-    });
+    }), error => error.code === 'GITHUB_FETCH_UNAVAILABLE');
+    assert.equal(f.ctx.waterfall('internal/get', f.ctx, 'web', null, () => original), original,
+      'service access outside the GitHub request is unchanged');
     assert.equal(originalFetches, 0);
   } finally { await f.ctx.dispose(); }
 });

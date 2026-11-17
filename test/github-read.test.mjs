@@ -801,6 +801,102 @@ test('an unavailable fetch adapter blocks the original tool before service inter
   } finally { await f.dispose(); }
 });
 
+test('known GitHub fetches reject an unrecognized caller at the fetch boundary without disabling direct reads', async t => {
+  const callers = {
+    'missing fiber': tools => ({ tools }),
+    'disposed fiber': tools => ({ tools, fiber: { uid: null } }),
+    'renamed runtime': tools => ({ tools, fiber: { uid: 1, runtime: { name: 'changed-tool-web' },
+      entry: { options: { name: '@deepseek-ai/dsh-tool-web' } }, config: { fetch: true } } }),
+    'different module': tools => ({ tools, fiber: { uid: 1, runtime: { name: 'tool-web' },
+      entry: { options: { name: 'other-tool' } }, config: { fetch: true } } }),
+    'disabled tool': tools => ({ tools, fiber: { uid: 1, runtime: { name: 'tool-web' },
+      entry: { options: { name: '@deepseek-ai/dsh-tool-web', disabled: true } }, config: { fetch: true } } }),
+    'fetch disabled': tools => ({ tools, fiber: { uid: 1, runtime: { name: 'tool-web' },
+      entry: { options: { name: '@deepseek-ai/dsh-tool-web' } }, config: { fetch: false } } }),
+  };
+  for (const [name, caller] of Object.entries(callers)) await t.test(name, async () => {
+    let originalCalls = 0, githubCalls = 0;
+    const f = await hostFixture({ fetch: async input => {
+      githubCalls++;
+      return response(new URL(input).pathname.endsWith('/comments') ? [] : root);
+    } });
+    const exec = { name: 'web_fetch', arguments: { url }, agent: { session: { id: 'host-session' } },
+      signal: new AbortController().signal };
+    try {
+      const original = { searchProviderId: 'unchanged', fetch: () => { originalCalls++; return {}; } };
+      await assert.rejects(f.events.get('tools/execute')[0](exec, () => {
+        const service = f.events.get('internal/get')[0](caller(f.tools), 'web', undefined, () => original);
+        assert.equal(service.searchProviderId, original.searchProviderId, 'ordinary service observations stay available');
+        return service.fetch({ url }, exec.signal);
+      }), { code: name === 'fetch disabled' ? 'GITHUB_PERMISSION' : 'GITHUB_FETCH_UNAVAILABLE' });
+      assert.equal(originalCalls, 0);
+      assert.equal(githubCalls, 0);
+      assert.equal((await f.execute('github_read', { url }, exec.agent)).isError, false);
+      assert.equal(f.github.snapshot().registered, true);
+    } finally { await f.dispose(); }
+  });
+});
+
+test('an intercepted GitHub request cannot be rewritten into an original-provider request', async () => {
+  let originalCalls = 0, githubCalls = 0;
+  const f = await hostFixture({ fetch: async input => {
+    githubCalls++;
+    return response(new URL(input).pathname.endsWith('/comments') ? [] : root);
+  } });
+  const exec = { name: 'web_fetch', arguments: { url }, agent: { session: { id: 'host-session' } },
+    signal: new AbortController().signal };
+  const caller = { tools: f.tools, fiber: { uid: 1, runtime: { name: 'tool-web' },
+    entry: { options: { name: '@deepseek-ai/dsh-tool-web' } }, config: { fetch: true } } };
+  try {
+    for (const changedUrl of ['https://example.org/page', 'https://github.com/octocat/example/issues/8']) {
+      await assert.rejects(f.events.get('tools/execute')[0](exec, () => {
+        const service = f.events.get('internal/get')[0](caller, 'web', undefined,
+          () => ({ fetch: () => { originalCalls++; return {}; } }));
+        return service.fetch({ url: changedUrl }, exec.signal);
+      }), { code: 'GITHUB_FETCH_UNAVAILABLE' });
+    }
+    assert.equal(originalCalls, 0);
+    assert.equal(githubCalls, 0);
+    assert.equal((await f.execute('web_fetch', { url: url + '#issuecomment-1' }, exec.agent)).isError, false);
+    assert.ok(githubCalls > 0, 'a normal canonical GitHub URL is still readable');
+  } finally { await f.dispose(); }
+});
+
+test('a known GitHub fetch cannot report success without completing the plugin reader', async () => {
+  const f = await hostFixture();
+  const exec = { name: 'web_fetch', arguments: { url }, agent: { session: { id: 'host-session' } },
+    signal: new AbortController().signal };
+  try {
+    await assert.rejects(f.events.get('tools/execute')[0](exec, async () => ({ body: 'unattributed result' })),
+      { code: 'GITHUB_FETCH_UNAVAILABLE' });
+    const denial = new Error('host permission denied');
+    await assert.rejects(f.events.get('tools/execute')[0](exec, async () => { throw denial; }),
+      failure => failure === denial);
+  } finally { await f.dispose(); }
+});
+
+test('ordinary URLs and explicitly disabled GitHub keep the original fetch route', async () => {
+  const f = await hostFixture();
+  let originalCalls = 0;
+  try {
+    for (const enabled of [true, false]) {
+      f.config.enabled = enabled;
+      f.github.sync();
+      const target = enabled ? 'https://example.org/page' : url;
+      const result = await f.events.get('tools/execute')[0]({
+        name: 'web_fetch', arguments: { url: target }, signal: new AbortController().signal,
+      }, () => {
+        const original = { fetch: () => { originalCalls++; return target; } };
+        const service = f.events.get('internal/get')[0]({}, 'web', undefined, () => original);
+        assert.equal(service, original);
+        return service.fetch({ url: target });
+      });
+      assert.equal(result, target);
+    }
+    assert.equal(originalCalls, 2);
+  } finally { await f.dispose(); }
+});
+
 test('GitHub capabilities are rechecked on execution and before delivering an in-flight result', async () => {
   let f;
   f = await hostFixture({ fetch: async input => {

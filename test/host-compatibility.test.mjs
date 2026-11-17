@@ -28,18 +28,25 @@ test('release metadata stays synchronized without an enumerated future host ceil
   assert.deepEqual(lock.packages[''].peerDependenciesMeta, manifest.peerDependenciesMeta);
 });
 
-test('the same-package acceptance plan contains 21 unique targets, none pre-marked tested', () => {
+test('21 target records reference named baselines without claiming a repeated release-package matrix', () => {
   const matrix = readJson('support-matrix.json');
   const targets = matrix.targets.map(targetKey).sort();
   const expected = acceptanceTargets().map(targetKey).sort();
   assert.deepEqual(targets, expected);
   assert.equal(new Set(targets).size, expected.length);
   assert.deepEqual(matrix.acceptanceVersions, [...ACCEPTANCE_VERSIONS]);
-  assert.ok(matrix.targets.every(row => row.verificationLevel === 'planned'));
+  assert.ok(matrix.targets.every(row => ['reference-reviewed', 'source-reviewed'].includes(row.verificationLevel)));
+  for (const row of matrix.targets) {
+    const reference = matrix.verificationReferences[row.verificationReference];
+    assert.ok(reference?.scope);
+    if (row.verificationLevel === 'reference-reviewed') assert.match(reference.packageSha256, /^[a-f0-9]{64}$/);
+    if (row.followupReference) assert.equal(matrix.verificationReferences[row.followupReference]?.userReportedPassed, true);
+  }
   assert(matrix.unsupported.some(value => value.includes('Windows 与 macOS') && value.includes('CLI/Web')));
   assert.equal(matrix.evidencePolicy.authority, 'external-exact-tgz');
   assert.equal(matrix.evidencePolicy.samePackageRequired, true);
-  assert.equal(matrix.evidencePolicy.postFreezePackageEditsInvalidateAcceptance, true);
+  assert.equal(matrix.evidencePolicy.postFreezePackageEditsChangePackageIdentity, true);
+  assert.equal(matrix.evidencePolicy.documentationOnlyRepackRequiresRuntimeIdentityCheck, true);
 });
 
 test('historical rc.4 source review never turns into current-package host execution evidence', () => {
@@ -69,11 +76,18 @@ test('runtime admission and immutable external evidence have distinct policies',
   assert.equal(matrix.admission.upperBound, null);
   assert.equal(matrix.admission.includePrerelease, true);
   assert.equal(matrix.admission.automaticOfficialFallback, false);
-  assert.equal(matrix.admission.capabilityChecksRequired, true);
-  assert.equal(matrix.evidencePolicy.embeddedResults, 'planned-only');
+  assert.equal(matrix.admission.capabilityChecksRequired, false);
+  assert.equal(matrix.admission.runtimeInitializationRequired, true);
+  assert.equal(matrix.evidencePolicy.embeddedResults, 'named-baseline-references');
   assert.equal(matrix.evidencePolicy.watcherDefault, 'released-npm-latest-exact-hash');
   for (const version of ['0.2.2-rc.3', '0.2.3-alpha.1', '9.0.0']) assert.equal(hostVersionAdmitted(version), true);
   assert.equal(hostVersionAdmitted('0.2.1-rc.1'), false);
+});
+
+test('release preparation preserves manual validation without enabling a recurring job', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/compatibility-watch.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /^\s+workflow_dispatch:/m);
+  assert.doesNotMatch(workflow, /^\s+schedule:|^\s+-\s+cron:/m);
 });
 
 test('Desktop 候选工具接受 0.2.2-rc.2 但不自动接受 alpha 或未来 rc', () => {

@@ -4,14 +4,14 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createOriginalSearchCounter } from './core/original-search-counter.mjs';
 import { createProductStore, createSearchConfigHook, normalizeCounterSnapshot, readSelection, PRODUCT_SEARCH_BUNDLE,
-  PRODUCT_PROVIDER_ID, effectiveSearchProvider, webEntry, checkRuntimeContracts }
+  PRODUCT_PROVIDER_ID, effectiveSearchProvider, webEntry }
   from './core/product-control.mjs';
 import { createConnectionSecurity } from './core/connection-security.mjs';
 import { createSearchLog } from './core/search-log.mjs';
 import { createToolRouteContext } from './core/tool-route-context.mjs';
-import { createToolBudgetController, checkToolBudgetContracts } from './core/tool-budget.mjs';
+import { createToolBudgetController } from './core/tool-budget.mjs';
 import {
-  createRuntimeCompatibility, assessRuntimeCapabilities, isConfirmedCoreCompatibilityFault,
+  createRuntimeCompatibility, isConfirmedCoreCompatibilityFault,
 } from './core/runtime-compat.mjs';
 import { createCompatibilityState } from './core/compatibility-state.mjs';
 import { GrokSearchError } from './core/errors.mjs';
@@ -42,7 +42,7 @@ const defaultRetryDelay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // The root deliberately does not depend on web. Its scoped config hook survives
 // a WebRuntime rebuild and leaves a missing/unavailable Grok provider fail-closed.
-export function apply(ctx, configuration, { load = loadModule, checkContracts = checkRuntimeContracts,
+export function apply(ctx, configuration, { load = loadModule,
   createState = createCompatibilityState, createStore = createProductStore,
   createPreferences = createPrivatePreferences, retryDelay = defaultRetryDelay } = {}) {
   let store = null, coordinator = null, stateStore = null, appBoot = null;
@@ -50,17 +50,11 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   let activeContext = null, lifecycleContext = null, lifecycleTask = null, generation = null;
   let lifecycleAttempt = null;
   let pumping = null, repump = false, bootstrapReady = false, stateUnsubscribe = null;
-  let assessedToken = null, assessedChecks = null, startTask = null, recheckTask = null;
+  let startTask = null, recheckTask = null, settingsAttempt = null;
   let failureCount = 0, retrySequence = 0;
   let retiring = null, githubPreferences = null;
   const rootFiber = ctx.fiber, rootEntry = rootFiber.entry;
   const stateListeners = new Set(), pending = new Set();
-  // Deny only the local sentinel while rechecking a live, still-authorized route.
-  const contractProbes = new WeakSet();
-  const protectExecution = execution => {
-    contractProbes.add(execution);
-    return () => contractProbes.delete(execution);
-  };
   const webExecutions = new AsyncLocalStorage();
   const backgroundError = error => ctx.logger?.warn?.('dsh-grok-search: %s',
     typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code) ? error.code : 'COMPATIBILITY_BLOCKED');
@@ -155,7 +149,6 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   };
   // Only post-install calls using the known host hooks are protected; pre-import host work is outside this boundary.
   ctx.on('tools/execute', (exec, next) => {
-    if (contractProbes.has(exec)) throw unavailable('COMPATIBILITY_CHECKING');
     let githubFetch = false;
     const search = exec?.name === 'web_search' && !searchReleased();
     if (search) assertSearchAllowed('web_search');
@@ -204,7 +197,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     } });
   }, { global: true, prepend: true });
   ctx.effect(() => () => webExecutions.disable());
-  ctx.on('internal/config', createSearchConfigHook({ required, requireSchema: true }), { global: true, prepend: true });
+  ctx.on('internal/config', createSearchConfigHook({ required }), { global: true, prepend: true });
 
   const searchLog = createSearchLog(), callRoutes = createToolRouteContext({ searchLog });
   readGithubIntent();
@@ -240,8 +233,8 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   };
   const compatibility = Object.freeze({
     ...coordinator, assertSearchAllowed,
-    report: () => { refreshOptionalStatus(generation); return coordinator.report(); },
-    snapshot: () => { refreshOptionalStatus(generation); return coordinator.report(); },
+    report: () => { refreshSettingsStatus(); refreshOptionalStatus(generation); return coordinator.report(); },
+    snapshot: () => { refreshSettingsStatus(); refreshOptionalStatus(generation); return coordinator.report(); },
     recheck: () => recheckCapabilities(),
     async confirm(request) {
       if (destroyed || !stateStore) throw unavailable('COMPATIBILITY_IDENTITY_UNKNOWN');
@@ -376,25 +369,74 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     })();
     return value.disposal;
   }
+  // Cordis creates a caller-bound proxy for each Service read.
+  const serviceIdentity = service => service?.[Symbol.for('cordis.original')] ?? service;
+  function refreshSettingsStatus() {
+    const attempt = settingsAttempt;
+    if (destroyed || !attempt || attempt.pending) return;
+    let available = false;
+    try {
+      const service = ctx.get('grokSearchSettings');
+      available = attempt.ready && attempt.fiber != null && attempt.fiber.uid !== null
+        && typeof service?.snapshot === 'function';
+    } catch { /* The optional service is currently unavailable. */ }
+    coordinator.setOptional('settings', { available, confirmedFailure: !available,
+      code: available ? undefined : 'COMPATIBILITY_SETTINGS_UNAVAILABLE' });
+  }
+  function startSettings() {
+    if (destroyed) return Promise.resolve();
+    const previous = settingsAttempt;
+    if (previous?.pending || previous?.cleanupFailed) return previous.task;
+    try {
+      if (previous?.ready && previous.fiber != null && previous.fiber.uid !== null
+        && typeof ctx.get('grokSearchSettings')?.snapshot === 'function') {
+        refreshSettingsStatus();
+        return Promise.resolve();
+      }
+    } catch { /* Retry a service that is actually absent. */ }
+    const attempt = { pending: true, ready: false, cleanupFailed: false, fiber: null, task: null };
+    settingsAttempt = attempt;
+    attempt.task = track(Promise.resolve().then(async () => {
+      try {
+        if (previous?.fiber) {
+          try { await previous.fiber.dispose(); }
+          catch (error) { attempt.cleanupFailed = true; throw error; }
+        }
+        const module = await load('settings');
+        if (destroyed || settingsAttempt !== attempt) return;
+        attempt.fiber = ctx.plugin(module, { configPath: configuration.configPath });
+        await attempt.fiber;
+        if (destroyed || settingsAttempt !== attempt) {
+          await attempt.fiber.dispose();
+          return;
+        }
+        const service = ctx.get('grokSearchSettings');
+        if (typeof service?.snapshot !== 'function') throw unavailable('COMPATIBILITY_SETTINGS_UNAVAILABLE');
+        attempt.ready = true;
+      } catch (error) {
+        try { await attempt.fiber?.dispose(); }
+        catch (cleanupError) { attempt.cleanupFailed = true; backgroundError(cleanupError); }
+        backgroundError(error);
+      } finally {
+        attempt.pending = false;
+        refreshSettingsStatus();
+      }
+    }));
+    return attempt.task;
+  }
   function refreshOptionalStatus(value, name = null) {
     if (!value || generation !== value || !current(value.token) || value.suspended) return;
-    for (const key of name ? [name] : ['settings', 'github']) {
+    for (const key of name ? [name] : ['github']) {
       const attempt = value.optionals[key];
       if (!attempt || attempt.pending) continue;
       const intent = key === 'github' ? readGithubIntent() : true;
       let available = false;
       try {
-        if (key === 'settings') {
-          available = attempt.ready && attempt.fiber?.uid !== null
-            && value.ctx.get('grokSearchSettings') === attempt.instance
-            && typeof attempt.instance?.snapshot === 'function';
-        } else {
-          const status = value.github?.snapshot?.();
-          available = attempt.ready && attempt.fiber?.uid !== null && value.github === attempt.instance
-            && value.ctx.get('grokSearchGithub') === attempt.instance
-            && (intent === false || intent === true && value.githubCapabilities?.().githubRead === true
-              && status?.enabled === true && status.registered === true && !status.error);
-        }
+        const status = value.github?.snapshot?.();
+        available = attempt.ready && attempt.fiber?.uid !== null && value.github === attempt.instance
+          && serviceIdentity(value.ctx.get('grokSearchGithub')) === serviceIdentity(attempt.instance)
+          && (intent === false || intent === true && value.githubCapabilities?.().githubRead === true
+            && status?.enabled === true && status.registered === true && !status.error);
       } catch { /* A failed snapshot cannot establish optional readiness. */ }
       coordinator.setOptional(key, { token: value.token, available,
         code: available ? undefined : intent === null ? 'COMPATIBILITY_OPTIONAL_PENDING'
@@ -410,7 +452,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     let retained = false;
     try {
       retained = previous?.ready && previous.fiber?.uid !== null
-        && value.ctx.get(key === 'settings' ? 'grokSearchSettings' : 'grokSearchGithub') === previous.instance;
+        && serviceIdentity(value.ctx.get('grokSearchGithub')) === serviceIdentity(previous.instance);
     } catch { /* Missing service access requires a fresh scoped attempt. */ }
     if (retained) {
       if (key === 'github') {
@@ -437,13 +479,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
         }
         const module = await load(key);
         assertAttempt();
-        if (key === 'settings') {
-          attempt.fiber = value.ctx.plugin(module);
-          await attempt.fiber;
-          assertAttempt();
-          attempt.instance = value.ctx.get('grokSearchSettings');
-          if (typeof attempt.instance?.snapshot !== 'function') throw unavailable('COMPATIBILITY_SETTINGS_UNAVAILABLE');
-        } else {
+        {
           const privatePreferences = preferences();
           const { createSharedConfigStore, resolveSharedConfigPath } = await load('sharedConfig');
           assertAttempt();
@@ -516,10 +552,17 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       }
     }));
     lifecycleTask = attempt.task;
-    attempt.task.then(schedule, error => { backgroundError(error); schedule(); });
+    attempt.task.then(schedule, error => {
+      if (lifecycleAttempt === attempt && !attempt.cleanupFailed) {
+        lifecycleTask = null;
+        lifecycleAttempt = null;
+      }
+      backgroundError(error);
+      schedule();
+    });
     return attempt.task;
   }
-  async function initialize(parent, token, contractChecks) {
+  async function initialize(parent, token) {
     const [program, core, control, host] = await Promise.all(
       ['program', 'core', 'control', 'web'].map(load));
     assertCurrent(token);
@@ -533,18 +576,17 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       },
     });
     const value = { token, parent, ctx: null, fiber: null, core: null, program: null, owner: null,
-      budgets: null, github: null, githubCapabilities: null, contractChecks, leaseArmed: false,
+      budgets: null, github: null, githubCapabilities: null, leaseArmed: false,
       optionals: {}, WebError: host.WebError,
       abort: new AbortController(), suspended: false };
     value.githubCapabilities = () => {
       const available = current(token) && coordinator.report().coreReady;
-      const checks = value.contractChecks;
-      return {
-        githubRead: available && checks.toolExecution === true && checks.toolResult === true
-          && checks.toolGuards === true && checks.githubRead === true,
-        githubFetch: available && checks.toolExecution === true && checks.toolResult === true
-          && checks.toolGuards === true && checks.githubRead === true && checks.githubFetch === true,
-      };
+      try {
+        const tools = value.ctx?.get('tools');
+        const githubRead = available && typeof tools?.register === 'function' && typeof tools?.get === 'function'
+          && typeof (tools.checkGuards ?? tools.guardReason) === 'function';
+        return { githubRead, githubFetch: githubRead };
+      } catch { return { githubRead: false, githubFetch: false }; }
     };
     generation = value;
     const fiber = parent.plugin({ name: 'dsh-grok-search-runtime', apply(child) {
@@ -576,17 +618,20 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     }) });
     assertCurrent(token);
     const owner = value.owner = child.get('grokSearchControl');
-    if (owner?.publicSnapshot().phase !== 'required'
-      || effectiveSearchProvider(webEntry(child)) !== PRODUCT_PROVIDER_ID) throw unavailable('COMPATIBILITY_ROUTE_UNCONFIRMED');
+    const ownership = owner?.publicSnapshot();
+    if (ownership?.phase !== 'required' || effectiveSearchProvider(webEntry(child)) !== PRODUCT_PROVIDER_ID) {
+      const code = ownership?.error?.code === 'CONTROL_SEARCH_SELECTION_CONFLICT'
+        ? ownership.error.code : 'COMPATIBILITY_ROUTE_UNCONFIRMED';
+      ctx.logger?.warn?.('dsh-grok-search route setup failed: %s', ownership?.error?.code ?? 'route-not-active');
+      throw unavailable(code);
+    }
     coordinator.setCapabilities({ token, stage: 'route', confirmed: true });
     value.leaseArmed = true;
-    await value.budgets.acquire();
-    assertCurrent(token);
-    if (effectiveSearchProvider(webEntry(child)) !== PRODUCT_PROVIDER_ID) throw unavailable('COMPATIBILITY_ROUTE_UNCONFIRMED');
-    coordinator.setCapabilities({ token, stage: 'budget', confirmed: true });
     coordinator.markReady(token);
+    // Host timeout extension is optional; the executor retains its own deadline.
+    track(value.budgets.acquire()).catch(backgroundError);
     store.startMaintenance();
-    startOptional(value, 'settings');
+    refreshSettingsStatus();
     startOptional(value, 'github');
     assertCurrent(token);
   }
@@ -594,36 +639,13 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     if (destroyed || userStopped) return;
     if (pumping) { repump = true; return; }
     pumping = track(Promise.resolve().then(async () => {
-      if (!bootstrapReady || !activeContext || !lifecycleContext || retiring || coordinator.report().phase === 'blocked'
+      if (!bootstrapReady || !activeContext || retiring || coordinator.report().phase === 'blocked'
         || generation && coordinator.isCurrent(generation.token)) return;
       const token = coordinator.captureEpoch(), parent = activeContext;
       try {
-        const lifecycle = lifecycleTask ?? startLifecycle(lifecycleContext);
-        try { await lifecycle; }
-        catch (error) {
-          if (lifecycleTask === lifecycle && !lifecycleAttempt?.cleanupFailed) {
-            lifecycleTask = null;
-            lifecycleAttempt = null;
-          }
-          throw error;
-        }
         assertCurrent(token);
-        if (assessedToken !== token) {
-          const shape = assessRuntimeCapabilities({ ctx: parent, token });
-          if (shape.transient) throw Object.assign(new Error(shape.code), { code: shape.code });
-          if (shape.shape === 'pending') { coordinator.setCapabilities(shape); return; }
-          if (shape.shape === 'failed') { coordinator.setCapabilities(shape); return; }
-          const contractChecks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token), protectExecution });
-          assertCurrent(token);
-          checkToolBudgetContracts(parent, configuration.budgetMs ?? 120_000);
-          const assessed = assessRuntimeCapabilities({ ctx: parent, token, contractChecks });
-          if (assessed.transient) throw Object.assign(new Error(assessed.code), { code: assessed.code });
-          coordinator.setCapabilities(assessed);
-          assertCurrent(token);
-          assessedToken = token;
-          assessedChecks = contractChecks;
-        }
         if (!coordinator.canAcquireRoute()) return;
+        coordinator.markStarting(token);
         if (generation) {
           const value = generation;
           const mayRebuild = () => {
@@ -636,7 +658,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
           if (!await disposeGeneration(value, mayRebuild)) return;
           assertCurrent(token);
         }
-        await initialize(parent, token, assessedChecks);
+        await initialize(parent, token);
         if (current(token) && coordinator.report().coreReady) failureCount = 0;
       } catch (error) {
         if (current(token)) await retryCoreCheck(token, error);
@@ -656,6 +678,10 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   }
   async function performRecheck() {
     if (destroyed || disabling || userStopped) throw unavailable('COMPATIBILITY_STOPPED');
+    startSettings();
+    if (lifecycleContext && !lifecycleTask && !lifecycleAttempt?.cleanupFailed) {
+      startLifecycle(lifecycleContext);
+    }
     const before = coordinator.report();
     if (!before.coreReady) {
       retrySequence++;
@@ -680,20 +706,10 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       await settled;
       return coordinator.report();
     }
-    const token = coordinator.captureEpoch(), parent = activeContext;
-    if (!parent) return coordinator.report();
     try {
-      const shape = assessRuntimeCapabilities({ ctx: parent, token });
-      if (shape.transient || shape.shape !== 'passed') return coordinator.report();
-      const checks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token), protectExecution });
-      assertCurrent(token);
-      const assessed = assessRuntimeCapabilities({ ctx: parent, token, contractChecks: checks });
-      if (assessed.transient || assessed.shape !== 'passed' || assessed.contract !== 'passed') return coordinator.report();
-      checkToolBudgetContracts(parent, configuration.budgetMs ?? 120_000);
-      if (generation?.token === token) {
-        generation.contractChecks = checks;
+      if (generation && current(generation.token)) {
         const value = generation;
-        await Promise.all(['settings', 'github'].map(key => startOptional(value, key)));
+        await startOptional(value, 'github');
         refreshOptionalStatus(value);
       }
     } catch (error) {
@@ -716,6 +732,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     async settled() { while (pending.size) await Promise.allSettled([...pending]); },
     start: compatibility.start,
   });
+  startSettings();
   try {
     store = createStore(ctx, { deferMaintenance: true });
     const initial = store.read()?.intent;
@@ -733,7 +750,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
       if (lifecycleContext === child) { lifecycleContext = null; lifecycleTask = null; lifecycleAttempt = null; }
     });
   });
-  ctx.inject(['web', 'tools'], child => {
+  ctx.inject(['web'], child => {
     activeContext = child;
     child.effect(() => () => {
       if (activeContext !== child) return;

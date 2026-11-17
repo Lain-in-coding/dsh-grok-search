@@ -1,4 +1,11 @@
 async page => {
+  const checks = [], errors = [], external = [];
+  const origin = new URL(page.url()).origin;
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('request', request => {
+    const url = request.url();
+    if (/^https?:/.test(url) && new URL(url).origin !== origin) external.push(url);
+  });
   await page.reload();
   await page.waitForFunction(() => Boolean(window.harness));
   const input = await page.evaluate(async () => {
@@ -7,12 +14,6 @@ async page => {
     return response.json();
   });
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
-  const checks = [], errors = [], external = [];
-  const origin = await page.evaluate(() => location.origin);
-  page.on('pageerror', error => errors.push(String(error)));
-  page.on('request', request => {
-    if (/^https?:/.test(request.url()) && !request.url().startsWith(origin)) external.push(request.url());
-  });
   const check = (name, actual, expected = true) => {
     const passed = JSON.stringify(actual) === JSON.stringify(expected);
     checks.push({ name, passed, ...(passed ? {} : { actual, expected }) });
@@ -44,9 +45,16 @@ async page => {
       const charge = log.calls[0].charge;
       const text = await row.innerText();
       check(provider + ' actual call renders', text.toLowerCase().includes(provider));
-      check(provider + ' real charge accuracy', charge.basis === 'unknown'
-        ? await row.locator('.lu-unknown').count() > 0
-        : text.includes(String(charge.amount)) && text.includes(charge.basis === 'estimated' ? '估算' : '接口报告'));
+      const usage = row.locator('.lu-row').first();
+      if (charge.basis === 'unknown') {
+        check(provider + ' real charge accuracy', await usage.locator('.lu-unknown').count(), 1);
+      } else {
+        const amount = charge.amount > 0 && charge.amount < 0.000001 ? '<0.000001'
+          : charge.amount.toLocaleString('en-US', { maximumFractionDigits: 6 });
+        const estimated = log.calls[0].provider === 'exa' || charge.basis === 'estimated';
+        check(provider + ' real charge accuracy', await usage.locator('.lu-charge').textContent(),
+          (charge.unit === 'USD' ? '$' + amount : amount + ' credits') + (estimated ? '估算' : '接口报告'));
+      }
       await row.locator('.le-head').click();
     }
     const fallback = input.logs.findIndex(log => log.kind === 'fallback');
@@ -101,9 +109,16 @@ async page => {
     if (!recorded.ok) throw new Error(recorded.message);
     console.log(JSON.stringify({ runId: run.runId, passed: checks.length, failed: 0 }));
   } catch (error) {
-    await page.screenshot({ path: run.directory + '/failed.png', fullPage: true });
-    await page.evaluate(summary => fetch('/evidence', { method: 'POST', body: JSON.stringify(summary) }),
-      { ...run, checks, errors, external, failed: 1, error: String(error) });
+    const summary = { ...run, checks, errors, external, failed: 1, error: String(error) };
+    try { await page.screenshot({ path: run.directory + '/failed.png', fullPage: true }); }
+    catch (failure) { summary.screenshotError = String(failure); }
+    try {
+      const recorded = await page.evaluate(async summary => {
+        const response = await fetch('/evidence', { method: 'POST', body: JSON.stringify(summary) });
+        return { ok: response.ok, text: await response.text() };
+      }, summary);
+      if (!recorded.ok) throw new Error(recorded.text);
+    } catch (failure) { console.error('Evidence write failed:', String(failure)); }
     throw error;
   }
 }

@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { runInNewContext } from 'node:vm';
 import { build } from 'esbuild';
+import { buildClient } from '../scripts/build-client.mjs';
 import { ACCEPTANCE_VERSIONS, EVIDENCE_TIMEOUTS, FULL_ACCEPTANCE_GATES, executionSha256, sha256 } from '../scripts/lib/compatibility-evidence.mjs';
 import {
   FROZEN_PRODUCT_SHA256, PUBLISHED_OLD_PRODUCT, MACOS_HOST_PINS, MACOS_RUNTIME_FILES, MACOS_STAGES,
@@ -781,6 +782,28 @@ test('reviewed public source closure selects exact product and required helpers 
   for (const path of Object.keys(result.metafile.inputs).map(value => value.replaceAll('\\', '/'))) {
     assert.ok(required.includes(path) || packagedSource(path), 'Unselected public verifier dependency: ' + path);
   }
+  const browser = await buildClient();
+  const browserInputs = Object.keys(browser.metafile.inputs).map(value => value.replaceAll('\\', '/'))
+    .filter(path => path !== 'dsh-client:data');
+  for (const path of browserInputs) {
+    assert.ok(required.includes(path) || packagedSource(path), 'Unselected browser build dependency: ' + path);
+  }
+  const builder = readFileSync(join(root, 'scripts/build-client.mjs'), 'utf8');
+  const start = builder.indexOf('const logoFiles ='), end = builder.indexOf('export async function buildClient()', start);
+  assert.ok(start >= 0 && end > start);
+  const resources = [];
+  runInNewContext(builder.slice(start, end) + '\nclientData();', {
+    root, join, SETTINGS_DESCRIPTORS: {}, COMPATIBILITY_DESCRIPTORS: {},
+    readFileSync(path, encoding) {
+      const name = relative(root, path).replaceAll('\\', '/');
+      assert.ok(required.includes(name), 'Unselected browser build resource: ' + name);
+      resources.push(name);
+      return encoding ? 'synthetic resource' : Buffer.from('synthetic resource');
+    },
+  }, { timeout: 1000 });
+  assert.deepEqual(new Set(PUBLIC_MACOS_SUPPORT_FILES.filter(path => path.startsWith('src/'))),
+    new Set([...browserInputs.filter(path => !packagedSource(path)), ...resources]),
+    'Select only the browser inputs and resources actually used by the pack preflight.');
   assert.equal(existsSync(join(root, 'unused-public-macos-closure')), false);
 });
 

@@ -433,3 +433,91 @@ test('async control commits wait for a short maintenance contention without chan
     await assert.rejects(store.compareAndSwapAsync({ expectedRevision: 60, intent: intent('stale') }), { code: 'CONTROL_CAS_CONFLICT' });
   } finally { clearTimeout(timer); lock.release(); }
 });
+
+test('an initial archive reuses its verified prefix when cancellation or contention advances the head', () => {
+  for (const mode of ['cancelled', 'busy']) {
+    const { directory } = setup();
+    appendFixture(directory, 1, 60);
+    const writer = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let lock;
+      const maintainer = createControlIntentStore({ directory, fault(stage) {
+        if (stage !== 'before-checkpoint-publish') return;
+        const current = writer.read();
+        writer.compareAndSwap({ expectedRevision: current.revision, intent: intent(`advance-${attempt}`) });
+        if (mode === 'cancelled') throw Object.assign(new Error('cancelled'), { code: 'CONTROL_MAINTENANCE_CANCELLED' });
+        lock = acquireOwnedLock(join(directory, 'control-write.lock'));
+      } });
+      try {
+        if (mode === 'cancelled') assert.throws(() => maintainer.maintain(), { code: 'CONTROL_MAINTENANCE_CANCELLED' });
+        else assert.equal(maintainer.maintain().status, 'busy');
+      } finally { lock?.release(); }
+    }
+    writer.maintain();
+    const names = readdirSync(join(directory, 'legacy-archives'));
+    assert.equal(names.length, 1, 'head advancement must not duplicate a complete initial archive');
+    const archive = join(directory, 'legacy-archives', names[0]);
+    assert.equal(readdirSync(archive).filter(name => /^v\d{12}\.json$/.test(name)).length, 63);
+    assert.equal(writer.read().revision, 63);
+    writer.maintain();
+    assert.deepEqual(readdirSync(join(directory, 'legacy-archives')), names);
+  }
+});
+
+test('commit guards run under the writer lock and immediately before publication', async () => {
+  const { directory } = setup();
+  const writer = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+  writer.compareAndSwap({ expectedRevision: 0, intent: intent('before') });
+  let current = true, checks = 0;
+  const guarded = createControlIntentStore({ directory, governance: true, autoMaintain: false,
+    fault(stage) { if (stage === 'before-publish') current = false; } });
+  await assert.rejects(guarded.compareAndSwapAsync({ expectedRevision: 1, intent: intent('stale'),
+    assertCurrent() {
+      checks++;
+      assert.equal(existsSync(join(directory, 'control-write.lock')), true);
+      if (!current) throw Object.assign(new Error('inputs changed'), { code: 'CONTROL_TEST_INPUT_CHANGED' });
+    },
+  }), { code: 'CONTROL_TEST_INPUT_CHANGED' });
+  assert.ok(checks >= 2);
+  assert.equal(writer.read().revision, 1);
+});
+
+test('a guarded write checks live validity before staging after real lock contention', async () => {
+  const { directory } = setup();
+  const store = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+  store.compareAndSwap({ expectedRevision: 0, intent: intent('before') });
+  const lock = acquireOwnedLock(join(directory, 'control-write.lock'));
+  const names = readdirSync(directory).filter(name => name.startsWith('stage-')).sort();
+  let current = true;
+  const pending = store.compareAndSwapAsync({ expectedRevision: 1, intent: intent('stale'),
+    assertCurrent() {
+      if (!current) throw Object.assign(new Error('superseded'), { code: 'CONTROL_TEST_INPUT_CHANGED' });
+    },
+  });
+  pending.catch(() => {});
+  try {
+    current = false;
+    lock.release();
+    await assert.rejects(pending, { code: 'CONTROL_TEST_INPUT_CHANGED' });
+    assert.equal(store.read().revision, 1);
+    assert.deepEqual(readdirSync(directory).filter(name => name.startsWith('stage-')).sort(), names);
+  } finally { lock.release(); await pending.catch(() => {}); }
+});
+
+test('resuming an initial archive does not accept a damaged previously sealed prefix', () => {
+  const { directory } = setup();
+  appendFixture(directory, 1, 60);
+  const interrupted = createControlIntentStore({ directory, fault(stage) {
+    if (stage === 'before-checkpoint-publish') throw new Error('cancel-after-archive');
+  } });
+  assert.throws(() => interrupted.maintain(), /cancel-after-archive/);
+  const archiveRoot = join(directory, 'legacy-archives'), names = readdirSync(archiveRoot);
+  const preserved = join(archiveRoot, names[0], revisionName(10));
+  writeFileSync(preserved, '{ synthetic damage\n');
+  const store = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+  store.compareAndSwap({ expectedRevision: 60, intent: intent('new-head') });
+  assert.throws(() => store.maintain(), { code: 'CONTROL_RECORD_INVALID' });
+  assert.deepEqual(readdirSync(archiveRoot), names);
+  assert.equal(readFileSync(preserved, 'utf8'), '{ synthetic damage\n');
+  assert.equal(store.read().revision, 61);
+});

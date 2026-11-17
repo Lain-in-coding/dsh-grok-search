@@ -400,6 +400,9 @@ function parseArgs(argv) {
     if (!key || index + 1 >= argv.length) throw new Error(`Invalid argument ${JSON.stringify(flag)}.\n${usage()}`);
     options[key] = argv[++index];
   }
+  if (options.runId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(options.runId)) {
+    throw new Error('--run-id must be a safe artifact directory name.');
+  }
   if (!options.dshCli || !options.dshVersion || !options.productPackage || !options.grokLinuxArchive
     || !options.pnpmEntry || !options.pnpmStore || !options.pnpmCache) {
     throw new Error(`--dsh-cli, --dsh-version, --product-package, --grok-linux-archive, --pnpm-entry, --pnpm-store and --pnpm-cache are required.\n${usage()}`);
@@ -1350,9 +1353,11 @@ async function waitFor(predicate, timeoutMs, label, intervalMs = 50) {
 async function terminateWebProcess(web, runRoot, grokExecutable) {
   if (!web || web.closed) {
     return {
-      signalSent: null, graceful: true, exitCode: web?.exitCode ?? null,
+      signalSent: null, graceful: Boolean(web?.closed && web.exitCode === 0 && web.signal === null),
+      exitCode: web?.exitCode ?? null,
       exitSignal: web?.signal ?? null, durationMs: 0,
-      dshAliveAfterExit: false, leftoverMatchingProcesses: [],
+      dshAliveAfterExit: web ? pidAlive(web.child.pid) : false,
+      leftoverMatchingProcesses: matchingProcesses([runRoot, grokExecutable]),
     };
   }
   const terminateStarted = Date.now();
@@ -1376,7 +1381,7 @@ async function terminateWebProcess(web, runRoot, grokExecutable) {
   return {
     ...(sendError ? { sent: false, error: sendError } : {}),
     signalSent: 'SIGTERM',
-    graceful: Boolean(closed),
+    graceful: Boolean(closed && web.exitCode === 0 && web.signal === null),
     exitCode: web.exitCode,
     exitSignal: web.signal,
     durationMs: Date.now() - terminateStarted,
@@ -1417,8 +1422,12 @@ async function linuxWorker(options) {
   const home = join(runRoot, 'home');
   const artifactDir = join(ARTIFACT_ROOT, runId);
   mkdirSync(ARTIFACT_ROOT, { recursive: true });
-  if (!existsSync(artifactDir)) mkdirSync(artifactDir, { recursive: false });
-  else if (!statSync(artifactDir).isDirectory()) throw new Error(`Artifact path is not a directory: ${artifactDir}`);
+  const priorArtifact = lstatSync(artifactDir, { throwIfNoEntry: false });
+  if (!priorArtifact) mkdirSync(artifactDir, { recursive: false });
+  else if (!options.bootstrapFile || !priorArtifact.isDirectory() || priorArtifact.isSymbolicLink()
+    || readdirSync(artifactDir).length !== 0) {
+    throw new Error(`Artifact directory must be new or an empty bootstrap handoff: ${artifactDir}`);
+  }
   if (options.runRoot !== undefined || !existsSync(runRoot)) mkdirSync(runRoot, { recursive: false, mode: 0o700 });
   for (const path of [dshHome, workspace, home, join(runRoot, 'tmp'),
     join(runRoot, 'xdg-config'), join(runRoot, 'xdg-cache'), join(runRoot, 'xdg-data')]) {
@@ -1680,9 +1689,10 @@ async function linuxWorker(options) {
     const pnpmBinDir = join(runRoot, 'pnpm-bin');
     mkdirSync(pnpmBinDir, { recursive: true });
     const pnpmWrapper = join(pnpmBinDir, 'pnpm');
+    const shellQuote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
     writeFileSync(pnpmWrapper, [
       '#!/bin/sh',
-      `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(options.pnpmEntry)} "$@"`,
+      `exec ${shellQuote(process.execPath)} ${shellQuote(options.pnpmEntry)} "$@"`,
       '',
     ].join('\n'));
     chmodSync(pnpmWrapper, 0o700);

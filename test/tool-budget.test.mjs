@@ -24,6 +24,56 @@ test('budget contract candidates validate without publishing a lease or enabling
   assert.deepEqual(checkToolBudgetContracts(ctx, BUDGET_MS), { checked: 0 });
 });
 
+function contractFixture({ modern, wrapped = false, fresh = false, validate = value => ({ value }) }) {
+  const raw = { ...AUTHOR_CONFIG, custom: { nested: { value: 'original' } } };
+  const effective = structuredClone(raw);
+  const normalized = () => wrapped
+    ? Object.fromEntries(Object.entries(effective).map(([key, value]) => [key, { get: () => value }]))
+    : { ...effective };
+  const runtime = { name: 'tool-web', fibers: new Set(),
+    Config: { '~standard': { version: 1, validate: value => validate(value, { raw, effective }) } } };
+  const fiber = { uid: 1, state: 2, runtime, config: modern ? raw : effective,
+    update() { assert.fail('Contract checks must not update a fiber'); }, await() {},
+    entry: { options: { name: '@deepseek-ai/dsh-tool-web', config: raw } } };
+  const property = modern ? 'effectiveConfig' : 'config';
+  if (fresh) Object.defineProperty(fiber, property, { get: normalized });
+  else fiber[property] = wrapped ? normalized() : effective;
+  runtime.fibers.add(fiber);
+  return { raw, effective, ctx: { registry: new Map([['tool-web', runtime]]) } };
+}
+
+for (const modern of [false, true]) {
+  const shape = modern ? 'modern' : 'legacy';
+  for (const wrapped of [false, true]) {
+    test(`${shape}: budget contracts accept fresh equal ${wrapped ? 'value wrappers' : 'effective objects'}`, () => {
+      const h = contractFixture({ modern, wrapped, fresh: true });
+      const before = structuredClone({ raw: h.raw, effective: h.effective });
+      assert.deepEqual(checkToolBudgetContracts(h.ctx, BUDGET_MS), { checked: 1 });
+      assert.deepEqual({ raw: h.raw, effective: h.effective }, before);
+    });
+  }
+  for (const target of ['raw', 'effective']) {
+    test(`${shape}: budget contracts detect nested in-place ${target} mutations`, () => {
+      const h = contractFixture({ modern, wrapped: target === 'effective',
+        validate: (value, state) => {
+          state[target].custom.nested.value = 'mutated';
+          return { value };
+        } });
+      assert.throws(() => checkToolBudgetContracts(h.ctx, BUDGET_MS),
+        { code: 'COMPATIBILITY_BUDGET_UNCONFIRMED' });
+    });
+  }
+  test(`${shape}: budget candidate normalization cannot mutate live raw or effective values`, () => {
+    const h = contractFixture({ modern, validate: value => {
+      value.custom.nested.value = 'normalized candidate';
+      return { value };
+    } });
+    const before = structuredClone({ raw: h.raw, effective: h.effective });
+    assert.deepEqual(checkToolBudgetContracts(h.ctx, BUDGET_MS), { checked: 1 });
+    assert.deepEqual({ raw: h.raw, effective: h.effective }, before);
+  });
+}
+
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });

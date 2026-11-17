@@ -353,6 +353,16 @@ async page => {
     check('pointer drag preserves disabled Firecrawl', await read(() => window.harness.state.content.firecrawl_enabled), false);
 
     await state('returning');
+    await page.evaluate(() => window.harness.configure({ delay: 200, nextSaveError: 'CONFIG_BUSY' }));
+    await page.locator('.row[data-id=exa] .row-main').focus();
+    await page.keyboard.press('Alt+ArrowUp');
+    await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'save'));
+    await page.evaluate(() => window.harness.unmount());
+    await page.waitForTimeout(350);
+    check('late failed ordering save leaves the settings DOM unmounted', await page.locator('#routeCard').count(), 0);
+    check('late failed ordering save produces no detached DOM exception', errors.length, 0);
+
+    await state('returning');
     await page.locator('.row[data-id=firecrawl] .switch').click();
     await page.evaluate(() => {
       window.harness.inject({ tinyfish_api_key: 'tf-synthetic', tinyfish_enabled: true });
@@ -950,6 +960,14 @@ async page => {
     await page.locator('[data-compatibility-title]').filter({ hasText: '核心搜索暂不可用' }).waitFor();
     check('confirmed core block never forwards to official search',
       await page.locator('[data-compatibility-text]').textContent(), '搜索已暂停，当前不会转交官方搜索。');
+    await page.evaluate(value => window.harness.compatibility(value), compatibilityReport());
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]')?.shadowRoot
+      ?.querySelector('[data-dsg-compatibility]')?.dataset.compatibilityPhase === 'normal', undefined, { timeout: 10000 });
+    check('backend recovery clears a stale core warning without remounting', await page.locator('.compatibility-banner').isVisible(), false);
+    await showCompatibility(compatibilityReport({
+      phase: 'blocked', coreReady: false, code: 'COMPATIBILITY_CORE_SHAPE',
+    }));
+    await page.locator('[data-compatibility-title]').filter({ hasText: '核心搜索暂不可用' }).waitFor();
     await page.setViewportSize({ width: 390, height: 844 });
     check('compatibility card fits a narrow viewport', await page.locator('.compatibility-banner').evaluate(element =>
       element.scrollWidth <= element.clientWidth + 1));

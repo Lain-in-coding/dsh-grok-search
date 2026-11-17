@@ -251,3 +251,207 @@ test('a failed resource-comparison mount rejects instead of throwing into an unr
     assert.equal(callbackError, null);
   } finally { clearTimeout(timer); }
 });
+
+const browserSource = file => readFileSync(new URL(file, import.meta.url), 'utf8');
+const browserScript = (file, diagnostics = []) => vm.runInNewContext(`(${browserSource(file)})`, {
+  URL, console: { log() {}, error: (...values) => diagnostics.push(values.map(String).join(' ')) },
+});
+
+function failedBrowserPage({ failure, screenshotError, evidenceError, reloadEvents = [] }) {
+  const origin = 'http://127.0.0.1:4321', listeners = new Map(), evidence = [];
+  const page = {
+    url: () => origin + '/',
+    on(event, callback) { listeners.set(event, callback); },
+    async reload() { for (const [event, value] of reloadEvents) listeners.get(event)?.(value); },
+    async waitForFunction() {},
+    async setViewportSize() { throw failure; },
+    async screenshot() { if (screenshotError) throw screenshotError; },
+    async evaluate(fn, value) {
+      const source = String(fn);
+      if (source.includes("fetch('/evidence'")) {
+        evidence.push(JSON.parse(JSON.stringify(value)));
+        if (evidenceError) throw evidenceError;
+        return { ok: true, text: 'recorded', body: 'recorded' };
+      }
+      if (source.includes('location.origin')) return origin;
+      if (source.includes("fetch('/live-evidence'")) return { logs: [], quotas: {} };
+      if (source.includes("fetch('/begin'")) return { runId: 'vm-browser-failure', directory: '/unused' };
+      throw new Error('Unexpected browser evaluation: ' + source);
+    },
+  };
+  return { page, evidence, origin };
+}
+
+for (const file of ['ui-route-browser.js', 'ui-search-log-browser.js',
+  'ui-search-log-live-browser.js', 'ui-github-read-browser.js']) {
+  test(`${file}: secondary screenshot failures retain the primary error and still attempt evidence`, async () => {
+    const failure = new Error('synthetic-browser-primary');
+    const screenshotError = new Error('synthetic-screenshot-failure');
+    const evidenceError = new Error('synthetic-evidence-failure');
+    for (const [imageFailure, reportFailure] of [[null, null], [screenshotError, null],
+      [screenshotError, evidenceError]]) {
+      const probe = failedBrowserPage({ failure, screenshotError: imageFailure, evidenceError: reportFailure });
+      const diagnostics = [];
+      await assert.rejects(browserScript(file, diagnostics)(probe.page), error => error === failure);
+      assert.equal(probe.evidence.length, 1, 'Evidence must be attempted even when a screenshot fails.');
+      assert.equal(probe.evidence[0].failed, 1);
+      assert.match(JSON.stringify(probe.evidence[0]), /synthetic-browser-primary/);
+      assert.equal(probe.evidence[0].screenshotError, imageFailure ? String(imageFailure) : undefined);
+      if (reportFailure) assert.ok(diagnostics.some(value => value.includes(reportFailure.message)));
+    }
+  });
+}
+
+for (const file of ['ui-search-log-browser.js', 'ui-search-log-live-browser.js']) {
+  test(`${file}: reload errors and exact-origin request violations enter the diagnostic receipt`, async () => {
+    const failure = new Error('stop-after-reload'), startup = new Error('synthetic-startup-error');
+    const sameOrigin = 'http://127.0.0.1:4321', otherPort = 'http://127.0.0.1:43210/request';
+    const upstream = 'https://outside.example.test/startup';
+    const requests = [sameOrigin, sameOrigin + '/local', 'data:text/plain,local', otherPort, upstream];
+    const probe = failedBrowserPage({ failure, reloadEvents: [
+      ['pageerror', startup], ...requests.map(url => ['request', { url: () => url }]),
+    ] });
+    await assert.rejects(browserScript(file)(probe.page), error => error === failure);
+    assert.deepEqual(probe.evidence[0].errors, [String(startup)]);
+    assert.deepEqual(probe.evidence[0].external, [otherPort, upstream]);
+  });
+}
+
+function settingsPerformancePage(errorPhase = null) {
+  const evidence = [], waits = [], listeners = new Map();
+  const failure = new Error('synthetic-' + errorPhase + '-error');
+  let callsPerQuery = 1, layerRead = 0, detached = 0;
+  const layers = [0, 0, 0, 1, 0];
+  const locator = selector => ({
+    first() { return this; },
+    locator: child => locator(child),
+    async click() {},
+    async count() { return selector === '[data-dsg-layer]' ? layers[layerRead++] : 16; },
+    async textContent() { return '\u641c\u7d22\u5185\u5bb9\u5df2\u9690\u85cf'; },
+  });
+  const page = {
+    on(event, callback) { listeners.set(event, callback); },
+    async reload() { if (errorPhase === 'startup') listeners.get('pageerror')?.(failure); },
+    async setViewportSize() { if (errorPhase === 'runtime') listeners.get('pageerror')?.(failure); },
+    async emulateMedia() {},
+    async waitForFunction(fn, arg, options) {
+      if (/__uiPerf\.ready|path\.getTotalLength/.test(String(fn))) {
+        waits.push({ arg, timeout: options?.timeout });
+      }
+    },
+    locator,
+    context: () => ({ async newCDPSession() { return {
+      async send() { return { metrics: [{ name: 'LayoutCount', value: 1 }] }; },
+      async detach() { detached++; },
+    }; } }),
+    // Stub only browser measurements; execute the original reporting and cleanup flow.
+    async evaluate(fn, arg) {
+      const source = String(fn);
+      if (source.includes("fetch('/begin'")) return { runId: 'vm-performance', directory: '/unused' };
+      if (arg?.queryCount) callsPerQuery = arg.callsPerQuery;
+      if (source.includes('readyMs: probe.ready')) return {
+        readyMs: 1, longestFrameMs: 16, longTasks: [], elements: 10, collapsedDetailsElements: 0,
+      };
+      if (source.includes("article.classList.contains('is-open')")) {
+        return { ms: 1, queries: 1, calls: callsPerQuery, open: true };
+      }
+      if (source.includes('const count = window.harness.state.calls')) return 0;
+      if (source.includes('const same =')) return true;
+      if (source.includes("fetch('/evidence'")) {
+        evidence.push(JSON.parse(JSON.stringify(arg)));
+        return { saved: true };
+      }
+    },
+  };
+  return { page, evidence, waits, failure, detached: () => detached };
+}
+
+for (const phase of ['startup', 'runtime']) {
+  test(`settings performance persists ${phase} page errors before rejecting`, async () => {
+    const probe = settingsPerformancePage(phase);
+    await assert.rejects(browserScript('ui-settings-performance-browser.js')(probe.page),
+      error => error.message.includes(probe.failure.message));
+    assert.equal(probe.evidence.length, 1);
+    assert.equal(probe.evidence[0].passed, false);
+    assert.deepEqual(probe.evidence[0].errors, [String(probe.failure)]);
+    assert.equal(probe.evidence[0].scenarios.length, 3, 'Keep measured diagnostics on a failed run.');
+    assert.equal(probe.detached(), 1);
+  });
+}
+
+test('settings performance passes bounded wait options as the third Playwright argument', async () => {
+  const probe = settingsPerformancePage();
+  await browserScript('ui-settings-performance-browser.js')(probe.page);
+  assert.deepEqual(probe.waits, [30000, 30000, 30000, 10000, 10000]
+    .map(timeout => ({ arg: undefined, timeout })));
+  assert.equal(probe.evidence[0].passed, true);
+  assert.equal(probe.detached(), 1);
+});
+
+async function checkLiveCharge(charge, displayed, unknownCount = 0) {
+  const source = browserSource('ui-search-log-live-browser.js');
+  const start = source.indexOf("    for (const provider of ['tavily', 'exa', 'firecrawl', 'tinyfish'])");
+  const end = source.indexOf('    const fallback = ', start);
+  assert.ok(start >= 0 && end > start);
+  const providers = ['tavily', 'exa', 'firecrawl', 'tinyfish'];
+  const valueFor = (value, provider) => typeof value === 'function' ? value(provider) : value;
+  const input = { logs: providers.map(provider => ({ served: provider, kind: 'sources',
+    calls: [{ provider, charge: valueFor(charge, provider) }] })) };
+  const usage = provider => ({ locator(selector) {
+    if (selector === '.lu-charge') return { async textContent() { return valueFor(displayed, provider); } };
+    if (selector === '.lu-unknown') return { async count() { return valueFor(unknownCount, provider); } };
+    throw new Error('Unexpected usage selector: ' + selector);
+  } });
+  const rows = providers.map(provider => ({
+    async innerText() { return `12:34:56 ${provider} ${valueFor(displayed, provider)} another call: 1 credits\u63a5\u53e3\u62a5\u544a`; },
+    locator(selector) {
+      if (selector === '.le-head') return { async click() {} };
+      if (selector === '.lu-row') return { first: () => usage(provider) };
+      // An unrelated call's unknown cost must not satisfy the selected call.
+      if (selector === '.lu-unknown') return { async count() { return 1; } };
+      throw new Error('Unexpected row selector: ' + selector);
+    },
+  }));
+  const execute = vm.runInNewContext(`(async () => {${source.slice(start, end)}})`, {
+    input, page: { locator: () => ({ nth: index => rows[index] }) },
+    check: (name, actual, expected = true) => assert.equal(actual, expected, name),
+  });
+  await execute();
+}
+
+test('live charge accuracy rejects row timestamps, unrelated costs and numeric substrings', async () => {
+  for (const amount of ['999', '11']) {
+    await assert.rejects(checkLiveCharge({ basis: 'reported', amount: 1, unit: 'credits' },
+      amount + ' credits\u63a5\u53e3\u62a5\u544a'), /real charge accuracy/);
+  }
+  await assert.rejects(checkLiveCharge({ basis: 'unknown' }, '', 0), /real charge accuracy/);
+});
+
+test('live charge accuracy accepts production-normalized rendered costs including reported Exa input', async () => {
+  const source = browserSource('../src/ui/search-log-view.mjs');
+  const usageStart = source.indexOf('const USAGE_CHANNELS = ');
+  const usageEnd = source.indexOf('\nlet logRows =', usageStart);
+  const chargeStart = source.indexOf('function logChargeAmount(');
+  const chargeEnd = source.indexOf('\nfunction logCallsHtml(', chargeStart);
+  assert.ok(usageStart >= 0 && usageEnd > usageStart && chargeStart >= 0 && chargeEnd > chargeStart);
+  // Use the production normalization and markup, not hand-authored UI text.
+  const render = vm.runInNewContext(`call => {
+    ${source.slice(usageStart, usageEnd)}
+    ${source.slice(chargeStart, chargeEnd)}
+    return logCharge(normalizeUsage([call])[0]);
+  }`, {
+    SUPP: ['tavily', 'exa', 'firecrawl', 'tinyfish'],
+    esc: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'),
+  });
+  const providers = ['tavily', 'exa', 'firecrawl', 'tinyfish'];
+  for (const [basis, amount] of [['reported', 1], ['reported', 1234.5], ['estimated', .003],
+    ['reported', .0000001], ['unknown', null]]) {
+    const charge = provider => ({ basis, amount,
+      unit: provider === 'tavily' || provider === 'firecrawl' ? 'credits' : 'USD' });
+    const html = Object.fromEntries(providers.map(provider => [provider, render({ provider, charge: charge(provider) })]));
+    if (basis === 'reported') assert.match(html.exa, /data-basis="estimated"/);
+    await checkLiveCharge(charge,
+      provider => html[provider].replace(/<[^>]*>/g, '').replaceAll('&lt;', '<'),
+      provider => Number(html[provider].includes('class="lu-unknown"')));
+  }
+});

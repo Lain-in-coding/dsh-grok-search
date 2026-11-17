@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { ControlRecordError, createControlIntentStore } from '../src/core/control-intent-store.mjs';
 import { commitExplicitRelease, createReleaseBarrier } from '../src/core/release-transaction.mjs';
+import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
 
 const HOST_ID = '00000000-0000-4000-8000-000000000001';
 const OTHER_HOST_ID = '00000000-0000-4000-8000-000000000002';
@@ -279,4 +280,26 @@ test('the release transaction core is an explicit package export', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(manifest.exports['./release-transaction'], './src/core/release-transaction.mjs');
   assert.match(manifest.scripts['test:release'], /release-transaction\.test\.mjs/);
+});
+
+test('legacy asynchronous verification does not publish its cached completion after contention', async t => {
+  const f = fixture(t);
+  const store = createControlIntentStore({ directory: f.directory, governance: true, autoMaintain: false });
+  let lock;
+  const events = [], supplied = controller(events);
+  const verify = supplied.verify;
+  supplied.verify = async input => {
+    const receipt = await verify(input);
+    lock = acquireOwnedLock(join(f.directory, 'control-write.lock'));
+    return receipt;
+  };
+  try {
+    const result = await commitExplicitRelease({ store, owner: owner(), controller: supplied,
+      operationId: randomUUID(), counterBaseline: 0 });
+    assert.equal(result.kind, 'incomplete');
+    assert.equal(result.error.code, 'CONTROL_STORAGE_BUSY');
+    assert.equal(result.completionCommitted, false);
+    assert.equal(store.read().intent.releaseCompletion, undefined);
+    assert.equal(store.read().revision, 2);
+  } finally { lock?.release(); }
 });

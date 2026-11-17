@@ -61,6 +61,9 @@ export async function connectRenderer(port, { timeoutMs = 20_000, requestTimeout
     const timer = setTimeout(() => reject(new Error('Renderer CDP WebSocket timed out.')), timeoutMs);
     socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
     socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Renderer CDP WebSocket failed.')); }, { once: true });
+  }).catch(error => {
+    socket.close();
+    throw error;
   });
   let serial = 0;
   const pending = new Map();
@@ -99,7 +102,8 @@ export async function connectRenderer(port, { timeoutMs = 20_000, requestTimeout
     });
     socket.send(JSON.stringify({ id, method, params }));
   });
-  await send('Runtime.enable');
+  try { await send('Runtime.enable'); }
+  catch (error) { socket.close(); throw error; }
   const evaluate = async expression => {
     const result = await send('Runtime.evaluate', {
       expression,

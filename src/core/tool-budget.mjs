@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { effectiveConfig } from './product-control.mjs';
 import { resolveRuntimeConfig } from './product-config.mjs';
 
@@ -13,15 +14,20 @@ export function checkToolBudgetContracts(ctx, budgetMs) {
   for (const runtime of ctx.registry.values()) {
     for (const fiber of runtime.fibers) {
       if (!target(fiber) || effectiveConfig(fiber)?.search === false) continue;
-      const before = effectiveConfig(fiber), raw = plain(before);
+      const before = structuredClone(plain(effectiveConfig(fiber)));
+      const rawConfig = () => 'effectiveConfig' in fiber ? fiber.config
+        : fiber.entry.options.config ?? effectiveConfig(fiber);
+      const raw = structuredClone(plain(rawConfig()));
       if (typeof fiber.update !== 'function' || typeof fiber.await !== 'function'
         || !fiber.runtime.Config) throw Object.assign(new Error('Search budget configuration cannot be validated.'), {
         code: 'COMPATIBILITY_BUDGET_UNCONFIRMED',
       });
-      const candidate = plain(resolveRuntimeConfig(fiber.runtime, { ...raw, searchTimeoutMs: budgetMs }));
-      if (candidate.searchTimeoutMs !== budgetMs || candidate.search !== raw.search
-        || candidate.fetch !== raw.fetch || candidate.fetchTimeoutMs !== raw.fetchTimeoutMs
-        || before !== effectiveConfig(fiber)) {
+      // Candidate normalization must not share nested values with live config or its snapshots.
+      const candidate = plain(resolveRuntimeConfig(fiber.runtime, { ...structuredClone(before), searchTimeoutMs: budgetMs }));
+      if (candidate.searchTimeoutMs !== budgetMs || candidate.search !== before.search
+        || candidate.fetch !== before.fetch || candidate.fetchTimeoutMs !== before.fetchTimeoutMs
+        || !isDeepStrictEqual(before, structuredClone(plain(effectiveConfig(fiber))))
+        || !isDeepStrictEqual(raw, structuredClone(plain(rawConfig())))) {
         throw Object.assign(new Error('The host does not preserve the search budget candidate contract.'), {
           code: 'COMPATIBILITY_BUDGET_UNCONFIRMED',
         });

@@ -332,6 +332,7 @@ export function createControlIntentStore({
   directory, legacyPath, trustedRoot = null, fault = () => {},
   now = () => new Date(), retention = {}, governance = false, onMaintenance = () => {},
   allowOfflineTransition = false, autoMaintain = true, maintenanceScheduler = null,
+  maintenanceLockTokens = null, onMaintenanceLock = () => {},
 }) {
   if (!text(directory) || !isAbsolute(directory) || rootNetworkPath(directory) || (legacyPath && (!isAbsolute(legacyPath) || rootNetworkPath(legacyPath)))) {
     invalid('Control storage and legacy evidence paths must be absolute.');
@@ -341,6 +342,10 @@ export function createControlIntentStore({
   }
   if (typeof fault !== 'function') invalid('Control fault seam must be a function.');
   if (typeof governance !== 'boolean') invalid('Control storage governance option must be boolean.');
+  if (typeof onMaintenanceLock !== 'function' || maintenanceLockTokens !== null
+    && (!UUID.test(maintenanceLockTokens.checkpoint ?? '') || !UUID.test(maintenanceLockTokens.writer ?? ''))) {
+    invalid('Control maintenance lock ownership is invalid.');
+  }
   const sealedMaxRevisions = retention.maxSealedRevisions ?? DEFAULT_SEALED_MAX_REVISIONS;
   const sealedMaxAgeMs = retention.maxAgeMs ?? DEFAULT_SEALED_MAX_AGE_MS;
   if (!Number.isSafeInteger(sealedMaxRevisions) || sealedMaxRevisions < 1
@@ -754,9 +759,9 @@ export function createControlIntentStore({
     const names = revisionList();
     const head = verified.envelope.revision;
     const retainedNames = names.filter(name => revisionOf(name) <= head);
-    // Reuse the same migration receipt after an interruption at the same
-    // verified head, rather than accumulating a full archive on every retry.
-    const name = `legacy-${verified.envelope.operationId}`;
+    // The immutable origin identifies the attempt even when writers append
+    // while maintenance is cancelled or waiting to publish its checkpoint.
+    const name = `legacy-${verified.origin.operationId}`;
     const archivePath = join(archivesRoot, name);
     assertDirectories(archivesRoot, boundary);
     mkdirSync(archivePath, { recursive: true, mode: 0o700 });
@@ -784,8 +789,15 @@ export function createControlIntentStore({
         invalid('Existing initial-archive manifest is unsafe or exceeds its supported size.');
       }
       const existing = parse(readFileSync(manifestPath));
-      if (existing.headRevision !== head || existing.headSha256 !== previousSha256
-        || !isDeepStrictEqual(existing.entries, entries)) invalid('Initial archive conflicts with a prior migration attempt.');
+      if (existing.format !== manifest.format || existing.schemaVersion !== 1 || !time(existing.archivedAt)
+        || !Number.isSafeInteger(existing.headRevision) || existing.headRevision < 1 || existing.headRevision > head
+        || existing.headSha256 !== entries[existing.headRevision - 1]?.sha256
+        || !isDeepStrictEqual(existing.entries, entries.slice(0, existing.headRevision))) {
+        invalid('Initial archive conflicts with a prior migration attempt.');
+      }
+      if (existing.headRevision < head) {
+        writeAtomicJson(manifestPath, { ...manifest, archivedAt: existing.archivedAt }, 'manifest-stage');
+      }
     } else writeAtomicJson(manifestPath, manifest, 'manifest-stage');
     const manifestSha256 = hash(readFileSync(manifestPath));
     fault('after-initial-archive', { name, headRevision: head, manifestSha256 });
@@ -864,6 +876,8 @@ export function createControlIntentStore({
     try {
       lock = acquireOwnedLock(join(root, CHECKPOINT_LOCK), {
         reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS, now: at.getTime(),
+        ...(maintenanceLockTokens ? { token: maintenanceLockTokens.checkpoint } : {}),
+        onAcquired: owner => onMaintenanceLock({ name: CHECKPOINT_LOCK, owner }),
       });
       // The maintenance lock serializes maintainers only, not user writes.
       // Initial archive creation can take seconds and must not block CAS.
@@ -920,7 +934,11 @@ export function createControlIntentStore({
         assertRevision(publishedLatest);
         if (publishedLatest.envelope.revision < latest) invalid('Control history moved backwards during maintenance.');
         let writer;
-        try { writer = acquireOwnedLock(join(root, CONTROL_WRITE_LOCK), { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS }); }
+        try { writer = acquireOwnedLock(join(root, CONTROL_WRITE_LOCK), {
+          reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS,
+          ...(maintenanceLockTokens ? { token: maintenanceLockTokens.writer } : {}),
+          onAcquired: owner => onMaintenanceLock({ name: CONTROL_WRITE_LOCK, owner }),
+        }); }
         catch (error) {
           if (error.code === 'EEXIST') return freeze({ status: 'busy', reason: 'writer-active', at: at.toISOString() });
           throw error;
@@ -973,8 +991,8 @@ export function createControlIntentStore({
       return autoMaintain ? maintain() : null;
     } catch (error) { return failed(error); }
   };
-  const withWriterLock = action => {
-    if (!governance && !stat(checkpointPath)) return action();
+  const withWriterLock = (action, required = false) => {
+    if (!required && !governance && !stat(checkpointPath)) return action();
     assertDirectories(root, boundary);
     mkdirSync(root, { recursive: true, mode: 0o700 });
     checkDirectory();
@@ -982,7 +1000,7 @@ export function createControlIntentStore({
     try {
       lock = acquireOwnedLock(join(root, CONTROL_WRITE_LOCK), { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS });
     } catch (error) {
-      if (error.code === 'EEXIST') fail('CONTROL_STORAGE_BUSY', {}, 'Control history is being committed or maintained; retry after it finishes.');
+      if (error.code === 'EEXIST') fail('CONTROL_STORAGE_BUSY', { retriable: true }, 'Control history is being committed or maintained; retry after it finishes.');
       throw error;
     }
     try { return action(); } finally { lock.release(); }
@@ -998,7 +1016,7 @@ export function createControlIntentStore({
     if (checkpoint && revision < checkpoint.revision) return readBytes(join(sealedRoot, filename(revision)));
     invalid('Committed revision disappeared without a verified retained copy.');
   };
-  const publish = ({ expectedRevision, intent, operationId, before, sourceCheck = () => {} }) => {
+  const publish = ({ expectedRevision, intent, operationId, before, sourceCheck = () => {}, assertCurrent = () => {} }) => {
     const actualRevision = before.envelope?.revision ?? 0;
     if (actualRevision !== expectedRevision) fail('CONTROL_CAS_CONFLICT', { expectedRevision, actualRevision });
     const candidate = jsonCopy({ format: CONTROL_RECORD_FORMAT, schemaVersion: CONTROL_RECORD_VERSION,
@@ -1029,6 +1047,7 @@ export function createControlIntentStore({
           fail('CONTROL_CAS_CONFLICT', { expectedRevision, actualRevision: latest.envelope?.revision ?? 0 });
         }
       }
+      assertCurrent();
       // This exclusive namespace publication, not the earlier read, is the CAS linearization point.
       try { linkSync(stagePath, targetPath); }
       catch (error) {
@@ -1092,17 +1111,34 @@ export function createControlIntentStore({
         throw error;
       }
     },
-    compareAndSwap({ expectedRevision, intent, operationId = randomUUID() }) {
+    compareAndSwap({ expectedRevision, intent, operationId = randomUUID(), assertCurrent = null, signal = null }) {
       if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= MAX_REVISION
         || !UUID.test(operationId)) invalid('Expected revision or operation ID is invalid.');
+      if (assertCurrent !== null && typeof assertCurrent !== 'function') invalid('The commit guard must be synchronous.');
+      const checkCurrent = () => {
+        try {
+          signal?.throwIfAborted();
+          const result = assertCurrent?.();
+          if (result && typeof result.then === 'function') {
+            Promise.resolve(result).catch(() => {});
+            invalid('The commit guard must not return asynchronous work.');
+          }
+        } catch (error) {
+          if (error instanceof ControlRecordError) throw error;
+          throw new ControlRecordError(error.code ?? 'CONTROL_COMMIT_INPUT_CHANGED', error.message,
+            { retriable: true });
+        }
+      };
       const envelope = withWriterLock(() => {
+        checkCurrent();
         const before = snapshot();
         if (!isDeepStrictEqual(intent?.migration ?? null, before.migration)) {
           invalid('Only explicit migration can introduce origin evidence; later writes must preserve it unchanged.');
         }
         return publish({ expectedRevision, intent, operationId, before,
+          assertCurrent: checkCurrent,
           sourceCheck: before.migration ? () => assertSource(before.migration.sourceSha256) : undefined });
-      });
+      }, assertCurrent !== null || signal !== null);
       maintainAfterWrite(envelope);
       return envelope;
     },
@@ -1113,7 +1149,8 @@ export function createControlIntentStore({
         captured.signal?.throwIfAborted();
         try { return this.compareAndSwap(captured); }
         catch (error) {
-          if (error.code !== 'CONTROL_STORAGE_BUSY' || performance.now() >= deadline) throw error;
+          if (error.code !== 'CONTROL_STORAGE_BUSY' || captured.retryOnBusy === false
+            || performance.now() >= deadline) throw error;
           // Only contention with storage maintenance is retried. A changed
           // revision is a genuine conflict, never merged or overwritten here.
           await delay(5, undefined, { signal: captured.signal });

@@ -17,7 +17,8 @@ const usage = 'Usage: node scripts/readme-demos.mjs --chrome <path> [--ffmpeg <p
 const options = new Map();
 for (let index = 2; index < process.argv.length; index += 2) {
   const key = process.argv[index], value = process.argv[index + 1];
-  if (!['--chrome', '--ffmpeg', '--formats', '--dpr', '--fps', '--speed', '--only', '--keep-frames'].includes(key) || value === undefined) throw new Error(usage);
+  if (!['--chrome', '--ffmpeg', '--formats', '--dpr', '--fps', '--speed', '--only', '--keep-frames'].includes(key)
+    || !value?.trim() || value.startsWith('--') || options.has(key)) throw new Error(usage);
   options.set(key, value);
 }
 const chrome = options.get('--chrome');
@@ -25,6 +26,7 @@ if (!chrome || !existsSync(chrome)) throw new Error('需要 --chrome 指向本�
 const ffmpeg = options.get('--ffmpeg') ?? 'ffmpeg';
 if (spawnSync(ffmpeg, ['-hide_banner', '-version'], { windowsHide: true }).status !== 0) throw new Error('找不到可用的 ffmpeg。');
 const formats = (options.get('--formats') ?? 'apng').split(',').map(value => value.trim()).filter(Boolean);
+if (!formats.length || new Set(formats).size !== formats.length) throw new Error('Choose at least one unique output format.');
 for (const format of formats) if (!['apng', 'gif', 'webp', 'mp4'].includes(format)) throw new Error('Unknown format: ' + format);
 const keepFrames = options.get('--keep-frames') ?? 'false';
 if (!['true', 'false'].includes(keepFrames)) throw new Error('--keep-frames must be true or false.');
@@ -35,6 +37,9 @@ if (!(minFrameMs >= 16 && minFrameMs <= 200)) throw new Error('--fps must be bet
 const speed = Number(options.get('--speed') ?? '0.3');
 if (!(speed >= 0.1 && speed <= 1)) throw new Error('--speed must be between 0.1 and 1.');
 const only = options.has('--only') ? new Set(options.get('--only').split(',').map(value => value.trim())) : null;
+if (only && [...only].some(id => !['test', 'fallback', 'first-use', 'order'].includes(id))) {
+  throw new Error('Choose known recording scenarios: test, fallback, first-use, order.');
+}
 
 const sleep = milliseconds => new Promise(done => setTimeout(done, milliseconds));
 const WIDTH = 1089, PAD = 44, RADIUS = 26;

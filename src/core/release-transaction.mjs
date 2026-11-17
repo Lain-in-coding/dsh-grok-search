@@ -174,9 +174,12 @@ async function finishExplicitRelease({ store, record, owner, controller, reason,
       previousRevision: record.revision, nextRevision: record.revision + 1 },
   };
   const intent = { ...record.intent, releaseCompletion: completion };
+  const assertCurrent = typeof controller.assertCurrent === 'function'
+    ? () => controller.assertCurrent({ owner: clone(owner), receipt: clone(completion.routeEvidence),
+      counterBaseline, routeChanged: restore.routeChanged }) : null;
   try {
     const envelope = await writeControlIntent(store, { expectedRevision: record.revision, intent,
-      operationId: completionOperationId });
+      operationId: completionOperationId, assertCurrent, retryOnBusy: assertCurrent !== null });
     return Object.freeze({ kind: 'released', recordCommitted: true, completionCommitted: true,
       inFlightInvalidated: true, drainSettled: true, routeChanged: restore.routeChanged,
       routeVerified: true, operationId: releaseOperationId, envelope, routeReceipt: receipt });
@@ -198,7 +201,7 @@ async function finishExplicitRelease({ store, record, owner, controller, reason,
     return Object.freeze({ ...releaseOutcome({ operationId: releaseOperationId, recordCommitted: true,
       completionCommitted: error.code === 'CONTROL_RECORD_COMMIT_UNCERTAIN' ? null : false,
       inFlightInvalidated: true, drainSettled: true, routeChanged: restore.routeChanged,
-      routeVerified: true, error }), envelope: record, routeReceipt: receipt });
+      routeVerified: error.code !== 'CONTROL_RELEASE_INPUT_CHANGED', error }), envelope: record, routeReceipt: receipt });
   }
 }
 
@@ -296,8 +299,11 @@ export async function commitExplicitRelease({ store, owner, controller, reason =
     release,
   };
   let committed;
+  const assertCurrent = typeof controller.assertCurrent === 'function'
+    ? () => controller.assertCurrent({ owner: clone(owner) }) : null;
   try {
-    committed = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId });
+    committed = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId,
+      assertCurrent, retryOnBusy: assertCurrent !== null });
   } catch (error) {
     if (error instanceof ControlRecordError) {
       error.releaseOutcome = Object.freeze(releaseOutcome({ operationId,

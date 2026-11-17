@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, lstatSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, lstatSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { GrokSearchError } from './errors.mjs';
 import { acquireOwnedLock, DEFAULT_STALE_LOCK_MS } from './owned-lock.mjs';
@@ -44,9 +44,14 @@ function validate(value) {
 export function createPrivatePreferences({ path, fault }) {
   if (typeof path !== 'string' || !isAbsolute(path)) fail('PREFERENCES_PATH_INVALID', '偏好文件必须使用绝对路径。');
   const read = () => {
-    if (!existsSync(path)) return { value: structuredClone(DEFAULTS), revision: 'missing' };
     try {
-      const stat = lstatSync(path);
+      let stat;
+      try { stat = lstatSync(path); }
+      catch (error) {
+        // Only an absent entry permits first-run defaults, never an unreadable or dangling link.
+        if (error.code === 'ENOENT') return { value: structuredClone(DEFAULTS), revision: 'missing' };
+        throw error;
+      }
       if (!stat.isFile() || stat.isSymbolicLink()) fail('PREFERENCES_PATH_UNSAFE', '偏好目标不是普通文件。');
       if (stat.size > 65536) fail('PREFERENCES_READ_FAILED', '插件偏好超过 64 KiB。');
       const bytes = readFileSync(path);

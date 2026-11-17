@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import vm from 'node:vm';
-import { validatePackChannel } from '../scripts/pack-internal.mjs';
+import * as pack from '../scripts/pack-internal.mjs';
+const { validatePackChannel } = pack;
 
 const read = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
 const manifest = JSON.parse(read('package.json'));
@@ -144,4 +149,59 @@ test('保留历史内部与 Beta 通道的身份约束，不改写旧候选', ()
     assert.equal(validatePackChannel({ ...manifest, version, private: privateValue },
       { ...matrix, packageVersion: version }, options), channel);
   }
+});
+
+test('pack receipts derive every file hash from the actual tarball and reject a changed checkout', () => {
+  assert.equal(typeof pack.inspectPackedSources, 'function');
+  const root = mkdtempSync(join(tmpdir(), 'dsh-pack-source-audit-'));
+  const files = new Map([['package.json', Buffer.from(JSON.stringify({ name: 'dsh-grok-search', version: '0.4.0' }))],
+    ['empty.md', Buffer.alloc(0)], ['entry.mjs', Buffer.from('export const value = 1;\n')]]);
+  const blocks = [];
+  for (const [path, bytes] of files) {
+    writeFileSync(join(root, path), bytes);
+    const header = Buffer.alloc(512);
+    header.write('package/' + path); header.write('0000644\0', 100);
+    header.write('0000000\0', 108); header.write('0000000\0', 116);
+    header.write(bytes.length.toString(8).padStart(11, '0') + '\0', 124);
+    header.write('00000000000\0', 136); header.fill(32, 148, 156); header[156] = 48;
+    const checksum = header.reduce((sum, value) => sum + value, 0);
+    header.write(checksum.toString(8).padStart(6, '0') + '\0 ', 148);
+    blocks.push(header, bytes, Buffer.alloc((512 - bytes.length % 512) % 512));
+  }
+  const archive = gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
+  const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+  const metadata = { name: 'dsh-grok-search', version: '0.4.0', size: archive.length,
+    integrity: 'sha512-' + createHash('sha512').update(archive).digest('base64'),
+    files: [...files].map(([path, bytes]) => ({ path, size: bytes.length })) };
+  const expected = [...files].map(([file, bytes]) => ({ file, sha256: hash(bytes) }));
+  assert.deepEqual(pack.inspectPackedSources(archive, metadata, root), expected);
+  writeFileSync(join(root, 'entry.mjs'), 'export const value = 2;\n');
+  assert.throws(() => pack.inspectPackedSources(archive, metadata, root), /PACK_SOURCE_CHANGED/);
+  writeFileSync(join(root, 'entry.mjs'), files.get('entry.mjs'));
+  assert.throws(() => pack.inspectPackedSources(archive, { ...metadata, files: metadata.files.slice(1) }, root), /PACK_FILE_INVENTORY/);
+  assert.throws(() => pack.inspectPackedSources(archive, { ...metadata, integrity: 'sha512-' + 'A'.repeat(88) }, root), /PACK_ARCHIVE_INTEGRITY/);
+});
+
+test('packing checks generated client and current development instructions keep normal peer resolution', () => {
+  const script = read('scripts/pack-internal.mjs'), readme = read('README.md');
+  assert.match(script, /checkClientArtifact/);
+  assert.match(script, /inspectPackedSources/);
+  assert.match(readme, /npm ci --ignore-scripts --legacy-peer-deps=false/);
+  assert.doesNotMatch(readme, /npm ci --ignore-scripts --legacy-peer-deps(?:\s|$)/m);
+  assert.doesNotMatch(readme, /见源码仓库的 `docs\/开发与验证\.md`/);
+});
+
+test('README recording refuses empty or unknown selections instead of reporting a zero-scenario success', () => {
+  const source = read('scripts/readme-demos.mjs');
+  const start = source.indexOf('const usage = '), end = source.indexOf('\nconst sleep = ', start);
+  assert.ok(start > 0 && end > start);
+  const parse = args => vm.runInNewContext(source.slice(start, end), {
+    process: { argv: ['node', 'readme-demos.mjs', ...args] },
+    existsSync: () => true, spawnSync: () => ({ status: 0 }),
+  });
+  assert.doesNotThrow(() => parse(['--chrome', 'synthetic-browser', '--only', 'first-use,order', '--formats', 'apng,mp4']));
+  for (const args of [
+    ['--only', ''], ['--only', 'typo'], ['--only', 'order,typo'], ['--formats', ','],
+    ['--chrome', 'second-browser'], ['--unknown', 'value'],
+  ]) assert.throws(() => parse(['--chrome', 'synthetic-browser', ...args]));
 });

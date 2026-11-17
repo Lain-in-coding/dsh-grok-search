@@ -442,6 +442,68 @@ test('queue overflow and queued cancellation never dispatch an extra request', a
   f.reader.dispose();
 });
 
+for (const queuedExit of ['abort', 'timeout']) {
+  test(`queued cursor ${queuedExit} preserves active ownership and subsequent continuation`, async () => {
+    let now = 0, holdRoot = false, entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const f = fixture(0, { reader: { now: () => now, idleMs: 1000, budgetMs: 2000 },
+      fetch: async input => {
+        if (new URL(input).pathname.endsWith('/comments')) {
+          return response([{ id: 1000, body: 'long-answer-'.repeat(5000) }]);
+        }
+        if (holdRoot) { entered(); await gate; }
+        return response(root);
+      } });
+    const pending = [];
+    const observe = task => {
+      pending.push(task);
+      task.catch(() => {});
+      return task;
+    };
+    try {
+      const first = await f.reader.read({ url, scope, limitChars: 3000 });
+      assert.equal(first.hasMore, true);
+      holdRoot = true;
+      const running = observe(f.reader.read({ url, scope, cursor: first.nextCursor, limitChars: 3000 }));
+      await ready;
+      const stop = new AbortController(), reason = new Error('cancel only the queued cursor read');
+      const queued = observe(f.reader.read({ url, scope, cursor: first.nextCursor, signal: stop.signal,
+        ...(queuedExit === 'timeout' ? { timeoutMs: 40 } : {}) }));
+      assert.equal(f.reader.snapshot().queued, 1);
+      const rejected = assert.rejects(queued, queuedExit === 'abort'
+        ? failure => failure === reason : { code: 'GITHUB_TIMEOUT' });
+      if (queuedExit === 'abort') stop.abort(reason);
+      await rejected;
+      assert.equal(f.reader.snapshot().active, 1);
+      assert.equal(f.reader.snapshot().resources, 1, 'a waiter cannot drop the active cursor state');
+      assert.equal(f.requests.length, 3, 'the waiter never dispatched');
+
+      // A new read runs expiration while the first continuation still owns the item.
+      now = 1001;
+      holdRoot = false;
+      const replay = observe(f.reader.read({ url, scope, cursor: first.nextCursor, limitChars: 3000 }));
+      assert.equal(f.reader.snapshot().resources, 1, 'queued exit must not clear busy before idle expiry');
+      assert.equal(f.reader.snapshot().queued, 1);
+      release();
+      const second = await running;
+      assert.equal(second.segment, 2);
+      assert.equal(second.parts[0].start, first.parts.at(-1).end);
+      const repeated = await replay;
+      assert.equal(repeated.cacheHit, true);
+      assert.equal(repeated.content, second.content);
+      assert.equal(repeated.nextCursor, second.nextCursor);
+      const third = await f.reader.read({ url, scope, cursor: second.nextCursor, limitChars: 3000 });
+      assert.equal(third.segment, 3);
+      assert.equal(third.parts[0].start, second.parts.at(-1).end);
+    } finally {
+      release();
+      f.reader.dispose();
+      await Promise.allSettled(pending);
+    }
+  });
+}
+
 test('oversized pages reduce to individual comments without skipping their ids', async () => {
   const f = fixture(5, { reader: { responseBytes: 600 } });
   for (const comment of f.comments) comment.body = 'value'.repeat(30);

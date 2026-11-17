@@ -1,11 +1,14 @@
 async page => {
+  const checks = [], errors = [], external = [], observations = [];
+  const origin = new URL(page.url()).origin;
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('request', request => {
+    const url = request.url();
+    if (/^https?:/.test(url) && new URL(url).origin !== origin) external.push(url);
+  });
   await page.reload();
   await page.waitForFunction(() => Boolean(window.harness));
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
-  const checks = [], errors = [], external = [], observations = [];
-  const origin = await page.evaluate(() => location.origin);
-  page.on('pageerror', error => errors.push(String(error)));
-  page.on('request', request => { if (!request.url().startsWith(origin) && /^https?:/.test(request.url())) external.push(request.url()); });
   const check = (name, actual, expected = true) => {
     const passed = JSON.stringify(actual) === JSON.stringify(expected);
     checks.push({ name, passed, ...(passed ? {} : { actual, expected }) });
@@ -704,9 +707,16 @@ async page => {
     console.log(JSON.stringify({ runId: run.runId, passed: checks.length, failed: 0 }));
     return { runId: run.runId, passed: checks.length, failed: 0, errors, external, observations };
   } catch (error) {
-    await page.screenshot({ path: run.directory + '/failed.png', fullPage: true });
     const summary = { ...run, checks, errors, external, observations, failed: 1, error: String(error), fixtureOnly: true };
-    await page.evaluate(summary => fetch('/evidence', { method: 'POST', body: JSON.stringify(summary) }), summary);
+    try { await page.screenshot({ path: run.directory + '/failed.png', fullPage: true }); }
+    catch (failure) { summary.screenshotError = String(failure); }
+    try {
+      const recorded = await page.evaluate(async summary => {
+        const response = await fetch('/evidence', { method: 'POST', body: JSON.stringify(summary) });
+        return { ok: response.ok, text: await response.text() };
+      }, summary);
+      if (!recorded.ok) throw new Error(recorded.text);
+    } catch (failure) { console.error('Evidence write failed:', String(failure)); }
     throw error;
   }
 }

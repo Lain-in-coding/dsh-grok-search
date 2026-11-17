@@ -42,7 +42,8 @@ export function createSearchConfigHook({ required, resolveConfig = resolveRuntim
 }
 
 /** Bounded, provider-free checks of the known config/event/lifetime adapter contracts. */
-export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, selection = () => readSelection(ctx) } = {}) {
+export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, selection = () => readSelection(ctx),
+  protectExecution = () => () => {} } = {}) {
   const entry = webEntry(ctx), fiber = entry.fiber.ctx?.fiber ?? entry.fiber;
   const modern = 'effectiveConfig' in fiber;
   const current = effectiveConfig(fiber), raw = rawConfig(current);
@@ -113,21 +114,22 @@ export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, sel
         toolRemoved &&= scopedTools.get(probeName) === undefined;
       } catch { toolRemoved = false; }
     }
-    if (typeof child.web?.fetch === 'function') {
-      const sentinelFetch = () => { throw new Error('Compatibility checks never fetch.'); };
-      let observedGet = false;
-      const removeGet = child.on('internal/get', (caller, key, _error, next) => {
-        const service = next();
-        if (key !== 'web' || caller?.fiber?.uid !== child.fiber.uid || !service) return service;
-        observedGet = true;
-        return new Proxy(service, { get(target, property, receiver) {
-          return property === 'fetch' ? sentinelFetch : Reflect.get(target, property, receiver);
-        } });
-      }, { global: true, prepend: true });
-      try { checks.githubFetch = child.web.fetch === sentinelFetch && observedGet; }
-      catch { checks.githubFetch = false; }
-      finally { removeGet?.(); }
-    } else checks.githubFetch = false;
+    try {
+      if (typeof child.web?.fetch === 'function') {
+        const sentinelFetch = () => { throw new Error('Compatibility checks never fetch.'); };
+        let observedGet = false;
+        const removeGet = child.on('internal/get', (caller, key, _error, next) => {
+          const service = next();
+          if (key !== 'web' || caller?.fiber?.uid !== child.fiber.uid || !service) return service;
+          observedGet = true;
+          return new Proxy(service, { get(target, property, receiver) {
+            return property === 'fetch' ? sentinelFetch : Reflect.get(target, property, receiver);
+          } });
+        }, { global: true, prepend: true });
+        try { checks.githubFetch = child.web.fetch === sentinelFetch && observedGet; }
+        finally { removeGet?.(); }
+      } else checks.githubFetch = false;
+    } catch { checks.githubFetch = false; }
     activated = true;
   } });
   try { await scope; assertCurrent(); }
@@ -136,9 +138,12 @@ export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, sel
 
   // No tool body is called: the bootstrap's first guard must stop this sentinel.
   let dispatched = false, blocked = false;
+  const searchProbe = { ...execution, name: 'web_search' };
+  const unprotect = protectExecution(searchProbe);
   try {
-    await ctx.waterfall('tools/execute', { ...execution, name: 'web_search' }, () => { dispatched = true; });
+    await ctx.waterfall('tools/execute', searchProbe, () => { dispatched = true; });
   } catch (error) { blocked = /^COMPATIBILITY_/.test(error?.code ?? ''); }
+  finally { unprotect(); }
   checks.toolExecution = blocked && !dispatched;
   let resultSeen = false;
   try {
@@ -512,6 +517,33 @@ export function createProductReleaseController({ ctx, priorIntent, core, routeVe
   // resolves injected services, even while the root is awaiting this release.
   const routeContext = counterSnapshot ? { loader: ctx.loader } : ctx;
   return {
+    assertCurrent({ owner, receipt = null, counterBaseline = null, routeChanged = false }) {
+      try {
+        if (!receipt) {
+          if (!isDeepStrictEqual(createLease(routeContext), owner)) throw new Error('The release owner changed.');
+          return;
+        }
+        const acquisition = priorIntent?.acquisition ?? {};
+        const current = routeReceipt(routeContext, {
+          authorSearchProvider: acquisition.authorSearchProvider,
+          authorFetchProvider: acquisition.authorFetchProvider,
+          expectedInjectSha256: acquisition.authorInjectSha256,
+          routeChanged, counterBaseline,
+          ...(counterSnapshot ? { counterSnapshot: counterSnapshot() } : {}),
+        });
+        if (!current.atAuthor || !current.fetchPreserved || !current.dependenciesPreserved
+          || current.originalSearchDelta !== 0 || current.actualSearchProvider !== receipt.actualSearchProvider
+          || receipt.counterSource !== undefined && current.counterSource !== receipt.counterSource
+          || receipt.counterAdapterVersion !== undefined && current.counterAdapterVersion !== receipt.counterAdapterVersion
+          || receipt.hostEvidence && !isDeepStrictEqual(current.hostEvidence, receipt.hostEvidence)) {
+          throw new Error('The verified release route changed before publication.');
+        }
+      } catch (error) {
+        throw new ControlRecordError('CONTROL_RELEASE_INPUT_CHANGED',
+          'Release inputs changed before publication; retry with current evidence.',
+          { retriable: true, causeCode: error.code ?? null });
+      }
+    },
     invalidate({ reason }) {
       if (!stopping) {
         try { routeBefore = effectiveSearchProvider(webEntry(routeContext)); } catch { routeBefore = null; }

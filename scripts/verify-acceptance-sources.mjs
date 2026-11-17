@@ -153,6 +153,9 @@ finally {
   const summary = { runId: run.runId, scope: 'frozen-package-existing-isolated-credentials-limited-live-search',
     packageSha256: receipt.sha256, programVersion: active.version, attempts, network, results, fatalCode,
     configUnchanged, cleanupVerified, invariantsPassed: !fatalCode && configUnchanged && cleanupVerified,
+    allSearchesPassed: ['grok', 'exa'].every(provider => [1, 2].every(pass =>
+      results.some(row => row.provider === provider && row.pass === pass && row.status === 'passed')))
+      && !results.some(row => row.status === 'failed'),
     primaryGrokVerified: results.some(row => row.provider === 'grok' && row.status === 'passed'),
     exaSearchVerified: results.some(row => row.provider === 'exa' && row.status === 'passed'),
     rawResponsesSaved: false, keysSaved: false, quotaQueried: false, desktopConversationVerified: false, published: false };
@@ -160,5 +163,5 @@ finally {
   writeJson(join(run.directory, 'summary.json'), summary);
   console.log(JSON.stringify({ runId: run.runId, packageSha256: receipt.sha256, attempts,
     invariantsPassed: summary.invariantsPassed, primaryGrokVerified: summary.primaryGrokVerified, exaSearchVerified: summary.exaSearchVerified }));
-  if (!summary.invariantsPassed || !summary.primaryGrokVerified || !summary.exaSearchVerified) process.exitCode = 1;
+  if (!summary.invariantsPassed || !summary.allSearchesPassed) process.exitCode = 1;
 }

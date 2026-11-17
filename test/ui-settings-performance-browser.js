@@ -1,9 +1,9 @@
 async page => {
+  const results = [], errors = [];
+  page.on('pageerror', error => errors.push(String(error)));
   await page.reload();
   await page.waitForFunction(() => Boolean(window.harness));
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
-  const results = [], errors = [];
-  page.on('pageerror', error => errors.push(String(error)));
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('Performance.enable');
   await page.setViewportSize({ width: 1279, height: 821 });
@@ -54,7 +54,7 @@ async page => {
         probe.raf = requestAnimationFrame(frame);
         window.harness.mount();
       });
-      await page.waitForFunction(() => window.__uiPerf.ready !== null, { timeout: 30000 });
+      await page.waitForFunction(() => window.__uiPerf.ready !== null, undefined, { timeout: 30000 });
       await page.evaluate(() => new Promise(resolve => {
         const started = performance.now();
         const check = () => performance.now() - started >= 1500 ? resolve() : requestAnimationFrame(check);
@@ -145,7 +145,7 @@ async page => {
           return Math.hypot(point.x - (port.left + port.width / 2),
             point.y - (port.top + port.height / 2)) < 3;
         });
-      }, { timeout: 10000 });
+      }, undefined, { timeout: 10000 });
       alignment.push(zoom);
     }
     await page.evaluate(() => { document.body.style.zoom = ''; window.harness.unmount(); });
@@ -160,6 +160,7 @@ async page => {
       return response.json();
     }, result);
     console.log(JSON.stringify({ ...saved, ...result }));
+    if (!result.passed) throw new Error('Settings performance browser errors: ' + errors.join('; '));
   } finally {
     await page.evaluate(() => {
       document.body.style.zoom = '';

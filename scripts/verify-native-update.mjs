@@ -6,6 +6,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import semver from 'semver';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
 import { prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
@@ -127,9 +128,12 @@ const hostStages = nativeUpdateHostStages(runtime.app.version, baselineRuntime.a
 const packages = [oldArgument, nextArgument].map(readUpgradePackage);
 const oldVersion = packages[0].manifest.version, targetVersion = packages[1].manifest.version;
 assert.notEqual(oldVersion, targetVersion, 'Native update needs distinct package versions.');
-assert.ok(packages[0].manifest.engines?.dsh?.split(' || ').includes(baselineRuntime.app.version),
+const admits = (manifest, version) => typeof manifest.engines?.dsh === 'string'
+  && semver.validRange(manifest.engines.dsh) !== null
+  && semver.satisfies(version, manifest.engines.dsh, { includePrerelease: true });
+assert.ok(admits(packages[0].manifest, baselineRuntime.app.version),
   'Install the unchanged historical package on a compatible baseline host; no exemptions are granted.');
-assert.ok(packages[1].manifest.engines?.dsh?.split(' || ').includes(runtime.app.version),
+assert.ok(admits(packages[1].manifest, runtime.app.version),
   'The actual candidate must support the target host.');
 for (const row of packages[1].receipt.sourceHashes) assert.equal(sha256(join(project, row.file)), row.sha256);
 const verificationHashes = ['scripts/verify-native-update.mjs', 'scripts/verify-search-log-upgrade.mjs']

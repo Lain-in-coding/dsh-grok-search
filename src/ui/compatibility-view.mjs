@@ -78,8 +78,10 @@ function describe(report) {
 
 /** Shows only backend-confirmed compatibility states; transport errors stay invisible. */
 export function createCompatibilityView({ root, remote = null, parseReport, timers = globalThis,
-  reportTimeoutMs = 4000, recheckTimeoutMs = 12000 }) {
+  reportTimeoutMs = 4000, recheckTimeoutMs = 20000, refreshIntervalMs = 5000 }) {
   let disposed = false, generation = 0, pending = null, report = null, detailsOpen = false;
+  let refreshTimer = null;
+  const flights = new Set();
   const document = root.ownerDocument;
   root.innerHTML = `<style>${COMPATIBILITY_CSS}</style><section class="compatibility-banner" data-tone="warn" role="status" aria-live="polite" aria-atomic="true" hidden>
     <span class="compatibility-mark" aria-hidden="true">!</span>
@@ -101,6 +103,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
     const state = describe(report);
     banner.hidden = !state;
     root.dataset.compatibilityPhase = state?.kind || 'normal';
+    root.setAttribute('aria-busy', String(Boolean(pending)));
     if (!state) return;
     banner.dataset.tone = state.tone;
     title.textContent = state.title;
@@ -114,17 +117,36 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
     recheckButton.disabled = Boolean(pending);
     recheckButton.setAttribute('aria-busy', String(pending?.method === 'recheckCompatibility'));
     recheckButton.textContent = pending?.method === 'recheckCompatibility' ? '正在检查…' : '重新检查';
-    root.setAttribute('aria-busy', String(Boolean(pending)));
+  }
+  function scheduleRefresh() {
+    timers.clearTimeout(refreshTimer);
+    refreshTimer = null;
+    if (disposed || pending || document.visibilityState === 'hidden'
+      || typeof remote?.compatibilityReport !== 'function') return;
+    refreshTimer = timers.setTimeout(() => {
+      refreshTimer = null;
+      // A transport deadline cannot cancel the RPC. Do not accumulate hung background reads.
+      if ([...flights].some(item => item.generation === generation && item.method === 'compatibilityReport')) {
+        scheduleRefresh();
+      } else void refresh();
+    }, refreshIntervalMs);
   }
   function request(method, timeoutMs) {
     if (disposed || !remote || pending) return pending?.task ?? Promise.resolve();
+    if ([...flights].filter(item => item.generation === generation && item.method === method).length >= 2) {
+      return Promise.resolve();
+    }
     const mine = { method, generation, remote, timer: null, task: null };
+    timers.clearTimeout(refreshTimer);
+    refreshTimer = null;
+    flights.add(mine);
     pending = mine;
     render();
     mine.timer = timers.setTimeout(() => {
       if (disposed || pending !== mine) return;
       pending = null;
       render();
+      scheduleRefresh();
     }, timeoutMs);
     mine.task = Promise.resolve().then(() => {
       if (disposed || pending !== mine || mine.generation !== generation) return null;
@@ -133,15 +155,19 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
     }).then(value => {
       if (!value || disposed || pending !== mine || mine.generation !== generation) return;
       const parsed = parseReport(value);
+      if (JSON.stringify(describe(parsed)) !== JSON.stringify(describe(report))) detailsOpen = false;
       report = parsed;
-      detailsOpen = false;
     }).catch(() => {
       // RPC failure is not evidence that the host or plugin is incompatible.
     }).finally(() => {
       timers.clearTimeout(mine.timer);
-      if (disposed || pending !== mine) return;
-      pending = null;
-      render();
+      flights.delete(mine);
+      if (disposed || mine.generation !== generation) return;
+      if (pending === mine) {
+        pending = null;
+        render();
+      }
+      scheduleRefresh();
     });
     return mine.task;
   }
@@ -153,6 +179,8 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
     render();
   };
   const visible = () => {
+    timers.clearTimeout(refreshTimer);
+    refreshTimer = null;
     if (document.visibilityState !== 'hidden') void refresh();
   };
   detailsButton.addEventListener('click', toggleDetails);
@@ -163,9 +191,12 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
   return Object.freeze({
     refresh, recheck,
     bind(next) {
-      if (disposed || remote === next) return;
+      if (disposed) return;
+      if (remote === next) { void refresh(); return; }
       generation++;
       timers.clearTimeout(pending?.timer);
+      timers.clearTimeout(refreshTimer);
+      refreshTimer = null;
       pending = null;
       remote = next;
       report = null;
@@ -178,10 +209,12 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
       disposed = true;
       generation++;
       timers.clearTimeout(pending?.timer);
+      timers.clearTimeout(refreshTimer);
       detailsButton.removeEventListener('click', toggleDetails);
       recheckButton.removeEventListener('click', recheck);
       document.removeEventListener('visibilitychange', visible);
       pending = null;
+      flights.clear();
       report = null;
       root.replaceChildren();
     },

@@ -2329,9 +2329,11 @@ ${dots.map((d) => d.tip).join("\n")}
           undo: () => commitOrder(prev, ids)
         });
       } catch (error) {
+        if (disposed) return;
         S.order = prev.slice();
         flipTo(prev);
         await refresh({ force: true });
+        if (disposed) return;
         operationError(error);
       } finally {
         S.busy = false;
@@ -6369,9 +6371,12 @@ ${dots.map((d) => d.tip).join("\n")}
     parseReport,
     timers = globalThis,
     reportTimeoutMs = 4e3,
-    recheckTimeoutMs = 12e3
+    recheckTimeoutMs = 2e4,
+    refreshIntervalMs = 5e3
   }) {
     let disposed = false, generation = 0, pending = null, report = null, detailsOpen = false;
+    let refreshTimer = null;
+    const flights = /* @__PURE__ */ new Set();
     const document2 = root.ownerDocument;
     root.innerHTML = `<style>${COMPATIBILITY_CSS}</style><section class="compatibility-banner" data-tone="warn" role="status" aria-live="polite" aria-atomic="true" hidden>
     <span class="compatibility-mark" aria-hidden="true">!</span>
@@ -6393,6 +6398,7 @@ ${dots.map((d) => d.tip).join("\n")}
       const state = describe(report);
       banner.hidden = !state;
       root.dataset.compatibilityPhase = state?.kind || "normal";
+      root.setAttribute("aria-busy", String(Boolean(pending)));
       if (!state) return;
       banner.dataset.tone = state.tone;
       title.textContent = state.title;
@@ -6406,17 +6412,34 @@ ${dots.map((d) => d.tip).join("\n")}
       recheckButton.disabled = Boolean(pending);
       recheckButton.setAttribute("aria-busy", String(pending?.method === "recheckCompatibility"));
       recheckButton.textContent = pending?.method === "recheckCompatibility" ? "正在检查…" : "重新检查";
-      root.setAttribute("aria-busy", String(Boolean(pending)));
+    }
+    function scheduleRefresh() {
+      timers.clearTimeout(refreshTimer);
+      refreshTimer = null;
+      if (disposed || pending || document2.visibilityState === "hidden" || typeof remote?.compatibilityReport !== "function") return;
+      refreshTimer = timers.setTimeout(() => {
+        refreshTimer = null;
+        if ([...flights].some((item) => item.generation === generation && item.method === "compatibilityReport")) {
+          scheduleRefresh();
+        } else void refresh();
+      }, refreshIntervalMs);
     }
     function request(method, timeoutMs) {
       if (disposed || !remote || pending) return pending?.task ?? Promise.resolve();
+      if ([...flights].filter((item) => item.generation === generation && item.method === method).length >= 2) {
+        return Promise.resolve();
+      }
       const mine = { method, generation, remote, timer: null, task: null };
+      timers.clearTimeout(refreshTimer);
+      refreshTimer = null;
+      flights.add(mine);
       pending = mine;
       render();
       mine.timer = timers.setTimeout(() => {
         if (disposed || pending !== mine) return;
         pending = null;
         render();
+        scheduleRefresh();
       }, timeoutMs);
       mine.task = Promise.resolve().then(() => {
         if (disposed || pending !== mine || mine.generation !== generation) return null;
@@ -6425,14 +6448,18 @@ ${dots.map((d) => d.tip).join("\n")}
       }).then((value) => {
         if (!value || disposed || pending !== mine || mine.generation !== generation) return;
         const parsed = parseReport(value);
+        if (JSON.stringify(describe(parsed)) !== JSON.stringify(describe(report))) detailsOpen = false;
         report = parsed;
-        detailsOpen = false;
       }).catch(() => {
       }).finally(() => {
         timers.clearTimeout(mine.timer);
-        if (disposed || pending !== mine) return;
-        pending = null;
-        render();
+        flights.delete(mine);
+        if (disposed || mine.generation !== generation) return;
+        if (pending === mine) {
+          pending = null;
+          render();
+        }
+        scheduleRefresh();
       });
       return mine.task;
     }
@@ -6444,6 +6471,8 @@ ${dots.map((d) => d.tip).join("\n")}
       render();
     };
     const visible = () => {
+      timers.clearTimeout(refreshTimer);
+      refreshTimer = null;
       if (document2.visibilityState !== "hidden") void refresh();
     };
     detailsButton.addEventListener("click", toggleDetails);
@@ -6455,9 +6484,15 @@ ${dots.map((d) => d.tip).join("\n")}
       refresh,
       recheck,
       bind(next) {
-        if (disposed || remote === next) return;
+        if (disposed) return;
+        if (remote === next) {
+          void refresh();
+          return;
+        }
         generation++;
         timers.clearTimeout(pending?.timer);
+        timers.clearTimeout(refreshTimer);
+        refreshTimer = null;
         pending = null;
         remote = next;
         report = null;
@@ -6470,10 +6505,12 @@ ${dots.map((d) => d.tip).join("\n")}
         disposed = true;
         generation++;
         timers.clearTimeout(pending?.timer);
+        timers.clearTimeout(refreshTimer);
         detailsButton.removeEventListener("click", toggleDetails);
         recheckButton.removeEventListener("click", recheck);
         document2.removeEventListener("visibilitychange", visible);
         pending = null;
+        flights.clear();
         report = null;
         root.replaceChildren();
       }

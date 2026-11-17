@@ -177,6 +177,23 @@ test('a new authorization epoch can reveal while an obsolete same-field request 
   assert.equal(dialog.revealing.size, 0);
 });
 
+test('a reloaded dialog baseline invalidates pending key reveals and permits a fresh request', async () => {
+  const h = harness(), dialog = h.open();
+  dialog.configBaseline = { revision: 'before', quotaRevision: 'before' };
+  const obsolete = h.context.revealFor('key');
+  dialog.configBaseline = { revision: 'reloaded', quotaRevision: 'reloaded' };
+  const fresh = h.context.revealFor('key');
+  const count = h.requests.length;
+  h.requests[0].resolve({ value: 'old-baseline-key' });
+  if (h.requests[1]) h.requests[1].resolve({ value: 'reloaded-baseline-key' });
+  const results = await Promise.all([obsolete, fresh]);
+  assert.equal(count, 2);
+  assert.deepEqual(results, [false, true]);
+  assert.equal(dialog.base.key, 'reloaded-baseline-key');
+  assert.equal(dialog.draft.key, 'reloaded-baseline-key');
+  assert.equal(dialog.revealing.size, 0);
+});
+
 test('a failed current reveal remains visible and prevents a waiting save', async () => {
   const h = harness(), dialog = h.open();
   dialog.draft.model = 'after';
@@ -224,4 +241,214 @@ test('hub validation uses the runtime fallback and response character ranges', (
   for (const [key, values] of [['fallback', [-1, 11, 0.5]], ['maxChars', [99, 500001, 100.5]]]) {
     for (const value of values) assert.ok(h.context.vHub({ ...base, [key]: value }).err[key], `${key}=${value}`);
   }
+});
+
+test('destination drafts cannot cross a known config path or effective identity change with identical file bytes', async () => {
+  for (const changed of [{ path: '/config-b.toml' }, { quotaRevision: 'effective-b' }]) {
+    const baseline = { path: '/config-a.toml', revision: 'same-file-hash', quotaRevision: 'effective-a', exists: true,
+      fields: { grok_api_url: { value: 'https://api.example', source: 'file' } } };
+    const config = { ...structuredClone(baseline), ...changed }, requests = [];
+    const context = vm.createContext({
+      S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+      remote: { save: async request => {
+        requests.push(request);
+        return { config: { ...config, revision: 'saved' } };
+      } },
+    });
+    vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+    await assert.rejects(context.saveConfig({ grok_api_url: 'https://new-destination.example' }, baseline),
+      error => error.code === 'CONFIG_CONFLICT');
+    assert.equal(requests.length, 0);
+  }
+});
+
+test('an effective identity change still permits an unrelated nonsecret draft edit', async () => {
+  const baseline = { path: '/config.toml', revision: 'same-file-hash', quotaRevision: 'effective-a', exists: true,
+    fields: { grok_model: { value: 'before', source: 'file' } } };
+  const config = { ...structuredClone(baseline), quotaRevision: 'effective-b' }, requests = [];
+  const context = vm.createContext({
+    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    remote: { save: async request => { requests.push(request); return { config: { ...config, revision: 'saved' } }; } },
+  });
+  vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+  await context.saveConfig({ grok_model: 'after' }, baseline);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].updates.grok_model, 'after');
+});
+
+test('disposing during a preference conflict reread prevents a retry and late state replacement', async () => {
+  const requests = [], before = { revision: 'old', value: { grokEnabled: true } };
+  let resolveRead, reading;
+  const started = new Promise(resolve => { reading = resolve; });
+  const context = vm.createContext({
+    S: { prefs: before, prov: { grok: { enabled: true } } }, disposed: false,
+    remote: {
+      savePreferences: async request => {
+        requests.push(request);
+        if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'PREFERENCES_CONFLICT' });
+        return { revision: 'saved', value: request.value };
+      },
+      preferences: () => new Promise(resolve => { resolveRead = resolve; reading(); }),
+    },
+  });
+  vm.runInContext(section('async function savePreference(', 'function configUndo('), context);
+  const saving = context.savePreference('grok', false);
+  await started;
+  context.disposed = true;
+  resolveRead({ revision: 'new', value: { grokEnabled: true } });
+  await saving;
+  assert.equal(requests.length, 1);
+  assert.equal(context.S.prefs, before);
+});
+
+test('disposing during a config conflict reread prevents a new save request', async () => {
+  const config = { path: '/config.toml', revision: 'before', fields: { grok_model: { value: 'before' } } };
+  const requests = [];
+  let resolveRead, reading;
+  const started = new Promise(resolve => { reading = resolve; });
+  const context = vm.createContext({
+    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    refresh: () => new Promise(resolve => { resolveRead = resolve; reading(); }),
+    remote: { save: async request => {
+      requests.push(request);
+      if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'CONFIG_CONFLICT' });
+      return { config: { ...config, revision: 'saved' } };
+    } },
+  });
+  vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+  const saving = context.saveConfig({ grok_model: 'after' });
+  await started;
+  context.disposed = true;
+  resolveRead();
+  await saving;
+  assert.equal(requests.length, 1);
+});
+
+test('an earlier settings poll cannot replace a successful config save', async () => {
+  const before = { path: '/config.toml', revision: 'before', exists: true,
+    fields: { grok_model: { value: 'before' } } };
+  const saved = { ...before, revision: 'saved', fields: { grok_model: { value: 'after' } } };
+  let resolveRead;
+  const context = vm.createContext({
+    disposed: false, accessGeneration: 0, stateGeneration: 0, readTask: null, drag: null,
+    snapshotSignature: null, logView: null, S: { config: before }, clone: structuredClone,
+    CARD_FIELDS: {}, acceptSnapshot(snapshot) { context.S.config = snapshot.config; },
+    syncAll() {}, denyPrivateAccess() {},
+    remote: {
+      snapshot: () => new Promise(resolve => { resolveRead = resolve; }), preferences: async () => ({}),
+      save: async () => ({ config: saved }),
+    },
+  });
+  vm.runInContext([
+    section('async function refresh(', 'function schedulePoll('),
+    section('function updateConfig(', 'function operationError('),
+    section('async function saveConfig(', 'async function savePreference('),
+  ].join('\n'), context);
+  const reading = context.refresh();
+  await context.saveConfig({ grok_model: 'after' });
+  assert.equal(context.S.config.revision, 'saved');
+  resolveRead({ config: before });
+  await reading;
+  assert.equal(context.S.config.revision, 'saved');
+  assert.equal(context.S.config.fields.grok_model.value, 'after');
+});
+
+test('an earlier settings poll cannot replace a successful preference save', async () => {
+  const before = { revision: 'before', value: { grokEnabled: true } };
+  const saved = { revision: 'saved', value: { grokEnabled: false } };
+  let resolveRead;
+  const context = vm.createContext({
+    disposed: false, accessGeneration: 0, stateGeneration: 0, readTask: null, drag: null,
+    snapshotSignature: null, logView: null, S: { prefs: before, prov: { grok: { enabled: true } } },
+    acceptSnapshot(_snapshot, prefs) { context.S.prefs = prefs; },
+    syncAll() {}, denyPrivateAccess() {},
+    remote: {
+      snapshot: () => new Promise(resolve => { resolveRead = resolve; }), preferences: async () => before,
+      savePreferences: async () => saved,
+    },
+  });
+  vm.runInContext([
+    section('async function refresh(', 'function schedulePoll('),
+    section('async function savePreference(', 'function configUndo('),
+  ].join('\n'), context);
+  const reading = context.refresh();
+  await context.savePreference('grok', false);
+  assert.equal(context.S.prefs, saved);
+  resolveRead({});
+  await reading;
+  assert.equal(context.S.prefs, saved);
+});
+
+test('a stale settings poll still revokes private access without restoring old config', async () => {
+  for (const rejectRead of [false, true]) {
+    let finish;
+    const context = vm.createContext({
+      disposed: false, accessGeneration: 0, stateGeneration: 0, readTask: null, drag: null,
+      snapshotSignature: null, logView: null, S: { capabilities: { secretsAllowed: true } },
+      acceptSnapshot() { assert.fail('stale config must not be accepted'); }, syncAll() {},
+      denyPrivateAccess(error) {
+        assert.equal(error.code, 'SETTINGS_SECURE_CONNECTION_REQUIRED');
+        context.S.capabilities = { secretsAllowed: false };
+        return true;
+      },
+      remote: {
+        snapshot: () => new Promise((resolve, reject) => { finish = rejectRead ? reject : resolve; }),
+        preferences: async () => ({}),
+      },
+    });
+    vm.runInContext(section('async function refresh(', 'function schedulePoll('), context);
+    const reading = context.refresh();
+    context.stateGeneration++;
+    finish(rejectRead ? Object.assign(new Error('restricted'), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' })
+      : { capabilities: { secretsAllowed: false } });
+    await reading;
+    assert.equal(context.S.capabilities.secretsAllowed, false);
+  }
+});
+
+test('an explicit draft reload cannot restore an authorization revoked while it was pending', async () => {
+  const dialog = { kind: 'card', id: 'grok',
+    base: { key: 'private-draft', enabled: true }, draft: { key: 'private-draft', enabled: true } };
+  let resolveRead, accepted = 0;
+  const context = vm.createContext({
+    disposed: false, accessGeneration: 0, stateGeneration: 0, D: dialog,
+    S: { capabilities: { secretsAllowed: true }, prov: { grok: dialog.base } },
+    dialogBusy: () => false, clone: structuredClone, lockDialog() {}, $: () => null,
+    fieldReadOnly: () => false, configFields: () => ({}), normCard, isSet: () => true,
+    renderCard() {}, quotaView: null, operationError() {},
+    acceptSnapshot(snapshot) { accepted++; context.S.capabilities = snapshot.capabilities; context.S.config = snapshot.config; },
+    remote: {
+      snapshot: () => new Promise(resolve => { resolveRead = resolve; }),
+      preferences: async () => ({}),
+    },
+  });
+  vm.runInContext(section('async function reloadDialogDraft(', '// One retry for an unrelated external write.'), context);
+  const reloading = context.reloadDialogDraft();
+  context.accessGeneration++;
+  context.S.capabilities = { secretsAllowed: false };
+  resolveRead({ config: { fields: {} }, capabilities: { secretsAllowed: true } });
+  await reloading;
+  assert.equal(accepted, 0);
+  assert.equal(context.S.capabilities.secretsAllowed, false);
+  assert.equal(context.S.busy, false);
+  assert.equal(dialog.saving, false);
+});
+
+test('a late ordering save failure cannot roll back a disposed settings DOM', async () => {
+  let rejectSave;
+  const context = vm.createContext({
+    disposed: false, S: { busy: false, order: ['tavily', 'exa'] },
+    cancelTest() {}, syncAll() {}, pumpWires() {},
+    sourceChain: { plan: () => ({}) },
+    saveConfig: () => new Promise((_resolve, reject) => { rejectSave = reject; }),
+    flipTo() { assert.fail('Disposed DOM must not be reordered'); },
+    refresh() { assert.fail('Disposed controller must not refresh'); },
+    operationError() { assert.fail('Disposed controller must not display errors'); },
+  });
+  vm.runInContext(section('async function commitOrder(', "colList.addEventListener('keydown'"), context);
+  const saving = context.commitOrder(['exa', 'tavily'], ['tavily', 'exa']);
+  context.disposed = true;
+  rejectSave(Object.assign(new Error('busy'), { code: 'CONFIG_BUSY' }));
+  await saving;
+  assert.equal(context.S.busy, false);
 });

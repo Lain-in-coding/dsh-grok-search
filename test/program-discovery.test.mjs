@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -177,4 +181,53 @@ test('other executables cannot masquerade as Grok', async () => {
   // reaches --version on each OS and proves that its output is not Grok.
   const other = process.platform === 'win32' ? process.execPath : '/bin/echo';
   await assert.rejects(inspectGrokProgram(other), error => error.code === 'GROK_PROGRAM_IDENTITY_INVALID');
+});
+
+for (const closes of [true, false]) test(`a failed version-process kill waits for ${closes ? 'owned close' : 'the reap deadline'}`, async () => {
+  const root = setup(), binary = makeFile(join(root, nativeBinary));
+  writeFileSync(binary, Buffer.from(process.platform === 'win32' ? '4d5a0000'
+    : process.platform === 'linux' ? '7f454c46' : 'cffaedfe', 'hex'));
+  chmodSync(binary, 0o700);
+  const child = Object.assign(new EventEmitter(), { pid: 12345, stdout: new PassThrough(), stderr: new PassThrough() });
+  child.kill = () => {
+    child.emit('error', Object.assign(new Error('synthetic signal denial'), { code: 'EPERM' }));
+    return false;
+  };
+  const originalSpawn = childProcess.spawn;
+  const controller = new AbortController(), reason = new Error('cancel version inspection');
+  let settled = false, pending;
+  try {
+    childProcess.spawn = () => child;
+    syncBuiltinESMExports();
+    pending = inspectGrokProgram(binary, { signal: controller.signal }).catch(failure => failure)
+      .then(value => { settled = true; return value; });
+    child.emit('spawn');
+    controller.abort(reason);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, 'a kill error is not proof of process exit');
+    child.emit('error', new Error('another signal delivery failure'));
+    if (closes) {
+      child.emit('close', null, 'SIGKILL');
+      assert.equal(await pending, reason);
+    } else {
+      assert.equal((await pending).code, 'GROK_PROGRAM_REAP_FAILED');
+    }
+  } finally {
+    child.emit('close', null, 'SIGKILL');
+    await pending;
+    child.stdout.destroy(); child.stderr.destroy();
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
+});
+
+test('resolver preserves unreaped version-process failures even when the caller cancelled', async () => {
+  const root = setup(), binary = makeFile(join(root, nativeBinary));
+  const controller = new AbortController(), reason = new Error('cancelled');
+  const failure = Object.assign(new Error('unproven exit'), { code: 'GROK_PROGRAM_REAP_FAILED' });
+  await assert.rejects(resolveGrokProgram({
+    configured: binary, signal: controller.signal,
+    inspect: async () => { controller.abort(reason); throw failure; },
+    installer: { active() { assert.fail('must not inspect another process'); }, install() { assert.fail('must not install'); } },
+  }), caught => caught === failure);
 });

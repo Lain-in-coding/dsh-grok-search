@@ -335,7 +335,7 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
     const timer = setTimeout(() => controller.abort(error('TIMEOUT', 'GitHub 读取达到本次时间上限。')), duration);
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     active.set(controller, scopeId);
-    let release, item, authorized = false, cached = false, created = false;
+    let release, item, authorized = false, cached = false, created = false, ownsItem = false;
     try {
       expire();
       if (cursor !== undefined && cursor !== null) {
@@ -350,7 +350,7 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       guard(captured, combined);
       if (item && !states.has(item)) throw error('CURSOR_INVALID', '续读位置已失效，请重新读取。');
       if (item?.busy) throw error('BUSY', '同一讨论正在读取，请稍后续读。');
-      if (item) item.busy = true;
+      if (item) { item.busy = true; ownsItem = true; }
       // Even a replayed segment must recheck the actual target on GitHub.
       let { data: root } = await request(item?.rootApi ?? resource.api, captured, combined);
       if (!item && resource.kind === 'issue' && root?.pull_request) {
@@ -368,6 +368,7 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
           deliveredChars: 0, bytes: 0, segment: 0, cursor: null, replay: null, complete: false };
         states.add(item);
         created = true;
+        ownsItem = true;
         if (!append(item, [normalize(root, 'body', resource)])) throw error('CACHE_FULL', '正文超过可用内存上限，未丢弃或伪报读取完整。');
       } else {
         if (String(root.id) !== item.rootId) { drop(item); throw error('RESOURCE_CHANGED', '目标资源已替换，请重新读取。'); }
@@ -458,13 +459,13 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       if (!nextCursor && !item.replay) drop(item);
       return result;
     } catch (failure) {
-      if (item && (created || signal?.aborted || ['GITHUB_AUTH', 'GITHUB_FORBIDDEN', 'GITHUB_NOT_ACCESSIBLE', 'GITHUB_STATE_CHANGED',
+      if (ownsItem && item && (created || signal?.aborted || ['GITHUB_AUTH', 'GITHUB_FORBIDDEN', 'GITHUB_NOT_ACCESSIBLE', 'GITHUB_STATE_CHANGED',
         'GITHUB_SCOPE_CHANGED', 'GITHUB_DISABLED', 'GITHUB_RESOURCE_CHANGED'].includes(failure?.code))) drop(item);
       // No content is returned when target access could not be confirmed.
       if (!authorized && controller.signal.reason?.code === 'GITHUB_TIMEOUT') throw controller.signal.reason;
       throw failure;
     } finally {
-      if (item) { item.busy = false; item.usedAt = now(); }
+      if (ownsItem && item) { item.busy = false; item.usedAt = now(); }
       release?.(); clearTimeout(timer); active.delete(controller);
     }
   };

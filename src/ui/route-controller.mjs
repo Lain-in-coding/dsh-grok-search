@@ -1842,8 +1842,10 @@ async function commitOrder(ids, prev) {
       undo: () => commitOrder(prev, ids),
     });
   } catch (error) {
+    if (disposed) return;
     S.order = prev.slice(); flipTo(prev);
     await refresh({ force: true });
+    if (disposed) return;
     operationError(error);
   } finally { S.busy = false; if (!disposed) syncAll(true); }
 }

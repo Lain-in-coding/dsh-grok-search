@@ -3,7 +3,7 @@ import { ControlRecordError } from './core/control-intent-store.mjs';
 import { completeDeferredStartup, completeReleaseRecovery } from './core/startup-recovery.mjs';
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE,
-  PRODUCT_HOST_ID, createProductStore, createRecoveryObservation, readSelection, restoreAuthorRoute,
+  PRODUCT_HOST_ID, createProductStore, createRecoveryObservation, readSelection, restoreAuthorRoute, routeReceipt,
 } from './core/product-control.mjs';
 
 export const name = 'dsh-grok-search-recovery';
@@ -30,6 +30,15 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
     state.recordEnvelope = envelope;
     return envelope;
   };
+  const readCurrent = ({ observation, routeChanged, counterBaseline }) => ({
+    observation: createRecoveryObservation(ctx, loadId),
+    receipt: routeReceipt(ctx, {
+      authorSearchProvider: observation.authorSearchProvider,
+      authorFetchProvider: observation.authorFetchProvider,
+      expectedInjectSha256: observation.authorInjectSha256,
+      routeChanged, counterBaseline,
+    }),
+  });
   const run = reason => {
     if (task) return task;
     state.phase = 'checking';
@@ -77,6 +86,7 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
           observe: async () => createRecoveryObservation(ctx, loadId),
           restoreRoute: ({ priorIntent }) => restoreAuthorRoute(ctx, priorIntent),
           verifyRoute,
+          readCurrent,
           operationId: randomUUID(),
           signal: lifetime.signal,
         });
@@ -105,6 +115,7 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
         store,
         observe: async () => createRecoveryObservation(ctx, loadId),
         verifyRoute,
+        readCurrent,
         restoreRoute: ({ priorIntent }) => restoreAuthorRoute(ctx, priorIntent),
         operationId: randomUUID(),
         signal: lifetime.signal,

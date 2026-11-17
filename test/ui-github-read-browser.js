@@ -1,6 +1,7 @@
 async page => {
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
   const results = [], errors = [];
+  let failure, screenshotError;
   page.on('pageerror', error => errors.push(String(error)));
   const check = (name, value) => { results.push({ name, passed: !!value }); if (!value) throw new Error(name); };
   const ready = () => page.locator('#routeCard:not([data-s=load])').waitFor();
@@ -118,18 +119,26 @@ async page => {
     await page.evaluate(() => window.harness.theme('dark'));
     await page.screenshot({ path: run.directory + '/github-read-replay-dark.png' });
     check('no browser exceptions', errors.length === 0);
-  } catch (failure) {
-    if (!results.some(row => row.passed === false)) results.push({ name: 'browser-run', passed: false, error: String(failure) });
-    await page.screenshot({ path: run.directory + '/failure.png' });
+  } catch (error) {
+    failure = error;
+    if (!results.some(row => row.passed === false)) results.push({ name: 'browser-run', passed: false, error: String(error) });
+    try { await page.screenshot({ path: run.directory + '/failure.png' }); }
+    catch (error) { screenshotError = String(error); }
   }
   const summary = { runId: run.runId, scope: 'generated-client-synthetic-github-030',
-    passed: results.filter(row => row.passed).length, failed: results.filter(row => !row.passed).length, results, pageErrors: errors };
-  const saved = await page.evaluate(async summary => {
-    const response = await fetch('/evidence', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(summary) });
-    return { ok: response.ok, body: await response.text() };
-  }, summary);
-  if (!saved.ok) throw new Error(saved.body);
-  if (summary.failed) throw new Error(`GitHub browser regression failed (${summary.failed}); evidence: ${run.runId}`);
+    passed: results.filter(row => row.passed).length, failed: results.filter(row => !row.passed).length, results, pageErrors: errors,
+    ...(screenshotError ? { screenshotError } : {}) };
+  try {
+    const saved = await page.evaluate(async summary => {
+      const response = await fetch('/evidence', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(summary) });
+      return { ok: response.ok, body: await response.text() };
+    }, summary);
+    if (!saved.ok) throw new Error(saved.body);
+  } catch (error) {
+    if (!summary.failed) throw error;
+    console.error('Evidence write failed:', String(error));
+  }
+  if (summary.failed) throw failure;
   return { runId: run.runId, passed: summary.passed, failed: summary.failed, directory: run.directory,
     failures: results.filter(row => !row.passed) };
 }

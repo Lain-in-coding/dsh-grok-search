@@ -170,6 +170,89 @@ test('failed recheck preserves the confirmed backend state and can be retried wi
   h.view.dispose();
 });
 
+test('visible reports converge without rechecking and hidden pages stop polling', async () => {
+  let current = report({ phase: 'checking', coreReady: false }), reads = 0;
+  const remote = { compatibilityReport: async () => { reads++; return current; } };
+  const h = harness(remote);
+  await settle();
+  current = blocked();
+  h.tick(5000);
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'blocked');
+  h.get('[data-compatibility-details]').dispatch('click');
+  h.tick(5000);
+  await settle();
+  assert.equal(h.get('[data-compatibility-detail]').hidden, false, 'unchanged polls preserve expanded details');
+  h.document.visibilityState = 'hidden';
+  h.document.dispatch('visibilitychange');
+  const before = reads;
+  h.tick(5000);
+  await settle();
+  assert.equal(reads, before);
+  current = report();
+  h.document.visibilityState = 'visible';
+  h.document.dispatch('visibilitychange');
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  assert.equal(h.root.getAttribute('aria-busy'), 'false');
+  h.view.dispose();
+  assert.equal(h.schedules.size, 0);
+});
+
+test('recheck allows the backend deadline and a timeout is followed by a report read', async () => {
+  let current = blocked(), finish;
+  const h = harness({
+    compatibilityReport: async () => current,
+    recheckCompatibility: () => new Promise(resolve => { finish = resolve; }),
+  });
+  await settle();
+  void h.view.recheck();
+  await settle();
+  assert.ok([...h.schedules.values()].some(timer => timer.ms === 20000));
+  h.tick(20000);
+  current = report();
+  h.tick(5000);
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  finish(blocked());
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal', 'late recheck cannot restore stale failure');
+  h.view.dispose();
+});
+
+test('automatic polling does not accumulate unresolved transport calls', async () => {
+  let reads = 0, finish;
+  const h = harness({ compatibilityReport: () => {
+    reads++;
+    return new Promise(resolve => { finish = resolve; });
+  } });
+  await settle();
+  h.tick(4000);
+  for (let index = 0; index < 5; index++) { h.tick(5000); await settle(); }
+  assert.equal(reads, 1);
+  finish(report());
+  await settle();
+  h.tick(5000);
+  await settle();
+  assert.equal(reads, 2);
+  h.view.dispose();
+  finish(blocked());
+  await settle();
+  assert.equal(h.schedules.size, 0);
+});
+
+test('binding the same live remote refreshes its changed state without remounting', async () => {
+  let current = blocked();
+  const remote = { compatibilityReport: async () => current };
+  const h = harness(remote);
+  await settle();
+  current = report();
+  h.view.bind(remote);
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  h.view.dispose();
+});
+
 test('scoped styles preserve keyboard focus, reduced motion and narrow layout without route selectors', () => {
   const h = harness({ compatibilityReport: async () => optionalFailure() });
   const css = h.root.innerHTML.match(/<style>([\s\S]*?)<\/style>/)[1];

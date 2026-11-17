@@ -211,7 +211,8 @@ export function cliUpgradeEnvironment(root, node, pnpmEntry) {
   for (const path of [home, bin, join(root, 'tmp'), join(root, 'xdg-config'),
     join(root, 'xdg-cache'), join(root, 'xdg-data'), join(root, 'npm-cache')]) mkdirSync(path, { recursive: true, mode: 0o700 });
   const wrapper = join(bin, 'pnpm');
-  const source = `#!/bin/sh\nexec ${JSON.stringify(node)} ${JSON.stringify(pnpmEntry)} "$@"\n`;
+  const shellQuote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+  const source = `#!/bin/sh\nexec ${shellQuote(node)} ${shellQuote(pnpmEntry)} "$@"\n`;
   if (existsSync(wrapper)) {
     assert.ok(lstatSync(wrapper).isFile() && !lstatSync(wrapper).isSymbolicLink());
     assert.equal(readFileSync(wrapper, 'utf8'), source, 'An existing Node-specific pnpm wrapper cannot be replaced.');

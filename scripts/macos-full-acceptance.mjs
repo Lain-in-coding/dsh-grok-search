@@ -42,20 +42,19 @@ export const ACCEPTANCE_TOOL_FILES = Object.freeze([
 ]);
 export const PUBLIC_MACOS_SUPPORT_FILES = Object.freeze([
   ...ACCEPTANCE_WORKFLOW_FILES,
-  '.gitattributes', '.npmrc', 'package-lock.json', 'scripts/build-client.mjs', 'scripts/pack-internal.mjs',
-  'scripts/compatibility-watch.mjs', 'scripts/b3-cli-web.mjs', 'src/client.template.js',
-  'src/ui/route-form.mjs', 'src/ui/route-controller.mjs', 'src/ui/search-log-view.mjs',
-  'src/ui/quota-view.mjs', 'src/ui/tool-route-view.mjs', 'src/ui/compatibility-view.mjs',
-  'src/ui/shared-styles.mjs', 'src/ui/tool-route.css', 'src/ui/route.css', 'src/ui/search-log.css',
-  'src/ui/route-card.html', 'src/ui/route-layer.html',
-  'src/assets/logos/deepseek-harness-settings.png', 'src/assets/logos/deepseek-harness-chat-light.png',
-  'src/assets/logos/deepseek-harness-chat-dark.png', 'src/assets/logos/deepseek-whale.svg',
-  'src/assets/logos/grok.png', 'src/assets/logos/tavily-mark-black.svg',
-  'src/assets/logos/tavily-mark-offwhite.svg', 'src/assets/logos/exa-logomark-blue.svg',
-  'src/assets/logos/exa-logomark-white.svg', 'src/assets/logos/tinyfish-icon.svg',
-  'src/assets/logos/firecrawl-logo.svg', 'src/assets/logos/github-invertocat-black.svg',
-  'src/assets/logos/github-invertocat-white.svg',
+  '.gitattributes', '.npmrc', 'package-lock.json', 'scripts/pack-internal.mjs', 'scripts/compatibility-watch.mjs', 'scripts/b3-cli-web.mjs',
   'test/compatibility-evidence.test.mjs', 'test/macos-acceptance-cases.mjs', 'test/retained-session-cases.mjs',
+  // Pack verifies the generated client in memory; transport must include its exact source inputs.
+  'scripts/build-client.mjs', 'src/client.template.js',
+  'src/ui/route-form.mjs', 'src/ui/route-controller.mjs', 'src/ui/search-log-view.mjs',
+  'src/ui/quota-view.mjs', 'src/ui/tool-route-view.mjs', 'src/ui/compatibility-view.mjs', 'src/ui/shared-styles.mjs',
+  'src/ui/tool-route.css', 'src/ui/route.css', 'src/ui/search-log.css', 'src/ui/route-card.html', 'src/ui/route-layer.html',
+  'src/assets/logos/deepseek-harness-settings.png', 'src/assets/logos/deepseek-harness-chat-light.png',
+  'src/assets/logos/deepseek-harness-chat-dark.png', 'src/assets/logos/deepseek-whale.svg', 'src/assets/logos/grok.png',
+  'src/assets/logos/tavily-mark-black.svg', 'src/assets/logos/tavily-mark-offwhite.svg',
+  'src/assets/logos/exa-logomark-blue.svg', 'src/assets/logos/exa-logomark-white.svg',
+  'src/assets/logos/tinyfish-icon.svg', 'src/assets/logos/firecrawl-logo.svg',
+  'src/assets/logos/github-invertocat-black.svg', 'src/assets/logos/github-invertocat-white.svg',
 ]);
 
 export async function reviewedMacosSourceClosure(product, sourceRoot = project) {

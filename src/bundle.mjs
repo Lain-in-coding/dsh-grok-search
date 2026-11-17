@@ -48,12 +48,19 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   let store = null, coordinator = null, stateStore = null, appBoot = null;
   let destroyed = false, disabling = false, userStopped = false, releaseTask = null;
   let activeContext = null, lifecycleContext = null, lifecycleTask = null, generation = null;
+  let lifecycleAttempt = null;
   let pumping = null, repump = false, bootstrapReady = false, stateUnsubscribe = null;
   let assessedToken = null, assessedChecks = null, startTask = null, recheckTask = null;
   let failureCount = 0, retrySequence = 0;
   let retiring = null, githubPreferences = null;
   const rootFiber = ctx.fiber, rootEntry = rootFiber.entry;
   const stateListeners = new Set(), pending = new Set();
+  // Deny only the local sentinel while rechecking a live, still-authorized route.
+  const contractProbes = new WeakSet();
+  const protectExecution = execution => {
+    contractProbes.add(execution);
+    return () => contractProbes.delete(execution);
+  };
   const webExecutions = new AsyncLocalStorage();
   const backgroundError = error => ctx.logger?.warn?.('dsh-grok-search: %s',
     typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code) ? error.code : 'COMPATIBILITY_BLOCKED');
@@ -148,6 +155,7 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   };
   // Only post-install calls using the known host hooks are protected; pre-import host work is outside this boundary.
   ctx.on('tools/execute', (exec, next) => {
+    if (contractProbes.has(exec)) throw unavailable('COMPATIBILITY_CHECKING');
     let githubFetch = false;
     const search = exec?.name === 'web_search' && !searchReleased();
     if (search) assertSearchAllowed('web_search');
@@ -232,6 +240,8 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   };
   const compatibility = Object.freeze({
     ...coordinator, assertSearchAllowed,
+    report: () => { refreshOptionalStatus(generation); return coordinator.report(); },
+    snapshot: () => { refreshOptionalStatus(generation); return coordinator.report(); },
     recheck: () => recheckCapabilities(),
     async confirm(request) {
       if (destroyed || !stateStore) throw unavailable('COMPATIBILITY_IDENTITY_UNKNOWN');
@@ -366,18 +376,148 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     })();
     return value.disposal;
   }
-  async function optional(key, token, work) {
-    try {
-      const module = await load(key);
-      if (!current(token)) return;
-      await work(module);
-    } catch (error) {
-      const name = key === 'github' ? 'github' : 'settings';
-      const confirmedFailure = key === 'settings' || key === 'github' && readGithubIntent() === true;
-      if (current(token)) coordinator.setOptional(key === 'github' ? 'github' : 'settings',
-        { token, available: false, code: error?.code ?? `COMPATIBILITY_${name.toUpperCase()}_UNAVAILABLE`, confirmedFailure });
-      backgroundError(error);
+  function refreshOptionalStatus(value, name = null) {
+    if (!value || generation !== value || !current(value.token) || value.suspended) return;
+    for (const key of name ? [name] : ['settings', 'github']) {
+      const attempt = value.optionals[key];
+      if (!attempt || attempt.pending) continue;
+      const intent = key === 'github' ? readGithubIntent() : true;
+      let available = false;
+      try {
+        if (key === 'settings') {
+          available = attempt.ready && attempt.fiber?.uid !== null
+            && value.ctx.get('grokSearchSettings') === attempt.instance
+            && typeof attempt.instance?.snapshot === 'function';
+        } else {
+          const status = value.github?.snapshot?.();
+          available = attempt.ready && attempt.fiber?.uid !== null && value.github === attempt.instance
+            && value.ctx.get('grokSearchGithub') === attempt.instance
+            && (intent === false || intent === true && value.githubCapabilities?.().githubRead === true
+              && status?.enabled === true && status.registered === true && !status.error);
+        }
+      } catch { /* A failed snapshot cannot establish optional readiness. */ }
+      coordinator.setOptional(key, { token: value.token, available,
+        code: available ? undefined : intent === null ? 'COMPATIBILITY_OPTIONAL_PENDING'
+          : `COMPATIBILITY_${key.toUpperCase()}_UNAVAILABLE`,
+        confirmedFailure: !available && intent === true });
     }
+  }
+  function startOptional(value, key) {
+    if (!current(value.token) || generation !== value || value.suspended) return Promise.resolve();
+    const previous = value.optionals[key];
+    // A failed cleanup is not permission to mount another provider beside it.
+    if (previous?.pending || previous?.cleanupFailed) return previous.task;
+    let retained = false;
+    try {
+      retained = previous?.ready && previous.fiber?.uid !== null
+        && value.ctx.get(key === 'settings' ? 'grokSearchSettings' : 'grokSearchGithub') === previous.instance;
+    } catch { /* Missing service access requires a fresh scoped attempt. */ }
+    if (retained) {
+      if (key === 'github') {
+        try { value.github?.sync?.(); } catch (error) { backgroundError(error); }
+      }
+      refreshOptionalStatus(value, key);
+      return Promise.resolve();
+    }
+    const attempt = { pending: true, ready: false, cleanupFailed: false, fiber: null, instance: null, task: null };
+    value.optionals[key] = attempt;
+    const assertAttempt = () => {
+      assertCurrent(value.token);
+      if (generation !== value || value.suspended || value.optionals[key] !== attempt) {
+        throw unavailable('COMPATIBILITY_STOPPED');
+      }
+    };
+    attempt.task = track(Promise.resolve().then(async () => {
+      try {
+        if (previous?.fiber) {
+          if (value.github === previous.instance) value.github = null;
+          try { await previous.fiber.dispose(); }
+          catch (error) { attempt.cleanupFailed = true; throw error; }
+          assertAttempt();
+        }
+        const module = await load(key);
+        assertAttempt();
+        if (key === 'settings') {
+          attempt.fiber = value.ctx.plugin(module);
+          await attempt.fiber;
+          assertAttempt();
+          attempt.instance = value.ctx.get('grokSearchSettings');
+          if (typeof attempt.instance?.snapshot !== 'function') throw unavailable('COMPATIBILITY_SETTINGS_UNAVAILABLE');
+        } else {
+          const privatePreferences = preferences();
+          const { createSharedConfigStore, resolveSharedConfigPath } = await load('sharedConfig');
+          assertAttempt();
+          attempt.fiber = value.ctx.plugin({ name: 'dsh-grok-search-github-runtime', apply(scope) {
+            assertAttempt();
+            const integration = module.createGithubIntegration({ ctx: scope, searchLog, callRoutes,
+              WebError: value.WebError, getCapabilities: value.githubCapabilities,
+              getState: () => {
+                const enabled = required() && privatePreferences.snapshot().value.githubReadEnabled === true;
+                if (!enabled) return { enabled: false, token: '' };
+                if (!current(value.token)) return { enabled: true, token: '', identity: 'compatibility-blocked' };
+                const path = scope.get('grokSearchProgram')?.snapshot?.()?.configPath || resolveSharedConfigPath({});
+                const effective = createSharedConfigStore({ path }).readEffective();
+                return { enabled, token: effective.github_token.value, identity: path };
+              } });
+            if (typeof integration?.snapshot !== 'function' || typeof integration.sync !== 'function') {
+              throw unavailable('COMPATIBILITY_GITHUB_UNAVAILABLE');
+            }
+            attempt.instance = Object.freeze({ ...integration, sync() {
+              try { return integration.sync(); }
+              finally { refreshOptionalStatus(value, 'github'); }
+            } });
+            value.github = attempt.instance;
+            scope.provide('grokSearchGithub', attempt.instance);
+          } });
+          await attempt.fiber;
+          assertAttempt();
+        }
+        attempt.ready = true;
+      } catch (error) {
+        try { await attempt.fiber?.dispose(); }
+        catch (cleanupError) { attempt.cleanupFailed = true; backgroundError(cleanupError); }
+        if (value.github === attempt.instance) value.github = null;
+        backgroundError(error);
+      } finally {
+        attempt.pending = false;
+        refreshOptionalStatus(value, key);
+      }
+    }));
+    return attempt.task;
+  }
+  function startLifecycle(parent) {
+    // One disposable scope owns both verifier and recovery partial initialization.
+    const attempt = { parent, fiber: null, cleanupFailed: false, task: null };
+    lifecycleAttempt = attempt;
+    const assertAttempt = () => {
+      if (destroyed || lifecycleContext !== parent || lifecycleAttempt !== attempt) {
+        throw unavailable('COMPATIBILITY_STOPPED');
+      }
+    };
+    attempt.task = track(Promise.resolve().then(async () => {
+      try {
+        const [verifier, recovery] = await Promise.all(['routeVerifier', 'recovery'].map(load));
+        assertAttempt();
+        attempt.fiber = parent.plugin({ name: 'dsh-grok-search-lifecycle', async apply(scope) {
+          assertAttempt();
+          await scope.plugin(verifier, { counter });
+          assertAttempt();
+          await scope.plugin({ ...recovery, apply: child => recovery.apply(child, { store }) });
+          assertAttempt();
+          await scope.get('grokSearchRecovery')?.retry();
+          assertAttempt();
+        } });
+        await attempt.fiber;
+        assertAttempt();
+      } catch (error) {
+        try { await attempt.fiber?.dispose(); }
+        catch (cleanupError) { attempt.cleanupFailed = true; throw cleanupError; }
+        throw error;
+      }
+    }));
+    lifecycleTask = attempt.task;
+    attempt.task.then(schedule, error => { backgroundError(error); schedule(); });
+    return attempt.task;
   }
   async function initialize(parent, token, contractChecks) {
     const [program, core, control, host] = await Promise.all(
@@ -394,7 +534,18 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     });
     const value = { token, parent, ctx: null, fiber: null, core: null, program: null, owner: null,
       budgets: null, github: null, githubCapabilities: null, contractChecks, leaseArmed: false,
+      optionals: {}, WebError: host.WebError,
       abort: new AbortController(), suspended: false };
+    value.githubCapabilities = () => {
+      const available = current(token) && coordinator.report().coreReady;
+      const checks = value.contractChecks;
+      return {
+        githubRead: available && checks.toolExecution === true && checks.toolResult === true
+          && checks.toolGuards === true && checks.githubRead === true,
+        githubFetch: available && checks.toolExecution === true && checks.toolResult === true
+          && checks.toolGuards === true && checks.githubRead === true && checks.githubFetch === true,
+      };
+    };
     generation = value;
     const fiber = parent.plugin({ name: 'dsh-grok-search-runtime', apply(child) {
       value.ctx = child;
@@ -435,61 +586,34 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     coordinator.setCapabilities({ token, stage: 'budget', confirmed: true });
     coordinator.markReady(token);
     store.startMaintenance();
-    track(optional('settings', token, async settings => {
-      await child.plugin(settings);
-      if (current(token)) coordinator.setOptional('settings', { token, available: true });
-    }));
-    track(optional('github', token, async github => {
-      const privatePreferences = preferences();
-      const { createSharedConfigStore, resolveSharedConfigPath } = await load('sharedConfig');
-      assertCurrent(token);
-      value.githubCapabilities = () => {
-        const available = current(token) && coordinator.report().coreReady;
-        const checks = value.contractChecks;
-        return {
-          githubRead: available && checks.toolExecution === true && checks.toolResult === true
-            && checks.toolGuards === true && checks.githubRead === true,
-          githubFetch: available && checks.toolExecution === true && checks.toolResult === true
-            && checks.toolGuards === true && checks.githubRead === true && checks.githubFetch === true,
-        };
-      };
-      value.github = github.createGithubIntegration({ ctx: child, searchLog, callRoutes, WebError: host.WebError,
-        getCapabilities: value.githubCapabilities,
-        getState: () => {
-          const enabled = required() && privatePreferences.snapshot().value.githubReadEnabled === true;
-          if (!enabled) return { enabled: false, token: '' };
-          if (!current(token)) return { enabled: true, token: '', identity: 'compatibility-blocked' };
-          const path = child.get('grokSearchProgram')?.snapshot?.()?.configPath || resolveSharedConfigPath({});
-          const effective = createSharedConfigStore({ path }).readEffective();
-          return { enabled, token: effective.github_token.value, identity: path };
-        } });
-      child.provide('grokSearchGithub', value.github);
-      const intent = privatePreferences.snapshot().value.githubReadEnabled === true;
-      const available = !intent || contractChecks.githubRead === true && contractChecks.toolExecution === true
-        && contractChecks.toolResult === true && contractChecks.toolGuards === true
-        && !value.github.snapshot?.().error;
-      coordinator.setOptional('github', { token, available,
-        code: intent && !available ? 'COMPATIBILITY_GITHUB_UNAVAILABLE' : undefined,
-        confirmedFailure: intent && !available });
-    }));
+    startOptional(value, 'settings');
+    startOptional(value, 'github');
     assertCurrent(token);
   }
   function schedule() {
     if (destroyed || userStopped) return;
     if (pumping) { repump = true; return; }
     pumping = track(Promise.resolve().then(async () => {
-      if (!bootstrapReady || !activeContext || !lifecycleTask || retiring || coordinator.report().phase === 'blocked'
+      if (!bootstrapReady || !activeContext || !lifecycleContext || retiring || coordinator.report().phase === 'blocked'
         || generation && coordinator.isCurrent(generation.token)) return;
       const token = coordinator.captureEpoch(), parent = activeContext;
       try {
-        await lifecycleTask;
+        const lifecycle = lifecycleTask ?? startLifecycle(lifecycleContext);
+        try { await lifecycle; }
+        catch (error) {
+          if (lifecycleTask === lifecycle && !lifecycleAttempt?.cleanupFailed) {
+            lifecycleTask = null;
+            lifecycleAttempt = null;
+          }
+          throw error;
+        }
         assertCurrent(token);
         if (assessedToken !== token) {
           const shape = assessRuntimeCapabilities({ ctx: parent, token });
           if (shape.transient) throw Object.assign(new Error(shape.code), { code: shape.code });
           if (shape.shape === 'pending') { coordinator.setCapabilities(shape); return; }
           if (shape.shape === 'failed') { coordinator.setCapabilities(shape); return; }
-          const contractChecks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token) });
+          const contractChecks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token), protectExecution });
           assertCurrent(token);
           checkToolBudgetContracts(parent, configuration.budgetMs ?? 120_000);
           const assessed = assessRuntimeCapabilities({ ctx: parent, token, contractChecks });
@@ -561,24 +685,16 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
     try {
       const shape = assessRuntimeCapabilities({ ctx: parent, token });
       if (shape.transient || shape.shape !== 'passed') return coordinator.report();
-      const checks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token) });
+      const checks = await checkContracts(parent, { assertCurrent: () => assertCurrent(token), protectExecution });
       assertCurrent(token);
       const assessed = assessRuntimeCapabilities({ ctx: parent, token, contractChecks: checks });
       if (assessed.transient || assessed.shape !== 'passed' || assessed.contract !== 'passed') return coordinator.report();
       checkToolBudgetContracts(parent, configuration.budgetMs ?? 120_000);
       if (generation?.token === token) {
         generation.contractChecks = checks;
-        generation.github?.sync?.();
-        const intent = readGithubIntent();
-        const github = generation.github?.snapshot?.();
-        const githubUnavailable = intent === true && (checks.githubRead !== true
-          || checks.toolExecution !== true || checks.toolResult !== true || checks.toolGuards !== true
-          || Boolean(github?.error));
-        coordinator.setOptional('github', {
-          token, available: intent !== true || !githubUnavailable,
-          code: githubUnavailable ? 'COMPATIBILITY_GITHUB_UNAVAILABLE' : undefined,
-          confirmedFailure: githubUnavailable,
-        });
+        const value = generation;
+        await Promise.all(['settings', 'github'].map(key => startOptional(value, key)));
+        refreshOptionalStatus(value);
       }
     } catch (error) {
       backgroundError(error);
@@ -612,20 +728,10 @@ export function apply(ctx, configuration, { load = loadModule, checkContracts = 
   }
   ctx.inject(['web'], child => {
     lifecycleContext = child;
-    lifecycleTask = track(Promise.resolve().then(async () => {
-      const [verifier, recovery] = await Promise.all(['routeVerifier', 'recovery'].map(load));
-      if (destroyed || lifecycleContext !== child) return;
-      await child.plugin(verifier, { counter });
-      if (destroyed || lifecycleContext !== child) return;
-      await child.plugin({ ...recovery, apply: scope => recovery.apply(scope, { store }) });
-      if (destroyed || lifecycleContext !== child) return;
-      await child.get('grokSearchRecovery')?.retry();
-    }));
-    lifecycleTask.then(schedule, error => {
-      if (!destroyed && lifecycleContext === child) coordinator.block(error?.code);
-      backgroundError(error);
+    startLifecycle(child);
+    child.effect(() => () => {
+      if (lifecycleContext === child) { lifecycleContext = null; lifecycleTask = null; lifecycleAttempt = null; }
     });
-    child.effect(() => () => { if (lifecycleContext === child) { lifecycleContext = null; lifecycleTask = null; } });
   });
   ctx.inject(['web', 'tools'], child => {
     activeContext = child;

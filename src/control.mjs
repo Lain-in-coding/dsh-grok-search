@@ -49,6 +49,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
   // An explicit stop wins over any later or still-pending host route update;
   // release drain waits for pending takeovers before restoring the author.
   let stopRequested = false;
+  let completedReleaseCleanup = false;
   const takeovers = new Set();
   ctx.inject(['grokSearchRouteVerifier'], () => { routeVerifier = ctx.get('grokSearchRouteVerifier'); });
   let releaseOperationId = null;
@@ -70,7 +71,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     state.phase = 'disposed';
   });
   const snapshot = () => {
-    if (!state.releaseOutcome) {
+    if (!state.releaseOutcome && !completedReleaseCleanup) {
       try {
         const current = store.read();
         const completion = current?.intent?.releaseCompletion;
@@ -242,13 +243,24 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       if (!before) throw new ControlRecordError('CONTROL_RELEASE_RECORD_MISSING',
         'No control record exists to release.');
       if (before.intent.policy === 'released' && before.intent.releaseCompletion) {
-        state.phase = 'released';
-        state.releaseOutcome = { kind: 'already-released', recordCommitted: false, completionCommitted: true,
-          routeChanged: before.intent.releaseCompletion.routeChanged === true,
-          routeVerified: before.intent.releaseCompletion.routeVerified === true };
+        completedReleaseCleanup = true;
+        controller = createProductReleaseController({ ctx, priorIntent: before.intent.priorIntent, core,
+          ...(unloading && counterSnapshot ? { counterSnapshot } : {}),
+          pendingTakeovers: async () => { await Promise.allSettled([...takeovers]); await runtimeStop; },
+          onState: phase => { state.phase = phase; } });
+        controller.invalidate({ reason: reason || 'explicit-user-release' });
         state.error = null;
-        setRecord(before);
-        return Promise.resolve(structuredClone(state.releaseOutcome));
+        releaseTask = (async () => {
+          await controller.drain();
+          completedReleaseCleanup = false;
+          state.phase = 'released';
+          state.releaseOutcome = { kind: 'already-released', recordCommitted: false, completionCommitted: true,
+            routeChanged: before.intent.releaseCompletion.routeChanged === true,
+            routeVerified: before.intent.releaseCompletion.routeVerified === true };
+          setRecord(before);
+          return structuredClone(state.releaseOutcome);
+        })().catch(error => { stopFailure(error); throw error; }).finally(() => { releaseTask = null; });
+        return releaseTask;
       }
       releaseOperationId ??= before.intent.release?.operationId ?? randomUUID();
       state.releaseOperationId = releaseOperationId;
@@ -287,7 +299,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     try {
       const current = store.readView();
       const completion = current?.intent?.releaseCompletion;
-      if (completion && current.intent.policy === 'released' && current.revision >= state.revision) {
+      if (!completedReleaseCleanup && completion && current.intent.policy === 'released' && current.revision >= state.revision) {
         presentation = { ...state, phase: disposed ? state.phase : 'released',
           record: current.intent, revision: current.revision,
           releaseOperationId: current.intent.release?.operationId ?? null,

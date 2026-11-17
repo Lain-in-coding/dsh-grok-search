@@ -14,7 +14,7 @@ import * as desktopPreparation from '../scripts/deferred-release-desktop-prepare
 import { CANDIDATE_VERSIONS } from '../scripts/lib/candidate-runtime.mjs';
 import { desktopCandidates, sha256, verifyHostAsset } from '../scripts/lib/compatibility-evidence.mjs';
 import { captureDesktopSearch, captureDesktopSeam, waitForDesktopRecovery } from '../fixtures/deferred-release/desktop-fixture.mjs';
-import { requestDesktopShutdown } from '../scripts/lib/renderer-cdp.mjs';
+import { connectRenderer, requestDesktopShutdown } from '../scripts/lib/renderer-cdp.mjs';
 import { desktopAcceptancePaths, desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from '../scripts/lib/desktop-acceptance-environment.mjs';
 import { commandResult } from '../scripts/lib/internal-candidate-utils.mjs';
 import { build } from 'esbuild';
@@ -25,6 +25,7 @@ import { readUpgradePackage, retainUpgradeCache, searchLogUpgradeStages } from '
 import * as upgradeVerifier from '../scripts/verify-search-log-upgrade.mjs';
 import { adaptRetainedSessionRpc, canonicalRetainedSessionCut, createRetainedSessionReader } from '../scripts/lib/retained-session.mjs';
 import './retained-session-cases.mjs';
+import './remaining-scripts-audit-cases.mjs';
 import * as cliUpgradeVerifier from '../scripts/compatibility-cli-upgrade.mjs';
 import { finishNativeUpdate, nativeUpdateMetadata, nativeUpdateHostStages, validateNativeUpdateOutcome } from '../scripts/verify-native-update.mjs';
 
@@ -1635,6 +1636,37 @@ test('Desktop 退出命令必须等待实际退出，不能发送后立刻关掉
   assert.equal(socket.closed, true, 'socket is released only after actual exit');
 });
 
+for (const failure of ['socket-error', 'open-timeout', 'runtime-enable']) {
+  test(`renderer initialization closes its owned socket after ${failure}`, async t => {
+    let socket;
+    const originalWebSocket = globalThis.WebSocket;
+    class FailingSocket extends EventTarget {
+      closed = false;
+      constructor() {
+        super(); socket = this;
+        if (failure !== 'open-timeout') queueMicrotask(() =>
+          this.dispatchEvent(new Event(failure === 'socket-error' ? 'error' : 'open')));
+      }
+      send(text) {
+        const { id, method } = JSON.parse(text);
+        assert.equal(method, 'Runtime.enable');
+        queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({ id, error: { message: 'synthetic Runtime.enable failure' } }),
+        })));
+      }
+      close() { this.closed = true; }
+    }
+    t.mock.method(globalThis, 'fetch', async () => ({
+      ok: true, json: async () => [{ type: 'page', webSocketDebuggerUrl: 'ws://127.0.0.1:12345/page/test' }],
+    }));
+    globalThis.WebSocket = FailingSocket;
+    try {
+      await assert.rejects(connectRenderer(12345, { timeoutMs: 30, requestTimeoutMs: 30 }));
+      assert.equal(socket.closed, true, 'failed setup cannot leave an unreachable live socket');
+    } finally { socket?.close(); globalThis.WebSocket = originalWebSocket; }
+  });
+}
+
 function acceptanceFixture() {
   const root = mkdtempSync(join(temporary, 'dsh-deferred-desktop-environment-'));
   const paths = desktopAcceptancePaths(root);
@@ -1718,6 +1750,92 @@ test('Windows桌面验收能按名称找到PowerShell且系统桌面解析到现
   assert.equal(result.exitCode, 0, result.spawnError ?? result.stderr);
   assert.equal(result.rawStdout.trim(), paths.desktop);
   assert.equal(env.PATH.includes(join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0')), true);
+});
+
+test('B3 legacy temporary mode rejects unsafe run identifiers before preparing outputs', async () => {
+  const { parseCliWebArguments } = await import('../scripts/b3-cli-web.mjs');
+  const args = ['--worker', '--dsh-cli', join(sandbox, 'bin.js'), '--dsh-version', 'rc2',
+    '--product-package', join(sandbox, 'product.tgz'), '--grok-linux-archive', join(sandbox, 'grok.tgz'),
+    '--browser-executable', '/synthetic/browser', '--pnpm-entry', join(sandbox, 'pnpm.cjs'),
+    '--pnpm-store', join(sandbox, 'store'), '--pnpm-cache', join(sandbox, 'cache')];
+  for (const runId of ['../../outside', '../previous', 'path/nested', 'path\\nested', '/absolute', '', 'line\nbreak']) {
+    assert.throws(() => parseCliWebArguments([...args, '--run-id', runId]), /run-id/);
+  }
+  assert.equal(parseCliWebArguments([...args, '--run-id', 'bounded-040']).runId, 'bounded-040');
+});
+
+test('B3 artifact preparation rejects historical receipts and links but permits an empty bootstrap handoff', async () => {
+  const { lstatSync } = await import('node:fs');
+  const source = readFileSync(new URL('../scripts/b3-cli-web.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('  mkdirSync(ARTIFACT_ROOT,');
+  const end = source.indexOf('  if (options.runRoot !== undefined || !existsSync(runRoot))', start);
+  assert.ok(start > 0 && end > start);
+  const prepare = new Function('ARTIFACT_ROOT', 'artifactDir', 'options', 'mkdirSync', 'existsSync',
+    'statSync', 'lstatSync', 'readdirSync', source.slice(start, end));
+  const root = mkdtempSync(join(sandbox, 'b3-artifact-boundary-')), previous = join(root, 'previous');
+  mkdirSync(previous);
+  const run = (directory, options = {}) => prepare(root, directory, options, mkdirSync, existsSync,
+    () => ({ isDirectory: () => true }), lstatSync, path => {
+      if (path === previous) return ['summary.json'];
+      return [];
+    });
+  writeFileSync(join(previous, 'summary.json'), '{"retained":true}\n', { flag: 'wx' });
+  assert.throws(() => run(previous), /Artifact directory must be new/);
+  assert.throws(() => run(previous, { bootstrapFile: 'explicit-bootstrap.json' }), /Artifact directory must be new/);
+  assert.equal(readFileSync(join(previous, 'summary.json'), 'utf8'), '{"retained":true}\n');
+  const empty = join(root, 'empty');
+  mkdirSync(empty);
+  assert.throws(() => run(empty), /Artifact directory must be new/);
+  assert.doesNotThrow(() => run(empty, { bootstrapFile: 'explicit-bootstrap.json' }));
+  const linked = join(root, 'linked');
+  symlinkSync(empty, linked, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => run(linked, { bootstrapFile: 'explicit-bootstrap.json' }), /Artifact directory must be new/);
+});
+
+test('B3 already-exited hosts retain actual exit failures and independently observed child residue', () => {
+  const source = readFileSync(new URL('../scripts/b3-cli-web.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('async function terminateWebProcess(');
+  const end = source.indexOf('\nfunction compactEvent(', start);
+  assert.ok(start > 0 && end > start);
+  const remaining = [{ pid: 202, command: '/owned/run/grok' }];
+  const terminate = new Function('pidAlive', 'matchingProcesses',
+    source.slice(start, end) + '\nreturn terminateWebProcess;')(
+    pid => { assert.equal(pid, 101); return false; },
+    paths => { assert.deepEqual(paths, ['/owned/run', '/owned/run/grok']); return remaining; });
+  return (async () => {
+    for (const [exitCode, signal] of [[23, null], [null, 'SIGKILL'], [0, null]]) {
+      const result = await terminate({ closed: true, exitCode, signal, child: { pid: 101 } },
+        '/owned/run', '/owned/run/grok');
+      assert.equal(result.graceful, exitCode === 0 && signal === null);
+      assert.equal(result.exitCode, exitCode);
+      assert.equal(result.exitSignal, signal);
+      assert.deepEqual(result.leftoverMatchingProcesses, remaining);
+    }
+  })();
+});
+
+test('B3 requested shutdown cannot classify abnormal actual exits as graceful', async () => {
+  const source = readFileSync(new URL('../scripts/b3-cli-web.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('async function terminateWebProcess(');
+  const end = source.indexOf('\nfunction compactEvent(', start);
+  assert.ok(start > 0 && end > start);
+  for (const [exitCode, signal] of [[23, null], [null, 'SIGTERM'], [0, null]]) {
+    let finish;
+    const web = { child: { pid: 101, kill() { assert.fail('The host already exited.'); } },
+      closed: false, exitCode: null, signal: null,
+      exited: new Promise(resolve => { finish = resolve; }) };
+    const terminate = new Function('pidAlive', 'matchingProcesses', 'process', 'delay',
+      source.slice(start, end) + '\nreturn terminateWebProcess;')(
+      () => false, () => [], { kill(pid, sent) {
+        assert.equal(pid, 101); assert.equal(sent, 'SIGTERM');
+        Object.assign(web, { closed: true, exitCode, signal });
+        finish({ code: exitCode, signal });
+      } }, () => new Promise(() => {}));
+    const result = await terminate(web, '/owned/run', '/owned/run/grok');
+    assert.equal(result.graceful, exitCode === 0 && signal === null);
+    assert.equal(result.exitCode, exitCode);
+    assert.equal(result.exitSignal, signal);
+  }
 });
 
 async function b3RunRootResolver() {
@@ -2584,6 +2702,39 @@ test('CLI upgrade persistent environment drops inherited secrets and isolates ea
   assert.equal(first.npm_config_strict_peer_dependencies, 'true');
   for (const key of ['GROK_API_KEY', 'GITHUB_TOKEN', 'HTTP_PROXY', 'HTTPS_PROXY', 'NODE_OPTIONS', 'NODE_PATH', 'NPM_TOKEN']) {
     assert.equal(Object.hasOwn(first, key), false);
+  }
+});
+
+test('CLI upgrade pnpm wrapper preserves literal shell metacharacters in verified paths', async t => {
+  const shell = process.platform === 'win32'
+    ? [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean)
+      .map(root => join(root, 'Git/bin/bash.exe')).find(existsSync)
+    : '/bin/sh';
+  if (!shell || !existsSync(shell)) return t.skip('A local POSIX shell is required for this argument-only test.');
+  const { spawnSync } = await import('node:child_process');
+  const root = mkdtempSync(join(sandbox, 'cli-shell-arguments-'));
+  const node = '/verified/$DSH_WRAPPER_SEGMENT/$(printf expanded)/node';
+  const pnpm = '/verified/single\' and "double"/`printf substituted`/pnpm.cjs';
+  cliUpgradeVerifier.cliUpgradeEnvironment(root, node, pnpm);
+  const bin = join(root, 'bin', createHash('sha256').update(node).digest('hex').slice(0, 16));
+  const wrappers = [readFileSync(join(bin, 'pnpm'), 'utf8')];
+  const source = readFileSync(new URL('../scripts/b3-cli-web.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('    const pnpmWrapper =');
+  const end = source.indexOf('    chmodSync(pnpmWrapper', start);
+  assert.ok(start > 0 && end > start);
+  new Function('join', 'pnpmBinDir', 'writeFileSync', 'process', 'options', source.slice(start, end))(
+    join, bin, (_path, value) => wrappers.push(value), { execPath: node }, { pnpmEntry: pnpm });
+  for (const wrapper of wrappers) {
+    assert.match(wrapper, /^exec /m);
+    const argumentPrinter = wrapper.replace(/^exec /m, "printf '%s\\n' ");
+    const result = spawnSync(shell, [...(process.platform === 'win32' ? ['--posix'] : []), '-c', argumentPrinter,
+      'pnpm-wrapper', '--flag', 'argument with spaces'], {
+      encoding: 'utf8', windowsHide: true, timeout: 5000, maxBuffer: 65536,
+      env: { SystemRoot: process.env.SystemRoot, PATH: dirname(shell), DSH_WRAPPER_SEGMENT: 'expanded' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.stdout.trimEnd().split(/\r?\n/),
+      [node, pnpm, '--flag', 'argument with spaces']);
   }
 });
 

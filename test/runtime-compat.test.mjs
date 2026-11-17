@@ -76,6 +76,54 @@ function validReport(compat) {
   return value;
 }
 
+test('compatibility regression: readable scalar fetch does not require the search selector wrapper ABI', () => {
+  const fixture = host();
+  fixture.fiber.effectiveConfig.fetchProvider = 'preserved';
+  const compat = createRuntimeCompatibility({ hostVersion: '0.2.2', pluginVersion });
+  const result = prepare(compat, fixture);
+  assert.equal(result.result.shape, 'passed');
+  finish(compat, result.token);
+  assert.equal(compat.report().coreReady, true);
+  assert.equal(fixture.fiber.effectiveConfig.fetchProvider, 'preserved');
+});
+
+test('compatibility regression: confirmed optional failures outrank diagnostic metadata errors', () => {
+  const store = memoryState('0.2.2'), compat = createRuntimeCompatibility({
+    hostVersion: '0.2.2', pluginVersion, stateStore: store,
+  });
+  const { token } = prepare(compat);
+  finish(compat, token);
+  store.change({ errorCode: 'COMPATIBILITY_STATE_READ_FAILED' });
+  compat.setOptional('settings', { token, available: false, confirmedFailure: true });
+  assert.equal(validReport(compat).phase, 'degraded');
+  assert.equal(validReport(compat).code, 'COMPATIBILITY_OPTIONAL_UNAVAILABLE');
+  assert.equal(compat.assertSearchAllowed(), true);
+  assert.equal(compat.isCurrent(token), true);
+  compat.setOptional('settings', { token, available: true });
+  assert.equal(validReport(compat).phase, 'ready');
+  assert.equal(validReport(compat).code, 'COMPATIBILITY_STATE_READ_FAILED');
+});
+
+test('compatibility regression: pending metadata cannot hide an already confirmed optional failure', async () => {
+  const store = memoryState('0.2.2'), pending = deferred();
+  const compat = createRuntimeCompatibility({ hostVersion: '0.2.2', pluginVersion, stateStore: store });
+  const { token } = prepare(compat);
+  finish(compat, token);
+  compat.setOptional('github', { token, available: false, confirmedFailure: true });
+  store.snapshot = () => pending.promise;
+  const refreshing = compat.refreshConfirmation();
+  try {
+    assert.equal(validReport(compat).phase, 'degraded');
+    assert.equal(validReport(compat).code, 'COMPATIBILITY_OPTIONAL_UNAVAILABLE');
+    assert.equal(compat.assertSearchAllowed(), true);
+    assert.equal(compat.isCurrent(token), true);
+  } finally {
+    pending.resolve({ hostVersion: '0.2.2', pluginVersion, errorCode: 'COMPATIBILITY_STATE_READ_FAILED' });
+    await refreshing;
+  }
+  assert.equal(validReport(compat).code, 'COMPATIBILITY_OPTIONAL_UNAVAILABLE');
+});
+
 test('minimum is unbounded for canonical stable and standard rc versions', () => {
   assert.equal(MINIMUM_DSH_VERSION, '0.2.1-rc.2');
   for (const version of ['0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.3', '0.2.1', '1.0.0', '999.0.0-rc.1']) {

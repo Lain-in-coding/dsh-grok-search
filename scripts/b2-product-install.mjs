@@ -90,6 +90,8 @@ function startHost(runtime, profile, env, initialize) {
     async close() {
       if (!state.stopped) { try { await host.request('close'); } catch { if (!state.stopped) child.kill('SIGKILL'); } }
       await state.closed;
+      assert.equal(state.exitCode, 0, 'The installed-product host must exit normally.');
+      assert.equal(state.signal, null, 'The installed-product host must not exit by signal.');
     },
   };
   hosts.push(host); child.send(initialize);
@@ -198,7 +200,9 @@ async function runVersion(runtime) {
   assert.equal(final.existingDependencyPresent, true);
   assert.ok(final.webInject.includes('candidateExistingDependency'));
   await third.close();
-  return { firstReady, before, secondReady, disabledState, disabledRecord, author, thirdReady, after, final, install: installed };
+  return { firstReady, before, secondReady, disabledState, disabledRecord, author, thirdReady, after, final,
+    install: { profile: installed.profile, installed: installed.installed, productReceipt: installed.productReceipt,
+      installExitCode: installed.installExitCode, installPolicy: installed.installPolicy } };
 }
 
 let fatal = null;

@@ -104,8 +104,11 @@ export function reclaimStaleOwnedLock(path, {
  */
 export function acquireOwnedLock(path, {
   reclaimStaleAfterMs = null, now = Date.now(), isProcessAlive = defaultProcessAlive,
+  token = randomUUID(), onAcquired = null,
 } = {}) {
-  const token = randomUUID();
+  if (!UUID.test(token) || onAcquired !== null && typeof onAcquired !== 'function') {
+    throw new TypeError('Owned locks require a UUID token and a synchronous acquisition observer.');
+  }
   const record = JSON.stringify({ schemaVersion: 1, token, pid: process.pid,
     createdAt: new Date().toISOString() }) + '\n';
   let descriptor, identity;
@@ -114,6 +117,7 @@ export function acquireOwnedLock(path, {
     try {
       identity = fstatSync(descriptor);
       writeFileSync(descriptor, record); fsyncSync(descriptor);
+      onAcquired?.(Object.freeze({ token, pid: process.pid, dev: identity.dev, ino: identity.ino, text: record }));
     }
     catch (error) {
       try { closeSync(descriptor); } catch {}
@@ -165,4 +169,20 @@ export function acquireOwnedLock(path, {
       } catch { return false; }
     },
   });
+}
+
+// The caller must first prove that this exact owner stopped (for example, a
+// known Worker's exit event). A PID alone is not such proof for worker threads.
+export function releaseOwnedLockReceipt(path, receipt) {
+  if (!receipt || !UUID.test(receipt.token ?? '') || typeof receipt.text !== 'string'
+    || Buffer.byteLength(receipt.text) > MAX_OWNER_BYTES) return false;
+  const current = ownerRecord(path);
+  if (!current.entry || current.parsed.token !== receipt.token || current.parsed.pid !== receipt.pid
+    || current.text !== receipt.text || current.entry.dev !== receipt.dev || current.entry.ino !== receipt.ino) return false;
+  try {
+    const after = lstatSync(path);
+    if (!after.isFile() || after.isSymbolicLink() || after.dev !== receipt.dev || after.ino !== receipt.ino) return false;
+    unlinkSync(path);
+    return true;
+  } catch { return false; }
 }

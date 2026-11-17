@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { ControlRecordError, createControlIntentStore } from '../src/core/control-intent-store.mjs';
+import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
 import { completeDeferredStartup, completeReleaseRecovery } from '../src/core/startup-recovery.mjs';
 
 // Synthetic observations/receipts exercise core validation only. They are not
@@ -353,6 +354,126 @@ test('startup correction can restore the recorded author route and reports route
   assert.equal(restoreCalls.length, 1);
   assert.equal(supplied.state.routeInputs[0].routeChanged, true);
   assert.deepEqual(supplied.state.events, ['observe', 'verify-route', 'observe']);
+});
+
+test('startup correction validates the original-search baseline before restoring any route', async t => {
+  const { store, before } = fixture(t);
+  const supplied = runtime({ observations: [observation({ observer: { counter: { calls: -1 } } })] });
+  let restores = 0;
+  await expectCode(() => completeDeferredStartup({ store, observe: supplied.observe, verifyRoute: supplied.verifyRoute,
+    restoreRoute: () => { restores++; return { routeChanged: true }; } }), 'CONTROL_ROUTE_COUNTER_REQUIRED');
+  assert.equal(restores, 0);
+  assert.equal(supplied.state.verifyCalls, 0);
+  assert.deepEqual(store.read(), before);
+});
+
+test('recovery cancellation at each asynchronous boundary preserves the committed record', async t => {
+  for (const kind of ['startup', 'release']) {
+    for (const cancelAt of ['observe', 'restore', 'verify', 'reobserve']) await t.test(`${kind}: ${cancelAt}`, async sub => {
+      const required = requiredIntent({ acquisition: { ...requiredIntent().acquisition,
+        authorSearchProvider: 'author-search-provider' } });
+      const intent = kind === 'startup' ? required : {
+        ...required, policy: 'released', priorIntent: structuredClone(required), release: {
+          explicit: true, committedAt: OBSERVED_AT, kind: 'intent-release-commit',
+          operationId: randomUUID(), hostId: OLD_HOST, counterBaseline: 0,
+        },
+      };
+      const { store, before } = fixture(sub, { intent });
+      const cancellation = new AbortController(), reason = new Error('owner disposed'), calls = [];
+      const checkpoint = stage => {
+        calls.push(stage);
+        if (stage === cancelAt) cancellation.abort(reason);
+      };
+      let observations = 0;
+      const recover = kind === 'startup' ? completeDeferredStartup : completeReleaseRecovery;
+      await assert.rejects(recover({ store, signal: cancellation.signal,
+        observe: async () => {
+          checkpoint(observations++ ? 'reobserve' : 'observe');
+          return observation();
+        },
+        restoreRoute: async () => { checkpoint('restore'); return { routeChanged: false }; },
+        verifyRoute: async input => { checkpoint('verify'); return routeReceipt(input); },
+      }), error => error === reason);
+      const expected = ['observe', 'restore', 'verify', 'reobserve'];
+      assert.deepEqual(calls, expected.slice(0, expected.indexOf(cancelAt) + 1));
+      assert.deepEqual(store.read(), before);
+    });
+  }
+});
+
+test('recovery callers with a synchronous current guard can wait for a busy writer without a signal', async t => {
+  for (const kind of ['startup', 'release']) await t.test(kind, async sub => {
+    const required = requiredIntent({ acquisition: { ...requiredIntent().acquisition,
+      authorSearchProvider: 'author-search-provider' } });
+    const intent = kind === 'startup' ? required : {
+      ...required, policy: 'released', priorIntent: structuredClone(required), release: {
+        explicit: true, committedAt: OBSERVED_AT, kind: 'intent-release-commit',
+        operationId: randomUUID(), hostId: OLD_HOST, counterBaseline: 0,
+      },
+    };
+    const { directory, before } = fixture(sub, { intent });
+    const store = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+    const lock = acquireOwnedLock(join(directory, 'control-write.lock'));
+    const timer = setTimeout(() => lock.release(), 20);
+    const recover = kind === 'startup' ? completeDeferredStartup : completeReleaseRecovery;
+    try {
+      const result = await recover({ store, observe: async () => observation(),
+        readCurrent: input => ({ observation: observation(), receipt: routeReceipt(input.observation, {
+          originalSearchBaseline: input.counterBaseline, routeChanged: input.routeChanged,
+        }) }),
+        restoreRoute: async () => ({ routeChanged: false }), verifyRoute: async input => routeReceipt(input) });
+      assert.equal(result.recordCommitted, true);
+      assert.equal(store.read().revision, before.revision + 1);
+    } finally { clearTimeout(timer); lock.release(); }
+  });
+});
+
+test('legacy async recovery fails retriably on contention instead of publishing cached evidence', async t => {
+  for (const kind of ['startup', 'release']) await t.test(kind, async sub => {
+    const required = requiredIntent({ acquisition: { ...requiredIntent().acquisition,
+      authorSearchProvider: 'author-search-provider' } });
+    const intent = kind === 'startup' ? required : {
+      ...required, policy: 'released', priorIntent: structuredClone(required), release: {
+        explicit: true, committedAt: OBSERVED_AT, kind: 'intent-release-commit',
+        operationId: randomUUID(), hostId: OLD_HOST, counterBaseline: 0,
+      },
+    };
+    const { directory, before } = fixture(sub, { intent });
+    const store = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+    const lock = acquireOwnedLock(join(directory, 'control-write.lock'));
+    let observations = 0;
+    try {
+      const recover = kind === 'startup' ? completeDeferredStartup : completeReleaseRecovery;
+      await assert.rejects(recover({ store, observe: async () => { observations++; return observation(); },
+        restoreRoute: async () => ({ routeChanged: false }), verifyRoute: async input => routeReceipt(input),
+      }), error => error.code === 'CONTROL_STORAGE_BUSY' && error.details.retriable === true);
+      assert.equal(observations, 2);
+      assert.deepEqual(store.read(), before);
+    } finally { lock.release(); }
+  });
+});
+
+test('startup correction checks the current selection after waiting for an actual writer lock', async t => {
+  const { directory, before } = fixture(t);
+  const store = createControlIntentStore({ directory, governance: true, autoMaintain: false });
+  const lock = acquireOwnedLock(join(directory, 'control-write.lock'));
+  let announce, current = observation();
+  const waiting = new Promise(resolve => { announce = resolve; });
+  const gated = { ...store, compareAndSwapAsync(request) { announce(); return store.compareAndSwapAsync(request); } };
+  const pending = completeDeferredStartup({ store: gated,
+    observe: async () => structuredClone(current),
+    verifyRoute: async input => routeReceipt(input),
+    readCurrent: input => ({ observation: structuredClone(current),
+      receipt: routeReceipt({ ...current, counterBaseline: input.counterBaseline }) }),
+  });
+  pending.catch(() => {});
+  try {
+    await waiting;
+    current = observation({ selectedBundles: [RECOVERY_BUNDLE, SEARCH_BUNDLE], selectionSha256: 'c'.repeat(64) });
+    lock.release();
+    await assert.rejects(pending, { code: 'CONTROL_RECOVERY_INPUT_CHANGED' });
+    assert.deepEqual(store.read(), before);
+  } finally { lock.release(); await pending.catch(() => {}); }
 });
 
 test('explicit release recovery preserves the release intent and completes it once', async t => {

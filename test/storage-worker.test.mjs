@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, existsSync, realpathSync, readFileSync, unlinkSync } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { createStorageMaintenanceWorker } from '../src/core/storage-worker.mjs';
 import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
+import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
 
 function fixture(count) {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-storage-worker-'));
@@ -45,7 +47,7 @@ test('worker leases deduplicate tasks, preserve the remaining owner and cancel o
     creations++;
     worker = new EventEmitter();
     worker.postMessage = ({ cancelBuffer }) => { cancelFlag = new Int32Array(cancelBuffer); };
-    worker.terminate = async () => 0;
+    worker.terminate = async () => { queueMicrotask(() => worker.emit('exit', 0)); return 0; };
     return worker;
   };
   const first = createStorageMaintenanceWorker({ ...f, workerFactory: factory });
@@ -79,7 +81,7 @@ test('a new owner waits for the cancelled predecessor rather than spawning overl
   const factory = () => {
     const worker = new EventEmitter();
     worker.postMessage = () => {};
-    worker.terminate = async () => 0;
+    worker.terminate = async () => { queueMicrotask(() => worker.emit('exit', 0)); return 0; };
     workers.push(worker);
     return worker;
   };
@@ -103,4 +105,102 @@ test('a new owner waits for the cancelled predecessor rather than spawning overl
     await pending;
     await resumed;
   }
+});
+
+test('an exited maintenance worker releases only its abandoned locks before later user writes', async () => {
+  for (const point of ['archive', 'checkpoint']) {
+    const f = fixture(60);
+    const moduleUrl = new URL('../src/core/control-intent-store.mjs', import.meta.url).href;
+    const source = `
+      const { parentPort, workerData } = require('node:worker_threads');
+      const fs = require('node:fs');
+      const originalRename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        if (${JSON.stringify(point)} === 'checkpoint' && String(from).includes('checkpoint-stage-')) process.exit(92);
+        return originalRename(from, to);
+      };
+      require('node:module').syncBuiltinESMExports();
+      parentPort.once('message', async () => {
+        const { createControlIntentStore } = await import(${JSON.stringify(moduleUrl)});
+        createControlIntentStore({ ...workerData,
+          onMaintenanceLock: receipt => parentPort.postMessage({ type: 'maintenance-lock', ...receipt }),
+          fault(stage) { if (${JSON.stringify(point)} === 'archive' && stage === 'maintenance-progress') process.exit(91); },
+        }).maintain();
+      });
+    `;
+    const worker = createStorageMaintenanceWorker({ ...f,
+      workerFactory: (_url, options) => new Worker(source, { ...options, eval: true }) });
+    try {
+      assert.equal((await worker.schedule()).code, 'CONTROL_MAINTENANCE_EXIT');
+      assert.equal(existsSync(join(f.directory, 'checkpoint.lock')), false);
+      assert.equal(existsSync(join(f.directory, 'control-write.lock')), false);
+      const store = createControlIntentStore({ ...f, governance: true, autoMaintain: false });
+      const record = await store.compareAndSwapAsync({ expectedRevision: 60,
+        intent: { schemaVersion: 1, policy: 'required', reason: 'after-worker-exit', release: null } });
+      assert.equal(record.revision, 61);
+    } finally { worker.dispose(); }
+  }
+});
+
+test('a worker error is not exit proof and exit never removes a replacement parent lock', async () => {
+  const f = fixture(1), moduleUrl = new URL('../src/core/owned-lock.mjs', import.meta.url).href;
+  const source = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    parentPort.once('message', async () => {
+      const { acquireOwnedLock } = await import(${JSON.stringify(moduleUrl)});
+      acquireOwnedLock(require('node:path').join(workerData.directory, 'checkpoint.lock'), {
+        token: workerData.maintenanceLockTokens.checkpoint,
+        onAcquired: owner => parentPort.postMessage({ type: 'maintenance-lock', name: 'checkpoint.lock', owner }),
+      });
+      parentPort.once('message', () => process.exit(93));
+    });
+  `;
+  let child, announce, settled = false, replacement;
+  const acquired = new Promise(resolve => { announce = resolve; });
+  const service = createStorageMaintenanceWorker({ ...f, workerFactory: (_url, options) => {
+    child = new Worker(source, { ...options, eval: true });
+    child.on('message', value => { if (value.type === 'maintenance-lock') announce(); });
+    return child;
+  } });
+  const pending = service.schedule();
+  pending.then(() => { settled = true; });
+  try {
+    await acquired;
+    const lockPath = join(f.directory, 'checkpoint.lock');
+    child.emit('error', Object.assign(new Error('synthetic worker error before exit'), { code: 'TEST_WORKER_ERROR' }));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(existsSync(lockPath), true);
+    unlinkSync(lockPath);
+    replacement = acquireOwnedLock(lockPath);
+    const bytes = readFileSync(lockPath);
+    child.postMessage({ exit: true });
+    assert.equal((await pending).code, 'TEST_WORKER_ERROR');
+    assert.deepEqual(readFileSync(lockPath), bytes, 'same PID does not authorize removing another owner');
+  } finally {
+    child?.postMessage({ exit: true });
+    await pending;
+    replacement?.release();
+    service.dispose();
+  }
+});
+
+test('an unrelated acquisition receipt cannot authorize cleanup of a parent lock', async () => {
+  const f = fixture(1), path = join(f.directory, 'control-write.lock');
+  let owner, child;
+  const parentLock = acquireOwnedLock(path, { onAcquired: value => { owner = value; } });
+  const before = readFileSync(path);
+  const service = createStorageMaintenanceWorker({ ...f, workerFactory: () => {
+    child = new EventEmitter();
+    child.postMessage = () => {};
+    child.terminate = async () => { queueMicrotask(() => child.emit('exit', 1)); return 1; };
+    return child;
+  } });
+  try {
+    const pending = service.schedule();
+    child.emit('message', { type: 'maintenance-lock', name: 'control-write.lock', owner });
+    child.emit('exit', 1);
+    await pending;
+    assert.deepEqual(readFileSync(path), before);
+  } finally { service.dispose(); parentLock.release(); }
 });

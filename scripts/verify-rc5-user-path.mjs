@@ -10,6 +10,7 @@ import { parseRuntimeReceiptArguments, readDesktopGateRuntimes, prepareDesktopFi
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
 import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
+import { readUpgradePackage } from './verify-search-log-upgrade.mjs';
 
 // Unlike the historical desktop suite, this starts without the fixture bundle,
 // replacement providers, pre-created preferences, control records or shared keys.
@@ -39,6 +40,8 @@ for (const row of packageReceipt.sourceHashes) {
   if (registryInstall && row.file === 'README.md') continue;
   assert.equal(sha256(join(project, row.file)), row.sha256);
 }
+const upgradePackage = upgradeFrom ? readUpgradePackage(upgradeFrom) : null;
+if (upgradePackage) assert.notEqual(upgradePackage.manifest.version, packageReceipt.version, 'Upgrade needs distinct verified package versions.');
 const run = freshRun('rc5-user-path');
 const root = join(tmpdir(), 'dsh-deferred-desktop-user-path-' + run.runId + (openConfig ? " 中文 空格 ' & $" : ''));
 prepareDesktopFixture(runtime.executable, root, { pluginManagerEntries: true, liveHmr: true, ...runtimeOptions });
@@ -49,6 +52,9 @@ const unpack = await commandResult('tar.exe', ['-xf', upgradeFrom || tarball, '-
 assert.equal(unpack.exitCode, 0);
 const product = join(control.profile, 'node_modules/dsh-grok-search');
 const manifest = JSON.parse(readFileSync(join(extraction, 'package/package.json'), 'utf8'));
+if (upgradePackage) for (const row of upgradePackage.receipt.sourceHashes) {
+  assert.equal(sha256(join(extraction, 'package', row.file)), row.sha256, 'The old installation must match its verified receipt.');
+}
 if (!liveInstall) {
   renameSync(join(extraction, 'package'), product);
   mkdirSync(join(product, 'node_modules'));
@@ -207,6 +213,7 @@ try {
     root, port, version: JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version,
     ...(registryResolution ? { registryResolution, repositoryReadmeDiffers } : {}),
     packageSha256: packageReceipt.sha256, fixtureBundle: false, snapshot, ui,
+    ...(upgradePackage ? { upgradeFrom: { version: upgradePackage.manifest.version, sha256: upgradePackage.receipt.sha256 } } : {}),
     log: await rpc('readSearchLog', { sessionId }),
     route: await rpc('toolCallRoute', { sessionId, callId: 'unknown' }),
     draftQuota: await rpc('previewAccountQuota', {

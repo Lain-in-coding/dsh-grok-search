@@ -1,5 +1,8 @@
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import { createControlIntentStore } from './control-intent-store.mjs';
+import { releaseOwnedLockReceipt } from './owned-lock.mjs';
 
 const tasks = new Map();
 const idle = () => ({ status: 'idle', at: null });
@@ -39,13 +42,12 @@ export function createStorageMaintenanceWorker({
       if (finished) return;
       finished = true;
       clearTimeout(task.timer); task.timer = null;
-      const worker = task.worker; task.worker = null;
+      task.worker = null;
       task.pending = null;
       task.latest = result;
       for (const listener of task.listeners) {
         try { listener(result); } catch {}
       }
-      void worker?.terminate().catch(() => {});
       resolve(result);
       const again = task.again; task.again = false;
       if (again && result.status !== 'error' && !task.disposed && task.refs > 0 && !task.retry) {
@@ -58,23 +60,46 @@ export function createStorageMaintenanceWorker({
         task.retry.unref?.();
       }
     };
+    let worker, result = null, failure = null;
+    const owned = new Map();
+    const maintenanceLockTokens = { checkpoint: randomUUID(), writer: randomUUID() };
+    const expectedTokens = new Map([['checkpoint.lock', maintenanceLockTokens.checkpoint],
+      ['control-write.lock', maintenanceLockTokens.writer]]);
+    const terminate = () => {
+      try { void worker?.terminate().catch(() => {}); } catch {}
+    };
     try {
       // Never pass process.execArgv: debugging or test flags from the host must
       // not turn the maintenance worker into another app or test runner.
-      const worker = workerFactory(new URL('./storage-worker.mjs', import.meta.url), {
-        execArgv: [], env: {}, workerData: { directory, legacyPath, trustedRoot },
+      worker = workerFactory(new URL('./storage-worker.mjs', import.meta.url), {
+        execArgv: [], env: {}, workerData: { directory, legacyPath, trustedRoot, maintenanceLockTokens },
       });
       task.worker = worker;
       const cancelFlag = new Int32Array(new SharedArrayBuffer(4));
       task.cancelFlag = cancelFlag;
-      worker.postMessage?.({ cancelBuffer: cancelFlag.buffer });
-      worker.once('message', result => finish(result));
-      worker.once('error', error => finish({ status: 'error', code: error.code ?? 'CONTROL_MAINTENANCE_WORKER',
-        message: 'Control history maintenance worker failed.' }));
+      worker.on('message', message => {
+        if (message?.type === 'maintenance-lock') {
+          if (expectedTokens.has(message.name) && message.owner?.token === expectedTokens.get(message.name)
+            && message.owner?.pid === process.pid) {
+            owned.set(message.name, message.owner);
+          }
+          return;
+        }
+        result ??= message;
+        terminate();
+      });
+      worker.once('error', error => {
+        failure = { status: 'error', code: error.code ?? 'CONTROL_MAINTENANCE_WORKER',
+          message: 'Control history maintenance worker failed.' };
+      });
       worker.once('exit', code => {
-        if (!finished) finish({ status: 'error', code: 'CONTROL_MAINTENANCE_EXIT',
+        // All acquisition receipts have arrived and this exact worker has
+        // stopped. Never infer thread death from its shared process PID.
+        for (const [name, owner] of owned) releaseOwnedLockReceipt(join(directory, name), owner);
+        finish(failure ?? result ?? { status: 'error', code: 'CONTROL_MAINTENANCE_EXIT',
           message: `Control history maintenance exited without a receipt (${code}).` });
       });
+      worker.postMessage?.({ cancelBuffer: cancelFlag.buffer });
       task.timer = setTimeout(() => {
         Atomics.store(cancelFlag, 0, 1);
         // Do not terminate mid-file operation: the worker observes cancellation
@@ -82,8 +107,10 @@ export function createStorageMaintenanceWorker({
       }, timeoutMs);
       task.timer.unref?.();
     } catch (error) {
-      finish({ status: 'error', code: error.code ?? 'CONTROL_MAINTENANCE_WORKER',
-        message: 'Unable to start the control history maintenance worker.' });
+      failure = { status: 'error', code: error.code ?? 'CONTROL_MAINTENANCE_WORKER',
+        message: 'Unable to start the control history maintenance worker.' };
+      if (worker) terminate();
+      else finish(failure);
     }
     return task.pending ?? Promise.resolve(task.latest);
   };
@@ -109,7 +136,9 @@ if (!isMainThread && workerData?.directory) {
   parentPort.once('message', ({ cancelBuffer }) => {
     const cancelFlag = new Int32Array(cancelBuffer);
     try {
-      const store = createControlIntentStore({ ...workerData, fault(stage) {
+      const store = createControlIntentStore({ ...workerData,
+        onMaintenanceLock: receipt => parentPort.postMessage({ type: 'maintenance-lock', ...receipt }),
+        fault(stage) {
         if (stage === 'maintenance-progress' || stage === 'before-checkpoint-publish') {
           if (Atomics.load(cancelFlag, 0)) throw Object.assign(new Error('Maintenance cancelled at a safe boundary.'), { code: 'CONTROL_MAINTENANCE_CANCELLED' });
         }

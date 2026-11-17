@@ -132,7 +132,8 @@ export function assessRuntimeCapabilities({ ctx, token, contractChecks } = {}) {
     for (const key of ['searchProvider', 'fetchProvider']) {
       if (key === 'fetchProvider' && !Object.hasOwn(config, key)) continue;
       const field = config[key];
-      if (modern && !method(field, 'get')) {
+      // Fetch may be a plain selector, but must remain readable for route preservation.
+      if (modern && key === 'searchProvider' && !method(field, 'get')) {
         return makeProbe(token, abi, 'failed', 'pending', 'COMPATIBILITY_ABI_UNSUPPORTED');
       }
       const value = method(field, 'get') ? field.get() : field;
@@ -193,12 +194,14 @@ export function createRuntimeCompatibility({ hostVersion, pluginVersion, stateSt
     if (stopped) return 'COMPATIBILITY_STOPPED';
     if (identityCode()) return identityCode();
     if (blocked) return blocked;
+    const featureCode = optionalCode();
+    if (ready() && featureCode === 'COMPATIBILITY_OPTIONAL_UNAVAILABLE') return featureCode;
     if (statePending) return 'COMPATIBILITY_CHECKING';
     if (!corePassed()) return core?.code ?? 'COMPATIBILITY_CORE_PENDING';
     if (!route) return 'COMPATIBILITY_ROUTE_UNCONFIRMED';
     if (!budget) return 'COMPATIBILITY_BUDGET_UNCONFIRMED';
     if (!initialized) return 'COMPATIBILITY_INITIALIZATION_PENDING';
-    return stateCode ?? optionalCode();
+    return stateCode ?? featureCode;
   };
   const report = () => {
     const coreReady = ready();

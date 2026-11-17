@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
@@ -25,6 +26,37 @@ test('invalid source order is rejected instead of silently normalized', () => {
   const initial = store.snapshot();
   assert.throws(() => store.save(initial.revision, { ...initial.value, sourceOrder: ['exa'] }),
     error => error.code === 'PREFERENCES_INVALID');
+});
+
+test('a dangling preference link is not a first-run default or writable missing file', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-pref-'));
+  const path = join(directory, 'preferences.json');
+  const store = createPrivatePreferences({ path });
+  const initial = store.snapshot();
+  symlinkSync(join(directory, 'missing-target'), path, process.platform === 'win32' ? 'junction' : 'file');
+  assert.equal(existsSync(path), false);
+  assert.throws(store.snapshot, { code: 'PREFERENCES_PATH_UNSAFE' });
+  assert.throws(() => store.save('missing', initial.value), { code: 'PREFERENCES_PATH_UNSAFE' });
+  assert.equal(lstatSync(path).isSymbolicLink(), true);
+});
+
+test('permission errors cannot silently reset disabled preference choices', () => {
+  const moduleUrl = new URL('../src/core/private-preferences.mjs', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { resolve } from 'node:path';
+    import { createPrivatePreferences } from ${JSON.stringify(moduleUrl)};
+    fs.existsSync = () => false;
+    fs.lstatSync = () => { throw Object.assign(new Error('private-path'), { code: 'EACCES' }); };
+    syncBuiltinESMExports();
+    const store = createPrivatePreferences({ path: resolve('synthetic-inaccessible-preferences.json') });
+    assert.throws(store.snapshot, error => error.code === 'PREFERENCES_READ_FAILED'
+      && !error.message.includes('private-path'));
+  `], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
 });
 
 test('new GitHub read consent defaults off and older clients cannot overwrite it', () => {

@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import { dirname, join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
-import { freshRun, project, writeJson, redact, sha256, commandResult, receipt } from './lib/internal-candidate-utils.mjs';
+import { freshRun, project, writeJson, redact, sha256, commandResult, receipt, cleanEnvironment } from './lib/internal-candidate-utils.mjs';
 import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { requestDesktopShutdown } from './lib/renderer-cdp.mjs';
@@ -125,9 +125,7 @@ async function start(runtime,folder,phase,fault=null,versioned=true,productCount
   const addressPath=join(folder,'address-'+(++serial)+'.json');
   const args=[control.archive,'--user-data-dir='+control.userData,'--remote-debugging-address=127.0.0.1',
     '--remote-debugging-port='+debuggerPort,'--lang=zh-CN'];
-  const env={...process.env};
-  if(process.platform==='darwin'){const isolatedUser=join(folder,'user');mkdirSync(isolatedUser,{recursive:true});Object.assign(env,{HOME:isolatedUser,TMPDIR:folder});}
-  for(const name of ['ELECTRON_RUN_AS_NODE','ELECTRON_FORCE_IS_PACKAGED','DSH_DESKTOP_DEV_APP','DSH_DESKTOP_MANDATORY_UPDATE_CONFIG','DSH_B2_RECORD_FAULT'])delete env[name];
+  const env=cleanEnvironment(folder);
   Object.assign(env,{DSH_HOME:control.dshHome,DSH_DESKTOP_DSH_DIR:control.runtime,
     DSH_DESKTOP_PRIMARY_RUNTIME_DIR:control.primaryRuntime,DSH_DESKTOP_PNPM_ENTRY:control.pnpmEntry,
     DSH_DESKTOP_OPEN_DEVTOOLS:'0',DSH_DESKTOP_HOST_INSPECT_PORT:String(hostInspectPort),

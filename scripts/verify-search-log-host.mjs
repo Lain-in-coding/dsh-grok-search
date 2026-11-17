@@ -99,6 +99,7 @@ async function start(runtime, folder) {
         await closed; clearTimeout(timer);
       }
       for (const item of pending.values()) clearTimeout(item.timer);
+      assert.equal(await closed, 0, 'The search-log host must exit normally.');
       return sanitize(stderr);
     },
   };
@@ -233,7 +234,8 @@ finally {
   const summary = { runId: run.runId, passed: !fatal, results, fatal, sourceCalls, quotaCalls, sourceHashes,
     tarballSha256: packageReceipt.sha256,
     scope: live ? 'official-ASAR-runtime-live-tavily-with-environment-only-credentials' : 'official-ASAR-runtime-with-loopback-upstream',
-    sharedConfigUnchanged, desktopRendererVerified: false, paidProviderVerified: live,
+    sharedConfigUnchanged, desktopRendererVerified: false,
+    paidProviderVerified: live && !fatal && results.length === executables.length && results.every(row => row.passed === true),
     dependenciesInstalled: false, published: false };
   writeJson(join(run.directory, 'summary.json'), summary);
   console.log(JSON.stringify({ runId: run.runId, passed: !fatal, results, fatal }));

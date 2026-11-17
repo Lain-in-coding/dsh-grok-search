@@ -540,6 +540,31 @@ test('route takeover rejects when the host does not apply the product provider',
   assert.equal(effectiveSearchProvider(entry), 'candidate-original');
 });
 
+test('a finishing takeover preserves an author config edit made while its host update was pending', async t => {
+  for (const edit of ['replacement', 'in-place']) await t.test(edit, async () => {
+    const ctx = makeContext(), entry = ctx.loader.entries()[0];
+    const acquisition = createAcquisition(ctx), lease = createLease(ctx);
+    const started = deferred(), finish = deferred(), update = entry.update;
+    entry.update = async options => {
+      await update(options);
+      if (edit === 'in-place') entry.options.config = options.config;
+      started.resolve();
+      await finish.promise;
+    };
+    const pending = takeOverAuthorRoute(ctx, acquisition, lease);
+    try {
+      await started.promise;
+      if (edit === 'replacement') entry.options.config = { searchProvider: 'candidate-original' };
+      const author = entry.options.config;
+      author.fetchProvider = 'new-author-fetch';
+      finish.resolve();
+      await pending;
+      assert.equal(entry.options.config, author);
+      assert.equal(entry.options.config.fetchProvider, 'new-author-fetch');
+    } finally { finish.resolve(); await pending.catch(() => {}); ctx.dispose(); }
+  });
+});
+
 test('route takeover never restores the author automatically when the host throws after applying a change', async () => {
   const runtime = { searchProviderId: 'candidate-original', fetchProviderId: 'candidate-fetch' };
   let attempts = 0;
@@ -894,6 +919,40 @@ test('product recovery completes an incomplete explicit release and restores the
   assert.deepEqual(store.read(), after);
 });
 
+test('disposing recovery while its completion waits for storage cannot publish a stale receipt', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  applyRouteVerifier(ctx);
+  const store = createProductStore(ctx);
+  const required = createRequiredRecord(ctx, store, randomUUID());
+  const released = store.compareAndSwap({ expectedRevision: required.revision, intent: {
+    ...required.intent, policy: 'released', reason: 'interrupted-release',
+    priorIntent: structuredClone(required.intent), release: {
+      explicit: true, committedAt: '2026-11-15T00:00:00.000Z', kind: 'intent-release-commit',
+      operationId: randomUUID(), hostId: required.intent.lease.hostId, counterBaseline: 0,
+    },
+  } });
+  const waiting = deferred();
+  const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+  let recovery;
+  try {
+    applyRecovery(ctx, { store: {
+      ...store,
+      compareAndSwapAsync(request) {
+        waiting.resolve();
+        return store.compareAndSwapAsync(request);
+      },
+    } });
+    recovery = ctx.get('grokSearchRecovery');
+    const pending = recovery.retry();
+    await waiting.promise;
+    ctx.dispose();
+    lock.release();
+    await pending;
+    assert.deepEqual(store.read(), released);
+    assert.equal(recovery.snapshot().phase, 'disposed');
+  } finally { lock.release(); ctx.dispose(); }
+});
+
 test('product recovery reports a completed explicit release without rewriting its record', async () => {
   const ctx = makeContext({ originalCalls: 0 });
   applyRouteVerifier(ctx);
@@ -1109,4 +1168,130 @@ test('the product manifest ships search, settings and recovery entries in one bu
   assert.ok(root.files.includes('src/bundle.mjs'));
   assert.ok(root.files.includes('src/control.mjs'));
   assert.ok(root.files.includes('src/recovery.mjs'));
+});
+
+test('an already-released stop waits for this generation cleanup and shares its pending result', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const program = deferred(), core = deferred();
+  let stopped = false, disposals = 0;
+  await applyControl(ctx);
+  await ctx.get('grokSearchControl').stop('seed-completion');
+  ctx.dispose();
+  ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(),
+    dispose: () => { disposals++; return core.promise; } });
+  await applyControl(ctx, { canAcquire: () => false, onStop: () => program.promise });
+  const control = ctx.get('grokSearchControl');
+  const pending = control.stop('cancel-new-generation');
+  pending.then(() => { stopped = true; }, () => {});
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stopped, false, 'historical completion is not proof of current cleanup');
+    assert.equal(control.stop('duplicate-stop'), pending);
+    program.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stopped, false, 'core disposal must also settle');
+    core.resolve();
+    assert.equal((await pending).kind, 'already-released');
+    assert.equal(disposals, 1);
+  } finally { program.resolve(); core.resolve(); await pending.catch(() => {}); ctx.dispose(); }
+});
+
+test('an already-released stop reports a new cancellation failure and can retry without redisposal', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  await ctx.get('grokSearchControl').stop('seed-completion');
+  ctx.dispose();
+  let canStop = false, disposals = 0;
+  const failure = Object.assign(new Error('program cleanup failed'), { code: 'TEST_PROGRAM_CLEANUP' });
+  ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => { disposals++; } });
+  await applyControl(ctx, { canAcquire: () => false,
+    onStop: () => canStop ? Promise.resolve() : Promise.reject(failure) });
+  try {
+    const control = ctx.get('grokSearchControl');
+    await assert.rejects(control.stop('stop-failed-generation'), { code: 'TEST_PROGRAM_CLEANUP' });
+    assert.equal(control.publicSnapshot().phase, 'incomplete');
+    assert.equal(control.snapshot().phase, 'incomplete');
+    canStop = true;
+    await control.retryRelease();
+    assert.equal(control.publicSnapshot().phase, 'released');
+    assert.equal(disposals, 1);
+  } finally { ctx.dispose(); }
+});
+
+test('an already-released stop bounds an unsettled new cleanup without redisposing its core', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  await applyControl(ctx);
+  await ctx.get('grokSearchControl').stop('seed-completion');
+  ctx.dispose();
+  let disposals = 0;
+  ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(),
+    dispose: async () => { disposals++; } });
+  await applyControl(ctx, { canAcquire: () => false, onStop: () => new Promise(() => {}) });
+  try {
+    const control = ctx.get('grokSearchControl');
+    await assert.rejects(control.stop('bounded-cleanup'), { code: 'CONTROL_RELEASE_DRAIN_TIMEOUT' });
+    assert.equal(control.publicSnapshot().phase, 'incomplete');
+    assert.equal(disposals, 1);
+  } finally { ctx.dispose(); }
+});
+
+test('release completion rejects live route changes while waiting for its writer lock', async t => {
+  for (const change of ['route', 'counter', 'counter-source', 'web-owner']) await t.test(change, async () => {
+  const ctx = makeContext({ originalCalls: 0 }), waiting = deferred();
+  const store = createProductStore(ctx);
+  let lock;
+  const gated = { ...store, compareAndSwapAsync(request) {
+    if (request.intent.releaseCompletion && !lock) {
+      lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+      waiting.resolve();
+    }
+    return store.compareAndSwapAsync(request);
+  } };
+  await applyControl(ctx, { store: gated });
+  const pending = ctx.get('grokSearchControl').stop('release-before-route-change');
+  try {
+    await waiting.promise;
+    const entry = ctx.loader.entries()[0];
+    if (change === 'route') {
+      entry.fiber.config.searchProvider = 'different-owner';
+      entry.options.config.searchProvider = 'different-owner';
+      ctx.get('web').searchProviderId = 'different-owner';
+    } else if (change === 'counter') {
+      ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 1 }) });
+    } else if (change === 'counter-source') {
+      ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 0, source: 'replacement-counter' }) });
+    } else entry.fiber.uid++;
+    lock.release();
+    const result = await pending;
+    assert.equal(result.kind, 'incomplete');
+    assert.equal(result.completionCommitted, false);
+    assert.equal(store.read().intent.releaseCompletion, undefined);
+  } finally { lock?.release(); await pending.catch(() => {}); ctx.dispose(); }
+  });
+});
+
+test('recovery completion rejects live input changes while waiting for its writer lock', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), waiting = deferred();
+  applyRouteVerifier(ctx);
+  const store = createProductStore(ctx), required = createRequiredRecord(ctx, store, randomUUID());
+  const released = store.compareAndSwap({ expectedRevision: required.revision, intent: {
+    ...required.intent, policy: 'released', priorIntent: required.intent, release: {
+      explicit: true, committedAt: new Date().toISOString(), kind: 'intent-release-commit',
+      operationId: randomUUID(), hostId: required.intent.lease.hostId, counterBaseline: 0,
+    },
+  } });
+  const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+  applyRecovery(ctx, { store: { ...store, compareAndSwapAsync(request) {
+    waiting.resolve();
+    return store.compareAndSwapAsync(request);
+  } } });
+  const pending = ctx.get('grokSearchRecovery').retry();
+  pending.catch(() => {});
+  try {
+    await waiting.promise;
+    ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 1 }) });
+    lock.release();
+    await assert.rejects(pending, error => /^CONTROL_RECOVERY_/.test(error.code));
+    assert.deepEqual(store.read(), released);
+  } finally { lock.release(); await pending.catch(() => {}); ctx.dispose(); }
 });

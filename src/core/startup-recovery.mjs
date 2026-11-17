@@ -44,6 +44,24 @@ function validateReceipt(receipt, expectedAuthor, routeChanged, counterBaseline)
   }
 }
 
+function commitGuard({ readCurrent, observation, receipt, routeChanged, counterBaseline, signal }) {
+  if (!readCurrent) return null;
+  return () => {
+    signal?.throwIfAborted();
+    const current = readCurrent({ observation: structuredClone(observation), routeChanged, counterBaseline });
+    if (!current || typeof current.then === 'function') {
+      if (current?.then) Promise.resolve(current).catch(() => {});
+      fail('CONTROL_RECOVERY_GUARD_INVALID');
+    }
+    const latest = validateObservation(current.observation);
+    if (!isDeepStrictEqual(stableObservation(latest), stableObservation(observation))) fail('CONTROL_RECOVERY_INPUT_CHANGED');
+    validateReceipt(current.receipt, observation.authorSearchProvider, routeChanged, counterBaseline);
+    if (receipt.hostEvidence && !isDeepStrictEqual(current.receipt.hostEvidence, receipt.hostEvidence)) {
+      fail('CONTROL_RECOVERY_INPUT_CHANGED');
+    }
+  };
+}
+
 function validateRequiredProvenance(prior, observation) {
   const lease = prior.lease, acquisition = prior.acquisition;
   if (!lease || !UUID.test(lease.hostId) || !acquisition
@@ -75,10 +93,11 @@ function releasedProvenance(prior) {
  * CAS commits one record only; it is not a cross-resource Host transaction.
  */
 export async function completeDeferredStartup({ store, observe, verifyRoute, restoreRoute = null,
-  operationId = randomUUID(), signal = null }) {
+  operationId = randomUUID(), signal = null, readCurrent = null }) {
   if (!store || typeof store.read !== 'function' || typeof store.compareAndSwap !== 'function'
     || typeof observe !== 'function' || typeof verifyRoute !== 'function'
-    || (restoreRoute !== null && typeof restoreRoute !== 'function') || !UUID.test(operationId)) {
+    || (restoreRoute !== null && typeof restoreRoute !== 'function')
+    || (readCurrent !== null && typeof readCurrent !== 'function') || !UUID.test(operationId)) {
     fail('CONTROL_RECOVERY_ARGUMENT_INVALID');
   }
   signal?.throwIfAborted();
@@ -141,13 +160,17 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
   const { releaseCompletion: archivedCompletion, ...archivedIntent } = prior;
   const intent = { ...archivedIntent, policy: 'released', reason: 'legal-load-observed-unselected-at-author',
     priorIntent: structuredClone(prior), recovery, release: null };
+  const assertCurrent = commitGuard({ readCurrent, observation, receipt, routeChanged, counterBaseline, signal });
   try {
     const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId,
+      assertCurrent, retryOnBusy: assertCurrent !== null,
       ...(signal ? { signal } : {}) });
     return outcome('corrected', envelope, { recordCommitted: true, routeVerified: true, routeChanged });
   } catch (error) {
     if (error instanceof ControlRecordError) {
-      error.recoveryOutcome = Object.freeze({ kind: 'incomplete', routeVerified: true, routeChanged,
+      error.recoveryOutcome = Object.freeze({ kind: 'incomplete',
+        routeVerified: !['CONTROL_RECOVERY_INPUT_CHANGED', 'CONTROL_RECOVERY_ROUTE_UNVERIFIED',
+          'CONTROL_RECOVERY_GUARD_INVALID'].includes(error.code), routeChanged,
         recordCommitted: error.code === 'CONTROL_RECORD_COMMIT_UNCERTAIN' ? null : false,
         operationId, expectedRevision: before.revision });
     }
@@ -161,10 +184,11 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
  * preserved; this branch adds only startup completion evidence.
  */
 export async function completeReleaseRecovery({ store, observe, restoreRoute, verifyRoute,
-  operationId = randomUUID(), signal = null }) {
+  operationId = randomUUID(), signal = null, readCurrent = null }) {
   if (!store || typeof store.read !== 'function' || typeof store.compareAndSwap !== 'function'
     || typeof observe !== 'function' || typeof restoreRoute !== 'function'
-    || typeof verifyRoute !== 'function' || !UUID.test(operationId)) {
+    || typeof verifyRoute !== 'function' || (readCurrent !== null && typeof readCurrent !== 'function')
+    || !UUID.test(operationId)) {
     fail('CONTROL_RECOVERY_ARGUMENT_INVALID');
   }
   signal?.throwIfAborted();
@@ -227,14 +251,18 @@ export async function completeReleaseRecovery({ store, observe, restoreRoute, ve
       previousRevision: before.revision, nextRevision: before.revision + 1 },
   };
   const intent = { ...prior, releaseCompletion: completion, recovery };
+  const assertCurrent = commitGuard({ readCurrent, observation, receipt, routeChanged, counterBaseline, signal });
   try {
     const envelope = await writeControlIntent(store, { expectedRevision: before.revision, intent, operationId,
+      assertCurrent, retryOnBusy: assertCurrent !== null,
       ...(signal ? { signal } : {}) });
     return outcome('completed', envelope, { recordCommitted: true, completionCommitted: true,
       routeVerified: true, routeChanged });
   } catch (error) {
     if (error instanceof ControlRecordError) {
-      error.recoveryOutcome = Object.freeze({ kind: 'incomplete', routeVerified: true, routeChanged,
+      error.recoveryOutcome = Object.freeze({ kind: 'incomplete',
+        routeVerified: !['CONTROL_RECOVERY_INPUT_CHANGED', 'CONTROL_RECOVERY_ROUTE_UNVERIFIED',
+          'CONTROL_RECOVERY_GUARD_INVALID'].includes(error.code), routeChanged,
         recordCommitted: error.code === 'CONTROL_RECORD_COMMIT_UNCERTAIN' ? null : false,
         completionCommitted: error.code === 'CONTROL_RECORD_COMMIT_UNCERTAIN' ? null : false,
         operationId, expectedRevision: before.revision });

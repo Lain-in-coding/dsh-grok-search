@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPrivateProgramInstaller, resolveGrokProgram, unpackPlatformArchive, verifyArchiveIntegrity } from '../src/core/program-install.mjs';
 import { createProgramController } from '../src/program.mjs';
+import { GrokSearchError } from '../src/core/errors.mjs';
 const NAME = '@epsiekygrr_zedxx/grok-search-rs-win32-x64';
 const VERSION = '0.1.26';
 const PLATFORM = { packageName: NAME, version: VERSION, platform: 'win32' };
@@ -222,6 +223,17 @@ test('cache damage is detected before executing a modified binary', async () => 
   writeFileSync(result.path, 'modified');
   await assert.rejects(installer.active(), error => error.code === 'GROK_CACHE_DAMAGED');
   assert.equal(versions.length, 1);
+});
+
+test('cache inspection preserves an unreaped verification failure over caller cancellation', async () => {
+  const { installer, directory } = fixture();
+  await installer.install();
+  const controller = new AbortController(), reason = new Error('cancel cache inspection');
+  const failure = new GrokSearchError('GROK_PROGRAM_REAP_FAILED', 'Unproven verification exit.');
+  const checking = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64',
+    fetchImpl: async () => assert.fail('cached inspection must not download'),
+    inspect: async () => { controller.abort(reason); throw failure; } });
+  await assert.rejects(checking.active({ signal: controller.signal }), caught => caught === failure);
 });
 
 function damagedCache(directory, missing = false) {

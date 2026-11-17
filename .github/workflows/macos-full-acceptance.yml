@@ -45,7 +45,7 @@ on:
         description: Root contains exactly the frozen tgz and package-receipt.json, no other material.
         type: string
         required: true
-        default: macos-frozen-package-6978abc6b4ad
+        default: macos-frozen-package-40a6354b4385
       old_package_run_id:
         description: Successful transport run holding the pinned prior package; may equal package_run_id.
         type: string
@@ -79,7 +79,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  EXPECTED_PACKAGE_SHA256: 6978abc6b4ade2ac9a348098571c44e460eb39d89ecf67dde15fb07a865e371e
+  EXPECTED_PACKAGE_SHA256: 40a6354b4385274235de50e04b68d5c54c2a7081749cea57435dd850edcc9faf
 
 jobs:
   inputs:

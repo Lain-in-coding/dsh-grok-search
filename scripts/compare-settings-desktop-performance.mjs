@@ -167,10 +167,20 @@ try {
 } finally {
   await stop();
   await new Promise(done => upstream.close(done));
+  const integrityErrors = [];
+  const unchanged = (path, expected, file) => {
+    try { return sha256(path) === expected; }
+    catch (error) { integrityErrors.push({ file, code: error?.code ?? 'INTEGRITY_READ_FAILED' }); return false; }
+  };
+  const officialFilesUnchanged = [
+    unchanged(runtime.archivePath, originalArchive, 'official-archive'),
+    unchanged(runtime.executable, originalExecutable, 'official-executable'),
+  ].every(Boolean);
+  const sourcesUnchanged = sourceHashes.map(row => unchanged(join(project, row.file), row.sha256, row.file)).every(Boolean);
   const summary = { runId: run.runId, scope: 'official-windows-rc5-desktop-synthetic-only',
-    passed: !fatal && results.length === 2 && exits.length === 2
+    passed: !fatal && officialFilesUnchanged && sourcesUnchanged && results.length === 2 && exits.length === 2
       && exits.every(row => row.code === 0 && !row.forced && !row.spawnError), fatal, results, exits, sourceHashes,
-    officialFilesUnchanged: sha256(runtime.archivePath) === originalArchive && sha256(runtime.executable) === originalExecutable,
+    officialFilesUnchanged, sourcesUnchanged, integrityErrors,
     profileAndKeys: 'new synthetic-only isolated profiles', realCredentialsRead: false, paidRequests: false };
   writeJson(join(run.directory, 'summary.json'), summary);
   console.log(JSON.stringify({ runId: run.runId, directory: run.directory, passed: summary.passed, fatal }));

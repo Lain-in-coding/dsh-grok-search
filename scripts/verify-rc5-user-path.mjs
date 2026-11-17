@@ -97,6 +97,7 @@ const closed = new Promise(done => child.once('close', (code, signal) => done({ 
 let renderer;
 let registryResolution;
 let result;
+let failure;
 try {
   renderer = await connectRenderer(port, { timeoutMs: 90_000, requestTimeoutMs: 200_000 });
   await waitForRenderer(renderer, client => client.evaluate('document.readyState === "complete" && !!document.querySelector(\'button[aria-label="插件"]\')'));
@@ -413,14 +414,50 @@ ConvertTo-Json -InputObject @{ first=$first; last=$last; crashEvents=$crashes; i
     result.realFolderVisibilityValidated = true;
     result.configOpenUsesSyntheticFile = true;
   }
+} catch (error) {
+  failure = error;
+  throw error;
 } finally {
   renderer?.close();
   try {
-    await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 });
+    try { await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 }); }
+    catch (error) {
+      let exit = null, forced = false, cleanupError = null;
+      const wait = async timeoutMs => {
+        let timer;
+        try {
+          return await Promise.race([closed,
+            new Promise(done => { timer = setTimeout(() => done(null), timeoutMs); })]);
+        } finally { clearTimeout(timer); }
+      };
+      const terminate = signal => {
+        // Never signal an exited lifetime whose PID could now belong to another process.
+        if (!Number.isSafeInteger(child.pid) || child.pid < 1 || child.exitCode !== null || child.signalCode !== null) return;
+        forced = true;
+        try { child.kill(signal); }
+        catch (cause) { cleanupError ??= String(cause?.message ?? cause).slice(0, 500); }
+      };
+      try {
+        terminate('SIGTERM');
+        exit = await wait(3000);
+        if (!exit) { terminate('SIGKILL'); exit = await wait(5000); }
+        if (!exit) {
+          cleanupError ??= 'The owned Desktop did not close within the cleanup deadline.';
+          child.stdout.destroy(); child.stderr.destroy(); child.unref();
+        }
+        writeJson(join(run.directory, 'exit.json'), {
+          ...(exit ?? { code: child.exitCode ?? null, signal: child.signalCode ?? null }),
+          forced, cleanupVerified: exit !== null, cleanupError,
+          shutdownError: { name: error?.name ?? 'Error', message: String(error?.message ?? error).slice(0, 1000) },
+        });
+      } finally { throw error; }
+    }
     const exit = await closed;
     writeJson(join(run.directory, 'exit.json'), exit);
     assert.equal(exit.code, 0, 'the owned Desktop exits successfully');
     assert.equal(exit.signal, null, 'the owned Desktop is not terminated by a signal');
+  } catch (error) {
+    if (failure === undefined) throw error;
   } finally {
     quotaServer.closeAllConnections();
     await new Promise(done => quotaServer.close(done));

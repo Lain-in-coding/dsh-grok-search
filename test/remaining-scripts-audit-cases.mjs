@@ -156,3 +156,77 @@ test('RC5 upgrade rejects an unverified old package before any fixture preparati
   assert.doesNotThrow(() => verify(null), 'Fresh-install preflight must not read an old package.');
   assert.throws(() => verify(old), /receipt/i);
 });
+
+async function performanceComparisonSummary({ changed = [], unreadable = [], fatal = null, exitCode = 0 } = {}) {
+  const text = source('compare-settings-desktop-performance.mjs');
+  const start = text.lastIndexOf('} finally {');
+  assert.ok(start >= 0);
+  const body = text.slice(start + '} finally {'.length, text.lastIndexOf('\n}'));
+  const runtime = { archivePath: 'fixture-archive', executable: 'fixture-executable' };
+  const project = 'fixture-project', read = [], evidence = [];
+  const sourceHashes = ['helper-one.mjs', 'helper-two.mjs'].map(file => ({ file, sha256: 'original-' + file }));
+  const hashes = new Map([[runtime.archivePath, 'original-archive'], [runtime.executable, 'original-executable'],
+    ...sourceHashes.map(row => [join(project, row.file), row.sha256])]);
+  const results = [{ label: 'baseline', measurement: 11 }, { label: 'optimized', measurement: 7 }];
+  const exits = [{ code: 0, forced: false }, { code: exitCode, forced: false }];
+  const context = { runtime, project, sourceHashes, fatal, results, exits, join, run: { runId: 'fixture-run', directory: 'unused' },
+    originalArchive: 'original-archive', originalExecutable: 'original-executable',
+    stop: async () => {}, upstream: { close(done) { done(); } }, process: { exitCode: null },
+    console: { log() {} }, writeJson(path, value) { evidence.push({ path, value }); },
+    sha256(path) {
+      read.push(path);
+      if (unreadable.includes(path)) throw Object.assign(new Error('Synthetic missing integrity input'), { code: 'ENOENT' });
+      assert.ok(hashes.has(path), 'Only the recorded integrity inputs may be read.');
+      return changed.includes(path) ? 'changed' : hashes.get(path);
+    },
+  };
+  await runInNewContext(`(async () => { ${body} })()`, context);
+  return { summary: evidence[0].value, exitCode: context.process.exitCode, read, sourceHashes, results, exits };
+}
+
+test('Desktop performance comparison fails changed official files without discarding measurements', async () => {
+  for (const file of ['fixture-archive', 'fixture-executable']) {
+    const result = await performanceComparisonSummary({ changed: [file] });
+    assert.equal(result.summary.officialFilesUnchanged, false);
+    assert.equal(result.summary.passed, false);
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.summary.results, result.results);
+    assert.equal(result.summary.exits, result.exits);
+  }
+});
+
+test('Desktop performance comparison rechecks every source hash and rejects drift or unreadable inputs', async () => {
+  for (const mode of ['changed', 'unreadable']) {
+    for (const file of ['helper-one.mjs', 'helper-two.mjs']) {
+      const result = await performanceComparisonSummary({ [mode]: [join('fixture-project', file)] });
+      assert.equal(result.summary.sourcesUnchanged, false);
+      assert.equal(result.summary.passed, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(result.sourceHashes.every(row => result.read.includes(join('fixture-project', row.file))));
+      assert.equal(result.summary.results, result.results);
+    }
+  }
+});
+
+test('Desktop performance comparison retains its primary failure even when final integrity reads fail', async () => {
+  const fatal = { name: 'AssertionError', message: 'synthetic original measurement failure' };
+  const result = await performanceComparisonSummary({ fatal, unreadable: ['fixture-archive'] });
+  assert.equal(result.summary.fatal, fatal);
+  assert.equal(result.summary.officialFilesUnchanged, false);
+  assert.equal(result.summary.passed, false);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.summary.results, result.results);
+  assert.ok(result.summary.integrityErrors.some(row => row.code === 'ENOENT'));
+});
+
+test('Desktop performance comparison passes intact inputs and preserves failed process outcomes', async () => {
+  const passed = await performanceComparisonSummary();
+  assert.equal(passed.summary.passed, true);
+  assert.equal(passed.summary.officialFilesUnchanged, true);
+  assert.equal(passed.summary.sourcesUnchanged, true);
+  assert.equal(passed.exitCode, 0);
+  assert.equal((await performanceComparisonSummary({ exitCode: 17 })).summary.passed, false);
+  const fatal = { name: 'Error', message: 'synthetic measurement failure' };
+  assert.equal((await performanceComparisonSummary({ fatal })).summary.fatal, fatal);
+  assert.equal((await performanceComparisonSummary({ fatal })).summary.passed, false);
+});

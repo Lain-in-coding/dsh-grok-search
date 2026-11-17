@@ -352,36 +352,133 @@ test('native update closes its owned process even without a renderer or after a 
   }
 });
 
-test('原生首装验证仅在宿主正常退出后生成通过摘要', async () => {
+function freshUserPathClosing({ closed, child, shutdownFailure = null, primaryFailure = null, timers = setTimeout }) {
   const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
-  const closing = source.slice(source.lastIndexOf('} finally {\n  renderer?.close();'));
-  assert.ok(closing.startsWith('} finally {'));
-  assert.ok(closing.indexOf('assert.equal(exit.code, 0') < closing.indexOf('result.passed = true'));
-  assert.ok(closing.indexOf('assert.equal(exit.signal, null') < closing.indexOf('result.passed = true'));
+  const finallyStart = source.lastIndexOf('} finally {\n  renderer?.close();');
+  assert.ok(finallyStart >= 0);
+  const catchStart = source.lastIndexOf('} catch (error) {\n  failure = error;', finallyStart);
+  const closing = source.slice(catchStart < 0 ? finallyStart : catchStart);
   const execute = new Function('assert', 'renderer', 'requestDesktopShutdown', 'port', 'closed',
-    'writeJson', 'join', 'run', 'quotaServer', 'result',
-    `return (async () => { try { ${closing} })();`);
+    'writeJson', 'join', 'run', 'quotaServer', 'result', 'child', 'primaryFailure', 'setTimeout', 'clearTimeout',
+    `return (async () => { let failure; try { if (primaryFailure) throw primaryFailure; ${closing} })();`);
+  const evidence = [], result = {}, state = { quotaClosed: false };
+  const verification = execute(assert, { close() {} },
+    async () => { if (shutdownFailure) throw shutdownFailure; }, 1234, closed,
+    (path, value) => evidence.push({ path, value }), join, { directory: '/isolated-fixture' },
+    { closeAllConnections() {}, close(done) { state.quotaClosed = true; done(); } },
+    result, child, primaryFailure, timers, clearTimeout);
+  return { verification, evidence, result, state };
+}
+
+function freshUserPathChild(onKill = () => {}) {
+  let finish;
+  const calls = [], closed = new Promise(done => { finish = done; });
+  const child = { pid: 1234, exitCode: null, signalCode: null,
+    kill(signal) { calls.push(signal); return onKill(signal); },
+    stdout: { destroy() { calls.push('stdout-destroy'); } },
+    stderr: { destroy() { calls.push('stderr-destroy'); } },
+    unref() { calls.push('unref'); },
+  };
+  const complete = exit => {
+    child.exitCode = exit.code; child.signalCode = exit.signal; finish(exit);
+  };
+  return { child, closed, calls, complete };
+}
+
+test('原生首装验证仅在宿主正常退出后生成通过摘要', async () => {
   for (const [exit, shutdownFailure] of [
     [{ code: 0, signal: null }, null],
     [{ code: 1, signal: null }, null],
     [{ code: null, signal: 'SIGTERM' }, null],
     [{ code: 0, signal: null }, new Error('synthetic shutdown timeout')],
   ]) {
-    const evidence = [];
-    let quotaClosed = false;
-    const result = {};
-    const verification = execute(assert, { close() {} },
-      async () => { if (shutdownFailure) throw shutdownFailure; }, 1234, Promise.resolve(exit),
-      (path, value) => evidence.push({ path, value }), join, { directory: '/isolated-fixture' },
-      { closeAllConnections() {}, close(done) { quotaClosed = true; done(); } }, result);
+    const owned = freshUserPathChild(() => assert.fail('An exited child cannot receive another signal.'));
+    owned.complete(exit);
+    const { verification, evidence, result, state } = freshUserPathClosing({ ...owned, shutdownFailure });
     const successful = exit.code === 0 && exit.signal === null && !shutdownFailure;
     if (successful) await verification;
     else await assert.rejects(verification);
-    assert.equal(quotaClosed, true, 'the local quota fixture closes even after a shutdown failure');
+    assert.equal(state.quotaClosed, true, 'the local quota fixture closes even after a shutdown failure');
     assert.equal(evidence.some(row => row.path.endsWith('summary.json')), successful);
     assert.equal(result.passed === true, successful);
     if (!shutdownFailure) assert.deepEqual(evidence[0].value, exit, 'failed exit diagnostics are retained');
   }
+});
+
+test('fresh user path reaps only its owned live child after CDP rejection and preserves that rejection', async () => {
+  const failure = new Error('synthetic CDP unavailable'), owned = freshUserPathChild(() => true);
+  const gate = freshUserPathClosing({ ...owned, shutdownFailure: failure });
+  let settled = false;
+  const rejected = assert.rejects(gate.verification, error => error === failure).then(() => { settled = true; });
+  await new Promise(done => setImmediate(done));
+  assert.deepEqual(owned.calls, ['SIGTERM']);
+  assert.equal(settled, false, 'Sending a signal does not prove actual exit.');
+  owned.complete({ code: null, signal: 'SIGTERM' });
+  await rejected;
+  assert.equal(gate.state.quotaClosed, true);
+  const exit = gate.evidence.find(row => row.path.endsWith('exit.json')).value;
+  assert.equal(exit.forced, true);
+  assert.equal(exit.cleanupVerified, true);
+  assert.equal(exit.shutdownError.message, failure.message);
+  assert.equal(gate.evidence.some(row => row.path.endsWith('summary.json')), false);
+});
+
+test('fresh user path escalates bounded owned-child cleanup when the first signal is ineffective', async () => {
+  for (const firstSignalThrows of [false, true]) {
+    const failure = new Error('synthetic shutdown timeout');
+    const owned = freshUserPathChild(signal => {
+      if (signal === 'SIGKILL') { owned.complete({ code: null, signal }); return true; }
+      if (firstSignalThrows) throw new Error('synthetic signal refusal');
+      return false;
+    });
+    const gate = freshUserPathClosing({ ...owned, shutdownFailure: failure,
+      timers: (callback, ms) => setTimeout(callback, Math.min(ms, 5)) });
+    await assert.rejects(gate.verification, error => error === failure);
+    assert.deepEqual(owned.calls, ['SIGTERM', 'SIGKILL']);
+    assert.equal(gate.evidence.find(row => row.path.endsWith('exit.json')).value.cleanupVerified, true);
+  }
+});
+
+test('fresh user path does not signal exited or unspawned children while awaiting their close observation', async () => {
+  for (const state of [{ exitCode: 0 }, { signalCode: 'SIGTERM' }, { pid: undefined }]) {
+    const owned = freshUserPathChild(() => assert.fail('Never signal a process without a live owned lifetime.'));
+    Object.assign(owned.child, state);
+    const failure = new Error('synthetic CDP disconnected');
+    const gate = freshUserPathClosing({ ...owned, shutdownFailure: failure });
+    const rejected = assert.rejects(gate.verification, error => error === failure);
+    await new Promise(done => setImmediate(done));
+    assert.deepEqual(owned.calls, []);
+    owned.complete({ code: state.exitCode ?? null, signal: state.signalCode ?? null });
+    await rejected;
+    assert.equal(gate.evidence.find(row => row.path.endsWith('exit.json')).value.forced, false);
+  }
+});
+
+test('fresh user path records unverified cleanup after both deadlines without replacing the CDP failure', async () => {
+  const failure = new Error('synthetic CDP failure'), owned = freshUserPathChild(() => false);
+  const gate = freshUserPathClosing({ ...owned, shutdownFailure: failure,
+    timers: (callback, ms) => setTimeout(callback, Math.min(ms, 5)) });
+  await assert.rejects(gate.verification, error => error === failure);
+  assert.deepEqual(owned.calls.slice(0, 2), ['SIGTERM', 'SIGKILL']);
+  assert.ok(owned.calls.includes('unref'), 'A failed close observation must not hold the runner open indefinitely.');
+  const exit = gate.evidence.find(row => row.path.endsWith('exit.json')).value;
+  assert.equal(exit.cleanupVerified, false);
+  assert.equal(exit.forced, true);
+  assert.ok(exit.cleanupError);
+  assert.equal(gate.state.quotaClosed, true);
+  assert.equal(gate.result.passed, undefined);
+});
+
+test('fresh user path preserves the original verification failure when owned cleanup also fails', async () => {
+  const primaryFailure = new Error('synthetic original verification failure');
+  const shutdownFailure = new Error('synthetic secondary CDP failure');
+  const owned = freshUserPathChild(signal => { owned.complete({ code: null, signal }); return true; });
+  const gate = freshUserPathClosing({ ...owned, primaryFailure, shutdownFailure });
+  await assert.rejects(gate.verification, error => error === primaryFailure);
+  assert.deepEqual(owned.calls, ['SIGTERM']);
+  assert.equal(gate.state.quotaClosed, true);
+  assert.equal(gate.evidence.find(row => row.path.endsWith('exit.json')).value.shutdownError.message, shutdownFailure.message);
+  assert.equal(gate.evidence.some(row => row.path.endsWith('summary.json')), false);
 });
 
 test('B2 settings snapshot pins the current idle test-button label', () => {

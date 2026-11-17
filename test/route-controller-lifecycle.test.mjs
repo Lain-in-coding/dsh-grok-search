@@ -31,13 +31,17 @@ function harness() {
   dlg.querySelector = $;
   const context = vm.createContext({
     NUM, normCard, normHub, validateHub,
-    D: null, S: { busy: false, capabilities: { secretsAllowed: true } }, disposed: false, secretEpoch: 0,
+    D: null, S: { busy: false, capabilities: { secretsAllowed: true },
+      config: { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before' } }, disposed: false, secretEpoch: 0,
     dlg, overlay, quotaView: null, closeTimer: 0, overlayEntranceTimer: 0, shakeCleanups: new Map(),
     $, $$: selector => selector === 'input[data-k]' ? inputs : selector === '[data-a=eye], [data-a=copy]' ? buttons : [],
     active: () => null, clone: structuredClone, reduced: () => false,
-    remote: { reveal(request) {
-      return new Promise((resolve, reject) => requests.push({ ...request, resolve, reject }));
-    } },
+    remote: {
+      reveal() { assert.fail('The new UI must not dispatch unguarded credential reads'); },
+      revealWithIdentity(request) {
+        return new Promise((resolve, reject) => requests.push({ ...request, resolve, reject }));
+      },
+    },
     setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {},
     hideStripTip() {}, shake() {}, svg: () => '', rowOf: () => null,
     refreshDialog() { context.D.v = { err: {}, warn: {} }; },
@@ -63,6 +67,7 @@ function harness() {
   function open(id = 'grok', draft = { key: marker, gwKey: marker, model: 'before', enabled: true }) {
     const dialog = {
       kind: 'card', id, draft: structuredClone(draft), base: structuredClone(draft),
+      configBaseline: structuredClone(context.S.config),
       fields: {}, revealing: new Map(), closed: false, touched: new Set(), edited: new Set(),
       show: {}, saving: false, clearing: false, submitted: false, clearTimer: 0,
     };
@@ -92,6 +97,10 @@ test('reveals deduplicate per field while native and gateway keys resolve indepe
   const native = h.context.revealFor('key'), duplicate = h.context.revealFor('key');
   const gateway = h.context.revealFor('gwKey');
   assert.deepEqual(h.requests.map(request => request.key), ['grok_api_key', 'openai_compatible_api_key']);
+  for (const request of h.requests) {
+    assert.equal(request.expectedRevision, dialog.configBaseline.revision);
+    assert.equal(request.configIdentity, dialog.configBaseline.quotaRevision);
+  }
   h.requests[1].resolve({ value: 'gateway-value' });
   assert.equal(await gateway, true);
   assert.equal(dialog.draft.gwKey, 'gateway-value');
@@ -179,9 +188,9 @@ test('a new authorization epoch can reveal while an obsolete same-field request 
 
 test('a reloaded dialog baseline invalidates pending key reveals and permits a fresh request', async () => {
   const h = harness(), dialog = h.open();
-  dialog.configBaseline = { revision: 'before', quotaRevision: 'before' };
   const obsolete = h.context.revealFor('key');
-  dialog.configBaseline = { revision: 'reloaded', quotaRevision: 'reloaded' };
+  h.context.S.config = { path: '/config.toml', revision: 'reloaded', quotaRevision: 'reloaded' };
+  dialog.configBaseline = structuredClone(h.context.S.config);
   const fresh = h.context.revealFor('key');
   const count = h.requests.length;
   h.requests[0].resolve({ value: 'old-baseline-key' });
@@ -192,6 +201,122 @@ test('a reloaded dialog baseline invalidates pending key reveals and permits a f
   assert.equal(dialog.base.key, 'reloaded-baseline-key');
   assert.equal(dialog.draft.key, 'reloaded-baseline-key');
   assert.equal(dialog.revealing.size, 0);
+});
+
+test('pending reveals reject changed paths, revisions and effective identities without changing their dialog baseline', async () => {
+  for (const change of [{ path: '/other.toml' }, { revision: 'other' }, { quotaRevision: 'effective-other' }]) {
+    const h = harness(), dialog = h.open(), baseline = dialog.configBaseline;
+    const revealing = h.context.revealFor('key');
+    h.context.S.config = { ...h.context.S.config, ...change };
+    h.requests[0].resolve({ value: 'obsolete-value' });
+    assert.equal(await revealing, false);
+    assert.equal(dialog.configBaseline, baseline);
+    assert.equal(dialog.draft.key, h.marker);
+    assert.equal(h.inputs.find(input => input.dataset.k === 'key').value, '');
+    assert.equal(dialog.revealing.size, 0);
+  }
+});
+
+test('a stale dialog cannot start a reveal even after an obsolete same-field request finishes', async () => {
+  const h = harness(), dialog = h.open();
+  const revealing = h.context.revealFor('key');
+  h.context.S.config = { ...h.context.S.config, quotaRevision: 'effective-other' };
+  h.requests[0].reject(new Error('obsolete failure'));
+  assert.equal(await revealing, false);
+  assert.equal(h.errors.length, 0);
+  const next = h.context.revealFor('key');
+  const calls = h.requests.length;
+  h.requests[1]?.resolve({ value: 'wrong-baseline-value' });
+  assert.equal(await next, false);
+  assert.equal(calls, 1);
+  assert.equal(dialog.draft.key, h.marker);
+  assert.equal(h.errors.at(-1)?.code, 'CONFIG_CONFLICT');
+});
+
+test('a revealed value cannot cross an in-place change to the captured config baseline', async () => {
+  const h = harness(), dialog = h.open();
+  const revealing = h.context.revealFor('key');
+  dialog.configBaseline.quotaRevision = 'effective-other';
+  h.context.S.config.quotaRevision = 'effective-other';
+  h.requests[0].resolve({ value: 'obsolete-value' });
+  assert.equal(await revealing, false);
+  assert.equal(dialog.draft.key, h.marker);
+});
+
+test('an unpolled host identity change rejects a reveal before reading another target credential', async () => {
+  const h = harness(), dialog = h.open(), before = structuredClone(h.context.S.config);
+  let identity = before.quotaRevision, reads = 0;
+  h.context.remote.revealWithIdentity = async request => {
+    if (request.expectedRevision !== before.revision || request.configIdentity !== identity) {
+      throw Object.assign(new Error('host target changed'), { code: 'CONFIG_CONFLICT' });
+    }
+    reads++;
+    return { value: 'other-target-value' };
+  };
+  identity = 'host-other-identity';
+  assert.equal(await h.context.revealFor('key'), false);
+  assert.equal(reads, 0);
+  assert.equal(dialog.draft.key, h.marker);
+  assert.equal(h.context.S.config.path, before.path);
+  assert.equal(h.errors.at(-1)?.code, 'CONFIG_CONFLICT');
+});
+
+test('a missing identity-aware reveal fails with a recovery action and never calls legacy reveal', async () => {
+  for (const missing of [true, false]) {
+    const h = harness(), dialog = h.open();
+    if (missing) delete h.context.remote.revealWithIdentity;
+    else h.context.remote.revealWithIdentity = async () => {
+      throw Object.assign(new Error('synthetic old backend'), { code: 'gateway/method_not_found' });
+    };
+    assert.equal(await h.context.revealFor('key'), false);
+    assert.equal(dialog.draft.key, h.marker);
+    assert.match(h.errors.at(-1)?.message || '', /重新打开设置/);
+    assert.match(h.errors.at(-1)?.message || '', /重启 DSH/);
+  }
+});
+
+test('accepted external config changes invalidate a reveal even if the original configuration returns', async () => {
+  const h = harness(), dialog = h.open(), before = structuredClone(h.context.S.config);
+  Object.assign(h.context, {
+    META: { grok: {} }, HUB_FIELDS: {}, sourceChain: { view: () => ({ order: [] }) },
+    providersFrom: () => ({ grok: {} }), providerIdentity: () => '',
+    ingestRoute() {}, buildRows() {}, syncOpenCardBaseline() {}, logView: null,
+  });
+  Object.assign(h.context.S, { order: [], identity: {}, checked: {}, bad: {}, providerBad: {}, hub: {},
+    configRevision: before.revision, configIdentity: before.quotaRevision, configPath: before.path });
+  vm.runInContext(section('function acceptSnapshot(', 'let readTask ='), h.context);
+  const revealing = h.context.revealFor('key');
+  const snapshot = config => ({ config, control: { policy: 'required' }, capabilities: { secretsAllowed: true }, plugin: {} });
+  h.context.acceptSnapshot(snapshot({ ...before, quotaRevision: 'effective-other' }), { value: {} });
+  h.context.acceptSnapshot(snapshot(before), { value: {} });
+  h.requests[0].resolve({ value: 'obsolete-value' });
+  assert.equal(await revealing, false);
+  assert.equal(dialog.draft.key, h.marker);
+});
+
+test('copy completion callbacks are inert after disposal for either clipboard outcome', async () => {
+  for (const failed of [false, true]) {
+    const h = harness();
+    h.open('grok', { key: 'synthetic-copy-value' });
+    let callback;
+    h.context.navigator = { clipboard: { writeText() {
+      return { then(resolve, reject) { callback = failed ? reject : resolve; } };
+    } } };
+    h.context.toast = () => assert.fail('A disposed controller must not publish clipboard feedback');
+    await h.context.copyKey(h.buttons.find(button => button.dataset.a === 'copy'));
+    h.context.disposed = true;
+    assert.equal(typeof callback, 'function');
+    assert.doesNotThrow(() => callback(new Error('synthetic clipboard rejection')));
+  }
+});
+
+test('a disposed toast never reads or mutates the removed DOM', () => {
+  const context = vm.createContext({
+    disposed: true,
+    $() { assert.fail('A disposed toast must not read its DOM'); },
+  });
+  vm.runInContext(section('function toast(text,', 'const shakeCleanups ='), context);
+  assert.doesNotThrow(() => context.toast('late feedback'));
 });
 
 test('a failed current reveal remains visible and prevents a waiting save', async () => {
@@ -262,18 +387,174 @@ test('destination drafts cannot cross a known config path or effective identity 
   }
 });
 
-test('an effective identity change still permits an unrelated nonsecret draft edit', async () => {
+test('an effective identity change requires explicit review even for an unrelated nonsecret draft edit', async () => {
   const baseline = { path: '/config.toml', revision: 'same-file-hash', quotaRevision: 'effective-a', exists: true,
     fields: { grok_model: { value: 'before', source: 'file' } } };
   const config = { ...structuredClone(baseline), quotaRevision: 'effective-b' }, requests = [];
   const context = vm.createContext({
     S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
-    remote: { save: async request => { requests.push(request); return { config: { ...config, revision: 'saved' } }; } },
+    remote: { save: async request => { requests.push(request); return { config: { ...config, revision: 'saved' } }; },
+      saveWithIdentity: async request => { requests.push(request); return { config: { ...config, revision: 'saved' } }; } },
   });
   vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
-  await context.saveConfig({ grok_model: 'after' }, baseline);
+  await assert.rejects(context.saveConfig({ grok_model: 'after' }, baseline), error => error.code === 'CONFIG_CONFLICT');
+  assert.equal(requests.length, 0);
+});
+
+test('new saves use the existing effective identity and never call the legacy endpoint', async () => {
+  const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', exists: true, fields: {} };
+  const saved = { ...config, revision: 'saved', quotaRevision: 'effective-saved' };
+  const requests = [];
+  const context = vm.createContext({
+    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    remote: {
+      save() { assert.fail('The new UI must not dispatch unguarded saves'); },
+      saveWithIdentity: async request => { requests.push(request); return { config: saved }; },
+    },
+  });
+  vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+  const receipt = await context.saveConfig({ grok_model: 'after' }, config);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].updates.grok_model, 'after');
+  assert.deepEqual(JSON.parse(JSON.stringify(requests[0])), {
+    expectedRevision: 'before', configIdentity: 'effective-before', updates: { grok_model: 'after' },
+  });
+  assert.equal(receipt.path, saved.path);
+  assert.equal(receipt.quotaRevision, saved.quotaRevision);
+  assert.equal(receipt.after, saved.revision);
+});
+
+function undoHarness({ changed = {}, failure = null, missing = false } = {}) {
+  const receipt = { before: 'before', after: 'saved', path: '/config.toml', quotaRevision: 'effective-saved', undo: true };
+  const config = { path: receipt.path, revision: receipt.after, quotaRevision: receipt.quotaRevision, ...changed };
+  const requests = [], errors = [], preferences = [], updates = [];
+  const context = vm.createContext({
+    disposed: false, S: { config, busy: false, capabilities: { secretsAllowed: true } },
+    updateConfig: value => updates.push(value), operationError: error => errors.push(error), syncAll() {}, toast() {},
+    savePreference: async (...args) => preferences.push(args),
+    remote: {
+      restoreConfig() { assert.fail('New undo cannot call the legacy restore endpoint'); },
+      ...(!missing ? { restoreConfigWithIdentity: async request => {
+        requests.push(request);
+        if (failure) throw Object.assign(new Error('Synthetic restore failure'), { code: failure });
+        return { config: { ...config, revision: 'restored' } };
+      } } : {}),
+    },
+  });
+  vm.runInContext(section('function configUndo(', 'function normalizeCode('), context);
+  return { context, receipt, requests, errors, preferences, updates };
+}
+
+test('config and card undo restore only the saved target identity before reverting a private switch', async () => {
+  for (const card of [false, true]) {
+    const h = undoHarness();
+    const undo = card ? h.context.cardUndo(h.receipt, 'grok', false, true) : h.context.configUndo(h.receipt);
+    await undo();
+    assert.deepEqual(JSON.parse(JSON.stringify(h.requests)), [{
+      expectedRevision: 'saved', configIdentity: 'effective-saved', revision: 'before',
+    }]);
+    assert.equal(h.errors.length, 0);
+    assert.equal(h.updates.length, 1);
+    assert.equal(h.preferences.length, card ? 1 : 0);
+    assert.equal(h.context.S.busy, false);
+  }
+});
+
+test('config and card undo reject a known different path, revision or credential identity without dispatch', async () => {
+  for (const card of [false, true]) {
+    for (const changed of [{ path: '/other.toml' }, { revision: 'other' }, { quotaRevision: 'effective-other' }]) {
+      const h = undoHarness({ changed });
+      const undo = card ? h.context.cardUndo(h.receipt, 'grok', false, true) : h.context.configUndo(h.receipt);
+      await undo();
+      assert.equal(h.requests.length, 0);
+      assert.equal(h.updates.length, 0);
+      assert.equal(h.preferences.length, 0);
+      assert.equal(h.errors.at(-1)?.code, 'CONFIG_CONFLICT');
+    }
+  }
+});
+
+test('an unpolled undo target change or missing new endpoint cannot fall back or revert the private switch', async () => {
+  for (const options of [{ failure: 'CONFIG_CONFLICT' }, { failure: 'gateway/method_not_found' }, { missing: true }]) {
+    for (const card of [false, true]) {
+      const h = undoHarness(options);
+      const undo = card ? h.context.cardUndo(h.receipt, 'grok', false, true) : h.context.configUndo(h.receipt);
+      await undo();
+      assert.equal(h.requests.length, options.missing ? 0 : 1);
+      assert.equal(h.updates.length, 0);
+      assert.equal(h.preferences.length, 0);
+      assert.equal(h.errors.at(-1)?.code, options.missing ? 'SETTINGS_RESTORE_UNAVAILABLE' : options.failure);
+      if (options.failure !== 'CONFIG_CONFLICT') {
+        assert.match(h.errors.at(-1)?.message || '', /重新打开设置/);
+        assert.match(h.errors.at(-1)?.message || '', /重启 DSH/);
+      }
+    }
+  }
+});
+
+test('a missing identity-aware save endpoint fails without legacy fallback or a config retry', async () => {
+  for (const missing of [true, false]) {
+    const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', fields: {} };
+    let guardedCalls = 0;
+    const context = vm.createContext({
+      S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+      refresh() { assert.fail('An unavailable endpoint is not a revision conflict'); },
+      remote: {
+        save() { assert.fail('The legacy endpoint cannot weaken identity checking'); },
+        ...(!missing ? { saveWithIdentity() {
+          guardedCalls++;
+          return Promise.reject(Object.assign(new Error('old backend'), { code: 'gateway/method_not_found' }));
+        } } : {}),
+      },
+    });
+    vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+    await assert.rejects(context.saveConfig({ grok_model: 'after' }), error => {
+      assert.equal(error.code, missing ? 'SETTINGS_SAVE_UNAVAILABLE' : 'gateway/method_not_found');
+      assert.match(error.message, /重新打开设置/);
+      assert.match(error.message, /重启 DSH/);
+      assert.doesNotMatch(error.message, /更新插件/);
+      return true;
+    });
+    assert.equal(guardedCalls, missing ? 0 : 1);
+  }
+});
+
+test('a conflict retry cannot rebase a draft across a different config path or effective identity', async () => {
+  for (const change of [{ path: '/other.toml' }, { quotaRevision: 'effective-other' }]) {
+    const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', fields: {} };
+    const requests = [];
+    const dispatch = async request => {
+      requests.push(request);
+      if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'CONFIG_CONFLICT' });
+      return { config: { ...config, revision: 'saved' } };
+    };
+    const context = vm.createContext({
+      S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+      refresh: async () => { context.S.config = { ...config, ...change }; },
+      remote: { save: dispatch, saveWithIdentity: dispatch },
+    });
+    vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+    await assert.rejects(context.saveConfig({ timeout_seconds: 65 }), error => error.code === 'CONFIG_CONFLICT');
+    assert.equal(requests.length, 1);
+  }
+});
+
+test('a comment-only config conflict can retry once with the unchanged effective identity', async () => {
+  const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', fields: {} };
+  const requests = [];
+  const context = vm.createContext({
+    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    refresh: async () => { context.S.config = { ...config, revision: 'comment-edit' }; },
+    remote: { saveWithIdentity: async request => {
+      requests.push(request);
+      if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'CONFIG_CONFLICT' });
+      return { config: { ...config, revision: 'saved' } };
+    } },
+  });
+  vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+  await context.saveConfig({ timeout_seconds: 65 }, config);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].expectedRevision, 'comment-edit');
+  assert.equal(requests[1].configIdentity, 'effective-before');
 });
 
 test('disposing during a preference conflict reread prevents a retry and late state replacement', async () => {
@@ -302,14 +583,15 @@ test('disposing during a preference conflict reread prevents a retry and late st
 });
 
 test('disposing during a config conflict reread prevents a new save request', async () => {
-  const config = { path: '/config.toml', revision: 'before', fields: { grok_model: { value: 'before' } } };
+  const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before',
+    fields: { grok_model: { value: 'before' } } };
   const requests = [];
   let resolveRead, reading;
   const started = new Promise(resolve => { reading = resolve; });
   const context = vm.createContext({
     S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
     refresh: () => new Promise(resolve => { resolveRead = resolve; reading(); }),
-    remote: { save: async request => {
+    remote: { saveWithIdentity: async request => {
       requests.push(request);
       if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'CONFIG_CONFLICT' });
       return { config: { ...config, revision: 'saved' } };
@@ -325,7 +607,7 @@ test('disposing during a config conflict reread prevents a new save request', as
 });
 
 test('an earlier settings poll cannot replace a successful config save', async () => {
-  const before = { path: '/config.toml', revision: 'before', exists: true,
+  const before = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', exists: true,
     fields: { grok_model: { value: 'before' } } };
   const saved = { ...before, revision: 'saved', fields: { grok_model: { value: 'after' } } };
   let resolveRead;
@@ -336,7 +618,7 @@ test('an earlier settings poll cannot replace a successful config save', async (
     syncAll() {}, denyPrivateAccess() {},
     remote: {
       snapshot: () => new Promise(resolve => { resolveRead = resolve; }), preferences: async () => ({}),
-      save: async () => ({ config: saved }),
+      saveWithIdentity: async () => ({ config: saved }),
     },
   });
   vm.runInContext([

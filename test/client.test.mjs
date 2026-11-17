@@ -175,6 +175,34 @@ test('compatibility adapter addresses its own namespace without affecting legacy
   assert.deepEqual(calls, ['compatibility', 'settings']);
 });
 
+test('settings adapter exposes target-bound save, reveal and restore without legacy fallback', async () => {
+  const client = loadClient();
+  for (const [method, legacy, extra] of [
+    ['saveWithIdentity', 'save', { updates: { timeout_seconds: 65 } }],
+    ['revealWithIdentity', 'reveal', { key: 'grok_api_key' }],
+    ['restoreConfigWithIdentity', 'restoreConfig', { revision: 'b'.repeat(64) }],
+  ]) {
+    const calls = [], descriptor = client.__test.descriptors.find(row => row.method === method);
+    assert.equal(descriptor.id, `dsh-grok-search#grokSearchSettings/${method}`);
+    const request = { expectedRevision: 'missing', configIdentity: 'a'.repeat(64), ...extra };
+    const service = {
+      [legacy]() { assert.fail('Target-bound operations must never call the legacy endpoint'); },
+      [method]: async value => { calls.push(value); return { ok: true, value: { applied: method } }; },
+    };
+    const adapter = client.__test.remoteAdapter({ grokSearchSettings: service });
+    assert.equal((await adapter[method](request)).applied, method);
+    assert.deepEqual(calls, [request]);
+    for (const missing of [true, false]) {
+      const old = { [legacy]() { assert.fail('An older backend cannot cause unguarded fallback'); },
+        ...(!missing ? { [method]: async () => ({ ok: false, error: {
+          code: 'gateway/method_not_found', message: 'Synthetic old backend',
+        } }) } : {}) };
+      await assert.rejects(client.__test.remoteAdapter({ grokSearchSettings: old })[method](request),
+        error => error.code === (missing ? 'SETTINGS_UNAVAILABLE' : 'gateway/method_not_found'));
+    }
+  }
+});
+
 test('chat and settings whale assets are compact variants and preserve the source artwork', () => {
   const logos = loadClient().__test.LOGOS;
   const original = readFileSync(new URL('../src/assets/logos/deepseek-harness.png', import.meta.url));

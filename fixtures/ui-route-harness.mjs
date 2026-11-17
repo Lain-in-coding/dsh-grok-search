@@ -29,9 +29,10 @@ const cancelledOperations = new Set(), activeDiagnostics = new Map();
 let counters = { added: 0, removed: 0 };
 const failure = (code, message) => ({ ok: false, error: { code, message, details: {} } });
 const revision = () => (++revisionNumber).toString(16).padStart(64, '0');
-// The production identity also includes effective environment values. Keep
-// this synthetic identity opaque and separate from the file revision.
-const quotaRevision = () => environmentRevision ? `fixture-effective-${currentRevision}-${environmentRevision}` : currentRevision;
+// Keep synthetic file/environment identities separate and valid for the
+// production digest codec, including before the first config save.
+const quotaRevision = () => environmentRevision.toString(16).padStart(16, '0')
+  + (currentRevision === 'missing' ? '0'.repeat(48) : currentRevision.slice(-48));
 function configSnapshot() {
   const fields = Object.fromEntries(Object.entries(mapping).map(([key, [fallback, type]]) => {
     const value = environment[key] ?? content[key] ?? fallback;
@@ -113,7 +114,10 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
   if (method === 'clearSearchLog') { logRecords = []; return { ok: true, value: { records: [] } }; }
   if (method === 'closeSearchLog') return { ok: true, value: { closed: true } };
   if (method === 'preferences') return { ok: true, value: clone(prefs) };
-  if (method === 'save') {
+  if (method === 'save' || method === 'saveWithIdentity') {
+    if (method === 'saveWithIdentity' && request.configIdentity !== quotaRevision()) {
+      return failure('CONFIG_CONFLICT', '配置路径或有效配置已变化，请重新读取后确认。');
+    }
     if (nextSaveError) { const error = nextSaveError; nextSaveError = null; return failure(error, '保存失败，草稿应保留。'); }
     if (request.expectedRevision !== currentRevision) return failure('CONFIG_CONFLICT', '配置已在别处修改。');
     if (Object.keys(request.updates).some(key => secrets.includes(key) || mapping[key]?.[1] === 'url') && !capabilities.secretsAllowed) return failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。');
@@ -123,19 +127,25 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
     exists = true; currentRevision = revision();
     return { ok: true, value: { config: configSnapshot() } };
   }
-  if (method === 'restoreConfig') {
+  if (method === 'restoreConfig' || method === 'restoreConfigWithIdentity') {
     if (request.expectedRevision !== currentRevision) return failure('CONFIG_CONFLICT', '配置已在别处修改。');
     if (!capabilities.secretsAllowed) return failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。');
+    if (method === 'restoreConfigWithIdentity' && request.configIdentity !== quotaRevision()) {
+      return failure('CONFIG_CONFLICT', '配置路径或有效配置已变化，请重新读取后确认。');
+    }
     if (!history[request.revision]) return failure('CONFIG_HISTORY_INVALID', '无效修订。');
     history[currentRevision] = clone(content);
     content = clone(history[request.revision]); currentRevision = revision();
     return { ok: true, value: { config: configSnapshot() } };
   }
-  if (method === 'reveal') {
-    const response = capabilities.secretsAllowed ? { ok: true, value: {
+  if (method === 'reveal' || method === 'revealWithIdentity') {
+    const matches = method === 'reveal' || request.expectedRevision === currentRevision && request.configIdentity === quotaRevision();
+    const response = !capabilities.secretsAllowed ? failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。')
+      : !matches ? failure('CONFIG_CONFLICT', '配置路径或有效配置已变化，请重新读取后确认。') : { ok: true, value: {
       key: request.key, value: environment[request.key] ?? content[request.key] ?? '',
+      source: Object.hasOwn(environment, request.key) ? 'environment' : Object.hasOwn(content, request.key) ? 'file' : 'default',
       readOnly: Object.hasOwn(environment, request.key),
-    } } : failure('SETTINGS_SECURE_CONNECTION_REQUIRED', '连接不安全。');
+    } };
     // Simulate delivery of an already-authorized reply after a transport change.
     if (revealDelay) await new Promise(done => setTimeout(done, revealDelay));
     return response;

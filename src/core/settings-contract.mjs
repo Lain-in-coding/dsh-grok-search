@@ -11,6 +11,10 @@ const errorSchema = {
 };
 const nullableError = { anyOf: [errorSchema, { type: 'null' }] };
 const nullableString = { anyOf: [{ type: 'string' }, { type: 'null' }] };
+const configIdentityProperties = {
+  expectedRevision: { type: 'string' },
+  configIdentity: { type: 'string', minLength: 64, maxLength: 64, pattern: '^[a-f0-9]{64}$' },
+};
 const capabilitiesSchema = {
   type: 'object',
   properties: {
@@ -353,6 +357,24 @@ export const SETTINGS_DESCRIPTORS = [
     result: codec('dsh-grok-search/settings#SaveResult', saveJsonSchema),
   },
   {
+    id: 'dsh-grok-search#grokSearchSettings/saveWithIdentity',
+    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'saveWithIdentity',
+    description: 'Save shared configuration only while its file revision and effective configuration identity still match.',
+    invocation: { kind: 'direct' },
+    parameters: [{
+      name: 'request', wire: 'request', source: 'json',
+      codec: codec('dsh-grok-search/settings#SaveWithIdentityRequest', {
+        type: 'object',
+        properties: {
+          ...configIdentityProperties,
+          updates: { type: 'object', additionalProperties: true },
+        },
+        required: ['expectedRevision', 'configIdentity', 'updates'], additionalProperties: false,
+      }),
+    }],
+    result: codec('dsh-grok-search/settings#SaveResult', saveJsonSchema),
+  },
+  {
     id: 'dsh-grok-search#grokSearchSettings/restoreConfig',
     service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'restoreConfig',
     description: 'Restore one verified configuration history revision with CAS over a secure connection.',
@@ -368,6 +390,21 @@ export const SETTINGS_DESCRIPTORS = [
     result: codec('dsh-grok-search/settings#RestoreResult', saveJsonSchema),
   },
   {
+    id: 'dsh-grok-search#grokSearchSettings/restoreConfigWithIdentity',
+    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'restoreConfigWithIdentity',
+    description: 'Restore verified configuration history only for the exact saved target and effective identity.',
+    invocation: { kind: 'direct' },
+    parameters: [{
+      name: 'request', wire: 'request', source: 'json',
+      codec: codec('dsh-grok-search/settings#RestoreWithIdentityRequest', {
+        type: 'object',
+        properties: { ...configIdentityProperties, revision: { type: 'string' } },
+        required: ['expectedRevision', 'configIdentity', 'revision'], additionalProperties: false,
+      }),
+    }],
+    result: codec('dsh-grok-search/settings#RestoreResult', saveJsonSchema),
+  },
+  {
     id: 'dsh-grok-search#grokSearchSettings/reveal',
     service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'reveal',
     description: 'Explicitly reveal one credential over an authenticated secure connection.',
@@ -377,6 +414,21 @@ export const SETTINGS_DESCRIPTORS = [
       codec: codec('dsh-grok-search/settings#RevealRequest', {
         type: 'object', properties: { key: { type: 'string' } },
         required: ['key'], additionalProperties: false,
+      }),
+    }],
+    result: codec('dsh-grok-search/settings#RevealResult', revealJsonSchema),
+  },
+  {
+    id: 'dsh-grok-search#grokSearchSettings/revealWithIdentity',
+    service: REMOTE_SERVICE, namespace: REMOTE_SERVICE, method: 'revealWithIdentity',
+    description: 'Reveal one credential only from the configuration target and effective identity the user viewed.',
+    invocation: { kind: 'direct' },
+    parameters: [{
+      name: 'request', wire: 'request', source: 'json',
+      codec: codec('dsh-grok-search/settings#RevealWithIdentityRequest', {
+        type: 'object',
+        properties: { ...configIdentityProperties, key: { type: 'string' } },
+        required: ['expectedRevision', 'configIdentity', 'key'], additionalProperties: false,
       }),
     }],
     result: codec('dsh-grok-search/settings#RevealResult', revealJsonSchema),

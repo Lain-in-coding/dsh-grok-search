@@ -134,6 +134,15 @@ class GrokSearchSettingsGateway extends Service {
       .update(JSON.stringify([captured.snapshot.path, captured.effective])).digest('hex');
   }
 
+  _checkConfigIdentity(store, request) {
+    const captured = store.readSnapshot();
+    if (request.expectedRevision !== captured.snapshot.revision
+      || request.configIdentity !== this._quotaRevision(captured)) {
+      throw new GrokSearchError('CONFIG_CONFLICT', '配置路径或有效配置已变化；请重新读取后确认。');
+    }
+    return captured;
+  }
+
   async snapshot() {
     this._owner();
     let config, captured, path = '';
@@ -176,6 +185,14 @@ class GrokSearchSettingsGateway extends Service {
   }
 
   async save(request = {}) {
+    return this._save(request);
+  }
+
+  async saveWithIdentity(request) {
+    return this._save(request, true);
+  }
+
+  _save(request, requireIdentity = false) {
     this._owner();
     const updates = request?.updates;
     if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
@@ -187,6 +204,9 @@ class GrokSearchSettingsGateway extends Service {
     const needsSecret = Object.keys(updates).some(key => ['secret', 'url'].includes(CONFIG_FIELDS[key]?.type));
     if (needsSecret) this.security.requireSecret(this.ctx);
     const store = this._store();
+    // Pin one store through each synchronous operation. Legacy methods retain
+    // their original contracts; guarded methods share the existing HMAC.
+    if (requireIdentity) this._checkConfigIdentity(store, request);
     const config = store.save({
       expectedRevision: request.expectedRevision,
       updates,
@@ -196,13 +216,22 @@ class GrokSearchSettingsGateway extends Service {
   }
 
   async reveal(request = {}) {
+    return this._reveal(request);
+  }
+
+  async revealWithIdentity(request) {
+    return this._reveal(request, true);
+  }
+
+  _reveal(request, requireIdentity = false) {
     this._owner();
     this.security.requireSecret(this.ctx);
     const key = request?.key;
     if (CONFIG_FIELDS[key]?.type !== 'secret') {
       throw new GrokSearchError('CONFIG_FIELD_INVALID', '只能显式查看凭据字段。');
     }
-    const result = this._store().reveal(key);
+    const store = this._store();
+    const result = requireIdentity ? this._checkConfigIdentity(store, request).effective[key] : store.reveal(key);
     return {
       key,
       value: String(result.value ?? ''),
@@ -212,11 +241,20 @@ class GrokSearchSettingsGateway extends Service {
   }
 
   async restoreConfig(request = {}) {
+    return this._restoreConfig(request);
+  }
+
+  async restoreConfigWithIdentity(request) {
+    return this._restoreConfig(request, true);
+  }
+
+  _restoreConfig(request, requireIdentity = false) {
     this._owner();
     // A history revision can contain every credential in the shared file.
     // Restoring it is a secret write even when the original edit was not.
     this.security.requireSecret(this.ctx);
     const store = this._store();
+    if (requireIdentity) this._checkConfigIdentity(store, request);
     const config = store.restore({
       expectedRevision: request.expectedRevision,
       revision: request.revision,

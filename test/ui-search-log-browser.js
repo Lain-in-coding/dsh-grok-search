@@ -69,7 +69,7 @@ async page => {
     check('reported credits display', await rows().first().locator('.lu-charge').textContent(), '1 credits接口报告');
     check('missing usage remains unknown', await rows().first().locator('.lu-unknown').count(), 1);
     check('no invented official count', await page.locator('.lofficial').count(), 0);
-    const before = await read(() => window.harness.state.calls.filter(call => ['diagnoseProvider', 'testSearch', 'save', 'savePreferences', 'accountQuota'].includes(call.method)).length);
+    const before = await read(() => window.harness.state.calls.filter(call => ['diagnoseProvider', 'testSearch', 'save', 'saveWithIdentity', 'savePreferences', 'accountQuota'].includes(call.method)).length);
     await rows().first().locator('[data-log-replay]').click();
     check('replay overlays main graph', await page.locator('#historyStage').isVisible());
     check('same complete chain in header', await page.locator('#historyRoute .lnode').evaluateAll(nodes => nodes.map(node => node.dataset.node)), ['dsh', 'hub', 'grok', 'tavily']);
@@ -79,7 +79,7 @@ async page => {
     await page.evaluate(() => window.harness.refresh());
     await page.waitForFunction(count => window.harness.state.calls.filter(call => call.method === 'readSearchLog').length > count, readsBefore);
     check('live polling never changes historical ports', await page.locator('#historyStage .hr-port').evaluateAll(nodes => nodes.map(node => node.dataset.mark || '')), historyMarks);
-    check('replay does not issue paid or config RPC', await read(() => window.harness.state.calls.filter(call => ['diagnoseProvider', 'testSearch', 'save', 'savePreferences', 'accountQuota'].includes(call.method)).length), before);
+    check('replay does not issue paid or config RPC', await read(() => window.harness.state.calls.filter(call => ['diagnoseProvider', 'testSearch', 'save', 'saveWithIdentity', 'savePreferences', 'accountQuota'].includes(call.method)).length), before);
     await page.locator('#historyStop').click();
     check('stop restores current graph', await page.locator('#historyStage').isHidden());
     await page.locator('#logPrivacy').click();
@@ -163,12 +163,12 @@ async page => {
     check('polling retains same expanded article', await rows().first().evaluate(el => el === window.__batchNode));
     check('polling retains header instead of resetting focus', await rows().first().locator('.le-head').evaluate(el => el === window.__batchHead));
     const paidBeforeChildReplay = await read(() => window.harness.state.calls.filter(call =>
-      ['diagnoseProvider', 'testSearch', 'accountQuota', 'save', 'savePreferences'].includes(call.method)).length);
+      ['diagnoseProvider', 'testSearch', 'accountQuota', 'save', 'saveWithIdentity', 'savePreferences'].includes(call.method)).length);
     await rows().nth(1).locator('[data-log-replay]').click();
     check('child replay uses the selected query in main graph', await page.locator('#historyQuery').textContent(), batch.queries[1].q);
     check('child replay marks the selected independent row', await rows().nth(1).locator('[data-log-replay]').getAttribute('aria-pressed'), 'true');
     check('child replay remains read only', await read(() => window.harness.state.calls.filter(call =>
-      ['diagnoseProvider', 'testSearch', 'accountQuota', 'save', 'savePreferences'].includes(call.method)).length), paidBeforeChildReplay);
+      ['diagnoseProvider', 'testSearch', 'accountQuota', 'save', 'saveWithIdentity', 'savePreferences'].includes(call.method)).length), paidBeforeChildReplay);
     await page.locator('#historyStop').click();
     await page.locator('#logPrivacy').click();
     check('privacy covers every child', await rows().locator('.le-query').allTextContents(), ['搜索内容已隐藏', '搜索内容已隐藏']);
@@ -357,7 +357,7 @@ async page => {
     await page.locator('#logCard').screenshot({ path: run.directory + '/compact-log-detail.png' });
 
     const quotaCallsBefore = await read(() => window.harness.state.calls.filter(call => call.method === 'accountQuota').length);
-    const revealsBefore = await read(() => window.harness.state.calls.filter(call => call.method === 'reveal').length);
+    const revealsBefore = await read(() => window.harness.state.calls.filter(call => ['reveal', 'revealWithIdentity'].includes(call.method)).length);
     await page.evaluate(() => window.harness.configure({ quotas: { tavily: [
       { kind: 'credits', used: 45, remaining: 955, plan: 1000,
         keyUsed: 5, keyLimit: 100, keyRemaining: 95, note: '真实数据格式，离线夹具' },
@@ -374,7 +374,7 @@ async page => {
     check('opening config automatically queries the saved account once',
       await read(() => window.harness.state.calls.filter(call => call.method === 'accountQuota').length), quotaCallsBefore + 1);
     check('automatic query never reveals credentials',
-      await read(() => window.harness.state.calls.filter(call => call.method === 'reveal').length), revealsBefore);
+      await read(() => window.harness.state.calls.filter(call => ['reveal', 'revealWithIdentity'].includes(call.method)).length), revealsBefore);
     check('automatic query leaves saved keys masked', await page.locator('input[data-k^="keys."]').evaluateAll(inputs => inputs.every(input => !input.value)));
     check('used and remaining are distinct', await page.locator('.qp-stats .qp-value').allTextContents(), ['45', '955']);
     check('approved quota details and separate key row are absent',

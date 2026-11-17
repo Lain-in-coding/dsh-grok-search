@@ -33,7 +33,7 @@ async page => {
     check('draft test does not save or enable', await page.evaluate(() => {
       const state = window.harness.state;
       return !state.content.github_token && state.prefs.value.githubReadEnabled === false
-        && !state.calls.some(call => ['save', 'savePreferences'].includes(call.method));
+        && !state.calls.some(call => ['save', 'saveWithIdentity', 'savePreferences'].includes(call.method));
     }));
     check('test leaves form open', await page.locator('#dialog').isVisible());
     await page.evaluate(() => window.harness.configure({ nextGithubError: 'CONFIG_CONFLICT', delay: 300 }));

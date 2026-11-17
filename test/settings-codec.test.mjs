@@ -35,7 +35,7 @@ test('Typert combines both pure contracts without host peers or a Service fallba
     const compatibility = await import(${JSON.stringify(new URL('../src/core/compatibility-contract.mjs', import.meta.url).href)});
     const expected = [...contract.SETTINGS_DESCRIPTORS, ...compatibility.COMPATIBILITY_DESCRIPTORS];
     assert.equal(host.default, host.TYPERT);
-    assert.equal(contract.SETTINGS_DESCRIPTORS.length, 25);
+    assert.equal(contract.SETTINGS_DESCRIPTORS.length, 28);
     assert.equal(expected.length, contract.SETTINGS_DESCRIPTORS.length + compatibility.COMPATIBILITY_DESCRIPTORS.length);
     assert.equal(host.TYPERT.invocations.length, expected.length);
     assert.deepEqual(host.TYPERT.invocations, expected);
@@ -78,6 +78,56 @@ test('settings codec enforces numeric bounds, integer unions and scalar enum cho
   const choice = codec({ enum: [null, false, 0, 'allowed'] });
   for (const value of [null, false, 0, 'allowed']) assert.equal(choice.parse(value), value);
   rejects(choice, [true, 1, '0', 'other', {}, []]);
+});
+
+test('identity-aware save has an additive strict request while legacy save and reveal stay exact', () => {
+  const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'saveWithIdentity');
+  assert.ok(descriptor);
+  assert.equal(descriptor.id, 'dsh-grok-search#grokSearchSettings/saveWithIdentity');
+  assert.equal(descriptor.parameters[0].codec.typeSymbol, 'dsh-grok-search/settings#SaveWithIdentityRequest');
+  const parser = descriptor.parameters[0].codec.create();
+  const valid = { expectedRevision: 'missing', configIdentity: 'a'.repeat(64), updates: { timeout_seconds: 65 } };
+  assert.equal(parser.parse(valid), valid);
+  rejects(parser, [
+    { expectedRevision: 'missing', updates: {} },
+    { ...valid, configIdentity: null }, { ...valid, configIdentity: '' },
+    { ...valid, configIdentity: 'a'.repeat(63) }, { ...valid, configIdentity: 'z'.repeat(64) },
+    { ...valid, path: '/caller-controlled.toml' }, { ...valid, updates: [] },
+  ]);
+  const save = SETTINGS_DESCRIPTORS.find(row => row.method === 'save');
+  const reveal = SETTINGS_DESCRIPTORS.find(row => row.method === 'reveal');
+  const legacy = { expectedRevision: 'missing', updates: { timeout_seconds: 65 } };
+  assert.equal(save.parameters[0].codec.create().parse(legacy), legacy);
+  assert.equal(reveal.parameters[0].codec.create().parse({ key: 'grok_api_key' }).key, 'grok_api_key');
+  rejects(save.parameters[0].codec.create(), [valid]);
+  rejects(reveal.parameters[0].codec.create(), [{ key: 'grok_api_key', configIdentity: valid.configIdentity }]);
+  assert.equal(descriptor.result.typeSymbol, save.result.typeSymbol);
+  assert.deepEqual(descriptor.result.jsonSchema, save.result.jsonSchema);
+});
+
+test('identity-aware reveal and restore add strict target preconditions without changing legacy codecs', () => {
+  const identity = { expectedRevision: 'missing', configIdentity: 'a'.repeat(64) };
+  for (const [method, old, field, value, symbol] of [
+    ['revealWithIdentity', 'reveal', 'key', 'grok_api_key', 'RevealWithIdentityRequest'],
+    ['restoreConfigWithIdentity', 'restoreConfig', 'revision', 'b'.repeat(64), 'RestoreWithIdentityRequest'],
+  ]) {
+    const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === method);
+    assert.ok(descriptor);
+    assert.equal(descriptor.id, `dsh-grok-search#grokSearchSettings/${method}`);
+    assert.equal(descriptor.parameters[0].codec.typeSymbol, `dsh-grok-search/settings#${symbol}`);
+    const parser = descriptor.parameters[0].codec.create();
+    const valid = { ...identity, [field]: value };
+    assert.equal(parser.parse(valid), valid);
+    rejects(parser, [
+      { [field]: value }, { expectedRevision: 'missing', [field]: value },
+      { ...valid, configIdentity: '' }, { ...valid, configIdentity: 'a'.repeat(63) },
+      { ...valid, configIdentity: 'z'.repeat(64) }, { ...valid, path: '/caller-target.toml' },
+    ]);
+    const legacy = SETTINGS_DESCRIPTORS.find(row => row.method === old);
+    rejects(legacy.parameters[0].codec.create(), [valid]);
+    assert.equal(descriptor.result.typeSymbol, legacy.result.typeSymbol);
+    assert.deepEqual(descriptor.result.jsonSchema, legacy.result.jsonSchema);
+  }
 });
 
 test('string bounds count Unicode code points and patterns retain JSON Schema match semantics', () => {

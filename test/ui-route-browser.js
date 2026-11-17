@@ -90,7 +90,7 @@ async page => {
     check('six provider rows', await page.locator('.row[data-id]').count(), 6);
     check('one layer host', await page.locator('[data-dsg-layer]').count(), 1);
     check('no global route IDs', await read(() => document.querySelector('#routeCard')), null);
-    check('snapshot never reveals keys', await read(() => window.harness.state.calls.filter(call => call.method === 'reveal').length), 0);
+    check('snapshot never reveals keys', await read(() => window.harness.state.calls.filter(call => ['reveal', 'revealWithIdentity'].includes(call.method)).length), 0);
     check('all local brand images decode', await read(() => [...document.querySelector('[data-dsg-route]').shadowRoot.querySelectorAll('img')].every(img => img.complete && img.naturalWidth > 0)));
     check('DSH and official logo differ', await read(() => {
       const root = document.querySelector('[data-dsg-route]').shadowRoot;
@@ -101,7 +101,7 @@ async page => {
       await card(id);
       check(id + ' dialog title', await page.locator('#dlgTitle').textContent(),
         { grok: 'Grok', tavily: 'Tavily', exa: 'Exa', tinyfish: 'TinyFish', firecrawl: 'Firecrawl', github: 'GitHub' }[id]);
-      check(id + ' open does not write', await read(() => window.harness.state.calls.filter(c => c.method === 'save').length), 0);
+      check(id + ' open does not write', await read(() => window.harness.state.calls.filter(c => ['save', 'saveWithIdentity'].includes(c.method)).length), 0);
       if (id === 'tinyfish') {
         check('TinyFish outside switch off', await page.locator('.row[data-id=tinyfish] .switch').getAttribute('aria-checked'), 'false');
         check('TinyFish draft switch off until key exists', await page.locator('.head-switch .switch').getAttribute('aria-checked'), 'false');
@@ -113,17 +113,25 @@ async page => {
     await card('grok');
     check('hidden key is not in input', await page.locator('input[data-k=key]').inputValue(), '');
     await page.locator('[data-a=eye][data-k=key]').click();
-    check('explicit reveal called once', await read(() => window.harness.state.calls.filter(c => c.method === 'reveal').length), 1);
+    check('explicit reveal called once', await read(() => window.harness.state.calls.filter(c => c.method === 'revealWithIdentity').length), 1);
+    check('explicit reveal sends only the viewed target identity and field name', await read(() => {
+      const state = window.harness.state, request = state.calls.find(c => c.method === 'revealWithIdentity').request;
+      return Object.keys(request).sort().join(',') === 'configIdentity,expectedRevision,key'
+        && request.key === 'grok_api_key' && request.expectedRevision === state.snapshot.config.revision
+        && request.configIdentity === state.snapshot.config.quotaRevision;
+    }));
     check('revealing does not dirty form', await page.locator('[data-a=save]').isDisabled());
     await page.locator('input[data-k=model]').fill('grok-test-model');
     await save();
     check('model save sends only changed field', await read(() => {
-      const call = window.harness.state.calls.filter(c => c.method === 'save').at(-1);
+      const call = window.harness.state.calls.filter(c => c.method === 'saveWithIdentity').at(-1);
       return Object.keys(call.request.updates);
     }), ['grok_model']);
     check('key preserved on unrelated edit', await read(() => window.harness.state.content.grok_api_key === 'xai-synthetic-key'));
     await page.locator('.t-act').click();
-    check('real CAS undo uses history', await read(() => window.harness.state.calls.some(c => c.method === 'restoreConfig')));
+    check('real CAS undo uses history once', await read(() => window.harness.state.calls.filter(c => c.method === 'restoreConfigWithIdentity').length), 1);
+    check('target-bound config operations never fall back to legacy RPCs', await read(() =>
+      window.harness.state.calls.filter(c => ['save', 'reveal', 'restoreConfig'].includes(c.method)).length), 0);
     check('history undo removes edited model', await read(() => !Object.hasOwn(window.harness.state.content, 'grok_model')));
 
     await card('tavily');
@@ -172,15 +180,21 @@ async page => {
       await read(() => !Object.hasOwn(window.harness.state.content, 'exa_api_url')));
     check('endpoint conflict preserves the draft', await page.locator('input[data-k=url]').inputValue(), 'https://merge.example.test');
     check('endpoint conflict does not retry the secret-bearing destination',
-      await read(() => window.harness.state.calls.filter(call => call.method === 'save').length), 1);
+      await read(() => window.harness.state.calls.filter(call => call.method === 'saveWithIdentity').length), 1);
     await close();
     await state('returning');
     await card('grok');
     await page.locator('input[data-k=model]').fill('grok-unrelated-merge');
     await page.evaluate(() => window.harness.inject({ response_max_chars: 65000 }));
+    await page.locator('[data-a=save]').click();
+    await page.locator('.save-error:has-text("CONFIG_CONFLICT")').waitFor();
+    check('effective identity conflict preserves a nonsecret draft', await page.locator('input[data-k=model]').inputValue(), 'grok-unrelated-merge');
+    check('identity conflict cannot silently rebase the draft', await read(() => !Object.hasOwn(window.harness.state.content, 'grok_model')));
+    await page.locator('[data-a=reload-draft]').click();
+    await page.locator('.save-error:has-text("CONFIG_RELOADED")').waitFor();
     await save();
-    check('unrelated CAS merge keeps external field', await read(() => window.harness.state.content.response_max_chars), 65000);
-    check('unrelated CAS merge still saves a non-destination field', await read(() => window.harness.state.content.grok_model), 'grok-unrelated-merge');
+    check('explicitly reviewed save keeps the external field', await read(() => window.harness.state.content.response_max_chars), 65000);
+    check('explicitly reviewed save keeps the nonsecret draft', await read(() => window.harness.state.content.grok_model), 'grok-unrelated-merge');
 
     await card('grok');
     await page.locator('[data-a=mode][data-v=compat]').click();
@@ -356,7 +370,7 @@ async page => {
     await page.evaluate(() => window.harness.configure({ delay: 200, nextSaveError: 'CONFIG_BUSY' }));
     await page.locator('.row[data-id=exa] .row-main').focus();
     await page.keyboard.press('Alt+ArrowUp');
-    await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'save'));
+    await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'saveWithIdentity'));
     await page.evaluate(() => window.harness.unmount());
     await page.waitForTimeout(350);
     check('late failed ordering save leaves the settings DOM unmounted', await page.locator('#routeCard').count(), 0);
@@ -752,7 +766,7 @@ async page => {
     check('remount also invalidates remembered results when the environment key changed',
       await page.locator('#strip .s-node[data-id=tavily]').getAttribute('data-health'), 'idle');
     check('environment identity checks never save credentials',
-      await read(() => window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+      await read(() => window.harness.state.calls.filter(call => ['save', 'saveWithIdentity'].includes(call.method)).length), 0);
     await state('returning');
     await card('exa');
     await page.locator('[data-a=eye][data-k=key]').click();
@@ -811,7 +825,7 @@ async page => {
     await page.locator('[data-a=mode][data-v=compat]').click();
     await page.locator('[data-a=eye][data-k=gwKey]').click();
     check('concurrent protocol fields issue independent reveal requests', await read(() =>
-      window.harness.state.calls.filter(call => call.method === 'reveal').map(call => call.request.key)),
+      window.harness.state.calls.filter(call => call.method === 'revealWithIdentity').map(call => call.request.key)),
     ['grok_api_key', 'openai_compatible_api_key']);
     await page.waitForFunction(() => document.querySelector('[data-dsg-layer]').shadowRoot
       .querySelector('input[data-k=gwKey]')?.value === 'gateway-synthetic-key');
@@ -842,7 +856,7 @@ async page => {
     await page.waitForTimeout(1350);
     check('old pending save leaves the replacement dialog open', await page.locator('#dlgTitle').textContent(), 'Grok');
     check('old pending save cannot write either dialog', await read(() =>
-      window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+      window.harness.state.calls.filter(call => ['save', 'saveWithIdentity'].includes(call.method)).length), 0);
     check('replacement draft stays unsaved after the old reveal settles', await page.locator('input[data-k=model]').inputValue(), 'next-unsaved-model');
     await close();
 
@@ -863,7 +877,7 @@ async page => {
     check('open failure retains copy-path fallback', await page.getByRole('button', { name: '复制路径', exact: true }).isVisible());
     check('file open failure restores controls', await page.locator('.rc-foot [data-open=file]').isEnabled());
     check('file opening never changes shared configuration', await read(() =>
-      window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+      window.harness.state.calls.filter(call => ['save', 'saveWithIdentity'].includes(call.method)).length), 0);
     await page.evaluate(() => window.harness.configure({ delay: 0, openError: null }));
     await state('fresh');
     await page.locator('.rc-foot [data-open=folder]').click();
@@ -911,7 +925,7 @@ async page => {
       .querySelector('[data-a=redetect]')?.textContent.trim() === '重新检测');
     check('successful repair restores ready status without restart', await read(() => window.harness.state.snapshot.program.phase), 'ready');
     check('repair does not rewrite shared configuration', await read(() => JSON.stringify(window.harness.state.content)), configurationBeforeRepair);
-    check('repair sends no config save', await read(() => window.harness.state.calls.filter(call => call.method === 'save').length), 0);
+    check('repair sends no config save', await read(() => window.harness.state.calls.filter(call => ['save', 'saveWithIdentity'].includes(call.method)).length), 0);
     await repairButton.click();
     check('healthy program still uses the compatible detection RPC',
       await read(() => window.harness.state.calls.some(call => call.method === 'prepareProgram')));

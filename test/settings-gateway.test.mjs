@@ -88,7 +88,7 @@ const peerFixture = (scenario, code) => {
     const { apply, createSettingsGateway, SETTINGS_DESCRIPTORS } =
       await import(${JSON.stringify(new URL('../src/settings-ui.mjs', import.meta.url).href)});
     assert.equal(typeof createSettingsGateway, 'function');
-    assert.equal(SETTINGS_DESCRIPTORS.length, 25);
+    assert.equal(SETTINGS_DESCRIPTORS.length, 28);
     ${code}
   `], { encoding: 'utf8', timeout: 10000 });
   assert.ifError(result.error);
@@ -142,9 +142,167 @@ test('production settings apply retains the explicit config path without a progr
 
 test('the legacy settings descriptor export shares the pure static contract', () => {
   assert.equal(SETTINGS_DESCRIPTORS, PURE_SETTINGS_DESCRIPTORS);
-  assert.equal(SETTINGS_DESCRIPTORS.length, 25);
-  assert.equal(createHash('sha256').update(JSON.stringify(SETTINGS_DESCRIPTORS)).digest('hex'),
+  assert.equal(SETTINGS_DESCRIPTORS.length, 28);
+  const legacy = SETTINGS_DESCRIPTORS.filter(row =>
+    !['saveWithIdentity', 'revealWithIdentity', 'restoreConfigWithIdentity'].includes(row.method));
+  assert.equal(legacy.length, 25);
+  assert.equal(createHash('sha256').update(JSON.stringify(legacy)).digest('hex'),
     'a755d8697157ad8437a08f22cdf73eb90dafa33996fca0741c8b15f4fe3deb96');
+});
+
+test('identity-aware save rejects an identical file at a changed path before any write', async () => withIsolatedHome(async () => {
+  const { gateway, path, directory, services } = viewGateway();
+  const other = join(directory, 'other.toml');
+  const original = 'grok_model = "before"\n';
+  writeFileSync(path, original);
+  writeFileSync(other, original);
+  const before = await gateway.snapshot();
+  services.set('grokSearchProgram', { snapshot: () => ({ configPath: other }) });
+  const current = await gateway.snapshot();
+  assert.equal(current.config.revision, before.config.revision);
+  assert.notEqual(current.config.quotaRevision, before.config.quotaRevision);
+  await assert.rejects(gateway.saveWithIdentity({
+    expectedRevision: before.config.revision, configIdentity: before.config.quotaRevision, updates: { grok_model: 'after' },
+  }), { code: 'CONFIG_CONFLICT' });
+  assert.equal(readFileSync(path, 'utf8'), original);
+  assert.equal(readFileSync(other, 'utf8'), original);
+  assert.equal(existsSync(join(directory, 'grok-search', 'config-history')), false);
+}));
+
+test('identity-aware save rejects a changed effective credential while the file revision stays unchanged', async () => withIsolatedHome(async () => {
+  const { gateway, path, directory } = viewGateway();
+  const original = 'grok_model = "before"\n';
+  writeFileSync(path, original);
+  try {
+    process.env.TAVILY_API_KEY = 'synthetic-before';
+    const before = await gateway.snapshot();
+    process.env.TAVILY_API_KEY = 'synthetic-after';
+    const current = await gateway.snapshot();
+    assert.equal(current.config.revision, before.config.revision);
+    assert.notEqual(current.config.quotaRevision, before.config.quotaRevision);
+    await assert.rejects(gateway.saveWithIdentity({
+      expectedRevision: before.config.revision, configIdentity: before.config.quotaRevision,
+      updates: { tavily_api_url: 'https://other.example.invalid' },
+    }), { code: 'CONFIG_CONFLICT' });
+    assert.equal(readFileSync(path, 'utf8'), original);
+    assert.equal(existsSync(join(directory, 'grok-search', 'config-history')), false);
+  } finally { delete process.env.TAVILY_API_KEY; }
+}));
+
+test('identity-aware save checks the file revision even when only comments changed', async () => withIsolatedHome(async () => {
+  const { gateway, path } = viewGateway();
+  writeFileSync(path, 'grok_model = "before"\n');
+  const before = await gateway.snapshot();
+  const changed = '# another writer\n' + readFileSync(path, 'utf8');
+  writeFileSync(path, changed);
+  const current = await gateway.snapshot();
+  assert.equal(current.config.quotaRevision, before.config.quotaRevision);
+  assert.notEqual(current.config.revision, before.config.revision);
+  await assert.rejects(gateway.saveWithIdentity({
+    expectedRevision: before.config.revision, configIdentity: before.config.quotaRevision, updates: { grok_model: 'after' },
+  }), { code: 'CONFIG_CONFLICT' });
+  assert.equal(readFileSync(path, 'utf8'), changed);
+}));
+
+test('identity-aware save returns the redacted saved identity and retains legacy save and reveal behavior', async () => withIsolatedHome(async () => {
+  const { gateway, path, services } = viewGateway();
+  let synced = 0;
+  services.set('grokSearchGithub', { sync() { synced++; } });
+  const before = await gateway.snapshot();
+  const saved = await gateway.saveWithIdentity({
+    expectedRevision: before.config.revision, configIdentity: before.config.quotaRevision,
+    updates: { github_token: 'synthetic-only', grok_model: 'after' },
+  });
+  assert.equal(synced, 1);
+  assert.equal(saved.config.path, path);
+  assert.equal(saved.config.fields.github_token.value, null);
+  assert.equal(saved.config.fields.github_token.configured, true);
+  assert.notEqual(saved.config.quotaRevision, before.config.quotaRevision);
+  assert.equal(saved.config.quotaRevision, (await gateway.snapshot()).config.quotaRevision);
+  assert.doesNotMatch(JSON.stringify(saved), /synthetic-only/);
+  assert.equal((await gateway.reveal({ key: 'github_token' })).value, 'synthetic-only');
+  const legacy = await gateway.save({ expectedRevision: saved.config.revision, updates: { grok_model: 'legacy' } });
+  assert.equal(legacy.config.fields.grok_model.value, 'legacy');
+}));
+
+test('identity-aware save preserves owner and secret-write gates before resolving configuration', async () => {
+  const { gateway } = viewGateway();
+  let reads = 0;
+  gateway._store = () => { reads++; assert.fail('Denied operations must not read or save'); };
+  const request = { expectedRevision: 'missing', configIdentity: 'a'.repeat(64), updates: { grok_model: 'after' } };
+  gateway.security = null;
+  await assert.rejects(gateway.saveWithIdentity(request), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+  gateway.security = {
+    requireOwner() {},
+    requireSecret() { throw new GrokSearchError('SETTINGS_SECURE_CONNECTION_REQUIRED', 'Synthetic restriction'); },
+  };
+  for (const updates of [{ grok_api_key: 'synthetic-only' }, { tavily_api_url: 'https://other.example.invalid' }]) {
+    await assert.rejects(gateway.saveWithIdentity({ ...request, updates }), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+  }
+  assert.equal(reads, 0);
+});
+
+test('identity-aware reveal and restore reject changed targets before credential reads or history writes', async () => {
+  for (const changed of [{ path: '/config-b.toml' }, { credential: 'synthetic-other' }, { revision: 'b'.repeat(64) }]) {
+    const { gateway } = viewGateway();
+    let target = { path: '/config-a.toml', credential: 'synthetic-viewed', revision: 'a'.repeat(64) };
+    let reveals = 0, restores = 0;
+    gateway._store = () => ({
+      readSnapshot: () => ({ snapshot: { path: target.path, revision: target.revision },
+        effective: { grok_api_key: { value: target.credential, source: 'environment', readOnly: true } } }),
+      reveal() { reveals++; return { value: target.credential, source: 'environment', readOnly: true }; },
+      restore() { restores++; assert.fail('A mismatched target cannot restore history'); },
+    });
+    const before = await gateway.snapshot();
+    target = { ...target, ...changed };
+    const request = { expectedRevision: before.config.revision, configIdentity: before.config.quotaRevision };
+    await assert.rejects(gateway.revealWithIdentity({ ...request, key: 'grok_api_key' }), { code: 'CONFIG_CONFLICT' });
+    await assert.rejects(gateway.restoreConfigWithIdentity({ ...request, revision: 'c'.repeat(64) }), { code: 'CONFIG_CONFLICT' });
+    assert.equal(reveals, 0);
+    assert.equal(restores, 0);
+  }
+});
+
+test('identity-aware reveal and restore use the captured store while legacy endpoints keep their schemas', async () => withIsolatedHome(async () => {
+  const { gateway, path } = viewGateway();
+  writeFileSync(path, 'grok_model = "before"\ngrok_api_key = "synthetic-before"\n');
+  const before = await gateway.snapshot();
+  const saved = await gateway.saveWithIdentity({
+    expectedRevision: before.config.revision, configIdentity: before.config.quotaRevision, updates: { grok_model: 'after' },
+  });
+  const request = { expectedRevision: saved.config.revision, configIdentity: saved.config.quotaRevision };
+  const revealed = await gateway.revealWithIdentity({ ...request, key: 'grok_api_key' });
+  assert.equal(revealed.value, 'synthetic-before');
+  assert.equal(revealed.source, 'file');
+  assert.equal(revealed.readOnly, false);
+  const restored = await gateway.restoreConfigWithIdentity({ ...request, revision: before.config.revision });
+  assert.equal(restored.config.fields.grok_model.value, 'before');
+  assert.equal(restored.config.quotaRevision, (await gateway.snapshot()).config.quotaRevision);
+  assert.equal(restored.config.fields.grok_api_key.value, null);
+  assert.equal((await gateway.reveal({ key: 'grok_api_key' })).value, 'synthetic-before');
+  await assert.rejects(gateway.revealWithIdentity({ ...request, key: 'grok_api_key' }), { code: 'CONFIG_CONFLICT' });
+  await assert.rejects(gateway.restoreConfigWithIdentity({ ...request, revision: before.config.revision }), { code: 'CONFIG_CONFLICT' });
+}));
+
+test('identity-aware reveal and restore retain secure owner gates before reading configuration', async () => {
+  const { gateway } = viewGateway();
+  let reads = 0;
+  gateway._store = () => { reads++; assert.fail('Denied operations must not resolve a target'); };
+  const request = { expectedRevision: 'missing', configIdentity: 'a'.repeat(64) };
+  const operations = [['revealWithIdentity', { ...request, key: 'grok_api_key' }],
+    ['restoreConfigWithIdentity', { ...request, revision: 'b'.repeat(64) }]];
+  gateway.security = null;
+  for (const [method, value] of operations) {
+    await assert.rejects(gateway[method](value), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+  }
+  gateway.security = {
+    requireOwner() {},
+    requireSecret() { throw new GrokSearchError('SETTINGS_SECURE_CONNECTION_REQUIRED', 'Synthetic restriction'); },
+  };
+  for (const [method, value] of operations) {
+    await assert.rejects(gateway[method](value), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+  }
+  assert.equal(reads, 0);
 });
 
 test('settings gateway reads shared config, saves with CAS and keeps secrets out of snapshot', async () => {

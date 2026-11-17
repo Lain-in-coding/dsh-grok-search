@@ -222,6 +222,8 @@ function providerIdentity(id, fields, p) {
 function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true, trustedConfigUpdate = false } = {}) {
   const fields = snapshot.config?.fields || {}, oldOrder = S.order.join();
   const capabilitiesChanged = Boolean(S.capabilities?.secretsAllowed) !== Boolean(snapshot.capabilities?.secretsAllowed);
+  const configChanged = S.config && (S.config.path !== snapshot.config?.path
+    || S.config.revision !== snapshot.config?.revision || S.config.quotaRevision !== snapshot.config?.quotaRevision);
   const externalRevision = !trustedConfigUpdate && (
     S.configRevision && S.configRevision !== snapshot.config?.revision
     || S.configIdentity && S.configIdentity !== snapshot.config?.quotaRevision);
@@ -232,7 +234,7 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
   S.program = snapshot.program;
   S.pluginInfo = snapshot.plugin || {};
   S.capabilities = snapshot.capabilities;
-  if (capabilitiesChanged) secretEpoch++;
+  if (capabilitiesChanged || configChanged) secretEpoch++;
   // Capability revocation is synchronous UI state, not the next log poll.
   // read() invalidates an outstanding private reply before awaiting anything.
   if (S.capabilities && !S.capabilities.secretsAllowed) void logView?.read();
@@ -443,10 +445,11 @@ async function reloadDialogDraft() {
 async function saveConfig(build, baseline = null) {
   if (!S.config || S.config.error) throw Object.assign(new Error('请先修正配置文件。'), { code: 'CONFIG_PARSE_FAILED' });
   const starting = clone(S.config);
-  // A destination change can forward an unchanged-looking (redacted) key to
-  // another service. Treat it like a secret edit: require explicit review of
-  // a newer revision instead of silently pairing the draft URL with its key.
-  const fieldChanged = (old, current, updates) => old.path !== current.path || Object.keys(updates).some(key =>
+  const saveUnavailable = '当前设置服务无法完成保存，请重新打开设置；仍不可用时重启 DSH 后重试。';
+  // An effective identity includes credentials that redacted fields cannot
+  // compare. Only an unchanged identity may rebase an unrelated file edit.
+  const fieldChanged = (old, current, updates) => old.path !== current.path
+    || old.quotaRevision !== current.quotaRevision || Object.keys(updates).some(key =>
     key.endsWith('_key') || key.endsWith('_url') || key === 'github_token'
     || JSON.stringify(old.fields[key]) !== JSON.stringify(current.fields[key]));
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -458,10 +461,20 @@ async function saveConfig(build, baseline = null) {
       throw Object.assign(new Error('配置已在别处修改，请核对草稿后再保存。'), { code: 'CONFIG_CONFLICT' });
     }
     try {
-      const result = await remote.save({ expectedRevision: revision, updates });
+      if (typeof remote.saveWithIdentity !== 'function' || !S.config.quotaRevision) {
+        throw Object.assign(new Error(saveUnavailable),
+          { code: 'SETTINGS_SAVE_UNAVAILABLE' });
+      }
+      const result = await remote.saveWithIdentity({
+        expectedRevision: revision, configIdentity: S.config.quotaRevision, updates,
+      });
       if (!disposed) updateConfig(result.config, Object.keys(updates));
-      return { before: revision, after: result.config.revision, undo: starting.exists };
+      return { before: revision, after: result.config.revision, undo: starting.exists,
+        path: result.config.path, quotaRevision: result.config.quotaRevision };
     } catch (error) {
+      if (/METHOD_NOT_FOUND|method[./_]not[./_]found|^SETTINGS_UNAVAILABLE$/i.test(error?.code || '')) {
+        throw Object.assign(new Error(saveUnavailable), { code: error.code });
+      }
       if (attempt || error?.code !== 'CONFIG_CONFLICT' || disposed) throw error;
       await refresh({ force: true });
       if (disposed) return null;
@@ -504,7 +517,7 @@ function configUndo(receipt) {
     if (disposed || S.busy) return;
     S.busy = true;
     try {
-      const result = await remote.restoreConfig({ expectedRevision: receipt.after, revision: receipt.before });
+      const result = await restoreReceipt(receipt);
       if (!disposed) { updateConfig(result.config); toast('已恢复保存前的配置 · 下次搜索生效'); }
     } catch (error) { operationError(error); }
     finally { S.busy = false; if (!disposed) syncAll(true); }
@@ -519,7 +532,7 @@ function cardUndo(receipt, id, previousEnabled, preferenceChanged) {
     let restored = false;
     try {
       if (receipt) {
-        const result = await remote.restoreConfig({ expectedRevision: receipt.after, revision: receipt.before });
+        const result = await restoreReceipt(receipt);
         if (disposed) return;
         updateConfig(result.config);
         restored = true;
@@ -531,6 +544,26 @@ function cardUndo(receipt, id, previousEnabled, preferenceChanged) {
         { code: 'SETTINGS_PARTIAL_RESTORE' }) : error);
     } finally { S.busy = false; if (!disposed) syncAll(true); }
   };
+}
+async function restoreReceipt(receipt) {
+  if (!receipt.path || !receipt.quotaRevision || receipt.path !== S.config?.path
+    || receipt.after !== S.config?.revision || receipt.quotaRevision !== S.config?.quotaRevision) {
+    throw Object.assign(new Error('配置路径或有效配置已变化，无法撤销；请重新读取并确认当前配置。'), { code: 'CONFIG_CONFLICT' });
+  }
+  const unavailable = '当前设置服务无法完成撤销，请重新打开设置；仍不可用时重启 DSH 后重试。';
+  if (typeof remote.restoreConfigWithIdentity !== 'function') {
+    throw Object.assign(new Error(unavailable), { code: 'SETTINGS_RESTORE_UNAVAILABLE' });
+  }
+  try {
+    return await remote.restoreConfigWithIdentity({
+      expectedRevision: receipt.after, configIdentity: receipt.quotaRevision, revision: receipt.before,
+    });
+  } catch (error) {
+    if (/METHOD_NOT_FOUND|method[./_]not[./_]found|^SETTINGS_UNAVAILABLE$/i.test(error?.code || '')) {
+      throw Object.assign(new Error(unavailable), { code: error.code });
+    }
+    throw error;
+  }
 }
 function normalizeCode(code) {
   return String(code || 'UNKNOWN').replace(/^HTTP_/i, '').trim();
@@ -1537,6 +1570,7 @@ function clearToasts() {
   $('#toasts').replaceChildren();
 }
 function toast(text, opt = {}) {
+  if (disposed) return;
   const box = $('#toasts');
   clearTimeout(toastTimer);
   const tone = opt.tone || 'ok';
@@ -1547,14 +1581,15 @@ function toast(text, opt = {}) {
   el.dataset.tone = tone;
   el.innerHTML = `<span class="t-ic">${svg(icon)}</span><span class="t-text">${esc(text)}</span>${action ? `<button type="button" class="t-act">${svg(action.icon || 'copy', 'ic ic-sm')}${esc(action.label)}</button>` : ''}`;
   if (action) el.querySelector('.t-act').addEventListener('click', () => {
+    if (disposed) return;
     dismissToast(el);
-    Promise.resolve().then(() => action.run()).catch(error => operationError(error));
+    Promise.resolve().then(() => { if (!disposed) return action.run(); }).catch(error => operationError(error));
   });
   box.replaceChildren(el);
   toastTimer = setTimeout(() => dismissToast(el), opt.ms || (action ? 5200 : 3200));
 }
 function dismissToast(el) {
-  if (!el.isConnected || el.classList.contains('is-out')) return;
+  if (disposed || !el.isConnected || el.classList.contains('is-out')) return;
   el.classList.add('is-out');
   setTimeout(() => el.remove(), 180);
 }
@@ -2418,8 +2453,16 @@ async function revealFor(k) {
   if (!S.capabilities?.secretsAllowed) return false;
   const mine = D, keyName = k.startsWith('keys') ? 'keys' : k;
   const epoch = secretEpoch, baseline = mine.configBaseline;
+  const { path, revision, quotaRevision } = baseline || {};
+  const matches = config => config && config.path === path
+    && config.revision === revision && config.quotaRevision === quotaRevision;
   const current = () => !disposed && !mine.closed && D === mine && epoch === secretEpoch
-    && baseline === mine.configBaseline && S.capabilities?.secretsAllowed === true;
+    && baseline === mine.configBaseline && matches(mine.configBaseline) && matches(S.config)
+    && S.capabilities?.secretsAllowed === true;
+  if (!current()) {
+    operationError(Object.assign(new Error('配置已在别处修改，请先读取最新配置后查看凭据。'), { code: 'CONFIG_CONFLICT' }), true);
+    return false;
+  }
   const configured = keyName === 'keys' ? mine.draft.keys.some(hidden) : hidden(mine.draft[keyName]);
   if (!configured) return true;
   const pending = mine.revealing;
@@ -2432,9 +2475,13 @@ async function revealFor(k) {
   const focused = active(), selection = focused?.selectionStart;
   const entry = { epoch, baseline, task: null };
   pending.set(keyName, entry);
+  const unavailable = '当前设置服务无法读取凭据，请重新打开设置；仍不可用时重启 DSH 后重试。';
   entry.task = (async () => {
     try {
-      const revealed = await remote.reveal({ key });
+      if (typeof remote.revealWithIdentity !== 'function' || !quotaRevision) {
+        throw Object.assign(new Error(unavailable), { code: 'SETTINGS_REVEAL_UNAVAILABLE' });
+      }
+      const revealed = await remote.revealWithIdentity({ key, expectedRevision: revision, configIdentity: quotaRevision });
       if (!current()) return false;
       if (keyName === 'keys') {
         const values = String(revealed.value || '').split(',').map(v => v.trim()).filter(Boolean);
@@ -2462,7 +2509,11 @@ async function revealFor(k) {
         if (typeof selection === 'number') focused.setSelectionRange(selection, selection);
       }
       return true;
-    } catch (error) { if (current()) operationError(error); return false; }
+    } catch (error) {
+      if (current()) operationError(/METHOD_NOT_FOUND|method[./_]not[./_]found|^SETTINGS_UNAVAILABLE$/i.test(error?.code || '')
+        ? Object.assign(new Error(unavailable), { code: error.code }) : error);
+      return false;
+    }
     finally { if (pending.get(keyName) === entry) pending.delete(keyName); }
   })();
   return await entry.task === true && current();
@@ -2483,7 +2534,10 @@ async function copyKey(b) {
   const v = dlg.querySelector(`input[data-k="${b.dataset.k}"]`).value.trim();
   if (!v) { toast('还没有可复制的内容', { tone: 'info' }); return; }
   if (!navigator.clipboard) { toast('复制失败：浏览器不允许访问剪贴板', { tone: 'warn' }); return; }
-  navigator.clipboard.writeText(v).then(() => toast('已复制到剪贴板'), () => toast('复制失败：浏览器不允许访问剪贴板', { tone: 'warn' }));
+  navigator.clipboard.writeText(v).then(
+    () => { if (!disposed) toast('已复制到剪贴板'); },
+    () => { if (!disposed) toast('复制失败：浏览器不允许访问剪贴板', { tone: 'warn' }); },
+  );
 }
 function setMode(b) {
   if (!D || dialogBusy()) return;

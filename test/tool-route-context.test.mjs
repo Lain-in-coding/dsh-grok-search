@@ -562,6 +562,52 @@ test('final host policy outcome overrides only the tool summary and keeps real s
   }
 });
 
+for (const omitted of [false, true]) {
+  test(`final host cancellation overrides an ${omitted ? 'omitted' : 'observed'} failed child`, async () => {
+    const history = createSearchLog({ now: () => 1000 });
+    const context = createToolRouteContext({ searchLog: history, now: () => 1000 });
+    const session = randomUUID(), call = exec(session, 'final-cancel-' + omitted);
+    const successfulQueries = omitted ? 16 : 1;
+    try {
+      await context.run(call, () => {
+        for (let index = 0; index <= successfulQueries; index++) {
+          const failed = index === successfulQueries;
+          const attribution = context.capture(), token = history.begin('query ' + index, attribution);
+          const supplier = { provider: 'tavily', keyIndex: 0, result: failed ? 'failed' : 'ok',
+            ...(failed ? { code: 'HTTP_429' } : { charge: { amount: 1, unit: 'credits', basis: 'reported' } }) };
+          const outcome = { served: failed ? null : 'tavily', outcome: failed ? 'failed' : 'ok',
+            code: failed ? 'HTTP_429' : '', callsComplete: true };
+          history.call(token, supplier); attribution.record(supplier);
+          history.finish(token, outcome); attribution.finish(outcome);
+        }
+        return { isError: false };
+      });
+      const view = history.open();
+      const beforeTrace = context.readTrace(session, call.callId), beforeLog = history.snapshot(view).records[0];
+      assert.equal(beforeTrace.state, 'failed');
+      assert.equal(beforeLog.kind, 'failed');
+      assert.equal(beforeLog.queryCount, successfulQueries + 1);
+      assert.equal(beforeLog.queries.length, omitted ? 16 : 2);
+      assert.equal(beforeLog.queriesComplete, !omitted);
+      if (omitted) assert.equal(beforeTrace.routesComplete, false);
+      else {
+        assert.equal(beforeTrace.routes[1].outcome, 'failed');
+        assert.equal(beforeTrace.routes[1].calls[0].code, 'HTTP_429');
+        assert.equal(beforeLog.queries[1].kind, 'failed');
+      }
+      context.finalize(call, { isError: true, error: { info: { code: 'ABORTED' } } });
+      const trace = context.readTrace(session, call.callId), row = history.snapshot(view).records[0];
+      assert.equal(row.kind, 'cancelled');
+      assert.equal(row.reason, 'ABORTED');
+      assert.deepEqual(trace.routes, beforeTrace.routes, 'supplier and child facts survive final cancellation');
+      assert.deepEqual(row.queries, beforeLog.queries, 'query outcomes and supplier usage are unchanged');
+      assert.deepEqual(row.queries[0].calls[0].charge, { amount: 1, unit: 'credits', basis: 'reported' });
+      assert.equal(trace.state, 'cancelled');
+      assert.equal(context.read(session, call.callId).state, 'cancelled');
+    } finally { context.dispose(); history.dispose(); }
+  });
+}
+
 test('late final outcomes cannot change another execution with reused or cleared identities', async () => {
   const history = createSearchLog(), context = createToolRouteContext({ searchLog: history });
   const session = randomUUID(), call = exec(session, 'reused-final');

@@ -29,7 +29,9 @@ export function createToolRouteContext({ capacity = 20, searchLog = null, now = 
     return {
       known: true,
       // Captures past the row cap still decide the outcome; only their rows are dropped.
-      state: entry.finished ? entry.failed || omitted.failed > 0 || entry.routes.some(route => route.outcome === 'failed') ? 'failed'
+      // Final host cancellation owns the summary, without rewriting child facts.
+      state: entry.finished ? entry.finalized && entry.cancelled && !entry.failed ? 'cancelled'
+        : entry.failed || omitted.failed > 0 || entry.routes.some(route => route.outcome === 'failed') ? 'failed'
         : entry.cancelled || omitted.cancelled > 0 || entry.routes.some(route => route.outcome === 'cancelled') ? 'cancelled' : 'done' : 'running',
       routes: entry.routes.map(route => ({ ...route,
         ...(route.resultProviders ? { resultProviders: [...route.resultProviders] } : {}) })),

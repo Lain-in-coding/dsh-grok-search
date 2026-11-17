@@ -215,6 +215,27 @@ test('observed calls report actual retries and interface credits, never credenti
   assert.equal(JSON.stringify(observed).includes('second'), false);
 });
 
+test('Tavily retry cancellation preserves the attempt operation and caller reason', async () => {
+  const controller = new AbortController(), reason = new DOMException('synthetic cancellation', 'AbortError');
+  const observed = [], progress = [];
+  const config = { ...baseConfig(), tavily_api_key: 'synthetic-first,synthetic-second' };
+  const { instance, calls } = router({ config, fetchImpl: async (_url, init, index) => {
+    if (index === 1) return json({}, 429);
+    return new Promise((_, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      controller.abort(reason);
+    });
+  } });
+  await assert.rejects(instance.search({ query: 'retry cancellation', signal: controller.signal,
+    onCall: value => observed.push(value), onProgress: value => progress.push(value) }), error => error === reason);
+  assert.equal(calls.length, 2, 'cancellation does not dispatch another key or supplier');
+  assert.deepEqual(progress.map(row => [row.provider, row.keyIndex, row.operation]),
+    [['tavily', 0, 'search'], ['tavily', 1, 'retry']]);
+  assert.deepEqual(observed.map(row => [row.provider, row.keyIndex, row.operation, row.result, row.code]),
+    [['tavily', 0, 'search', 'failed', 'HTTP_429'], ['tavily', 1, 'retry', 'cancelled', 'CANCELLED']]);
+  assert.doesNotMatch(JSON.stringify({ observed, progress }), /synthetic-first|synthetic-second/);
+});
+
 test('Exa dollar costs are estimates from the response, never a made-up price per result', async () => {
   const observed = [];
   const config = without(baseConfig(), 'tavily', 'tinyfish', 'firecrawl');

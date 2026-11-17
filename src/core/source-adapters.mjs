@@ -339,7 +339,7 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       try { last = await attempt(source, source.keys[keyIndex], query, limit, { signal, timeoutMs: remaining }); }
       catch (error) {
         const cancelled = isCancellation(error, signal?.aborted === true);
-        onCall?.({ provider: source.id, keyIndex, result: cancelled ? 'cancelled' : 'failed',
+        onCall?.({ provider: source.id, keyIndex, operation: offset ? 'retry' : 'search', result: cancelled ? 'cancelled' : 'failed',
           code: cancelled ? 'CANCELLED' : 'TIMEOUT' });
         throw error;
       }

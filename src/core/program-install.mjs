@@ -194,8 +194,14 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     } catch (error) {
       if (['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error?.code)) throw error;
       signal?.throwIfAborted();
+      const permissionCause = ['EACCES', 'EPERM'].includes(error.code) ? error
+        : ['EACCES', 'EPERM'].includes(error.cause?.code) ? error.cause : null;
+      if (permissionCause) {
+        const denied = new GrokSearchError('GROK_CACHE_ACCESS_DENIED', '没有读取或执行程序缓存的权限，请检查目录权限。');
+        Object.defineProperty(denied, 'cause', { value: permissionCause, writable: true, configurable: true });
+        throw denied;
+      }
       if (error instanceof GrokSearchError) throw error;
-      if (['EACCES', 'EPERM'].includes(error.code)) fail('GROK_CACHE_ACCESS_DENIED', '没有读取程序缓存的权限，请检查目录权限。');
       fail('GROK_CACHE_DAMAGED', '私有 Grok 缓存记录无效，请重新准备。');
     }
   };

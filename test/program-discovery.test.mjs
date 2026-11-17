@@ -4,7 +4,7 @@ import childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import fs, { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { discoverGrokCandidates, findExistingGrok, grokPlatformPackage, inspectGrokProgram } from '../src/core/program-discovery.mjs';
@@ -147,6 +147,35 @@ test('launch scripts are rejected before spawn even with an executable filename'
   writeFileSync(wrapper, '#!/usr/bin/env node\nthrow new Error(\"must not run\");');
   await assert.rejects(inspectGrokProgram(wrapper), error =>
     ['GROK_PROGRAM_NOT_NATIVE', 'GROK_PROGRAM_MISSING'].includes(error.code));
+});
+for (const code of ['EACCES', 'EPERM']) test(`program inspection retains the original ${code} access cause without spawning`, async () => {
+  const binary = realpathSync(makeFile(join(setup(), nativeBinary)));
+  const cause = Object.assign(new Error('synthetic-private-access'), { code, path: binary });
+  const originalAccess = fs.accessSync, originalSpawn = childProcess.spawn;
+  let accesses = 0, spawns = 0;
+  fs.accessSync = (path, mode) => {
+    if (path !== binary) return originalAccess(path, mode);
+    accesses++;
+    throw cause;
+  };
+  childProcess.spawn = () => { spawns++; assert.fail('Access denial must stop before spawn.'); };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(inspectGrokProgram(binary), error => {
+      assert.equal(error.code, 'GROK_PROGRAM_MISSING');
+      assert.equal(error.cause, cause);
+      assert.equal(Object.getOwnPropertyDescriptor(error, 'cause').enumerable, false);
+      assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(error)), 'cause'), false);
+      assert.equal(error.message.includes('synthetic-private-access'), false);
+      return true;
+    });
+    assert.equal(accesses, 1);
+    assert.equal(spawns, 0);
+  } finally {
+    fs.accessSync = originalAccess;
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
 });
 test('no installed candidate reports missing without downloading', async () => {
   const root = setup();

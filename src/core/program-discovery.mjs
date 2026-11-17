@@ -71,7 +71,11 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
     if (!stat.isFile() || stat.size > 100 * 1024 * 1024) throw new Error();
     if (platform === 'win32' && !actual.toLowerCase().endsWith('.exe')) throw new Error();
     accessSync(actual, platform === 'win32' ? constants.R_OK : constants.X_OK);
-  } catch { throw new GrokSearchError('GROK_PROGRAM_MISSING', '找不到可执行的 Grok 程序，请检查路径或重新准备。'); }
+  } catch (cause) {
+    const error = new GrokSearchError('GROK_PROGRAM_MISSING', '找不到可执行的 Grok 程序，请检查路径或重新准备。');
+    Object.defineProperty(error, 'cause', { value: cause, writable: true, configurable: true });
+    throw error;
+  }
   const descriptor = openSync(actual, 'r'), magic = Buffer.alloc(4);
   try { readSync(descriptor, magic, 0, 4, 0); } finally { closeSync(descriptor); }
   const native = platform === 'win32' ? magic.subarray(0, 2).toString('ascii') === 'MZ'

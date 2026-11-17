@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import { gzipSync } from 'node:zlib';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPrivateProgramInstaller, resolveGrokProgram, unpackPlatformArchive, verifyArchiveIntegrity } from '../src/core/program-install.mjs';
@@ -223,6 +225,58 @@ test('cache damage is detected before executing a modified binary', async () => 
   writeFileSync(result.path, 'modified');
   await assert.rejects(installer.active(), error => error.code === 'GROK_CACHE_DAMAGED');
   assert.equal(versions.length, 1);
+});
+
+for (const code of ['EACCES', 'EPERM']) test(`existing cache ${code} access denial disables controller repair without changing the cache`, async () => {
+  const { installer, directory } = fixture();
+  const installed = await installer.install();
+  const binary = realpathSync(installed.path), recordPath = join(directory, 'active.json');
+  const binaryBytes = readFileSync(binary), recordBytes = readFileSync(recordPath);
+  const before = fs.statSync(binary), names = readdirSync(directory).sort();
+  const cause = Object.assign(new Error('synthetic-private-cache-access'), { code, path: binary });
+  const originalAccess = fs.accessSync, originalSpawn = childProcess.spawn;
+  let accesses = 0, spawns = 0, downloads = 0;
+  const checking = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64',
+    fetchImpl: async () => { downloads++; assert.fail('Access denial must not download another program.'); } });
+  const manager = createProgramController({ directory, installer: checking, configuration: {},
+    env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: '' }) });
+  const denied = error => {
+    assert.equal(error.code, 'GROK_CACHE_ACCESS_DENIED');
+    assert.equal(error.cause, cause);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'cause').enumerable, false);
+    assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(error)), 'cause'), false);
+    assert.equal(error.message.includes('synthetic-private-cache-access'), false);
+    return true;
+  };
+  fs.accessSync = (path, mode) => {
+    if (path !== binary) return originalAccess(path, mode);
+    accesses++;
+    throw cause;
+  };
+  childProcess.spawn = () => { spawns++; assert.fail('Access denial must stop before spawn.'); };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(checking.active(), denied);
+    await assert.rejects(manager.prepare(), denied);
+    assert.equal(manager.snapshot().canRepair, false);
+    assert.equal(manager.snapshot().error.code, 'GROK_CACHE_ACCESS_DENIED');
+    assert.equal(JSON.stringify(manager.snapshot()).includes('synthetic-private-cache-access'), false);
+    await assert.rejects(manager.repair(), { code: 'GROK_CACHE_REPAIR_UNAVAILABLE' });
+    await assert.rejects(checking.repair(), denied);
+    assert.equal(accesses, 3);
+    assert.equal(spawns, 0);
+    assert.equal(downloads, 0);
+    assert.deepEqual(readFileSync(binary), binaryBytes);
+    assert.deepEqual(readFileSync(recordPath), recordBytes);
+    assert.deepEqual(readdirSync(directory).sort(), names);
+    assert.equal(fs.statSync(binary).ino, before.ino);
+    assert.equal(fs.statSync(binary).mode, before.mode);
+  } finally {
+    fs.accessSync = originalAccess;
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+    await manager.dispose();
+  }
 });
 
 test('cache inspection preserves an unreaped verification failure over caller cancellation', async () => {

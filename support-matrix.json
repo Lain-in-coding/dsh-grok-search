@@ -11,7 +11,7 @@
     "automaticOfficialFallback": false,
     "runtimeInitializationRequired": true
   },
-  "verificationBaseline": "运行代码在 GitHub 局部修复后通过专项回归及 Windows rc.5 用户人工验收。各组合引用下列具名 0.4.0 基线；发布收尾仅改文档和元数据，不将旧包矩阵改写为新包完整实测。",
+  "verificationBaseline": "GitHub 局部修复基线已通过专项回归及 Windows rc.5 用户人工验收。后续发布前复审另做启停、配置身份、凭据显示、记录结算及缓存权限的定向修复和离线验证；各组合继续引用下列具名 0.4.0 基线，不把旧包矩阵或人工结果改写为本轮修复实测。",
   "supportPolicy": "达到硬下限直接初始化服务；未知或未来版本不要求确认，不运行主动兼容预检。实际故障按对应功能处理，可选异常不撤销已运行核心；未明确停用时禁止自动回退官方搜索。未测试不限制用户尝试，也不表示该版本已实测。",
   "verificationLevels": {
     "planned": "保留的验收计划，不代表已经执行。",
@@ -19,7 +19,7 @@
     "host-tested": "仅包外证据可声明：同一 tgz、宿主资产、平台入口与实际门禁均绑定哈希。",
     "source-reviewed": "历史源码审查，不替代本次真实宿主验收。",
     "historical": "只描述指定旧包，不继承给本包。",
-    "reference-reviewed": "已核对具名基线的宿主结果，包哈希与范围见 verificationReference；不声明当前文档收尾包重新执行了同一矩阵。"
+    "reference-reviewed": "已核对具名基线的宿主结果，包哈希与范围见 verificationReference；不声明当前发布前修复重新执行了同一矩阵。"
   },
   "platforms": [
     {
@@ -421,8 +421,8 @@
     "Windows 与 macOS 独立 CLI/Web 不属于当前完整验收计划"
   ],
   "notTested": [
-    "发布收尾的新包没有重跑完整宿主矩阵；仅文档和元数据变化，运行文件须逐项匹配人工验收包。",
-    "取消主动兼容预检及后续GitHub边界修复尚未做macOS实机复验；较早六版结果只属于引用基线。",
+    "发布前复审修复没有重跑完整宿主矩阵或重新进行用户人工验收；旧包结果按具名基线引用，新增修复以其定向回归结果为准。",
+    "取消主动兼容预检、后续GitHub边界及发布前复审修复尚未做macOS实机复验；较早六版结果只属于引用基线。",
     "rc.4 Desktop按关键源码审查支持，不将该版本CLI/Web实测写成Windows或macOS发行包实测。",
     "原生Linux烟测不能替代WSL Ubuntu 22.04完整验收；其他系统和真实付费接口见historical.notTested。",
     "任意未来宿主没有相应实测证据时保持未测试，不因此阻止初始化或要求用户确认。"

@@ -1633,6 +1633,88 @@ test('same-root explicit stop and start create a fresh owner without requiring m
   } finally { await f.ctx.dispose(); }
 });
 
+test('a later explicit stop cancels a pending start and a newer start can still run', { timeout: 10_000 }, async t => {
+  for (const restartWhilePending of [false, true]) await t.test(
+    restartWhilePending ? 'restart before stale start settles' : 'restart after stale start settles', async () => {
+      const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-start-stop-'));
+      writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+      const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+        trustedRoot: directory, governance: true, autoMaintain: false });
+      const draining = deferred(), drained = deferred();
+      let mounts = 0, pendingStart, pendingStop, nextStart;
+      const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }), overrides: {
+        control: { name: 'control', apply: applyControl },
+        routeVerifier: { name: 'verifier', apply: applyRouteVerifier },
+        core: { name: 'core', apply(child) {
+          const first = ++mounts === 1;
+          child.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {
+            if (first) { draining.resolve(); await drained.promise; }
+          } });
+        } },
+      } });
+      f.ctx.profileContext.dir = directory;
+      f.entry.update = async ({ config }) => {
+        f.entry.options.config = structuredClone(config);
+        f.webFiber.config = structuredClone(config);
+        f.webFiber.rawConfig = f.webFiber.config;
+        f.webFiber.effectiveConfig = f.webFiber.resolveConfig(config);
+        f.web.config = f.webFiber.effectiveConfig;
+        f.web.searchProviderId = selectedId(f.webFiber.effectiveConfig.searchProvider);
+        f.web.fetchProviderId = selectedId(f.webFiber.effectiveConfig.fetchProvider);
+      };
+      try {
+        f.start();
+        await f.settle();
+        const owner = f.service('grokSearchControl');
+        assert.equal(f.coordinator().report().coreReady, true);
+        f.coordinator().block('COMPATIBILITY_CORE_UNAVAILABLE');
+        await draining.promise;
+        pendingStart = owner.start();
+        const startOutcome = pendingStart.then(() => ({ status: 'fulfilled' }),
+          error => ({ status: 'rejected', code: error.code }));
+        await turn();
+        assert.equal(mounts, 1, 'the old start must still be waiting for its generation to drain');
+        pendingStop = owner.stop('later-explicit-stop');
+        if (restartWhilePending) {
+          nextStart = f.coordinator().start();
+          nextStart.catch(() => {});
+          assert.notEqual(nextStart, pendingStart, 'a new start must not reuse the invalidated pending one');
+        }
+        drained.resolve();
+        assert.equal((await pendingStop).kind, 'released');
+        const stale = await startOutcome;
+        await f.settle();
+        if (!restartWhilePending) {
+          assert.equal(f.coordinator().report().coreReady, false, 'the later stop must keep search stopped');
+          assert.equal(f.web.searchProviderId, 'author');
+          assert.equal(store.read().intent.policy, 'released');
+          assert.equal(mounts, 1);
+        }
+        assert.deepEqual(stale, { status: 'rejected', code: 'COMPATIBILITY_STOPPED' });
+        nextStart ??= f.coordinator().start();
+        await nextStart;
+        await f.settle();
+        assert.equal(f.coordinator().report().coreReady, true);
+        assert.equal(f.web.searchProviderId, 'grok-search');
+        assert.equal(store.read().intent.policy, 'required');
+        assert.equal(mounts, 2);
+        const nextOwner = f.service('grokSearchControl');
+        assert.notEqual(nextOwner, owner);
+        assert.equal((await nextOwner.stop('completed-stop-before-restart')).kind, 'released');
+        await nextOwner.start();
+        await f.settle();
+        assert.equal(f.coordinator().report().coreReady, true, 'internal retryRelease must not cancel the new start');
+        assert.equal(f.web.searchProviderId, 'grok-search');
+        assert.equal(store.read().intent.policy, 'required');
+        assert.equal(mounts, 3);
+      } finally {
+        drained.resolve();
+        await Promise.allSettled([pendingStart, pendingStop, nextStart]);
+        await f.ctx.dispose();
+      }
+    });
+});
+
 test('revoked runtime authority keeps the release owner reachable and a fresh explicit start rechecks', async () => {
   const f = bootstrapFixture();
   try {

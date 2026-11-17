@@ -50,7 +50,8 @@ export function apply(ctx, configuration, { load = loadModule,
   let activeContext = null, lifecycleContext = null, lifecycleTask = null, generation = null;
   let lifecycleAttempt = null;
   let pumping = null, repump = false, bootstrapReady = false, stateUnsubscribe = null;
-  let startTask = null, recheckTask = null, settingsAttempt = null;
+  let startAttempt = null, recheckTask = null, settingsAttempt = null;
+  let userIntent = 0, retryingRelease = false;
   let failureCount = 0, retrySequence = 0;
   let retiring = null, githubPreferences = null;
   const rootFiber = ctx.fiber, rootEntry = rootFiber.entry;
@@ -224,6 +225,7 @@ export function apply(ctx, configuration, { load = loadModule,
   const current = token => !destroyed && !userStopped && coordinator.isCurrent(token);
   const assertCurrent = token => { if (!current(token)) throw unavailable('COMPATIBILITY_STOPPED'); };
   const pause = () => {
+    if (!retryingRelease) userIntent++;
     userStopped = true;
     retrySequence++;
     coordinator.block('COMPATIBILITY_STOPPED');
@@ -253,30 +255,44 @@ export function apply(ctx, configuration, { load = loadModule,
     },
     start() {
       if (destroyed || disabling) return Promise.reject(unavailable('COMPATIBILITY_STOPPED'));
-      if (startTask) return startTask;
+      if (startAttempt?.intent === userIntent) return startAttempt.task;
       if (!userStopped && coordinator.report().coreReady) return Promise.resolve(coordinator.report());
+      const attempt = { intent: ++userIntent, task: null };
+      const assertIntent = () => {
+        if (destroyed || disabling || attempt.intent !== userIntent) throw unavailable('COMPATIBILITY_STOPPED');
+      };
+      startAttempt = attempt;
       userStopped = true;
       coordinator.block('COMPATIBILITY_STOPPED');
-      startTask = (async () => {
+      attempt.task = (async () => {
+        assertIntent();
         retrySequence++;
         failureCount = 0;
         await suspendGeneration(generation);
+        assertIntent();
         if (retiring) await retiring;
         if (releaseTask) await releaseTask;
+        assertIntent();
         const owner = generation?.owner ?? generation?.ctx?.get('grokSearchControl');
-        await owner?.retryRelease?.();
+        let release;
+        // retryRelease calls onStop synchronously; do not suppress user stops while it awaits cleanup.
+        retryingRelease = true;
+        try { release = owner?.retryRelease?.(); }
+        finally { retryingRelease = false; }
+        await release;
+        assertIntent();
         const record = store?.read()?.intent;
         if (record?.policy === 'released' && !record.releaseCompletion && !record.recovery) {
           throw unavailable('COMPATIBILITY_BLOCKED');
         }
         await disposeGeneration(generation);
-        if (destroyed || disabling) throw unavailable('COMPATIBILITY_STOPPED');
+        assertIntent();
         userStopped = false;
         coordinator.beginEpoch();
         schedule();
         return coordinator.report();
-      })().finally(() => { startTask = null; });
-      return startTask;
+      })().finally(() => { if (startAttempt === attempt) startAttempt = null; });
+      return attempt.task;
     },
   });
   ctx.provide('grokSearchCompatibility', compatibility);

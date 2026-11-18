@@ -9,7 +9,7 @@ import {
 import { inspectPackage, validateInstallManifest } from './compatibility-smoke.mjs';
 import { PROGRAM_CASE_IDS, casePassed } from './compatibility-program-checks.mjs';
 
-export const FROZEN_PRODUCT_SHA256 = '51e777c14d75f87ef6a3bbf2bae75a3fd316fbec897f3f60fde05c720f24e12b';
+export const FROZEN_PRODUCT_SHA256 = '02474f57cf0815bdd41a488826b5e5f2679087174f6294a5b329bcb492a2c558';
 export const PUBLISHED_OLD_PRODUCT = Object.freeze({
   name: 'dsh-grok-search', version: '0.3.0',
   sha256: '24ab92c59221d4ef011986afa81022a2d0e6cd1f4bc07358e409e6d8c21d3b48',

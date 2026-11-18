@@ -98,7 +98,8 @@ test('0.4.0发布文档固定目标版本并保留历史实录与验证范围', 
   assert.match(readme, /实际发布状态以/);
   assert.match(readme, /releases\/tag\/v0\.4\.0/);
   assert.match(readme, /历史操作实录：Windows Desktop 0\.2\.2-rc\.2 · 插件 0\.3\.0/);
-  assert.match(readme, /运行文件与该人工验收包逐字节一致/);
+  assert.match(readme, /原人工验收与宿主矩阵保留各自包的验证范围/);
+  assert.doesNotMatch(readme, /运行文件与该人工验收包逐字节一致/);
   assert.match(readme, /尚未做 macOS 实机复验/);
   assert.match(readme, /npm run pack:release/);
   assert.doesNotMatch(readme, /npm run pack:alpha|0\.3\.0-alpha\.1/);

@@ -325,12 +325,17 @@ export async function runCompatibilityHostProbe({ hostRoot, directory, installed
     const native = await within(invokeCompatibilitySearch(boot.ctx, {
       queries: ['compatibility-smoke-native-1', 'compatibility-smoke-native-2'], modern: fixture.modern, signal,
     }), signal);
+    const directMatched = containsSource(direct), nativeMatched = containsSource(native);
+    receipt.observations.directSearch = { passed: directMatched, sourceMatched: directMatched };
+    receipt.observations.nativeTool = { passed: native?.isError === false && nativeMatched,
+      queries: 2, sourceMatched: nativeMatched, modern: fixture.modern, isError: native?.isError ?? null,
+      errorCode: native?.isError === true ? errorCode(native.error?.info) : null };
+    receipt.observations.searchRoute = { requests: upstream.state.requests.filter(row => !row.held).length,
+      officialSearchCalls: trace.calls.original, unexpectedRequests: upstream.state.unexpected };
     insist(containsSource(direct) && native?.isError === false && containsSource(native)
       && upstream.state.requests.filter(row => !row.held).length === 3
       && trace.calls.original === 0 && upstream.state.unexpected === 0,
     'COMPATIBILITY_SMOKE_SEARCH_FAILED');
-    receipt.observations.directSearch = { passed: true, sourceMatched: true };
-    receipt.observations.nativeTool = { passed: true, queries: 2, sourceMatched: true, modern: fixture.modern };
     gates[2].passed = true;
     const controller = new AbortController(), reason = Object.assign(new Error('COMPATIBILITY_SMOKE_CANCELLED'),
       { code: 'COMPATIBILITY_SMOKE_CANCELLED' });

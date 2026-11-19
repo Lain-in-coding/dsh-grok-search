@@ -283,7 +283,9 @@ function mockInstallation(t, { version = '0.4.0', reportAvailable = true, reject
         state.native++;
         const queries = JSON.parse(input.calls[0].arguments).queries, sources = [];
         for (const query of queries) sources.push(...(await web.search({ query }, input.signal)).sources);
-        return { results: [{ result: { isError: nativeFailure, sources } }] };
+        return { results: [{ result: { isError: nativeFailure, sources,
+          ...(nativeFailure ? { error: { message: 'Synthetic error /private/config with a secret',
+            info: { code: 'TOOL_OUTPUT_INVALID' } } } : {}) } }] };
       },
     },
   };
@@ -360,6 +362,11 @@ test('legacy readiness alone cannot pass capabilities when the native tool fails
   assert.equal(result.gates.find(gate => gate.id === 'search-no-official-fallback').passed, false);
   assert.equal(result.gates.find(gate => gate.id === 'cancellation').passed, false);
   assert.equal(result.cleanupVerified, true);
+  assert.equal(result.observations.directSearch.sourceMatched, true);
+  assert.equal(result.observations.nativeTool.isError, true);
+  assert.equal(result.observations.nativeTool.errorCode, 'TOOL_OUTPUT_INVALID');
+  assert.deepEqual(result.observations.searchRoute, { requests: 3, officialSearchCalls: 0, unexpectedRequests: 0 });
+  assert.doesNotMatch(JSON.stringify(result), /private|secret/);
 });
 
 test('passing query gates without fixture disposal never produce a passing receipt', async t => {

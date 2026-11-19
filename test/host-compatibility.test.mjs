@@ -84,10 +84,13 @@ test('runtime admission and immutable external evidence have distinct policies',
   assert.equal(hostVersionAdmitted('0.2.1-rc.1'), false);
 });
 
-test('release preparation preserves manual validation without enabling a recurring job', () => {
+test('authorized six-hour maintenance watch preserves manual selection and never publishes', () => {
   const workflow = readFileSync(new URL('../.github/workflows/compatibility-watch.yml', import.meta.url), 'utf8');
   assert.match(workflow, /^\s+workflow_dispatch:/m);
-  assert.doesNotMatch(workflow, /^\s+schedule:|^\s+-\s+cron:/m);
+  assert.match(workflow, /^  schedule:\r?\n    - cron: "17 \*\/6 \* \* \*"\r?\n/m);
+  assert.match(workflow, /options: \[released, candidate\]\s+default: released/);
+  assert.match(workflow, /contents: read\s+actions: read/);
+  assert.doesNotMatch(workflow, /\b(?:npm publish|git push|self-hosted)\b/);
 });
 
 test('Desktop 候选工具接受 0.2.2-rc.2 但不自动接受 alpha 或未来 rc', () => {

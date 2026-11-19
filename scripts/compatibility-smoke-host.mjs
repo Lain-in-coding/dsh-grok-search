@@ -107,7 +107,8 @@ export async function invokeCompatibilitySearch(ctx, { queries = [query], modern
   insist(Array.isArray(queries) && queries.length > 0 && queries.length <= 4
     && queries.every(value => typeof value === 'string' && value.startsWith('compatibility-smoke-')
       && value.length <= 100), 'COMPATIBILITY_SMOKE_QUERY_INVALID');
-  const tools = ctx.get('tools'), agent = { session: { id: randomUUID() }, ctx }, callId = randomUUID();
+  const tools = ctx.get('tools'), agent = { session: { id: randomUUID(),
+    requestContext: () => ({ provider: 'compatibility-smoke' }) }, ctx }, callId = randomUUID();
   insist(typeof tools?.execute === 'function', 'COMPATIBILITY_SMOKE_NATIVE_TOOL_UNAVAILABLE');
   signal ??= new AbortController().signal;
   signal.throwIfAborted();

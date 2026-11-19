@@ -167,6 +167,7 @@ test('modern native invocation resolves one tool set and always awaits its dispo
         events.push('executed');
         assert.equal(input.toolSet, toolSet);
         assert.equal(input.signal, signal);
+        assert.equal(input.agent.session.requestContext?.()?.provider, 'compatibility-smoke');
         assert.equal(input.calls.length, 1);
         assert.equal(input.calls[0].type, 'tool_call');
         assert.equal(input.calls[0].name, 'web_search');
@@ -281,6 +282,7 @@ function mockInstallation(t, { version = '0.4.0', reportAvailable = true, reject
       async resolve() { return { dispose() { state.disposedTools++; } }; },
       async execute(input) {
         state.native++;
+        assert.equal(input.agent.session.requestContext?.()?.provider, 'compatibility-smoke');
         const queries = JSON.parse(input.calls[0].arguments).queries, sources = [];
         for (const query of queries) sources.push(...(await web.search({ query }, input.signal)).sources);
         return { results: [{ result: { isError: nativeFailure, sources,

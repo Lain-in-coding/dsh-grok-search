@@ -137,18 +137,24 @@ test('a network root from realpath is rejected before accessing any child', { sk
 });
 
 test('unreadable, missing and malformed downgrade receipts retain distinct diagnoses', t => {
-  const { profile, directory } = fixture();
-  const transition = directory + '.transition.json';
+  const { profile } = fixture();
+  // Match maintenance's native canonical root, including Windows drive aliases.
+  const transition = join(realpathSync.native(profile), 'control-intent.records.transition.json');
   const recover = () => runStorageMaintenance({ profile, mode: 'recover-downgrade', offline: true });
   assert.throws(recover, { code: 'ENOENT' });
   writeFileSync(transition, '{broken');
   assert.throws(recover, { code: 'CONTROL_STORAGE_RECEIPT_INVALID' });
   const read = fs.readFileSync;
+  let receiptReads = 0;
   mockFs(t, fs, 'readFileSync', (path, ...args) => {
-    if (path === transition) throw Object.assign(new Error('Synthetic receipt read failure'), { code: 'EIO' });
+    if (path === transition) {
+      receiptReads++;
+      throw Object.assign(new Error('Synthetic receipt read failure'), { code: 'EIO' });
+    }
     return read(path, ...args);
   });
   assert.throws(recover, { code: 'EIO' });
+  assert.equal(receiptReads, 1, 'The receipt read failure must actually be injected.');
   assert.equal(read(transition, 'utf8'), '{broken');
 });
 

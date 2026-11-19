@@ -3001,15 +3001,20 @@ test('CLI upgrade host peer identity hashes declared CLI boot and conditional ES
   assert.throws(() => selected({ name: '@deepseek-ai/dsh', bin: { dsh: 'lib/index.js' } }), /differs from the verified/);
 });
 
-test('CLI upgrade compatibility metadata is created by the real 0.4 state API without granting consent and pins exact bytes', async () => {
+test('CLI upgrade fixture uses the real state API under its pinned 0.4.0 identity without granting consent', async () => {
   const profileDir = mkdtempSync(join(sandbox, 'cli-real-state-'));
-  const productDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const productDir = mkdtempSync(join(sandbox, 'cli-state-product-'));
+  // The historical driver stays pinned when the development package version changes.
+  writeFileSync(join(productDir, 'package.json'), JSON.stringify({ name: 'dsh-grok-search', version: '0.4.0', type: 'module' }));
+  symlinkSync(join(sourceDir, 'src'), join(productDir, 'src'), process.platform === 'win32' ? 'junction' : 'dir');
   const before = cliUpgradeVerifier.readCliUpgradeCompatibilityState(profileDir);
   assert.deepEqual(before, { present: false, sha256: null, size: 0 });
   const seeded = await cliUpgradeVerifier.seedCliUpgradeCompatibilityState({
     profileDir, hostVersion: '0.2.1-rc.2', productDir,
   });
   assert.equal(seeded.operation, 'shipped-createCompatibilityState.markNotified');
+  assert.equal(seeded.pluginVersion, '0.4.0');
   assert.equal(seeded.before.revision, 'missing');
   assert.equal(seeded.after.notified, true);
   assert.equal(seeded.after.confirmed, false);

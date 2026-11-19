@@ -98,14 +98,15 @@ export function createToolRouteView({ React, jsx, remote, Original, logos = {}, 
   const finiteMs = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
   const duration = value => finiteMs(value) === null ? '—' : `${(value / 1000).toFixed(1)} 秒`;
   const errorText = code => {
-    if (/401|grok_auth_error/.test(code)) return '鉴权失败';
-    if (/403/.test(code)) return '访问受限';
+    if (/401|AUTH|UNAUTHORIZED/i.test(code)) return '鉴权失败';
+    if (/403|FORBIDDEN|PERMISSION/i.test(code)) return '访问受限';
+    if (/402|432|433|QUOTA|BILLING|PAYMENT/i.test(code)) return '额度不足';
     if (/429|rate.limit/i.test(code)) return '请求限流';
-    if (/TIMEOUT|timeout/.test(code)) return '响应超时';
-    if (/50[234]/.test(code)) return '服务不可用';
-    if (/EMPTY|empty|NO_RESULTS/.test(code)) return '未返回结果';
-    if (/NETWORK|CONNECT|network/.test(code)) return '连接失败';
-    if (/BUDGET|OUTPUT_LIMIT/.test(code)) return '达到调用上限';
+    if (/SOURCE_BUDGET_EXHAUSTED|TIMED?_?OUT|TIMEOUT/i.test(code)) return '响应超时';
+    if (/50[0234]/.test(code)) return '服务不可用';
+    if (/EMPTY|NO_RESULTS/i.test(code)) return '未返回结果';
+    if (/NETWORK|CONNECT|ENOTFOUND|ECONN|CERT_|TLS|SSL/i.test(code)) return '连接失败';
+    if (/BUDGET|OUTPUT_LIMIT/i.test(code)) return '达到调用上限';
     return '调用失败';
   };
   const safeUrl = value => {

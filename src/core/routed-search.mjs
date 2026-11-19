@@ -22,11 +22,12 @@ const failureRows = list => (Array.isArray(list) ? list : []).slice(0, 8)
  * only stable codes and provider ids: never the query, results, URLs, keys or
  * upstream text.
  */
-export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBarrier, searchLog: suppliedLog,
+export function createRoutedSearch({ grok, canFallback = () => true, sourceRouter, preferences, releaseBarrier, searchLog: suppliedLog,
   getConfig = () => ({}), budgetMs = 120_000, cleanupMs = 2_000, now = Date.now,
   assertExecution = () => {}, executionEpoch = () => 0 }) {
   let lastRoute = null, lastRouteIdentity = null;
   const identityKey = randomBytes(32);
+  const fallbackState = config => config.fallback_sources !== 0 ? sourceRouter.snapshot?.(config) : null;
   const searchLog = suppliedLog ?? createSearchLog({ now });
   const checkExecution = request => {
     const decision = assertExecution();
@@ -108,7 +109,7 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
       const onCall = call => { searchLog.call(token, call); token.trace?.record?.(call); };
       const onProgress = call => token.trace?.record?.({ ...call, result: 'running' });
       const sourceInput = { ...request, signal, onCall, onProgress, configuration: config, remainingMs };
-      const sourceState = config.fallback_sources !== 0 ? sourceRouter.snapshot?.(config) : null;
+      const sourceState = fallbackState(config);
       const available = sourceState?.available === true;
       token.trace?.planned?.([...(grokEnabled ? ['grok'] : []), ...(available && Array.isArray(sourceState.enabled) ? sourceState.enabled : [])]);
       if (!grokEnabled) {
@@ -205,7 +206,7 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
     // A host batch may contain ten queries. Leave bounded room for a batch
     // alongside existing work without increasing upstream concurrency.
     budgetMs, cleanupMs, maxRunning: 1, maxQueued: 16,
-    snapshot: request => { checkExecution(request); return configuration(request); },
+    snapshot: request => { checkExecution(request); return request?.[SEARCH_DIAGNOSTIC] ? {} : configuration(request); },
     runQuery: ({ request, signal, maxChars, config, execution, grokEnabled, remainingMs, identity }) => {
       checkExecution(request);
       if (request[SEARCH_DIAGNOSTIC]) return request[SEARCH_DIAGNOSTIC](signal, remainingMs);
@@ -253,7 +254,18 @@ export function createRoutedSearch({ grok, sourceRouter, preferences, releaseBar
     query: 'DeepSeek Harness', testPrimary: true, [SEARCH_DIAGNOSTIC]: work, [EXECUTION_EPOCH]: epoch,
   }, signal));
 
-  return { search, testGrok, scheduleDiagnosis, searchLog, dispose: async () => { if (!suppliedLog) searchLog.dispose(); return executor.dispose(); }, snapshot: executor.snapshot,
+  const available = () => {
+    if (releaseBarrier.snapshot().state !== 'active' || !executor.snapshot().accepting) return false;
+    try {
+      const { config, grokEnabled } = configuration();
+      if (grokEnabled) {
+        if (grok.available?.()) return true;
+        if (!canFallback()) return false;
+      }
+      return fallbackState(config)?.available === true;
+    } catch { return false; }
+  };
+  return { search, available, testGrok, scheduleDiagnosis, searchLog, dispose: async () => { if (!suppliedLog) searchLog.dispose(); return executor.dispose(); }, snapshot: executor.snapshot,
     routeSnapshot: captured => {
       if (!lastRoute) return null;
       try {

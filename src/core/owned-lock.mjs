@@ -2,7 +2,9 @@ import { closeSync, fsyncSync, fstatSync, lstatSync, openSync, readFileSync, unl
 import { randomUUID } from 'node:crypto';
 
 const MAX_OWNER_BYTES = 4096;
+const MAX_DATE_MS = 8_640_000_000_000_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const validTimestamp = value => typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= MAX_DATE_MS;
 export const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 
 function ownerRecord(path) {
@@ -52,7 +54,7 @@ function defaultProcessAlive(pid) {
 export function reclaimStaleOwnedLock(path, {
   now = Date.now(), staleAfterMs = DEFAULT_STALE_LOCK_MS, isProcessAlive = defaultProcessAlive,
 } = {}) {
-  if (!Number.isFinite(now) || !Number.isFinite(staleAfterMs) || staleAfterMs < 0
+  if (!validTimestamp(now) || !Number.isFinite(staleAfterMs) || staleAfterMs < 0
     || typeof isProcessAlive !== 'function') return { reclaimed: false, reason: 'invalid-options' };
   const owner = ownerRecord(path);
   if (owner.missing) return { reclaimed: false, reason: 'missing' };
@@ -62,37 +64,37 @@ export function reclaimStaleOwnedLock(path, {
   if (!(age >= staleAfterMs)) return { reclaimed: false, reason: 'fresh', age };
   let alive;
   try { alive = isProcessAlive(owner.parsed.pid); }
-  catch { return { reclaimed: false, reason: 'liveness-unknown', age } };
+  catch { return { reclaimed: false, reason: 'liveness-unknown', age }; }
   if (alive !== false) return { reclaimed: false, reason: alive ? 'owner-alive' : 'liveness-unknown', age };
   // Serialize reclaimers for this exact owner. A second reclaimer must never
   // unlink a new lock installed between the first reclaimer's unlink and its
   // own check. An interrupted recovery claim is deliberately fail-closed.
   let claim;
-  try { claim = acquireOwnedLock(`${path}.reclaim-${owner.parsed.token}`); }
+  try { claim = acquireOwnedLock(`${path}.reclaim-${owner.parsed.token}`, { now }); }
   catch { return { reclaimed: false, reason: 'recovery-busy', age }; }
   try {
-  let current;
-  try { current = lstatSync(path); }
-  catch (error) {
-    if (error.code === 'ENOENT') return { reclaimed: false, reason: 'missing' };
-    return { reclaimed: false, reason: 'unreadable' };
-  }
-  if (!current.isFile() || current.isSymbolicLink() || current.size > MAX_OWNER_BYTES
-    || current.dev !== owner.entry.dev || current.ino !== owner.entry.ino) {
-    return { reclaimed: false, reason: 'replaced' };
-  }
-  let text;
-  try { text = readFileSync(path, 'utf8'); }
-  catch { return { reclaimed: false, reason: 'unreadable' }; }
-  if (text !== owner.text) return { reclaimed: false, reason: 'replaced' };
-  try {
-    const after = lstatSync(path);
-    if (after.dev !== current.dev || after.ino !== current.ino) return { reclaimed: false, reason: 'replaced' };
-    unlinkSync(path);
-    return { reclaimed: true, reason: 'owner-exited', age };
-  } catch {
-    return { reclaimed: false, reason: 'unlink-failed' };
-  }
+    let current;
+    try { current = lstatSync(path); }
+    catch (error) {
+      if (error.code === 'ENOENT') return { reclaimed: false, reason: 'missing' };
+      return { reclaimed: false, reason: 'unreadable' };
+    }
+    if (!current.isFile() || current.isSymbolicLink() || current.size > MAX_OWNER_BYTES
+      || current.dev !== owner.entry.dev || current.ino !== owner.entry.ino) {
+      return { reclaimed: false, reason: 'replaced' };
+    }
+    let text;
+    try { text = readFileSync(path, 'utf8'); }
+    catch { return { reclaimed: false, reason: 'unreadable' }; }
+    if (text !== owner.text) return { reclaimed: false, reason: 'replaced' };
+    try {
+      const after = lstatSync(path);
+      if (after.dev !== current.dev || after.ino !== current.ino) return { reclaimed: false, reason: 'replaced' };
+      unlinkSync(path);
+      return { reclaimed: true, reason: 'owner-exited', age };
+    } catch {
+      return { reclaimed: false, reason: 'unlink-failed' };
+    }
   } finally { claim.release(); }
 }
 
@@ -106,11 +108,12 @@ export function acquireOwnedLock(path, {
   reclaimStaleAfterMs = null, now = Date.now(), isProcessAlive = defaultProcessAlive,
   token = randomUUID(), onAcquired = null,
 } = {}) {
-  if (!UUID.test(token) || onAcquired !== null && typeof onAcquired !== 'function') {
-    throw new TypeError('Owned locks require a UUID token and a synchronous acquisition observer.');
+  if (!validTimestamp(now) || typeof token !== 'string' || !UUID.test(token) || onAcquired !== null && typeof onAcquired !== 'function') {
+    throw new TypeError('Owned locks require a valid epoch-ms timestamp, UUID token and synchronous acquisition observer.');
   }
+  const timestamp = Math.trunc(now);
   const record = JSON.stringify({ schemaVersion: 1, token, pid: process.pid,
-    createdAt: new Date().toISOString() }) + '\n';
+    createdAt: new Date(timestamp).toISOString() }) + '\n';
   let descriptor, identity;
   const create = () => {
     descriptor = openSync(path, 'wx', 0o600);
@@ -135,7 +138,7 @@ export function acquireOwnedLock(path, {
   catch (error) {
     if (descriptor !== undefined) { try { closeSync(descriptor); } catch {} descriptor = undefined; }
     if (error.code !== 'EEXIST' || !Number.isFinite(reclaimStaleAfterMs) || reclaimStaleAfterMs < 0) throw error;
-    const reclaimed = reclaimStaleOwnedLock(path, { now, staleAfterMs: reclaimStaleAfterMs, isProcessAlive });
+    const reclaimed = reclaimStaleOwnedLock(path, { now: timestamp, staleAfterMs: reclaimStaleAfterMs, isProcessAlive });
     error.reclaim = reclaimed;
     if (!reclaimed.reclaimed && reclaimed.reason !== 'missing') throw error;
     // Retry only once. A normal contender may have acquired the lock first.
@@ -155,10 +158,7 @@ export function acquireOwnedLock(path, {
         if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_OWNER_BYTES) return false;
         if (before.dev !== identity.dev || before.ino !== identity.ino) return false;
         if (readFileSync(path, 'utf8') !== record) return false;
-      } catch (error) {
-        if (error.code === 'ENOENT') return false;
-        return false;
-      }
+      } catch { return false; }
       // Re-check immediately before unlinking. This is a cooperative local
       // lock, not an atomic defense against a hostile filesystem writer.
       try {

@@ -533,3 +533,30 @@ test('the chain order and on/off come from the shared source_providers and *_ena
     sourceEnabled: { tavily: false, exa: false, tinyfish: false, firecrawl: false } } }, fetchImpl: async () => ok.clone() });
   assert.deepEqual(legacy.instance.snapshot().enabled, ['tavily', 'exa', 'firecrawl']);
 });
+
+test('maxResults: 0 probes upstream with minimum valid limit and returns empty sources; OUTPUT_LIMIT fails before onCall', async () => {
+  let upstreamLimit = null;
+  const zero = router({
+    config: { ...baseConfig(), source_providers: ['exa'] },
+    fetchImpl: async (_url, init) => {
+      upstreamLimit = JSON.parse(init.body).numResults;
+      return json({ results: [{ url: 'https://exa.example/1', title: 'One' }] });
+    },
+  });
+  const empty = await zero.instance.search({ query: 'probe', maxResults: 0 });
+  assert.equal(upstreamLimit, 1);
+  assert.deepEqual(empty.sources, []);
+
+  const events = [];
+  const tiny = router({
+    config: { ...baseConfig(), source_providers: ['exa'], response_max_chars: 100 },
+    fetchImpl: async () => json({ results: [{ url: 'https://exa.example/' + 'long-path-'.repeat(12), title: 'Long' }] }),
+  });
+  await assert.rejects(
+    tiny.instance.search({ query: 'tiny', onCall: event => events.push(event) }),
+    error => error.code === 'SOURCE_ALL_FAILED' && error.details?.failures?.[0]?.code === 'OUTPUT_LIMIT',
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].result, 'failed');
+  assert.equal(events[0].code, 'OUTPUT_LIMIT');
+});

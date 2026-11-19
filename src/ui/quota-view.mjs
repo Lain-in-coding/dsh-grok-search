@@ -4,7 +4,7 @@
  */
 export function createQuotaView(host) {
 const { $, S, getDialog, dlg, active, DEF, SUPP, svg, EXT, esc, reduced, dialogBusy,
-  remote, uuid, hideTip, hidden = value => typeof value === 'string' && value.startsWith('\u2063dsg-configured-secret:') } = host;
+  remote, uuid, hideTip, onPrivateAccessDenied, hidden = value => typeof value === 'string' && value.startsWith('\u2063dsg-configured-secret:') } = host;
 let D = null, disposed = false;
 const QUOTA_PROVIDERS = new Set(SUPP);
 const QUOTA_CONSOLE = {
@@ -105,7 +105,7 @@ function quotaHtml() {
   if (!view) return '';
   const { context, status, cached } = view;
   const select = context.id === 'tavily' && D.draft.keys.length > 1
-    ? `<label class="qp-key"><select data-quota-key aria-label="查看哪个 Tavily Key 的额度">${D.draft.keys.map((_, index) =>
+    ? `<label class="qp-key"><select data-quota-key${dialogBusy() ? ' disabled' : ''} aria-label="查看哪个 Tavily Key 的额度">${D.draft.keys.map((_, index) =>
       `<option value="${index}"${index === context.keyIndex ? ' selected' : ''}>Key ${index + 1}</option>`).join('')}</select></label>` : '';
   const value = ['ready', 'loading', 'error'].includes(status) ? cached?.value : null;
   const credits = value?.kind === 'credits';
@@ -215,6 +215,7 @@ function syncDialog() {
 function render() {
   if (disposed) return;
   syncDialog();
+  if (!S.capabilities?.secretsAllowed) quotaCache.clear();
   const view = quotaView();
   // Both saved and draft reads are cancelled when their account identity changes.
   if (D?.quotaRequest && (!view?.unchanged || !S.capabilities?.secretsAllowed
@@ -233,7 +234,6 @@ async function refresh({ automatic = false } = {}) {
   const request = { scope: view.context.scope, operationId: uuid() };
   mine.quotaRequest = request;
   renderQuota();
-  const previous = quotaCache.get(request.scope);
   try {
     const query = view.context.draftSame ? remote.accountQuota : remote.previewAccountQuota;
     const savedKey = (D.id === 'tavily' ? D.base.keys[view.context.keyIndex] : D.base.key) || '';
@@ -253,15 +253,21 @@ async function refresh({ automatic = false } = {}) {
   } catch (error) {
     if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
     D = mine; mine.quotaRequest = null;
+    if (error?.code === 'SETTINGS_AUTH_REQUIRED' || error?.code === 'SETTINGS_SECURE_CONNECTION_REQUIRED') {
+      quotaCache.clear();
+      onPrivateAccessDenied?.(error);
+      return;
+    }
     const current = quotaView();
     if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
     const category = error?.details?.category;
     const status = error?.details?.httpStatus;
+    const previous = current.cached;
     quotaCache.set(request.scope, { value: previous?.value ?? null, updatedAt: previous?.updatedAt,
       completedAt: Date.now(), error: Object.hasOwn(QUOTA_ERRORS, category) ? category : 'UNAVAILABLE',
       httpStatus: Number.isInteger(status) && status >= 300 && status <= 599 ? status : null,
       message: error?.code === 'QUOTA_QUERY_FAILED' ? error.message
-        : `设置服务返回 ${/^[\w./-]{1,80}$/.test(error?.code || '') ? error.code : '未知错误'}；额度查询失败不代表搜索不可用。` });
+        : `设置服务返回 ${/^[\w./-]{1,80}$/.test(error?.code || '') ? error.code : '未知错误'}。` });
   } finally {
     while (quotaCache.size > 16) quotaCache.delete(quotaCache.keys().next().value);
     if (!disposed && getDialog() === mine) { D = mine; renderQuota(); }
@@ -274,8 +280,9 @@ return Object.freeze({
   refresh, cancel,
   stopAnimations: cancelAnimations,
   key(index) {
-    if (disposed || dialogBusy()) return;
+    if (disposed) return;
     syncDialog();
+    if (dialogBusy()) { if (D) renderQuota(); return; }
     if (D) {
       cancel(); D.quotaKeyIndex = index; renderQuota();
       return refresh({ automatic: true });

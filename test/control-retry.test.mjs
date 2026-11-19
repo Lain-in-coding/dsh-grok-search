@@ -1,5 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mkdtempTracked } from './helpers/temp-fixture.mjs';
+import { apply as applyControl } from '../src/control.mjs';
+import { ControlRecordError } from '../src/core/control-intent-store.mjs';
 import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { joinSentences } from '../src/ui/route-form.mjs';
@@ -15,8 +21,7 @@ const Gateway = createSettingsGateway({ Service: TestService, RemoteError: TestR
 function gateway(control, authorize = () => {}) {
   const instance = new Gateway({ provide() {}, get: name => name === 'grokSearchControl' ? control
     : name === 'grokSearchConnectionSecurity' ? { requireOwner: authorize } : null });
-  // This suite tests the new RPC dispatch; full snapshot codecs are covered
-  // with real control state by product-wiring.test.mjs.
+  // Dispatch-only tests can use a sentinel result.
   instance.snapshot = async () => ({ control: 'current' });
   return instance;
 }
@@ -38,6 +43,33 @@ test('legacy owner without retry support is only observed; no new stop intent', 
   assert.deepEqual(await gateway({ stop() { stops++; } }).retryControlRelease(), { control: 'current' });
   assert.equal(stops, 0);
 });
+
+for (const method of ['snapshot', 'retryControlRelease']) {
+  for (const retriable of [true, false]) test(`${method} encodes a real control error with internal retriable=${retriable}`, async () => {
+    const dir = mkdtempTracked(join(tmpdir(), 'dsh-control-rpc-'));
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+    const fault = new ControlRecordError(retriable ? 'CONTROL_STORAGE_BUSY' : 'CONTROL_RECORD_INVALID', 'Cannot read control intent.', { retriable });
+    const services = new Map([['grokSearchConnectionSecurity', { requireOwner() {},
+      capabilities: () => ({ secretsAllowed: false, transport: 'restricted', reason: null }) }]]);
+    const disposers = [];
+    const ctx = { profileContext: { dir }, get: key => services.get(key), provide: (key, value) => services.set(key, value),
+      inject: (keys, run) => keys.includes('web') ? run(ctx) : undefined,
+      on() {}, effect: factory => disposers.push(factory()) };
+    try {
+      await applyControl(ctx, { store: { read() { throw fault; }, readView() { return null; } }, keepAliveOnFailure: true });
+      const Settings = createSettingsGateway({ Service: TestService, RemoteError: TestRemoteError, configPath: join(dir, 'config.toml') });
+      const result = await new Settings(ctx)[method]();
+      const codec = SETTINGS_DESCRIPTORS.find(row => row.method === method).result.create();
+      assert.equal(codec.safeParse(result).success, true);
+      const error = { code: fault.code, message: fault.message };
+      assert.deepEqual(result.control.error, error);
+      assert.deepEqual(result.error, error);
+      assert.deepEqual(ctx.get('grokSearchControl').snapshot().error, { ...error, retriable });
+      assert.equal(codec.safeParse({ ...result, error: { ...error, retriable } }).success, false);
+      assert.equal(codec.safeParse({ ...result, control: { ...result.control, error: { ...error, retriable } } }).success, false);
+    } finally { for (const dispose of disposers.reverse()) await dispose(); }
+  });
+}
 
 test('release failure keeps its diagnostic code without exposing raw host error details', async () => {
   const instance = gateway({

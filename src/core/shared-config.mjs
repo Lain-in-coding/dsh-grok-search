@@ -367,8 +367,7 @@ export function createSharedConfigStore({
     return [key, { value, source, readOnly: spec.readOnly === true || source === 'environment' }];
   }));
   };
-  const readSnapshot = () => {
-    const document = read();
+  const snapshotFrom = document => {
     const resolved = effective(document);
     const fields = { ...resolved };
     for (const [key, item] of Object.entries(fields)) if (CONFIG_FIELDS[key].type === 'secret') {
@@ -378,6 +377,7 @@ export function createSharedConfigStore({
     return { effective: resolved, snapshot: { path, exists: document.exists, revision: document.revision, fields,
       unknownFields: Object.keys(document.values).filter(key => !Object.hasOwn(CONFIG_FIELDS, key) && !knownReadOnly.has(key)) } };
   };
+  const readSnapshot = () => snapshotFrom(read());
   const snapshot = () => readSnapshot().snapshot;
   const preserveHistory = before => {
     checkHistoryDirectory();
@@ -409,7 +409,7 @@ export function createSharedConfigStore({
       try { unlinkSync(stage); } catch { /* A private incomplete stage is never a restorable revision. */ }
     }
   };
-  const commit = (expectedRevision, transform, { keepHistory = [] } = {}) => {
+  const commit = (expectedRevision, transform, { keepHistory = [], verify, paired = false } = {}) => {
     if (expectedRevision !== 'missing' && !/^[a-f0-9]{64}$/.test(expectedRevision ?? '')) fail('CONFIG_REVISION_REQUIRED', '保存前必须读取当前配置修订。');
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     let lock, stage, published = false;
@@ -418,21 +418,31 @@ export function createSharedConfigStore({
       try { lock = acquireOwnedLock(lockPath, { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS }); }
       catch (error) { if (error.code === 'EEXIST') fail('CONFIG_BUSY', '配置正在保存或上次保存被中断，请稍后检查。'); throw error; }
       const before = read();
+      if (verify) verify(snapshotFrom(before));
       if (before.revision !== expectedRevision) fail('CONFIG_CONFLICT', '配置已被其他程序修改；草稿已保留，请重新读取后合并。');
       const text = transform(before);
       if (Buffer.byteLength(text) > MAX_BYTES) fail('CONFIG_SIZE_LIMIT', '保存内容超过 1 MiB。');
       parseDocument(text);
-      if (text === before.text && before.exists) return snapshot();
+      if (text === before.text && before.exists) {
+        const current = readSnapshot();
+        if (current.snapshot.revision !== expectedRevision) fail('CONFIG_CONFLICT', '配置已被其他程序修改；草稿已保留，请重新读取后合并。');
+        if (verify) verify(current);
+        return paired ? current : current.snapshot;
+      }
       if (before.exists && historyDirectory) preserveHistory(before);
       stage = join(dirname(path), '.dsh-grok-search-' + randomUUID() + '.tmp');
       const fd = openSync(stage, 'wx', before.mode);
       try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
       fault?.('before-publish');
-      if (read().revision !== expectedRevision) fail('CONFIG_CONFLICT', '配置已被其他程序修改；草稿已保留，请重新读取后合并。');
+      const latest = read();
+      if (latest.revision !== expectedRevision) fail('CONFIG_CONFLICT', '配置已被其他程序修改；草稿已保留，请重新读取后合并。');
+      if (verify) verify(snapshotFrom(latest));
       renameSync(stage, path);
       published = true;
       fault?.('after-publish');
-      const result = snapshot();
+      const current = readSnapshot();
+      // A writer outside our lock may already have replaced the published bytes.
+      if (current.snapshot.revision !== hash(text)) fail('CONFIG_COMMIT_UNCERTAIN', '配置写入后再次发生变化；请重新读取确认，不要重复保存。');
       if (historyDirectory) {
         try {
           if (before.exists) recordHistory(before.revision);
@@ -442,9 +452,9 @@ export function createSharedConfigStore({
             message: '配置已保存，历史索引维护未完成；请检查历史目录。' });
         }
       }
-      return result;
+      return paired ? current : current.snapshot;
     } catch (error) {
-      if (published) fail('CONFIG_COMMIT_UNCERTAIN', '配置已写入，但回读未完成；请重新读取后确认，不要重复保存。');
+      if (published && error?.code !== 'CONFIG_COMMIT_UNCERTAIN') fail('CONFIG_COMMIT_UNCERTAIN', '配置已写入，但回读未完成；请重新读取后确认，不要重复保存。');
       if (error instanceof GrokSearchError) throw error;
       fail('CONFIG_WRITE_FAILED', '无法保存配置；原文件未由本次操作替换，请检查文件权限。');
     } finally {
@@ -464,7 +474,7 @@ export function createSharedConfigStore({
       if (CONFIG_FIELDS[key]?.type !== 'secret') fail('CONFIG_FIELD_INVALID', '只能显式查看凭据字段。');
       return { key, ...effective(read())[key] };
     },
-    save({ expectedRevision, updates }) {
+    save({ expectedRevision, updates, verify, paired = false }) {
       const captured = structuredClone(updates);
       return commit(expectedRevision, before => {
         const current = effective(before);
@@ -472,12 +482,12 @@ export function createSharedConfigStore({
           fail('CONFIG_ENV_OVERRIDE', '这些配置由启动环境提供，不能在插件中覆盖，请先修改环境变量。');
         }
         return patchSharedToml(before.text, captured);
-      });
+      }, { verify, paired });
     },
     history() {
       return historyNames().map(name => ({ revision: name.slice(0, -5) }));
     },
-    restore({ expectedRevision, revision }) {
+    restore({ expectedRevision, revision, verify, paired = false }) {
       if (!historyDirectory || !/^[a-f0-9]{64}$/.test(revision ?? '')) fail('CONFIG_HISTORY_INVALID', '配置历史修订无效。');
       return commit(expectedRevision, () => {
         checkHistoryDirectory();
@@ -490,7 +500,7 @@ export function createSharedConfigStore({
           if (hash(text) !== revision) fail('CONFIG_HISTORY_INVALID', '配置历史校验失败。');
           return text;
         } finally { closeSync(fd); }
-      }, { keepHistory: [revision] });
+      }, { keepHistory: [revision], verify, paired });
     },
     retainHistory(options) {
       if (!historyDirectory || !existsSync(historyDirectory)) return { deleted: [], retained: 0 };

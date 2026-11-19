@@ -354,6 +354,34 @@ test('secondary limits without headers are classified and observed without immed
   f.reader.dispose();
 });
 
+test('explicit GitHub rate headers establish cooldown without waiting for a stalled error body', async t => {
+  for (const kind of ['retry-after', 'remaining-zero']) await t.test(kind, async () => {
+    let at = Date.parse('2026-01-01T00:00:00Z'), limited = true, cancelled = 0;
+    const headers = kind === 'retry-after' ? { 'retry-after': '60' }
+      : { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(at / 1000 + 60) };
+    const f = fixture(0, { reader: { budgetMs: 100, now: () => at }, fetch: async input => limited
+      ? new Response(new ReadableStream({ cancel() { cancelled++; } }), { status: 403, headers })
+      : response(new URL(input).pathname.endsWith('/comments') ? [] : root) });
+    try {
+      await assert.rejects(f.reader.read({ url, scope }), failure => {
+        assert.equal(failure.code, 'GITHUB_RATE_LIMIT');
+        assert.equal(failure.details.httpStatus, 403);
+        assert.equal(Date.parse(failure.details.retryAt), at + 60_000);
+        return true;
+      });
+      await assert.rejects(f.reader.read({ url, scope }), { code: 'GITHUB_RATE_LIMIT' });
+      assert.equal(f.requests.length, 1, 'cooldown blocks a second API request');
+      assert.equal(cancelled, 1, 'the unread error stream is cancelled');
+      assert.equal(f.reader.snapshot().active, 0);
+      assert.equal(f.reader.snapshot().queued, 0);
+      at += 60_000;
+      limited = false;
+      assert.equal((await f.reader.read({ url, scope })).hasMore, false);
+      assert.equal(f.requests.length, 3, 'the released lane resumes after cooldown');
+    } finally { f.reader.dispose(); }
+  });
+});
+
 test('observed token change and reverting never resurrects old cursors', async () => {
   const f = fixture(100, { config: { token: 'a' } });
   const first = await f.reader.read({ url, scope });
@@ -1041,4 +1069,191 @@ test('host boundaries preserve caller cancellation identity and keep local timeo
       failure => failure.code === 'GITHUB_TIMEOUT' && failure.name === 'WebError');
     } finally { await f.dispose(); }
   }
+});
+
+test('pagination Link header allows next inside target URLs like vercel/next.js while rejecting malformed rel=next', async () => {
+  const nextJsUrl = 'https://github.com/vercel/next.js/issues/1';
+  const finalPage = fixture(0, {
+    fetch: async input => {
+      const parsed = new URL(input);
+      if (!parsed.pathname.endsWith('/comments')) return response(root);
+      const page = Number(parsed.searchParams.get('page'));
+      if (page === 1) {
+        return response([{ id: 1001, body: 'page-1-body', user: { login: 'u1' } }], 200, {
+          link: '<https://api.github.com/repos/vercel/next.js/issues/1/comments?per_page=100&page=2>; rel="next", <https://api.github.com/repos/vercel/next.js/issues/1/comments?per_page=100&page=2>; rel="last"',
+        });
+      }
+      return response([{ id: 1002, body: 'page-2-body', user: { login: 'u2' } }], 200, {
+        link: '<https://api.github.com/repos/vercel/next.js/issues/1/comments?per_page=100&page=1>; rel="prev", <https://api.github.com/repos/vercel/next.js/issues/1/comments?per_page=100&page=1>; rel="first"',
+      });
+    },
+  });
+  try {
+    const results = await collect(finalPage.reader, nextJsUrl);
+    assert.equal(results.at(-1).acquiredComplete, true);
+    assert.equal(results.at(-1).hasMore, false);
+    assert.match(results.map(r => r.content).join(''), /page-2-body/);
+  } finally {
+    finalPage.reader.dispose();
+  }
+
+  const malformed = fixture(0, {
+    fetch: async input => new URL(input).pathname.endsWith('/comments')
+      ? response([{ id: 1001, body: 'partial', user: { login: 'u1' } }], 200, {
+        link: '<https://api.github.com/repos/vercel/next.js/issues/1/comments?per_page=100&page=2> rel="next"',
+      })
+      : response(root),
+  });
+  try {
+    const result = await malformed.reader.read({ url: nextJsUrl, scope });
+    assert.equal(result.acquiredComplete, false);
+    assert.equal(result.incomplete?.code, 'GITHUB_PAGINATION');
+  } finally {
+    malformed.reader.dispose();
+  }
+});
+
+test('reactive fetch config wrapper is admitted and downstream { isError: true } denial is preserved without GITHUB_FETCH_UNAVAILABLE', async () => {
+  const f = await hostFixture();
+  try {
+    const exec = {
+      name: 'web_fetch',
+      arguments: { url },
+      agent: { session: { id: 'reactive-session' } },
+      callId: 'reactive-call',
+      signal: new AbortController().signal,
+    };
+    const reactiveResult = await f.events.get('tools/execute')[0](exec, async () => {
+      const caller = {
+        tools: f.tools,
+        fiber: {
+          uid: 1,
+          runtime: { name: 'tool-web' },
+          entry: { options: { name: '@deepseek-ai/dsh-tool-web' } },
+          effectiveConfig: { fetch: { get: () => true }, fetchMaxOutputChars: { get: () => 16000 } },
+        },
+      };
+      const service = f.events.get('internal/get')[0](caller, 'web', undefined, () => ({
+        fetch() { assert.fail('must not hit fallback'); },
+      }));
+      return service.fetch({ url }, exec.signal);
+    });
+    assert.ok(reactiveResult?.body?.content);
+
+    await assert.rejects(
+      f.events.get('tools/execute')[0](exec, async () => {
+        const caller = {
+          tools: f.tools,
+          fiber: {
+            uid: 1,
+            runtime: { name: 'tool-web' },
+            entry: { options: { name: '@deepseek-ai/dsh-tool-web' } },
+            effectiveConfig: { fetch: { get: () => false } },
+          },
+        };
+        const service = f.events.get('internal/get')[0](caller, 'web', undefined, () => ({}));
+        return service.fetch({ url }, exec.signal);
+      }),
+      failure => failure.code === 'GITHUB_PERMISSION' || failure.info?.code === 'GITHUB_PERMISSION',
+    );
+
+    const policyDenied = { isError: true, error: { message: 'Blocked by host tool guard' } };
+    const deniedOut = await f.events.get('tools/execute')[0](exec, async () => policyDenied);
+    assert.equal(deniedOut, policyDenied);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test('pagination validates every next declaration even beside a valid one', async t => {
+  const target = 'https://github.com/vercel/next.js/issues/1';
+  const next = 'https://api.github.com/repos/vercel/next.js/issues/1/comments?per_page=100&page=2';
+  const valid = `<${next}>; rel="next"`;
+  const malformed = {
+    separator: `<${next}> rel="next"`, bare: `<${next}>; rel=next`, singleQuote: `<${next}>; rel='next'`,
+    openQuote: `<${next}>; rel="next`, openTarget: `<${next}; rel="next"`, emptyTarget: `<>; rel="next"`,
+    duplicate: `<${next}>; rel="next"; rel="next"`,
+  };
+  for (const [name, bad] of Object.entries(malformed)) {
+    for (const [order, link] of [['alone', bad], ['after', `${valid}, ${bad}`], ['before', `${bad}, ${valid}`]]) {
+      await t.test(`${name}: ${order}`, async () => {
+        const f = fixture(0, { fetch: async input => {
+          const parsed = new URL(input);
+          if (!parsed.pathname.endsWith('/comments')) return response(root);
+          const page = Number(parsed.searchParams.get('page'));
+          return response([{ id: page, body: 'partial' }], 200, page === 1 ? { link } : {});
+        } });
+        try {
+          const result = await f.reader.read({ url: target, scope });
+          assert.equal(result.incomplete?.code, 'GITHUB_PAGINATION');
+          assert.equal(result.acquiredComplete, false);
+          assert.equal(f.requests.length, 2);
+        } finally { f.reader.dispose(); }
+      });
+    }
+  }
+});
+
+test('pagination ignores unrelated next tokens and continues repository-id links on the original endpoint', async t => {
+  const target = 'https://github.com/vercel/next.js/issues/1';
+  const endpoint = '/repos/vercel/next.js/issues/1/comments';
+  const next = 'https://api.github.com/repositories/42/issues/1/comments?per_page=100&page=2';
+  for (const relation of ['prev', 'first', 'next-page', 'https://relations.invalid/next']) {
+    await t.test(relation, async () => {
+      const f = fixture(0, { fetch: async input => {
+        const parsed = new URL(input);
+        if (!parsed.pathname.endsWith('/comments')) return response(root);
+        const page = Number(parsed.searchParams.get('page'));
+        return response([{ id: page, body: `page-${page}` }], 200, { link: page === 1
+          ? `<${next}>; rel="next"`
+          : `<https://api.github.com${endpoint}?per_page=100&page=1>; rel="${relation}"; title="next, not pagination"` });
+      } });
+      try {
+        const result = await f.reader.read({ url: target, scope });
+        assert.equal(result.acquiredComplete, true);
+        assert.equal(result.hasMore, false);
+        assert.match(result.content, /page-2/);
+        assert.ok(f.requests.every(request => new URL(request.url).pathname.startsWith('/repos/vercel/next.js/')));
+        assert.deepEqual(f.requests.filter(request => new URL(request.url).pathname === endpoint)
+          .map(request => new URL(request.url).searchParams.get('page')), ['1', '2']);
+      } finally { f.reader.dispose(); }
+    });
+  }
+});
+
+test('fetch policy denial invalidates only the denied Agent cursors', async t => {
+  for (const denial of ['reactive-disabled', 'downstream-policy', 'downstream-permission', 'result-permission', 'thrown-policy']) await t.test(denial, async () => {
+    const f = await hostFixture({ noRoute: true });
+    const one = { session: { id: 'same-session' } }, other = { session: { id: 'same-session' } };
+    try {
+      const first = await f.execute('github_read', { url }, one);
+      const kept = await f.execute('github_read', { url }, other);
+      assert.ok(first.value.nextCursor && kept.value.nextCursor);
+      const exec = { name: 'web_fetch', arguments: { url }, agent: one, signal: new AbortController().signal };
+      const code = denial.endsWith('-permission') ? 'GITHUB_PERMISSION' : 'PERMISSION_DENIED';
+      const policy = { isError: true, error: { info: { code }, message: 'host policy' } };
+      const rejection = Object.assign(new Error('host guard'), { code });
+      const run = () => f.events.get('tools/execute')[0](exec, async () => {
+        if (denial === 'thrown-policy') throw rejection;
+        if (denial.startsWith('downstream-')) return policy;
+        const caller = { tools: f.tools, fiber: { uid: 1, runtime: { name: 'tool-web' },
+          entry: { options: { name: '@deepseek-ai/dsh-tool-web' } }, effectiveConfig: {
+            fetch: { get: () => false },
+            get fetchMaxOutputChars() { assert.fail('disabled fetch read the output budget'); },
+          } } };
+        const service = f.events.get('internal/get')[0](caller, 'web', undefined, () => ({
+          fetch() { assert.fail('policy denial fell back to the original provider'); },
+        }));
+        return service.fetch({ url }, exec.signal);
+      });
+      if (denial === 'result-permission') {
+        for (const observe of f.events.get('tools/result')) observe(exec, policy);
+      } else if (denial.startsWith('downstream-')) assert.equal(await run(), policy);
+      else if (denial === 'thrown-policy') await assert.rejects(run(), error => error === rejection);
+      else await assert.rejects(run(), { code: 'GITHUB_PERMISSION' });
+      assert.equal((await f.execute('github_read', { url, cursor: first.value.nextCursor }, one)).error?.info?.code,
+        'GITHUB_CURSOR_INVALID');
+      assert.equal((await f.execute('github_read', { url, cursor: kept.value.nextCursor }, other)).isError, false);
+    } finally { await f.dispose(); }
+  });
 });

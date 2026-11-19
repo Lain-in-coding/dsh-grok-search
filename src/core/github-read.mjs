@@ -105,14 +105,38 @@ async function readJson(response, signal, limit) {
 
 function nextPage(header, endpoint, page, perPage) {
   if (!header) return null;
-  const matches = [...header.matchAll(/<([^>]+)>\s*;\s*rel="([^"]+)"/g)].filter(item => item[2].split(/\s+/).includes('next'));
-  if (!matches.length) {
-    if (/\bnext\b/.test(header)) throw error('PAGINATION', 'GitHub 分页链接格式异常，未声明获取完整。');
-    return null;
+  const invalid = () => error('PAGINATION', 'GitHub 分页链接格式异常，未声明获取完整。');
+  const targets = [];
+  let rest = header.trim();
+  // Consume whole declarations, including non-next links. A valid next link
+  // must not hide a malformed neighbour; commas inside URLs/titles are data.
+  while (rest) {
+    const link = /^<([^<>]+)>\s*/.exec(rest);
+    if (!link) throw invalid();
+    rest = rest.slice(link[0].length);
+    let relation;
+    while (rest.startsWith(';')) {
+      const parameter = /^;\s*([!#$%&'*+\-.^_`|~\w]+)(?:\s*=\s*("(?:[^"\\]|\\.)*"|[!#$%&'*+\-.^_`|~\w]+))?\s*/.exec(rest);
+      if (!parameter) throw invalid();
+      rest = rest.slice(parameter[0].length);
+      if (parameter[1].toLowerCase() !== 'rel') continue;
+      if (relation !== undefined || parameter[2] === undefined) throw invalid();
+      const raw = parameter[2], quoted = raw.startsWith('"');
+      relation = quoted ? raw.slice(1, -1).replace(/\\(.)/g, '$1') : raw;
+      // Keep GitHub's quoted-next contract, without treating next.js,
+      // next-page or extension relation URIs as the next relation.
+      if (!quoted && /^'?next'?$/i.test(raw)) throw invalid();
+      if (relation.toLowerCase().split(/\s+/).includes('next')) targets.push(link[1]);
+    }
+    if (!rest) break;
+    if (!rest.startsWith(',')) throw invalid();
+    rest = rest.slice(1).trimStart();
+    if (!rest) throw invalid();
   }
-  if (matches.length !== 1) throw error('PAGINATION', 'GitHub 返回重复的下一页链接。');
+  if (!targets.length) return null;
+  if (targets.length !== 1) throw error('PAGINATION', 'GitHub 返回重复的下一页链接。');
   let next;
-  try { next = new URL(matches[0][1]); } catch { throw error('PAGINATION', 'GitHub 分页链接无效。'); }
+  try { next = new URL(targets[0]); } catch { throw error('PAGINATION', 'GitHub 分页链接无效。'); }
   // GitHub sometimes emits /repositories/<id> links. Only extract the page
   // number; requests always use our original, resource-bound /repos path.
   const tail = endpoint.replace(/^\/repos\/[^/]+\/[^/]+/, '');
@@ -229,10 +253,11 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
     try {
       guard(captured, signal);
       if (!response.ok) {
-        // A secondary limit may be HTTP 403 without rate headers. Inspect only
-        // its classification; never pass an upstream body or token to the UI.
+        // Rate headers are sufficient even if the error body stalls. Only an
+        // ambiguous 403 needs body classification; never expose upstream text.
         let rateLimited = false;
-        if (response.status === 403) {
+        if (response.status === 403 && response.headers.get('x-ratelimit-remaining') !== '0'
+          && !response.headers.has('retry-after')) {
           try { rateLimited = /rate limit|secondary.*limit|abuse/i.test((await readJson(response, signal, 65536))?.message ?? ''); }
           catch (failure) { signal.throwIfAborted(); }
         }
@@ -424,10 +449,6 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       signal?.throwIfAborted();
       guard(captured, new AbortController().signal);
       item.complete = item.endpoint >= item.endpoints.length;
-      if (item.replay) {
-        cursors.delete(item.replay.cursor);
-        bytes -= item.replay.bytes; item.bytes -= item.replay.bytes; item.replay = null;
-      }
       const candidateCursor = randomUUID();
       const envelope = { url: resource.url, type: resource.kind, content: '',
         segment: item.segment + 1, acquiredComplete: item.complete, hasMore: true, nextCursor: candidateCursor,
@@ -441,6 +462,10 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       const delivered = take(item, Math.max(0, limit - overhead));
       if (overhead > limit || !delivered.parts.length && item.entries.length) {
         throw error('OUTPUT_LIMIT', '当前输出上限不足以容纳这一条内容的标识，请提高宿主输出上限后续读。');
+      }
+      if (item.replay) {
+        cursors.delete(item.replay.cursor);
+        bytes -= item.replay.bytes; item.bytes -= item.replay.bytes; item.replay = null;
       }
       const hasMore = !item.complete || item.entries.length > 0;
       const nextCursor = hasMore ? candidateCursor : null;

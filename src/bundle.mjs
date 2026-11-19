@@ -39,6 +39,8 @@ const modules = Object.freeze({
 const loadModule = key => modules[key]();
 const unavailable = code => new GrokSearchError(code, 'Search is blocked until runtime compatibility is established.');
 const defaultRetryDelay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const retriableControlError = (error, code = error?.code) => error?.retriable === true || error?.details?.retriable === true
+  || code === 'CONTROL_STORAGE_BUSY' || code === 'CONTROL_CAS_CONFLICT';
 
 // The root deliberately does not depend on web. Its scoped config hook survives
 // a WebRuntime rebuild and leaves a missing/unavailable Grok provider fail-closed.
@@ -51,6 +53,7 @@ export function apply(ctx, configuration, { load = loadModule,
   let lifecycleAttempt = null;
   let pumping = null, repump = false, bootstrapReady = false, stateUnsubscribe = null;
   let startAttempt = null, recheckTask = null, settingsAttempt = null;
+  let startupInitialized = false, startupToken = null, startupError = null;
   let userIntent = 0, retryingRelease = false;
   let failureCount = 0, retrySequence = 0;
   let retiring = null, githubPreferences = null;
@@ -84,8 +87,11 @@ export function apply(ctx, configuration, { load = loadModule,
     let routed = false;
     try { routed = effectiveSearchProvider(webEntry(activeContext ?? ctx)) === PRODUCT_PROVIDER_ID; } catch {}
     if (!routed) {
-      coordinator.block('COMPATIBILITY_ROUTE_UNCONFIRMED');
-      throw unavailable('COMPATIBILITY_ROUTE_UNCONFIRMED');
+      if (generation?.owner?.refreshing?.()) throw unavailable('COMPATIBILITY_CHECKING');
+      const ownerCode = generation?.owner?.publicSnapshot?.()?.error?.code;
+      const code = ownerCode === 'CONTROL_SEARCH_SELECTION_CONFLICT' ? ownerCode : 'COMPATIBILITY_ROUTE_UNCONFIRMED';
+      coordinator.block(code);
+      throw unavailable(code);
     }
     return true;
   };
@@ -255,6 +261,7 @@ export function apply(ctx, configuration, { load = loadModule,
     },
     start() {
       if (destroyed || disabling) return Promise.reject(unavailable('COMPATIBILITY_STOPPED'));
+      if (startupError && !retriableControlError(startupError)) return Promise.resolve(coordinator.report());
       if (startAttempt?.intent === userIntent) return startAttempt.task;
       if (!userStopped && coordinator.report().coreReady) return Promise.resolve(coordinator.report());
       const attempt = { intent: ++userIntent, task: null };
@@ -504,12 +511,15 @@ export function apply(ctx, configuration, { load = loadModule,
             const integration = module.createGithubIntegration({ ctx: scope, searchLog, callRoutes,
               WebError: value.WebError, getCapabilities: value.githubCapabilities,
               getState: () => {
-                const enabled = required() && privatePreferences.snapshot().value.githubReadEnabled === true;
-                if (!enabled) return { enabled: false, token: '' };
+                if (disabling) return { enabled: false, token: '' };
+                let prefSnapshot;
+                try { prefSnapshot = privatePreferences.snapshot(); }
+                catch (error) { if (!required()) return { enabled: false, token: '' }; throw error; }
+                if (prefSnapshot.value.githubReadEnabled !== true || !required()) return { enabled: false, token: '' };
                 if (!current(value.token)) return { enabled: true, token: '', identity: 'compatibility-blocked' };
                 const path = scope.get('grokSearchProgram')?.snapshot?.()?.configPath || resolveSharedConfigPath({});
                 const effective = createSharedConfigStore({ path }).readEffective();
-                return { enabled, token: effective.github_token.value, identity: path };
+                return { enabled: true, token: effective.github_token.value, identity: path };
               } });
             if (typeof integration?.snapshot !== 'function' || typeof integration.sync !== 'function') {
               throw unavailable('COMPATIBILITY_GITHUB_UNAVAILABLE');
@@ -636,9 +646,12 @@ export function apply(ctx, configuration, { load = loadModule,
     const owner = value.owner = child.get('grokSearchControl');
     const ownership = owner?.publicSnapshot();
     if (ownership?.phase !== 'required' || effectiveSearchProvider(webEntry(child)) !== PRODUCT_PROVIDER_ID) {
-      const code = ownership?.error?.code === 'CONTROL_SEARCH_SELECTION_CONFLICT'
-        ? ownership.error.code : 'COMPATIBILITY_ROUTE_UNCONFIRMED';
-      ctx.logger?.warn?.('dsh-grok-search route setup failed: %s', ownership?.error?.code ?? 'route-not-active');
+      const internalError = owner?.snapshot?.()?.error;
+      const errorCode = ownership?.error?.code ?? internalError?.code;
+      const retriable = retriableControlError(internalError, errorCode);
+      const code = errorCode === 'CONTROL_SEARCH_SELECTION_CONFLICT' ? errorCode
+        : retriable ? 'COMPATIBILITY_CORE_UNAVAILABLE' : 'COMPATIBILITY_ROUTE_UNCONFIRMED';
+      ctx.logger?.warn?.('dsh-grok-search route setup failed: %s', errorCode ?? 'route-not-active');
       throw unavailable(code);
     }
     coordinator.setCapabilities({ token, stage: 'route', confirmed: true });
@@ -652,7 +665,13 @@ export function apply(ctx, configuration, { load = loadModule,
     assertCurrent(token);
   }
   function schedule() {
-    if (destroyed || userStopped) return;
+    if (destroyed || disabling || userStopped) return;
+    if (!startupInitialized) {
+      const token = coordinator.captureEpoch();
+      if (current(token) && startupToken !== token && retriableControlError(startupError)
+        && coordinator.report().phase !== 'blocked') initializeStartup(token);
+      return;
+    }
     if (pumping) { repump = true; return; }
     pumping = track(Promise.resolve().then(async () => {
       if (!bootstrapReady || !activeContext || retiring || coordinator.report().phase === 'blocked'
@@ -693,8 +712,9 @@ export function apply(ctx, configuration, { load = loadModule,
     return recheckTask;
   }
   async function performRecheck() {
-    if (destroyed || disabling || userStopped) throw unavailable('COMPATIBILITY_STOPPED');
+    if (!current(coordinator.captureEpoch()) || disabling) throw unavailable('COMPATIBILITY_STOPPED');
     startSettings();
+    if (startupError && !retriableControlError(startupError)) return coordinator.report();
     if (lifecycleContext && !lifecycleTask && !lifecycleAttempt?.cleanupFailed) {
       startLifecycle(lifecycleContext);
     }
@@ -749,72 +769,101 @@ export function apply(ctx, configuration, { load = loadModule,
     start: compatibility.start,
   });
   startSettings();
-  try {
-    store = createStore(ctx, { deferMaintenance: true });
-    const initial = store.read()?.intent;
-    if (initial?.policy === 'released' && initial.release?.kind === 'intent-release-commit'
-      && !initial.releaseCompletion) pause();
-  } catch (error) {
-    coordinator.block(error?.code);
-    backgroundError(error);
-    return;
-  }
-  ctx.inject(['web'], child => {
-    lifecycleContext = child;
-    startLifecycle(child);
-    child.effect(() => () => {
-      if (lifecycleContext === child) { lifecycleContext = null; lifecycleTask = null; lifecycleAttempt = null; }
-    });
-  });
-  ctx.inject(['web'], child => {
-    activeContext = child;
-    child.effect(() => () => {
-      if (activeContext !== child) return;
-      activeContext = null;
-      if (!destroyed && !userStopped) coordinator.beginEpoch();
-      const value = generation;
-      if (!value || value.parent !== child) return;
-      const task = track(disposeGeneration(value));
-      retiring = task;
-      task.then(() => {
-        if (retiring === task) retiring = null;
-        schedule();
-      }, error => {
-        if (!destroyed && retiring === task) coordinator.block(error?.code);
+  // Keep the secured report and recheck RPC reachable even when the startup ledger is unreadable.
+  track(Promise.resolve().then(async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (destroyed || disabling) return;
+      let fiber;
+      try {
+        const service = await load('compatibilityService');
+        if (destroyed || disabling) return;
+        fiber = ctx.plugin(service);
+        await fiber;
+        if (destroyed || disabling) await fiber.dispose();
+        return;
+      } catch (error) {
+        // Retire partial registration before allowing another service owner.
+        await fiber?.dispose();
+        if (destroyed || disabling || attempt === 2) throw error;
         backgroundError(error);
-      });
-      return task;
-    });
-    schedule();
-  });
-  track(Promise.resolve().then(async () => {
-    // Host packages are outside the synchronous spine, including version discovery.
-    let hostVersion = null, imported = null;
-    try {
-      imported = await load('appBoot');
-      if (typeof imported?.getDshRuntimeVersion === 'function') {
-        hostVersion = await imported.getDshRuntimeVersion();
+        await retryDelay(attempt === 0 ? 1000 : 3000);
       }
-    } catch (error) { backgroundError(error); }
-    if (destroyed) return;
-    appBoot = imported;
-    try {
-      stateStore = createState({ profileDir: ctx.profileContext.dir, hostVersion, pluginVersion });
-      try { stateUnsubscribe = stateStore.onChange(() => { for (const listener of stateListeners) listener(); }); }
-      catch (error) { backgroundError(error); }
-    } catch (error) {
-      stateStore = null;
-      backgroundError(error);
     }
-    coordinator.setHostVersion(hostVersion);
-    if (userStopped) coordinator.block('COMPATIBILITY_STOPPED');
-    bootstrapReady = true;
-    schedule();
-  }).catch(error => { if (!destroyed) coordinator.block(error?.code); backgroundError(error); }));
-  track(Promise.resolve().then(async () => {
+  }).catch(backgroundError));
+  initializeStartup(coordinator.captureEpoch());
+
+  function initializeStartup(token) {
+    startupToken = token;
+    let initial;
     try {
-      const service = await load('compatibilityService');
-      if (!destroyed) await ctx.plugin(service);
-    } catch (error) { backgroundError(error); }
-  }));
+      store ??= createStore(ctx, { deferMaintenance: true });
+      initial = store.read()?.intent;
+    } catch (error) {
+      startupError = error;
+      backgroundError(error);
+      if (retriableControlError(error)) {
+        coordinator.markStarting(token);
+        track(retryCoreCheck(token, error)).catch(backgroundError);
+      } else coordinator.block(error?.code, token);
+      return;
+    }
+    // Recovering a failed read is not a new activation of a released owner.
+    const recovering = startupError !== null;
+    startupError = null;
+    startupInitialized = true;
+    if (initial?.policy === 'released' && (recovering || initial.release?.kind === 'intent-release-commit'
+      && !initial.releaseCompletion)) pause();
+    ctx.inject(['web'], child => {
+      lifecycleContext = child;
+      startLifecycle(child);
+      child.effect(() => () => {
+        if (lifecycleContext === child) { lifecycleContext = null; lifecycleTask = null; lifecycleAttempt = null; }
+      });
+    });
+    ctx.inject(['web'], child => {
+      activeContext = child;
+      child.effect(() => () => {
+        if (activeContext !== child) return;
+        activeContext = null;
+        if (!destroyed && !userStopped) coordinator.beginEpoch();
+        const value = generation;
+        if (!value || value.parent !== child) return;
+        const task = track(disposeGeneration(value));
+        retiring = task;
+        task.then(() => {
+          if (retiring === task) retiring = null;
+          schedule();
+        }, error => {
+          if (!destroyed && retiring === task) coordinator.block(error?.code);
+          backgroundError(error);
+        });
+        return task;
+      });
+      schedule();
+    });
+    track(Promise.resolve().then(async () => {
+      // Host packages are outside the synchronous spine, including version discovery.
+      let hostVersion = null, imported = null;
+      try {
+        imported = await load('appBoot');
+        if (typeof imported?.getDshRuntimeVersion === 'function') {
+          hostVersion = await imported.getDshRuntimeVersion();
+        }
+      } catch (error) { backgroundError(error); }
+      if (destroyed) return;
+      appBoot = imported;
+      try {
+        stateStore = createState({ profileDir: ctx.profileContext.dir, hostVersion, pluginVersion });
+        try { stateUnsubscribe = stateStore.onChange(() => { for (const listener of stateListeners) listener(); }); }
+        catch (error) { backgroundError(error); }
+      } catch (error) {
+        stateStore = null;
+        backgroundError(error);
+      }
+      coordinator.setHostVersion(hostVersion);
+      if (userStopped) coordinator.block('COMPATIBILITY_STOPPED');
+      bootstrapReady = true;
+      schedule();
+    }).catch(error => { if (!destroyed) coordinator.block(error?.code); backgroundError(error); }));
+  }
 }

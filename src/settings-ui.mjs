@@ -134,13 +134,39 @@ class GrokSearchSettingsGateway extends Service {
       .update(JSON.stringify([captured.snapshot.path, captured.effective])).digest('hex');
   }
 
-  _checkConfigIdentity(store, request) {
-    const captured = store.readSnapshot();
+  _verifyCapturedIdentity(captured, request) {
     if (request.expectedRevision !== captured.snapshot.revision
       || request.configIdentity !== this._quotaRevision(captured)) {
       throw new GrokSearchError('CONFIG_CONFLICT', '配置路径或有效配置已变化；请重新读取后确认。');
     }
     return captured;
+  }
+
+  _checkConfigIdentity(store, request) {
+    return this._verifyCapturedIdentity(store.readSnapshot(), request);
+  }
+
+  _syncGithubAfterWrite() {
+    let github;
+    try {
+      github = this.ctx.get?.('grokSearchGithub');
+      github?.sync();
+    } catch {
+      // The file commit stands even if the optional service or its host is retiring.
+      try { github?.invalidate?.(); } catch {}
+      try { this.ctx.logger?.warn?.('GitHub state refresh failed after a settings write.'); } catch {}
+    }
+  }
+
+  _commitSettings(write, affectsGithub) {
+    let result;
+    try { result = write(); }
+    catch (error) {
+      if (error?.code === 'CONFIG_COMMIT_UNCERTAIN' || error?.code === 'PREFERENCES_COMMIT_UNCERTAIN') this._syncGithubAfterWrite();
+      throw error;
+    }
+    if (affectsGithub) this._syncGithubAfterWrite();
+    return result;
   }
 
   async snapshot() {
@@ -207,12 +233,15 @@ class GrokSearchSettingsGateway extends Service {
     // Pin one store through each synchronous operation. Legacy methods retain
     // their original contracts; guarded methods share the existing HMAC.
     if (requireIdentity) this._checkConfigIdentity(store, request);
-    const config = store.save({
+    const committed = this._commitSettings(() => store.save({
       expectedRevision: request.expectedRevision,
       updates,
-    });
-    if (Object.hasOwn(updates, 'github_token')) this.ctx.get?.('grokSearchGithub')?.sync();
-    return { config: { ...config, quotaRevision: this._quotaRevision(store.readSnapshot()) } };
+      verify: requireIdentity ? before => this._verifyCapturedIdentity(before, request) : undefined,
+      paired: true,
+    }), Object.hasOwn(updates, 'github_token'));
+    const paired = committed?.snapshot && committed?.effective ? committed : null;
+    const config = paired ? paired.snapshot : committed;
+    return { config: { ...config, quotaRevision: this._quotaRevision(paired ?? store.readSnapshot()) } };
   }
 
   async reveal(request = {}) {
@@ -255,11 +284,15 @@ class GrokSearchSettingsGateway extends Service {
     this.security.requireSecret(this.ctx);
     const store = this._store();
     if (requireIdentity) this._checkConfigIdentity(store, request);
-    const config = store.restore({
+    const committed = this._commitSettings(() => store.restore({
       expectedRevision: request.expectedRevision,
       revision: request.revision,
-    });
-    return { config: { ...config, quotaRevision: this._quotaRevision(store.readSnapshot()) } };
+      verify: requireIdentity ? before => this._verifyCapturedIdentity(before, request) : undefined,
+      paired: true,
+    }), true);
+    const paired = committed?.snapshot && committed?.effective ? committed : null;
+    const config = paired ? paired.snapshot : committed;
+    return { config: { ...config, quotaRevision: this._quotaRevision(paired ?? store.readSnapshot()) } };
   }
 
   async prepareProgram() {
@@ -563,9 +596,7 @@ class GrokSearchSettingsGateway extends Service {
   async savePreferences(request = {}) {
     this._owner();
     if (request.value?.githubReadEnabled === true && this.preferenceStore.snapshot().value.githubReadEnabled !== true) this._privateView();
-    const result = this.preferenceStore.save(request.expectedRevision, request.value);
-    this.ctx.get?.('grokSearchGithub')?.sync();
-    return result;
+    return this._commitSettings(() => this.preferenceStore.save(request.expectedRevision, request.value), true);
   }
 
   async stop() {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -12,7 +13,7 @@ import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID, createAcquisition, createLease, createProductStore,
   createProductReleaseController, effectiveFetchProvider, effectiveSearchProvider, routeReceipt, takeOverAuthorRoute,
-  restoreAuthorRoute, effectiveConfig, createSearchConfigHook,
+  restoreAuthorRoute, effectiveConfig, createSearchConfigHook, readSelection,
 } from '../src/core/product-control.mjs';
 import { commitExplicitRelease, createReleaseBarrier } from '../src/core/release-transaction.mjs';
 import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
@@ -118,6 +119,37 @@ function createRequiredRecord(ctx, store, hostId) {
   const intent = { schemaVersion: 1, policy: 'required', reason: 'test-product-record', release: null, acquisition, lease };
   return store.compareAndSwap({ expectedRevision: 0, intent });
 }
+
+test('damaged product selections expose a stable code without rewriting the manifest', async t => {
+  for (const text of ['{broken', 'null', '{}', '{"dsh":{"profile":{"bundles":null}}}',
+    '{"dsh":{"profile":{"bundles":[""]}}}', '{"dsh":{"profile":{"bundles":[42]}}}']) {
+    await t.test(text, () => {
+      const ctx = makeContext();
+      const manifest = join(ctx.profileContext.dir, 'package.json');
+      writeFileSync(manifest, text);
+      try {
+        assert.throws(() => readSelection(ctx), { code: 'CONTROL_SELECTION_INVALID' });
+        assert.equal(readFileSync(manifest, 'utf8'), text);
+      } finally { ctx.dispose(); }
+    });
+  }
+});
+
+test('control startup retains the actual damaged-selection code in its incomplete snapshot', async () => {
+  const ctx = makeContext();
+  const manifest = join(ctx.profileContext.dir, 'package.json');
+  const text = '{broken';
+  writeFileSync(manifest, text);
+  try {
+    await applyControl(ctx, { keepAliveOnFailure: true });
+    const snapshot = ctx.get('grokSearchControl').snapshot();
+    assert.equal(snapshot.phase, 'incomplete');
+    assert.equal(snapshot.error.code, 'CONTROL_SELECTION_INVALID');
+    assert.equal(snapshot.revision, 0);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+    assert.equal(readFileSync(manifest, 'utf8'), text);
+  } finally { ctx.dispose(); }
+});
 
 test('native release keeps live loader and counter across child-context disposal', async () => {
   const ctx = makeContext({ originalCalls: 0 });

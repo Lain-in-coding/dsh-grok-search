@@ -18,6 +18,13 @@ const hostFailure = (failure, signal, WebError) => {
   return failure instanceof GrokSearchError && WebError ? new WebError(failure.message, failure.code) : failure;
 };
 
+const permissionDenied = code => code === 'GITHUB_PERMISSION' || code === 'PERMISSION_DENIED';
+const hostRejection = result => {
+  if (!result?.isError) return false;
+  const code = result.error?.info?.code ?? result.error?.code;
+  return permissionDenied(code) || !String(code).startsWith('GITHUB_');
+};
+
 /** Service-access adapter: the original tool's execute and policy pipeline stay intact. */
 export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, readerOptions = {}, WebError, getCapabilities }) {
   const storage = new AsyncLocalStorage();
@@ -144,19 +151,23 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
           assertCapability(exec, true);
         }
         const result = await next();
+        if ((githubUrl || exec.name === 'github_read') && hostRejection(result)) invalidateScope(exec);
         if (githubUrl) {
           exec.signal?.throwIfAborted();
-          if (!current.readerCompleted) throw fetchUnavailable();
+          if (!current.readerCompleted && !result?.isError) throw fetchUnavailable();
         }
         return result;
-      } catch (failure) { throw hostFailure(failure, exec.signal, WebError); }
+      } catch (failure) {
+        if ((githubUrl || exec.name === 'github_read') && failure !== exec.signal?.reason
+          && permissionDenied(failure?.info?.code ?? failure?.code)) invalidateScope(exec);
+        throw hostFailure(failure, exec.signal, WebError);
+      }
       finally { current.active = false; }
     });
   }, { global: true, prepend: true });
   ctx.on('tools/result', (exec, result) => {
     if (disposed) return;
-    if (!result?.isError) return;
-    if (String(result.error?.info?.code ?? '').startsWith('GITHUB_')) return;
+    if (!hostRejection(result)) return;
     // A host permission/output policy can reject after retrieval, or before
     // the adapter runs at all. Do not retain usable cursors across that denial.
     const tools = ctx.get('tools');
@@ -191,7 +202,11 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
             || fiber.entry?.options?.name !== '@deepseek-ai/dsh-tool-web'
             || fiber.entry.options.disabled === true) throw fetchUnavailable();
           const config = effectiveConfig(fiber);
-          if (config?.fetch === false) throw new GrokSearchError('GITHUB_PERMISSION', '网页读取工具已关闭。');
+          const unwrap = item => typeof item?.get === 'function' ? item.get() : item;
+          if (unwrap(config?.fetch) === false) {
+            invalidateScope(exec);
+            throw new GrokSearchError('GITHUB_PERMISSION', '网页读取工具已关闭。');
+          }
           let targetUrl;
           try { targetUrl = parseGithubUrl(request?.url).url; } catch { throw fetchUnavailable(); }
           if (targetUrl !== current.githubUrl) throw fetchUnavailable();
@@ -206,7 +221,8 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
             invalidateScope(exec);
             throw new GrokSearchError('GITHUB_PERMISSION', 'GitHub 读取工具被禁用或拒绝访问，未绕过该限制。');
           }
-          const cap = typeof config?.fetchMaxOutputChars === 'number' ? config.fetchMaxOutputChars : 16000;
+          const rawCap = unwrap(config?.fetchMaxOutputChars);
+          const cap = typeof rawCap === 'number' ? rawCap : 16000;
           // Reserve room for the original tool's header and trust notice.
           const result = await perform({ url: request.url }, { ...exec, signal }, {
             limitChars: Math.min(16000, cap - 1200), timeoutMs: Math.min(30_000, resolved.timeoutMs ?? 30_000),

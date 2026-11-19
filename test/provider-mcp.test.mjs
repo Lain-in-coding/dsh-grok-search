@@ -2,9 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { runMcpSearch, executionEnvironment } from '../src/core/mcp-search.mjs';
+import { GrokSearchError } from '../src/core/errors.mjs';
 import { createGrokProvider } from '../src/provider.mjs';
 
 // The installed, pinned product SDK is also a valid offline protocol runtime.
@@ -281,4 +283,102 @@ integration('Grok 诊断补查挂起仍受原总截止限制，并确认进程�
     checkReaped(error.diagnostic);
     return true;
   });
+});
+
+test('关闭连接抛出普通异常时不覆盖主搜索错误，抛出 GROK_PROCESS_REAP_FAILED 时优先上报', async () => {
+  const makeConnection = (callError, closeError) => ({
+    client: {
+      callTool: async () => { throw callError; },
+      close: async () => {},
+    },
+    transport: {
+      fatal: new Promise(() => {}),
+      failure: null,
+      diagnostic: () => ({ exited: closeError?.code !== 'GROK_PROCESS_REAP_FAILED', childPid: null, stdoutBytes: 0 }),
+      close: async () => { if (closeError) throw closeError; },
+    },
+  });
+
+  const primaryTimeout = new GrokSearchError('GROK_TIMEOUT', '主搜索超时');
+  await assert.rejects(
+    runMcpSearch(options('structured', {
+      connection: makeConnection(primaryTimeout, new GrokSearchError('GROK_CLOSE_ERROR', '普通关闭失败')),
+    })),
+    error => error.code === 'GROK_TIMEOUT',
+  );
+
+  const reapFailed = new GrokSearchError('GROK_PROCESS_REAP_FAILED', '子进程未确认退出');
+  await assert.rejects(
+    runMcpSearch(options('structured', {
+      connection: makeConnection(primaryTimeout, reapFailed),
+    })),
+    error => error === reapFailed && error.code === 'GROK_PROCESS_REAP_FAILED',
+  );
+});
+
+test('transport.close 已确认子进程退出后 client.close 普通异常不抛出伪 GROK_CLOSE_ERROR', async () => {
+  const connection = {
+    client: {
+      callTool: async () => ({
+        isError: false,
+        structuredContent: { content: '正常命中', sources: [{ url: 'https://example.invalid/ok', title: 'OK' }] },
+      }),
+      close: async () => { throw new Error('SDK client memory teardown warning'); },
+    },
+    transport: {
+      fatal: new Promise(() => {}),
+      failure: null,
+      diagnostic: () => ({ exited: true, childPid: null, stdoutBytes: 64 }),
+      close: async () => {},
+    },
+  };
+  const result = await runMcpSearch(options('structured', { connection }));
+  assert.equal(result.content, '正常命中');
+  assert.equal(result.sources.length, 1);
+});
+
+test('client-only synthetic MCP connections retain primary errors across SDK cleanup failures', async t => {
+  for (const code of ['GROK_TIMEOUT', 'grok_auth_error']) await t.test(code, async () => {
+    const primary = new GrokSearchError(code, 'primary failure');
+    let calls = 0, closes = 0;
+    const connection = { client: {
+      callTool() { calls++; throw primary; },
+      async close() { closes++; throw new Error('synthetic SDK cleanup failure'); },
+    } };
+    await assert.rejects(runMcpSearch(options('structured', { connection })), error => error === primary);
+    assert.equal(calls, 1);
+    assert.equal(closes, 1);
+  });
+});
+
+test('client-only synthetic MCP connections await asynchronous primary results', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const connection = { client: { callTool: () => pending, close: async () => {} } };
+  const search = runMcpSearch(options('structured', { connection }));
+  finish({ structuredContent: { content: 'synthetic answer', sources: [{ url: 'https://example.invalid/ok' }] } });
+  const result = await search;
+  assert.equal(result.content, 'synthetic answer');
+  assert.equal(result.sources.length, 1);
+});
+
+test('synthetic SDK transport without optional diagnostics preserves the primary error', async () => {
+  const primary = new GrokSearchError('GROK_TOOL_ERROR', 'synthetic primary failure');
+  const connection = { client: { callTool: async () => { throw primary; }, close: async () => {} },
+    transport: { close: async () => {} } };
+  await assert.rejects(runMcpSearch(options('structured', { connection })), error => error === primary);
+});
+
+test('managed synthetic SDK setup preserves the primary error through owner retirement', async () => {
+  const primary = new GrokSearchError('GROK_SDK_UNSUPPORTED', 'synthetic framing setup failed');
+  let closes = 0;
+  const core = createGrokProvider({ configuration: { executable, configPath }, sdkFactory: async () => ({
+    Client: class { async close() { closes++; throw new Error('synthetic SDK cleanup failed'); } },
+    ReadBuffer: class { constructor() { throw primary; } }, serializeMessage: () => '',
+  }) });
+  try {
+    await assert.rejects(core.provider.search({ query: 'offline' }), error => error === primary);
+    assert.equal(closes, 1);
+    assert.equal(core.snapshot().session.faulted, false, 'no process was spawned');
+  } finally { await core.dispose(); }
 });

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';

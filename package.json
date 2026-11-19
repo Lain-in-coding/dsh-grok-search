@@ -1,6 +1,7 @@
 {
   "name": "dsh-grok-search",
-  "version": "0.4.0",
+  "version": "0.4.1",
+  "icon": "icon.png",
   "type": "module",
   "description": "填写任一可用搜索来源的 API Key，开启插件即可接管网页搜索；支持共享配置、补充来源静默回退和即时恢复官方搜索。",
   "engines": {
@@ -43,6 +44,7 @@
     "pack:release": "node scripts/pack-internal.mjs --release"
   },
   "files": [
+    "icon.png",
     "locale/",
     "docs/plugin-detail.zh.md",
     "docs/plugin-detail.en.md",

@@ -29,7 +29,10 @@ export function projectPublicSnapshot(current, disposed = false) {
       || current.record?.recovery?.routeVerified === true,
     routeChanged: current.releaseOutcome?.routeChanged === true
       || current.record?.releaseCompletion?.routeChanged === true,
-    error: current.error,
+    error: current.error ? {
+      code: typeof current.error.code === 'string' ? current.error.code : null,
+      message: typeof current.error.message === 'string' ? current.error.message : '',
+    } : null,
     canStop: !disposed && current.phase === 'required' && current.record?.policy === 'required'
       && current.record?.release === null && current.record?.pause?.confirmed !== true,
   };
@@ -211,7 +214,8 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       // A superseded takeover failure must not overwrite the explicit stop state.
       if (disposed || stopRequested) return snapshot();
       state.phase = 'incomplete';
-      state.error = { code: error.code ?? null, message: error.message };
+      state.error = { code: error.code ?? null, message: error.message,
+        retriable: error.retriable === true || error.details?.retriable === true };
       throw error;
     }).finally(() => { task = null; });
     return task;
@@ -318,6 +322,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
   ctx.provide('grokSearchControl', {
     snapshot,
     publicSnapshot,
+    refreshing: () => Boolean(task),
     retry: () => refresh(),
     start: () => {
       if (disposed || typeof onStart !== 'function') {

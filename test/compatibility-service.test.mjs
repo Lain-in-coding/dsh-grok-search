@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { realpathSync, rmSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import test from 'node:test';
@@ -57,13 +58,15 @@ function fixture(t) {
     effect: callback => effects.push(callback()),
   };
   const gateway = new Gateway(ctx);
-  t.after(() => {
+  t.after(ctx => {
     for (const effect of effects) effect();
     state.dispose(); security.dispose();
     const target = resolve(profileDir);
     assert.equal(dirname(target), root);
     assert.ok(target.startsWith(root + sep) && target.includes('dsh-compatibility-service-'));
-    rmSync(target, { recursive: true, force: true });
+    if (ctx?.passed !== false && process.env.DSH_KEEP_TEST_FIXTURES !== '1') {
+      rmSync(target, { recursive: true, force: true });
+    }
   });
   const request = extra => ({
     hostVersion: HOST, pluginVersion: PLUGIN, expectedRevision: state.revision, acceptRisk: true, ...extra,
@@ -440,4 +443,24 @@ test('production apply requires actual peers and never installs a fallback servi
     await assert.rejects(task, { code: 'ERR_MODULE_NOT_FOUND' });
     assert.equal(installed, undefined);
   }
+});
+
+test('production apply waits for gateway registration and propagates its failure', async t => {
+  try { import.meta.resolve('@deepseek-ai/cordis'); import.meta.resolve('@deepseek-ai/dsh-typert-protocol'); }
+  catch (error) { if (error.code === 'ERR_MODULE_NOT_FOUND') return t.skip('Host peers are not installed.'); throw error; }
+  let rejectRegistration, mounted;
+  const registration = new Promise((_, reject) => { rejectRegistration = reject; });
+  const started = new Promise(resolve => { mounted = resolve; });
+  registration.catch(() => {});
+  let finished = false;
+  const task = apply({ plugin() { mounted(); return registration; } });
+  task.then(() => { finished = true; }, () => { finished = true; });
+  await started;
+  await new Promise(resolve => setImmediate(resolve));
+  const finishedBeforeRegistration = finished;
+  const failure = new Error('gateway registration failed');
+  const rejected = assert.rejects(task, error => error === failure);
+  rejectRegistration(failure);
+  await rejected;
+  assert.equal(finishedBeforeRegistration, false);
 });

@@ -86,7 +86,7 @@ export function createToolRouteContext({ capacity = 20, searchLog = null, now = 
         entry.omitted.running = 0;
         if (entry.logScope) searchLog.finishCall(entry.logScope, {
           failed: entry.failed, cancelled: entry.cancelled,
-          code: code(failure?.code),
+          code: code(reported?.code),
         });
         // Remembered even without routes, so a later repeat is still detected.
         if (!disposed && entry.generation === generation) remember(id, entry.ambiguous ? AMBIGUOUS : entry);

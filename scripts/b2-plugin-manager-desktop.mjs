@@ -526,10 +526,10 @@ async function settingsDialogRendererFlow(host) {
     check('key absent from ordinary snapshot', !JSON.stringify(configured).includes('dsh-offline-ui-key'));
     check('model persisted', configured.config.fields.grok_model.value, 'grok-ui-test-model');
     check('card reopen', await click('.row[data-id=grok] .row-main'));
-    check('reopened key starts hidden', await renderer.evaluate(`${q('input[data-k=key')}?.value`), '');
+    check('reopened key starts hidden', await renderer.evaluate(`${q('input[data-k=key]')}?.value`), '');
     check('eye invokes reveal', await click('[data-a=eye][data-k=key]'));
-    await waitForRenderer(renderer, current => current.evaluate(`${q('input[data-k=key')}?.type === 'text'
-      && ${q('input[data-k=key')}?.value === 'dsh-offline-ui-key'`));
+    await waitForRenderer(renderer, current => current.evaluate(`${q('input[data-k=key]')}?.type === 'text'
+      && ${q('input[data-k=key]')}?.value === 'dsh-offline-ui-key'`));
     check('reveal does not dirty draft', await renderer.evaluate(`${q('[data-a=save]')}?.disabled`));
     check('close reveal', await click('[data-a=cancel]')); await closed();
     check('open Hub', await click('#nodeHub'));
@@ -538,9 +538,9 @@ async function settingsDialogRendererFlow(host) {
     check('Hub persisted', (await snapshot()).config.fields.timeout_seconds.value, 65);
     check('open Hub advanced', await click('#nodeHub'));
     check('expand advanced', await click('[data-a=adv]'));
-    check('program path read-only', await renderer.evaluate(`${q('input[data-k=exeOverride')}?.readOnly`));
-    check('config path read-only', await renderer.evaluate(`${q('input[data-k=cfgOverride')}?.readOnly`));
-    check('budget read-only', await renderer.evaluate(`${q('input[data-k=budget')}?.readOnly`));
+    check('program path read-only', await renderer.evaluate(`${q('input[data-k=exeOverride]')}?.readOnly`));
+    check('config path read-only', await renderer.evaluate(`${q('input[data-k=cfgOverride]')}?.readOnly`));
+    check('budget read-only', await renderer.evaluate(`${q('input[data-k=budget]')}?.readOnly`));
     check('close advanced', await click('[data-a=cancel]')); await closed();
     check('open TinyFish', await click('.row[data-id=tinyfish] .row-main'));
     check('TinyFish search URL exists', await renderer.evaluate(`Boolean(${q('input[data-k=searchUrl]')})`));

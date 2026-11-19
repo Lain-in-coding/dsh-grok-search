@@ -245,11 +245,12 @@ export class OwnedStdioTransport {
 
 const defaultSdkFactory = () => import('@modelcontextprotocol/client');
 
-async function closeConnection(connection, cleanupMs) {
+async function closeConnection(connection, cleanupMs, primaryError) {
   if (connection.closing) return connection.closing;
   connection.closing = (async () => {
     const deadline = performance.now() + cleanupMs;
     let error;
+    const hasTransport = Boolean(connection.transport?.close);
     try { await connection.transport?.close(); } catch (caught) { error = caught; }
     if (connection.client) {
       let timer;
@@ -258,8 +259,13 @@ async function closeConnection(connection, cleanupMs) {
           timer = setTimeout(() => reject(failure('GROK_CLOSE_ERROR', 'MCP 会话未在回收预算内关闭。')),
             Math.max(1, deadline - performance.now()));
         })]);
-      } catch (caught) { error ??= caught instanceof GrokSearchError ? caught : failure('GROK_CLOSE_ERROR', 'MCP 会话关闭失败。'); }
-      finally { clearTimeout(timer); }
+      } catch (caught) {
+        // Transport close owns the exit proof. Before spawn, SDK cleanup only
+        // supplies an error if the operation had none, including on retirement.
+        if (!hasTransport && primaryError === undefined) {
+          error ??= caught instanceof GrokSearchError ? caught : failure('GROK_CLOSE_ERROR', 'MCP 会话关闭失败。');
+        }
+      } finally { clearTimeout(timer); }
     }
     if (error) throw error;
   })();
@@ -269,10 +275,14 @@ async function closeConnection(connection, cleanupMs) {
 // Only hashes leave the identity calculation; keys and file contents are not
 // exposed in diagnostics. The environment used to spawn is the captured one.
 export function createManagedMcpSearch({ idleMs = 300_000, onError } = {}) {
+  let closeCode;
   const owner = createSessionOwner({ idleMs, onError,
     open: async configuration => {
       const connection = {};
-      return { connection, close: () => closeConnection(connection, configuration.cleanupMs ?? 2_000) };
+      return { connection, close: async () => {
+        try { await closeConnection(connection, configuration.cleanupMs ?? 2_000); }
+        catch (error) { closeCode = error?.code; throw error; }
+      } };
     },
   });
   return {
@@ -322,6 +332,7 @@ export function createManagedMcpSearch({ idleMs = 300_000, onError } = {}) {
       });
     },
     snapshot: owner.snapshot,
+    exitPending: () => closeCode === 'GROK_PROCESS_REAP_FAILED' && owner.snapshot().faulted,
     dispose: owner.dispose,
   };
 }
@@ -371,7 +382,7 @@ export async function runMcpSearch({
     if (sdkFactory === defaultSdkFactory) sdkEntry = import.meta.resolve('@modelcontextprotocol/client');
     budget();
     if (typeof sdk.Client !== 'function' || typeof sdk.ReadBuffer !== 'function' || typeof sdk.serializeMessage !== 'function') throw failure('GROK_SDK_UNSUPPORTED', 'MCP SDK 缺少所需公开接口，请检查依赖版本。');
-    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.4.0' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
+    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.4.1' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
     connection.client = client;
     // 所有可能拒绝的 framing 参数先校验，再启动本次进程。
     const buffer = new sdk.ReadBuffer({ maxBufferSize: maxMessageBytes + 1 });
@@ -382,10 +393,11 @@ export async function runMcpSearch({
     serverVersion = safeLabel(client.getServerVersion()?.version);
     Object.assign(connection, { sdkEntry, serverVersion });
     }
-    const race = operation => Promise.race([operation, aborted, transport.fatal]);
+    const interrupts = transport?.fatal ? [aborted, transport.fatal] : [aborted];
+    const race = operation => Promise.race([operation, ...interrupts]);
     const options = () => ({ signal: activeSignal, timeout: budget(), resetTimeoutOnProgress: false });
     budget();
-    if (transport.failure) throw transport.failure;
+    if (transport?.failure) throw transport.failure;
     if (handshakeOnly) {
       if (!Object.hasOwn(client.getServerCapabilities() ?? {}, 'tools')) throw failure('GROK_SDK_UNSUPPORTED', 'Grok 未声明 MCP 工具能力。');
       result = { serverVersion, toolsDeclared: true };
@@ -397,7 +409,7 @@ export async function runMcpSearch({
       payload = decodeGrokResult(await race(client.callTool({ name: 'web_search', arguments: { query: request.query, response_format: 'concise' } }, options())));
     } catch (caught) {
       activeSignal.throwIfAborted();
-      if (transport.failure) throw transport.failure;
+      if (transport?.failure) throw transport.failure;
       const classified = classifyEmptySearch(caught);
       if (request.testPrimary === true && classified?.code === 'grok_provider_error') {
         // This child is primary-only: all source switches and both fan-out
@@ -408,10 +420,10 @@ export async function runMcpSearch({
           const detail = primaryDoctorFailure(await race(client.callTool({ name: 'doctor', arguments: {} },
             { ...options(), timeout: Math.min(10_000, budget()) })));
           if (detail) throw detail;
-        } catch (error) {
+        } catch (doctorError) {
           activeSignal.throwIfAborted();
-          if (transport.failure) throw transport.failure;
-          if (error instanceof GrokSearchError) throw error;
+          if (transport?.failure) throw transport.failure;
+          if (doctorError instanceof GrokSearchError) throw doctorError;
           // Older/unsupported doctors retain the original, honest diagnosis.
         }
       }
@@ -431,7 +443,7 @@ export async function runMcpSearch({
         sourceRecovery = 'completed';
       } catch (caught) {
         activeSignal.throwIfAborted();
-        if (transport.failure) throw transport.failure;
+        if (transport?.failure) throw transport.failure;
         if (caught instanceof GrokSearchError && caught.code !== 'GROK_TOOL_ERROR') throw caught;
         // 只允许普通远端补取失败保留部分结果；协议与取消不能转成成功。
         if (!(caught instanceof GrokSearchError && caught.code === 'GROK_TOOL_ERROR') && (!Number.isInteger(caught?.code) || !([-32601, -32603].includes(caught.code) || (caught.code <= -32000 && caught.code >= -32099)))) throw caught;
@@ -451,7 +463,8 @@ export async function runMcpSearch({
     activeSignal.removeEventListener('abort', onAbort);
     if (activeSignal.aborted && error === undefined) error = activeSignal.reason;
     if (!keepAlive || error !== undefined) {
-      try { await closeConnection(connection, cleanupMs); } catch (caught) { error = caught; }
+      try { await closeConnection(connection, cleanupMs, error); }
+      catch (caught) { if (error === undefined || caught?.code === 'GROK_PROCESS_REAP_FAILED') error = caught; }
     }
   }
   // fallback_reason is a stable grok-search-rs identifier (grok_auth_error,
@@ -459,7 +472,7 @@ export async function runMcpSearch({
   const diagnostic = { serverVersion, sdkEntry, searchProvider: safeLabel(payload?.search_provider), fallbackUsed: payload?.fallback_used ?? null,
     fallbackReason: safeLabel(payload?.fallback_reason),
     sourceProvenance: searchSourceProvenance(result?.sources),
-    sourceRecovery, elapsedMs: Math.round(performance.now() - started), ...(transport?.diagnostic() ?? { exited: true, childPid: null }) };
+    sourceRecovery, elapsedMs: Math.round(performance.now() - started), ...(transport?.diagnostic?.() ?? { exited: true, childPid: null }) };
   if (error !== undefined) {
     if (error instanceof Error && Object.isExtensible(error) && !Object.hasOwn(error, 'diagnostic')) Object.defineProperty(error, 'diagnostic', { value: diagnostic });
     throw error;

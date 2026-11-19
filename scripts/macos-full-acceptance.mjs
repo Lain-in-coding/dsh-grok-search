@@ -25,6 +25,7 @@ const project = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workflow = '.github/workflows/macos-full-acceptance.yml';
 export const ACCEPTANCE_WORKFLOW_FILES = Object.freeze([
   workflow, '.github/workflows/macos-package-transport.yml', '.github/workflows/offline-gates.yml',
+  '.github/workflows/macos-beta-gate.yml',
 ]);
 export const ACCEPTANCE_TOOL_FILES = Object.freeze([
   'scripts/macos-full-acceptance.mjs', 'scripts/macos-clean-lifecycle.mjs', 'scripts/lib/macos-acceptance-evidence.mjs',
@@ -43,7 +44,12 @@ export const ACCEPTANCE_TOOL_FILES = Object.freeze([
 export const PUBLIC_MACOS_SUPPORT_FILES = Object.freeze([
   ...ACCEPTANCE_WORKFLOW_FILES,
   '.gitattributes', '.npmrc', 'package-lock.json', 'scripts/pack-internal.mjs', 'scripts/compatibility-watch.mjs', 'scripts/b3-cli-web.mjs',
-  'test/compatibility-evidence.test.mjs', 'test/macos-acceptance-cases.mjs', 'test/retained-session-cases.mjs',
+  'test/compatibility-evidence.test.mjs', 'test/macos-acceptance-cases.mjs', 'test/retained-session-cases.mjs', 'test/helpers/temp-fixture.mjs',
+  'test/remaining-scripts-audit-cases.mjs', 'test/delivery-tooling-cases.mjs',
+  // Audit cases also read these helpers as source instead of importing them.
+  'scripts/b2-control-desktop.mjs', 'scripts/b2-product-install.mjs', 'scripts/verify-search-log-host.mjs',
+  'scripts/verify-acceptance-sources.mjs', 'scripts/verify-native-update.mjs', 'scripts/verify-rc5-user-path.mjs',
+  'scripts/compare-settings-desktop-performance.mjs',
   // Pack verifies the generated client in memory; transport must include its exact source inputs.
   'scripts/build-client.mjs', 'src/client.template.js',
   'src/ui/route-form.mjs', 'src/ui/route-controller.mjs', 'src/ui/search-log-view.mjs',

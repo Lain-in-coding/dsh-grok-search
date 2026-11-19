@@ -285,6 +285,10 @@
 
   // src/ui/route-controller.mjs
   function createRouteController({ root, layer, remote, logos, sourceChain, memory = {}, logMemory = null, createSearchLogView: createSearchLogView2, createQuotaView: createQuotaView2, dark = false }) {
+    if (memory.remote !== remote) {
+      for (const key of Object.keys(memory)) delete memory[key];
+      memory.remote = remote;
+    }
     let disposed = false;
     let logView = null, quotaView = null;
     let controlRetrying = false;
@@ -752,7 +756,7 @@
         if (snapshot.config.error) throw Object.assign(new Error(snapshot.config.error.message), { code: snapshot.config.error.code });
         acceptSnapshot(snapshot, prefs);
         mine.base = clone(mine.kind === "card" ? S.prov[mine.id] : S.hub);
-        if (mine.kind === "card" && !isSet(mine.id, mine.base)) mine.base.enabled = true;
+        if (mine.kind === "card" && mine.id !== "github" && !isSet(mine.id, mine.base)) mine.base.enabled = true;
         mine.fields = clone(configFields());
         mine.configBaseline = clone(S.config);
         mine.draft = clone(mine.base);
@@ -776,7 +780,11 @@
         if (D === mine) operationError(error, true);
       } finally {
         S.busy = false;
-        if (D === mine) mine.saving = false;
+        if (!disposed && D === mine && mine.saving) {
+          mine.saving = false;
+          if (mine.kind === "card") renderCard();
+          else renderHub();
+        }
       }
     }
     async function saveConfig(build, baseline = null) {
@@ -826,6 +834,8 @@
     }
     async function savePreference(id, on) {
       const key = id === "grok" ? "grokEnabled" : "githubReadEnabled";
+      const readEnabled = (prefs, targetId) => targetId === "github" ? prefs?.value?.githubReadEnabled === true : prefs?.value?.grokEnabled !== false;
+      const starting = S.prefs;
       for (let attempt = 0; attempt < 2; attempt++) {
         if (disposed) return;
         try {
@@ -837,7 +847,8 @@
             stateGeneration++;
             snapshotSignature = null;
             S.prefs = result;
-            S.prov[id].enabled = result.value[key] !== false;
+            if (S.prov?.grok) S.prov.grok.enabled = readEnabled(result, "grok");
+            if (S.prov?.github) S.prov.github.enabled = readEnabled(result, "github");
           }
           return result;
         } catch (error) {
@@ -847,6 +858,9 @@
           stateGeneration++;
           snapshotSignature = null;
           S.prefs = current;
+          if (S.prov?.grok) S.prov.grok.enabled = readEnabled(current, "grok");
+          if (S.prov?.github) S.prov.github.enabled = readEnabled(current, "github");
+          if (readEnabled(current, id) !== readEnabled(starting, id)) throw error;
         }
       }
     }
@@ -921,7 +935,8 @@
       }
     }
     function normalizeCode(code) {
-      return String(code || "UNKNOWN").replace(/^HTTP_/i, "").trim();
+      const raw = String(code || "UNKNOWN").replace(/^HTTP_/i, "").trim();
+      return /^[\w./:-]{1,80}$/.test(raw) ? raw : "UNKNOWN";
     }
     function ingestRoute(route, first = false) {
       if (!route || route.origin === "test" || route.at <= S.lastRouteAt) return;
@@ -1798,7 +1813,12 @@ ${dots.map((d) => d.tip).join("\n")}
       GITHUB_PERMISSION: ["权限", "读取工具被禁用或拒绝"],
       GITHUB_OUTPUT_LIMIT: ["上限", "输出空间不足"],
       GITHUB_CACHE_FULL: ["分段", "已到缓存边界，可续读"],
-      GITHUB_PAGINATION: ["分页", "分页异常，未完整读取"]
+      GITHUB_PAGINATION: ["分页", "分页异常，未完整读取"],
+      GITHUB_URL_UNSUPPORTED: ["链接", "仅支持受支持的 GitHub 链接"],
+      GITHUB_REDIRECT: ["跳转", "GitHub 资源已重定向，请使用当前资源的官方链接"],
+      GITHUB_RESPONSE_INVALID: ["响应", "GitHub 返回数据无效"],
+      GITHUB_FETCH_UNAVAILABLE: ["环境", "网页读取环境暂不可用"],
+      GITHUB_SCOPE_REQUIRED: ["上下文", "读取调用上下文已失效"]
     };
     function failureInfo(code) {
       const value = normalizeCode(code).toUpperCase();
@@ -1926,7 +1946,7 @@ ${dots.map((d) => d.tip).join("\n")}
         const observed = S.lastRoute?.resultProviders?.length ? S.lastRoute.resultProviders.filter((id) => META[id]).map((id) => META[id].name).join(" / ") + (S.lastRoute.resultProvidersComplete ? "" : " / 来源未报告") : unknownFallback() ? "来源未报告" : META[sv]?.name || "补充来源";
         const grokCode = codeOf("grok") || S.program?.error?.code;
         const rotates = sv && codeOf(sv).split("/").every((code) => TAVILY_ROTATE.has(code));
-        const part = sv && isPart(sv) ? `；${META[sv].name} 有 Key 返回 ${codeOf(sv)}${rotates ? "，可换用其他 Key" : "，各 Key 的验证结果单独保留"}` : "";
+        const part = sv && isPart(sv) ? `；${META[sv].name} 有 Key 返回 ${esc(codeOf(sv))}${rotates ? "，可换用其他 Key" : "，各 Key 的验证结果单独保留"}` : "";
         html = B(
           "fallback",
           "reroute",
@@ -1953,13 +1973,13 @@ ${dots.map((d) => d.tip).join("\n")}
         const auxKey = aux ? `${aux}:${codeOf(aux)}:${isBad(aux)}` : "";
         if (aux && S.auxDismissed !== auxKey) {
           const rotates = codeOf(aux).split("/").every((code) => TAVILY_ROTATE.has(code));
-          const title = isBad(aux) ? `${META[aux].name} 最近检查失败 · ${codeOf(aux)}` : `${META[aux].name} 部分 Key 返回 ${codeOf(aux)}${rotates ? "，其他 Key 可用" : ""}`;
+          const title = isBad(aux) ? `${META[aux].name} 最近检查失败 · ${esc(codeOf(aux))}` : `${META[aux].name} 部分 Key 返回 ${esc(codeOf(aux))}${rotates ? "，其他 Key 可用" : ""}`;
           html = B(
             "soft",
             "warn",
             title,
             `${errText(codeOf(aux))}。其余来源照常工作，搜索不受影响。`,
-            btn("open:" + aux, `检查 ${META[aux].name}`) + `<button type="button" class="icon-btn" data-act="dismiss-aux" data-k="${auxKey}" aria-label="关闭提示">${svg("x")}</button>`
+            btn("open:" + aux, `检查 ${META[aux].name}`) + `<button type="button" class="icon-btn" data-act="dismiss-aux" data-k="${esc(auxKey)}" aria-label="关闭提示">${svg("x")}</button>`
           );
         } else if (!S.capabilities?.secretsAllowed) {
           html = B("info", "lock", "当前连接仅显示脱敏配置", `${esc(S.capabilities?.reason || "请在已认证的本机直连或 HTTPS 连接下查看和保存 Key。")} 仍可在服务器端执行连通性测试。`);
@@ -2434,7 +2454,7 @@ ${dots.map((d) => d.tip).join("\n")}
       }
     }
     function lockDialog() {
-      $$("button, input", dlg).forEach((el) => {
+      $$("button, input, select", dlg).forEach((el) => {
         el.disabled = true;
       });
     }
@@ -2823,7 +2843,7 @@ ${dots.map((d) => d.tip).join("\n")}
       const fn = $(".foot-note", dlg);
       if (fn && !D.warned) {
         let base = D.kind === "hub" ? "共享项写入配置，插件专属项只读" : "保存后写入共享配置，下次搜索生效";
-        if (D.kind === "card" && D.id === "grok" && dirty) {
+        if (D.kind === "card" && (D.id === "grok" || D.id === "github") && dirty) {
           const a = normCard(D.draft), b = JSON.parse(D.orig);
           delete a.enabled;
           delete b.enabled;
@@ -2870,6 +2890,17 @@ ${dots.map((d) => d.tip).join("\n")}
       setDraft(t.dataset.k, t.value);
       if (D.id === "github") {
         D.githubRevision = (D.githubRevision || 0) + 1;
+        if (D.githubOperation) {
+          const staleOp = D.githubOperation;
+          D.githubOperation = null;
+          void remote.cancelDiagnosis({ operationId: staleOp }).catch(() => {
+          });
+          const testBtn = $('[data-a="test-github"]', dlg);
+          if (testBtn) {
+            testBtn.disabled = dialogBusy();
+            testBtn.textContent = "测试连接";
+          }
+        }
         const outcome = $(".search-result", dlg);
         if (outcome) {
           outcome.hidden = true;
@@ -2964,13 +2995,14 @@ ${dots.map((d) => d.tip).join("\n")}
         resultNode.dataset.tone = result.status === "ok" ? "ok" : "err";
       } catch (error) {
         if (current()) {
+          if (denyPrivateAccess(error)) return;
           resultNode.dataset.tone = "err";
           resultNode.textContent = `${error.code || "连接失败"} · ${error.message || "请稍后重试。"}`;
         }
       } finally {
-        if (D === mine) {
+        if (D === mine && mine.githubOperation === operationId) {
           mine.githubOperation = null;
-          button.disabled = false;
+          button.disabled = dialogBusy();
           button.textContent = "测试连接";
           if (!current()) {
             resultNode.hidden = true;
@@ -3199,6 +3231,7 @@ ${dots.map((d) => d.tip).join("\n")}
         try {
           await savePreference(id, draft.enabled !== false);
         } catch (error) {
+          if (disposed || D !== mine) return;
           mine.saving = false;
           if (receipt) {
             mine.configBaseline = clone(S.config);
@@ -3213,6 +3246,7 @@ ${dots.map((d) => d.tip).join("\n")}
           throw error;
         }
       }
+      if (disposed || D !== mine) return;
       const credentialsChanged = CRED[id].some((name) => JSON.stringify(base[name]) !== JSON.stringify(draft[name]));
       if (credentialsChanged) reconcileChecks(id, previous, normCard(draft));
       mine.saving = false;
@@ -3221,7 +3255,7 @@ ${dots.map((d) => d.tip).join("\n")}
       bump(rowOf(id));
       const changedMode = id === "grok" && base.mode !== "compat" && draft.mode === "compat";
       toast(
-        changedMode ? "已保存兼容网关 · 原 xAI Key 已删除并备份到配置历史" : receipt ? `已保存 ${META[id].name} · 下次搜索生效，可点「测试搜索」验证` : `已保存 ${META[id].name} 开关 · 仅对 DSH 生效`,
+        changedMode ? "已保存兼容网关 · 原 xAI Key 已删除并备份到配置历史" : receipt ? `已保存 ${META[id].name} · 下次搜索生效，${id === "github" ? "可在卡片内点「测试连接」验证" : "可点「测试连接」验证"}` : `已保存 ${META[id].name} 开关 · 仅对 DSH 生效`,
         { undo: cardUndo(receipt, id, base.enabled !== false, prefsChanged) }
       );
     }
@@ -3748,6 +3782,12 @@ ${dots.map((d) => d.tip).join("\n")}
           const result = await request;
           if (!alive()) return;
           S.diagnosticOperation = null;
+          if (denyPrivateAccess(result)) {
+            cancelTest({ preserve: true });
+            syncAll(true);
+            toast(errText(result.code), { tone: "warn" });
+            return;
+          }
           if (result.code === "CONFIG_CONFLICT") {
             cancelTest();
             S.checked = {};
@@ -3858,7 +3898,7 @@ ${dots.map((d) => d.tip).join("\n")}
     let pathOpening = false;
     function syncPathOpening() {
       $$('[data-open], [data-a="open-file"], [data-a="open-folder"], [data-act="open-file"]').forEach((button) => {
-        button.disabled = pathOpening || button.matches('[data-open="file"]') && !S.cfgExists;
+        button.disabled = pathOpening || dlg?.contains(button) && dialogBusy() || button.matches('[data-open="file"], [data-a="open-file"]') && !S.cfgExists;
         if (pathOpening) button.setAttribute("aria-busy", "true");
         else button.removeAttribute("aria-busy");
       });
@@ -3982,6 +4022,7 @@ ${dots.map((d) => d.tip).join("\n")}
         dialogBusy,
         remote,
         uuid,
+        onPrivateAccessDenied: denyPrivateAccess,
         hideTip: () => {
           if (stripTipTarget?.matches("[data-quota-tip]")) hideStripTip();
         }
@@ -5358,6 +5399,11 @@ ${dots.map((d) => d.tip).join("\n")}
         await remote.clearSearchLog({ sessionId: id });
         if (!disposed) toast("已清空当前插件的搜索记录", { tone: "info" });
       } catch (error) {
+        logBaselined = false;
+        if (!disposed && (error?.code === "SETTINGS_AUTH_REQUIRED" || error?.code === "SETTINGS_SECURE_CONNECTION_REQUIRED")) {
+          restrict(error.code);
+          onPrivateAccessDenied?.(error);
+        }
         if (error?.code === "SEARCH_LOG_VIEW_EXPIRED" && typeof remote.openSearchLog === "function") sessionId = null;
         if (!disposed) toast("清空未确认，请稍后重试", { tone: "info" });
       } finally {
@@ -5426,6 +5472,7 @@ ${dots.map((d) => d.tip).join("\n")}
       remote,
       uuid,
       hideTip,
+      onPrivateAccessDenied,
       hidden = (value) => typeof value === "string" && value.startsWith("⁣dsg-configured-secret:")
     } = host;
     let D = null, disposed = false;
@@ -5544,7 +5591,7 @@ ${dots.map((d) => d.tip).join("\n")}
       const view = quotaView();
       if (!view) return "";
       const { context, status, cached } = view;
-      const select = context.id === "tavily" && D.draft.keys.length > 1 ? `<label class="qp-key"><select data-quota-key aria-label="查看哪个 Tavily Key 的额度">${D.draft.keys.map((_, index) => `<option value="${index}"${index === context.keyIndex ? " selected" : ""}>Key ${index + 1}</option>`).join("")}</select></label>` : "";
+      const select = context.id === "tavily" && D.draft.keys.length > 1 ? `<label class="qp-key"><select data-quota-key${dialogBusy() ? " disabled" : ""} aria-label="查看哪个 Tavily Key 的额度">${D.draft.keys.map((_, index) => `<option value="${index}"${index === context.keyIndex ? " selected" : ""}>Key ${index + 1}</option>`).join("")}</select></label>` : "";
       const value = ["ready", "loading", "error"].includes(status) ? cached?.value : null;
       const credits = value?.kind === "credits";
       const placeholder = {
@@ -5643,6 +5690,7 @@ ${dots.map((d) => d.tip).join("\n")}
     function render() {
       if (disposed) return;
       syncDialog();
+      if (!S.capabilities?.secretsAllowed) quotaCache.clear();
       const view = quotaView();
       if (D?.quotaRequest && (!view?.unchanged || !S.capabilities?.secretsAllowed || D.quotaRequest.scope !== view.context.scope)) cancel();
       renderQuota();
@@ -5661,7 +5709,6 @@ ${dots.map((d) => d.tip).join("\n")}
       const request = { scope: view.context.scope, operationId: uuid() };
       mine.quotaRequest = request;
       renderQuota();
-      const previous = quotaCache.get(request.scope);
       try {
         const query = view.context.draftSame ? remote.accountQuota : remote.previewAccountQuota;
         const savedKey = (D.id === "tavily" ? D.base.keys[view.context.keyIndex] : D.base.key) || "";
@@ -5692,17 +5739,23 @@ ${dots.map((d) => d.tip).join("\n")}
         if (disposed || getDialog() !== mine || epoch !== quotaEpoch || mine.quotaRequest !== request) return;
         D = mine;
         mine.quotaRequest = null;
+        if (error?.code === "SETTINGS_AUTH_REQUIRED" || error?.code === "SETTINGS_SECURE_CONNECTION_REQUIRED") {
+          quotaCache.clear();
+          onPrivateAccessDenied?.(error);
+          return;
+        }
         const current = quotaView();
         if (!current?.unchanged || !S.capabilities?.secretsAllowed || current.context.scope !== request.scope) return;
         const category = error?.details?.category;
         const status = error?.details?.httpStatus;
+        const previous = current.cached;
         quotaCache.set(request.scope, {
           value: previous?.value ?? null,
           updatedAt: previous?.updatedAt,
           completedAt: Date.now(),
           error: Object.hasOwn(QUOTA_ERRORS, category) ? category : "UNAVAILABLE",
           httpStatus: Number.isInteger(status) && status >= 300 && status <= 599 ? status : null,
-          message: error?.code === "QUOTA_QUERY_FAILED" ? error.message : `设置服务返回 ${/^[\w./-]{1,80}$/.test(error?.code || "") ? error.code : "未知错误"}；额度查询失败不代表搜索不可用。`
+          message: error?.code === "QUOTA_QUERY_FAILED" ? error.message : `设置服务返回 ${/^[\w./-]{1,80}$/.test(error?.code || "") ? error.code : "未知错误"}。`
         });
       } finally {
         while (quotaCache.size > 16) quotaCache.delete(quotaCache.keys().next().value);
@@ -5726,8 +5779,12 @@ ${dots.map((d) => d.tip).join("\n")}
       cancel,
       stopAnimations: cancelAnimations,
       key(index) {
-        if (disposed || dialogBusy()) return;
+        if (disposed) return;
         syncDialog();
+        if (dialogBusy()) {
+          if (D) renderQuota();
+          return;
+        }
         if (D) {
           cancel();
           D.quotaKeyIndex = index;
@@ -5875,14 +5932,15 @@ ${dots.map((d) => d.tip).join("\n")}
     const finiteMs = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
     const duration = (value) => finiteMs(value) === null ? "—" : `${(value / 1e3).toFixed(1)} 秒`;
     const errorText = (code) => {
-      if (/401|grok_auth_error/.test(code)) return "鉴权失败";
-      if (/403/.test(code)) return "访问受限";
+      if (/401|AUTH|UNAUTHORIZED/i.test(code)) return "鉴权失败";
+      if (/403|FORBIDDEN|PERMISSION/i.test(code)) return "访问受限";
+      if (/402|432|433|QUOTA|BILLING|PAYMENT/i.test(code)) return "额度不足";
       if (/429|rate.limit/i.test(code)) return "请求限流";
-      if (/TIMEOUT|timeout/.test(code)) return "响应超时";
-      if (/50[234]/.test(code)) return "服务不可用";
-      if (/EMPTY|empty|NO_RESULTS/.test(code)) return "未返回结果";
-      if (/NETWORK|CONNECT|network/.test(code)) return "连接失败";
-      if (/BUDGET|OUTPUT_LIMIT/.test(code)) return "达到调用上限";
+      if (/SOURCE_BUDGET_EXHAUSTED|TIMED?_?OUT|TIMEOUT/i.test(code)) return "响应超时";
+      if (/50[0234]/.test(code)) return "服务不可用";
+      if (/EMPTY|NO_RESULTS/i.test(code)) return "未返回结果";
+      if (/NETWORK|CONNECT|ENOTFOUND|ECONN|CERT_|TLS|SSL/i.test(code)) return "连接失败";
+      if (/BUDGET|OUTPUT_LIMIT/i.test(code)) return "达到调用上限";
       return "调用失败";
     };
     const safeUrl = (value) => {
@@ -6433,12 +6491,20 @@ ${dots.map((d) => d.tip).join("\n")}
     root,
     remote = null,
     parseReport,
+    memory = null,
     timers = globalThis,
     reportTimeoutMs = 4e3,
     recheckTimeoutMs = 2e4,
     refreshIntervalMs = 5e3
   }) {
-    let disposed = false, generation = 0, pending = null, report = null, detailsOpen = false;
+    function bindCachedReport() {
+      if (!memory || typeof memory !== "object") return null;
+      if (remote && memory.remote === remote) return memory.report ?? null;
+      memory.remote = remote;
+      memory.report = null;
+      return null;
+    }
+    let disposed = false, generation = 0, pending = null, report = bindCachedReport(), detailsOpen = false;
     let refreshTimer = null;
     const flights = /* @__PURE__ */ new Set();
     const document2 = root.ownerDocument;
@@ -6473,7 +6539,7 @@ ${dots.map((d) => d.tip).join("\n")}
       detailsButton.setAttribute("aria-expanded", String(detailsOpen));
       detailsButton.textContent = detailsOpen ? "收起详情" : "查看原因";
       recheckButton.hidden = typeof remote?.recheckCompatibility !== "function";
-      recheckButton.disabled = Boolean(pending);
+      recheckButton.disabled = pending?.method === "recheckCompatibility";
       recheckButton.setAttribute("aria-busy", String(pending?.method === "recheckCompatibility"));
       recheckButton.textContent = pending?.method === "recheckCompatibility" ? "正在检查…" : "重新检查";
     }
@@ -6489,10 +6555,12 @@ ${dots.map((d) => d.tip).join("\n")}
       }, refreshIntervalMs);
     }
     function request(method, timeoutMs) {
-      if (disposed || !remote || pending) return pending?.task ?? Promise.resolve();
+      if (disposed || !remote) return Promise.resolve();
+      if (pending && (method !== "recheckCompatibility" || pending.method === method)) return pending.task;
       if ([...flights].filter((item) => item.generation === generation && item.method === method).length >= 2) {
         return Promise.resolve();
       }
+      timers.clearTimeout(pending?.timer);
       const mine = { method, generation, remote, timer: null, task: null };
       timers.clearTimeout(refreshTimer);
       refreshTimer = null;
@@ -6514,6 +6582,7 @@ ${dots.map((d) => d.tip).join("\n")}
         const parsed = parseReport(value);
         if (JSON.stringify(describe(parsed)) !== JSON.stringify(describe(report))) detailsOpen = false;
         report = parsed;
+        if (memory?.remote === mine.remote) memory.report = parsed;
       }).catch(() => {
       }).finally(() => {
         timers.clearTimeout(mine.timer);
@@ -6559,7 +6628,7 @@ ${dots.map((d) => d.tip).join("\n")}
         refreshTimer = null;
         pending = null;
         remote = next;
-        report = null;
+        report = bindCachedReport();
         detailsOpen = false;
         render();
         void refresh();
@@ -7334,13 +7403,14 @@ a{color:inherit}
   .qp-refresh.is-retry span{display:none}
 }
 @media (max-width:520px){
-  .dialog:has(#quotaPanel) .field{grid-template-columns:minmax(0,1fr);gap:6px}
-  .dialog:has(#quotaPanel) .f-label{padding-top:0}
-  .dialog:has(#quotaPanel) .dlg-head{flex-wrap:wrap;gap:8px}
-  .dialog:has(#quotaPanel) .dlg-titles{flex-basis:calc(100% - 84px)}
-  .dialog:has(#quotaPanel) .head-switch{margin-left:auto}
-  .dialog:has(#quotaPanel) .dlg-foot{flex-wrap:wrap}
-  .dialog:has(#quotaPanel) .foot-note{flex-basis:100%;order:2;text-align:left}
+  .dialog .field{grid-template-columns:minmax(0,1fr);gap:6px}
+  .dialog .f-label{padding-top:0}
+  .dialog .seg{flex-wrap:wrap}
+  .dialog .dlg-head{flex-wrap:wrap;gap:8px}
+  .dialog .dlg-titles{flex-basis:calc(100% - 84px)}
+  .dialog .head-switch{margin-left:auto}
+  .dialog .dlg-foot{flex-wrap:wrap}
+  .dialog .foot-note{flex-basis:100%;order:2;text-align:left}
 }
 
 

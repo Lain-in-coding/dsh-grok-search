@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -8,6 +9,7 @@ import test from 'node:test';
 import { createSettingsGateway, SETTINGS_DESCRIPTORS, inject } from '../src/settings-ui.mjs';
 import { SETTINGS_DESCRIPTORS as PURE_SETTINGS_DESCRIPTORS } from '../src/core/settings-contract.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
+import { createSharedConfigStore } from '../src/core/shared-config.mjs';
 import { createConnectionSecurity } from '../src/core/connection-security.mjs';
 import { createConfigLocationOpener } from '../src/core/config-opener.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
@@ -167,6 +169,53 @@ test('identity-aware save rejects an identical file at a changed path before any
   assert.equal(readFileSync(path, 'utf8'), original);
   assert.equal(readFileSync(other, 'utf8'), original);
   assert.equal(existsSync(join(directory, 'grok-search', 'config-history')), false);
+}));
+
+test('save and restore never issue undo credentials for an external post-publish edit', async () => withIsolatedHome(async () => {
+  const { gateway, path, directory, services } = viewGateway();
+  let invalidated = 0;
+  services.set('grokSearchGithub', { sync() { throw new Error('optional failure'); }, invalidate() { invalidated++; } });
+  gateway.ctx.logger = { warn() { throw new Error('logger failure'); } };
+  const original = 'grok_model = "before"\n', external = 'grok_model = "outside"\n';
+  writeFileSync(path, original);
+  let race = false;
+  const store = createSharedConfigStore({ path, historyDirectory: join(directory, 'history'), env: () => ({}),
+    fault(stage) { if (race && stage === 'after-publish') writeFileSync(path, external); } });
+  gateway._store = () => store;
+  const identity = config => ({ expectedRevision: config.revision, configIdentity: config.quotaRevision });
+  const before = (await gateway.snapshot()).config;
+  const saved = (await gateway.saveWithIdentity({ ...identity(before), updates: { grok_model: 'plugin' } })).config;
+  race = true;
+  await assert.rejects(gateway.restoreConfigWithIdentity({ ...identity(saved), revision: before.revision }), { code: 'CONFIG_COMMIT_UNCERTAIN' });
+  assert.equal(readFileSync(path, 'utf8'), external);
+  const current = (await gateway.snapshot()).config;
+  await assert.rejects(gateway.saveWithIdentity({ ...identity(current), updates: { grok_model: 'plugin' } }), { code: 'CONFIG_COMMIT_UNCERTAIN' });
+  await assert.rejects(gateway.restoreConfigWithIdentity({ ...identity(saved), revision: before.revision }), { code: 'CONFIG_CONFLICT' });
+  assert.equal(readFileSync(path, 'utf8'), external);
+  assert.equal(invalidated, 2, 'both uncertain writes invalidate stale readers without replacing the original error');
+}));
+
+test('optional GitHub sync failure invalidates stale reads and preserves committed RPC results', async () => withIsolatedHome(async () => {
+  const { gateway, path, services } = viewGateway();
+  const warnings = [], calls = [];
+  gateway.ctx.logger = { warn(message) { warnings.push(message); } };
+  services.set('grokSearchGithub', { sync() { calls.push('sync'); throw new Error('synthetic-private-detail'); },
+    invalidate() { calls.push('invalidate'); } });
+  writeFileSync(path, 'github_token = "synthetic-before"\n');
+  const before = (await gateway.snapshot()).config;
+  const saved = await gateway.saveWithIdentity({ expectedRevision: before.revision, configIdentity: before.quotaRevision,
+    updates: { github_token: 'synthetic-after' } });
+  const restored = await gateway.restoreConfigWithIdentity({ expectedRevision: saved.config.revision,
+    configIdentity: saved.config.quotaRevision, revision: before.revision });
+  assert.equal(restored.config.revision, before.revision);
+  assert.equal(restored.config.quotaRevision, before.quotaRevision);
+  assert.equal(readFileSync(path, 'utf8'), 'github_token = "synthetic-before"\n');
+  const prefs = await gateway.preferences();
+  const updated = await gateway.savePreferences({ expectedRevision: prefs.revision, value: { ...prefs.value, githubReadEnabled: true } });
+  assert.equal(updated.value.githubReadEnabled, true);
+  assert.deepEqual(calls, ['sync', 'invalidate', 'sync', 'invalidate', 'sync', 'invalidate']);
+  assert.ok(warnings.length > 0);
+  assert.doesNotMatch(JSON.stringify(warnings), /synthetic/);
 }));
 
 test('identity-aware save rejects a changed effective credential while the file revision stays unchanged', async () => withIsolatedHome(async () => {
@@ -1477,3 +1526,38 @@ test('a failed test search is reported as is, never retried through the sources'
   assert.deepEqual(await bare.testSearch({ query: 'q' }), { sources: [{ url: 'https://a.test' }], fallbackUsed: true, provider: 'exa' });
   assert.equal(sourceCalls, 1);
 });
+
+test('restoreConfigWithIdentity syncs GitHub credential state and rejects concurrent identity drift', async () => withIsolatedHome(async () => {
+  const { gateway, path, services } = viewGateway();
+  let githubSynced = 0;
+  services.set('grokSearchGithub', { sync() { githubSynced++; } });
+  writeFileSync(path, 'github_token = "synthetic-initial"\ngrok_model = "before"\n');
+  const initial = await gateway.snapshot();
+  const saved = await gateway.saveWithIdentity({
+    expectedRevision: initial.config.revision,
+    configIdentity: initial.config.quotaRevision,
+    updates: { github_token: 'synthetic-updated', grok_model: 'after' },
+  });
+  assert.equal(githubSynced, 1);
+
+  // External credential drift invalidates restoreConfigWithIdentity before writing.
+  process.env.TAVILY_API_KEY = 'synthetic-drift';
+  try {
+    await assert.rejects(gateway.restoreConfigWithIdentity({
+      revision: initial.config.revision,
+      expectedRevision: saved.config.revision,
+      configIdentity: saved.config.quotaRevision,
+    }), { code: 'CONFIG_CONFLICT' });
+  } finally {
+    delete process.env.TAVILY_API_KEY;
+  }
+  assert.equal(githubSynced, 1);
+
+  const restored = await gateway.restoreConfigWithIdentity({
+    revision: initial.config.revision,
+    expectedRevision: saved.config.revision,
+    configIdentity: saved.config.quotaRevision,
+  });
+  assert.equal(githubSynced, 2, 'restoring config must immediately sync GitHub token/cursor state');
+  assert.equal(restored.config.fields.grok_model.value, 'before');
+}));

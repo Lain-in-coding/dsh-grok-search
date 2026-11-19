@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -124,4 +125,23 @@ test('reclaimer refuses a lock replaced during the process check and never follo
   assert.equal(result.reclaimed, false);
   assert.equal(result.reason, 'replaced');
   assert.equal(readFileSync(path, 'utf8'), replacement);
+});
+
+test('acquireOwnedLock honors injected timestamp and rejects out-of-range or NaN timestamps without clobbering locks', () => {
+  const path = fixture();
+  const fixedNow = Date.UTC(2026, 10, 18, 12, 0, 0, 456);
+  const lock = acquireOwnedLock(path, { now: fixedNow });
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).createdAt, new Date(fixedNow).toISOString());
+  assert.equal(lock.release(), true);
+
+  for (const badNow of [Number.NaN, Number.POSITIVE_INFINITY, 1e20, -1e20, '2026-11-18']) {
+    assert.throws(() => acquireOwnedLock(path, { now: badNow }), TypeError);
+  }
+
+  writeFileSync(path, owner(), { flag: 'wx' });
+  for (const badNow of [Number.NaN, 1e20, -1e20]) {
+    const result = reclaimStaleOwnedLock(path, { now: badNow, staleAfterMs: DEFAULT_STALE_LOCK_MS, isProcessAlive: () => false });
+    assert.deepEqual(result, { reclaimed: false, reason: 'invalid-options' });
+    assert.equal(existsSync(path), true);
+  }
 });

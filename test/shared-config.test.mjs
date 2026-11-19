@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { CONFIG_FIELDS, createSharedConfigStore, patchSharedToml, resolveSharedConfigPath } from '../src/core/shared-config.mjs';
+import { GrokSearchError } from '../src/core/errors.mjs';
 
 function setup(text, options = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-config-test-'));
@@ -284,6 +286,48 @@ test('no-op save is idempotent and creates no redundant history', () => {
   assert.equal(store.save({ expectedRevision: revision, updates: { grok_model: 'existing' } }).revision, revision);
   assert.deepEqual(store.history(), []);
 });
+
+test('no-op save refuses a revision replaced after the locked identity check', () => {
+  const { store, path } = setup('grok_model = "existing"\n');
+  assert.throws(() => store.save({ expectedRevision: store.snapshot().revision, updates: {}, paired: true,
+    verify() { writeFileSync(path, 'grok_model = "external"\n'); } }), code('CONFIG_CONFLICT'));
+  assert.equal(store.snapshot().fields.grok_model.value, 'external');
+  assert.deepEqual(store.history(), []);
+});
+
+test('no-op save rechecks the effective identity of the returned snapshot', () => {
+  let model = 'initial';
+  const { store } = setup('grok_model = "file"\n', { env: () => ({ GROK_SEARCH_MODEL: model }) });
+  assert.throws(() => store.save({ expectedRevision: store.snapshot().revision, updates: {}, paired: true,
+    verify(pair) {
+      if (pair.effective.grok_model.value !== 'initial') throw new GrokSearchError('CONFIG_CONFLICT', 'identity changed');
+      model = 'external';
+    } }), code('CONFIG_CONFLICT'));
+});
+
+for (const action of ['save', 'restore']) {
+  test(`${action} rechecks effective identity immediately before publication`, () => {
+    let key = 'synthetic-original';
+    const env = () => ({ GROK_SEARCH_API_KEY: key });
+    const f = setup('grok_model = "original"\n', { env });
+    const revision = f.store.snapshot().revision;
+    f.store.save({ expectedRevision: revision, updates: { grok_model: 'current' } });
+    const before = readFileSync(f.path);
+    const expectedRevision = f.store.snapshot().revision;
+    const store = createSharedConfigStore({ path: f.path, historyDirectory: f.historyDirectory, env,
+      fault(stage) { if (stage === 'before-publish') key = 'synthetic-rotated'; } });
+    const verify = pair => {
+      if (pair.effective.grok_api_key.value !== 'synthetic-original') {
+        throw new GrokSearchError('CONFIG_CONFLICT', 'Effective credential changed.');
+      }
+    };
+    assert.throws(() => action === 'save'
+      ? store.save({ expectedRevision, updates: { grok_api_url: 'https://changed.example' }, verify })
+      : store.restore({ expectedRevision, revision, verify }), code('CONFIG_CONFLICT'));
+    assert.deepEqual(readFileSync(f.path), before, 'a stale effective identity must not publish a new file');
+    assert.equal(existsSync(f.path + '.dsh-grok-search.lock'), false);
+  });
+}
 
 test('configuration history keeps at most twenty verified revisions', () => {
   const { store } = setup('grok_model = "v0"\n');

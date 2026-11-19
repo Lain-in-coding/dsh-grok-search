@@ -1,13 +1,121 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { decodeGrokResult, mapSearchResult } from '../src/core/result-map.mjs';
 import { createSearchExecutor } from '../src/core/search-executor.mjs';
+import { apply as applySearch } from '../src/index.mjs';
+import { mkdtempTracked } from './helpers/temp-fixture.mjs';
 
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const answer = { content: '已完成', sources: [], truncated: false };
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+function registeredSearch(t, { ready = false, grokEnabled = true, sources = true, fallback = 5 } = {}) {
+  const directory = mkdtempTracked(join(tmpdir(), 'dsh-search-slice-'));
+  const configPath = join(directory, 'config.toml');
+  const save = (enabled, count) => writeFileSync(configPath, [
+    'source_providers = ["tavily"]', `tavily_enabled = ${enabled}`, 'tavily_api_key = "offline-fixture"',
+    'tavily_api_url = "https://source.invalid"', `fallback_sources = ${count}`,
+  ].join('\n'));
+  save(sources, fallback);
+  const prefs = { grokEnabled }, services = new Map(), calls = [];
+  let provider;
+  const execution = { executable: process.execPath,
+    executableArgs: [fileURLToPath(new URL('../fixtures/mcp/grok-server.mjs', import.meta.url)), 'structured'], configPath };
+  services.set('grokSearchPreferences', { snapshot: () => ({ value: prefs }) });
+  services.set('grokSearchProgram', { snapshot: () => ({ phase: ready ? 'ready' : 'missing', configPath }),
+    execution: () => ready ? execution : { ...execution, executable: '' } });
+  const ctx = { get: name => services.get(name), provide: (name, value) => services.set(name, value), effect() {},
+    web: { registerSearchProvider: value => { provider = value; } }, logger: { warn() {} } };
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    assert.equal(String(url), 'https://source.invalid/search');
+    calls.push({ url, init });
+    return new Response(JSON.stringify({ results: [{ url: 'https://result.invalid/one', title: 'offline' }] }));
+  });
+  applySearch(ctx, {}, { WebError: class extends Error {
+    constructor(message, code) { super(message); this.code = code; }
+  }, assertExecution: () => {}, executionEpoch: () => 1 });
+  return { provider, prefs, calls, save, core: services.get('grokSearchCore') };
+}
+
+test('registered search discovery follows disabled primary and the actual source fallback budget', async t => {
+  const f = registeredSearch(t, { ready: true, grokEnabled: false, sources: false });
+  try {
+    assert.equal(f.provider.available(), false, 'a disabled primary cannot advertise a missing source route');
+    await assert.rejects(f.provider.search({ query: 'offline' }), { code: 'SOURCE_NOT_CONFIGURED' });
+    f.save(true, 0);
+    assert.equal(f.provider.available(), false, 'configured keys cannot override a zero fallback budget');
+    await assert.rejects(f.provider.search({ query: 'offline' }), { code: 'FALLBACK_SOURCES_ZERO' });
+    assert.equal(f.calls.length, 0);
+    f.save(true, 5);
+    assert.equal(f.provider.available(), true);
+    assert.equal((await f.provider.search({ query: 'offline' })).sources.length, 1);
+    assert.equal(f.calls.length, 1);
+  } finally { await f.core.dispose(); }
+});
+
+test('registered search supports source-only use while the primary executable is missing', async t => {
+  const f = registeredSearch(t);
+  try {
+    assert.equal(f.provider.available(), true);
+    assert.equal((await f.provider.search({ query: 'offline' })).sources.length, 1);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.core.snapshot().session.connected, false);
+  } finally { await f.core.dispose(); }
+});
+
+async function checkIdleFault(t, code) {
+  const { Client } = await import('@modelcontextprotocol/client');
+  const connect = Client.prototype.connect;
+  let transport;
+  t.mock.method(Client.prototype, 'connect', function (owned, ...args) {
+    transport = owned;
+    return connect.call(this, owned, ...args);
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = registeredSearch(t, { ready: true });
+  let close, fault;
+  try {
+    assert.equal((await f.provider.search({ query: 'offline' })).sources.length > 0, true);
+    close = transport.close.bind(transport);
+    fault = new GrokSearchError(code, 'offline idle cleanup failed');
+    if (code === 'GROK_PROCESS_REAP_FAILED') Object.defineProperty(fault, 'whenExited', { value: transport.whenExited });
+    transport.close = async () => { throw fault; };
+    t.mock.timers.tick(300_000);
+    await tick();
+    assert.equal(f.core.snapshot().session.faulted, true);
+    assert.equal(f.core.snapshot().routeExecutor.accepting, true, 'idle fault is outside the outer executor');
+    const unreaped = code === 'GROK_PROCESS_REAP_FAILED';
+    assert.equal(f.provider.available(), !unreaped, 'only unresolved process exit forbids fallback');
+    f.prefs.grokEnabled = false;
+    assert.equal(f.provider.available(), true, 'explicit source-only routing does not enter the blocked primary');
+    assert.equal((await f.provider.search({ query: 'source only' })).sources.length, 1);
+    assert.equal(f.calls.length, 1);
+    f.prefs.grokEnabled = true;
+    if (unreaped) {
+      await assert.rejects(f.provider.search({ query: 'blocked primary' }), { code });
+      assert.equal(f.calls.length, 1);
+      await close();
+      await tick();
+      assert.equal(f.provider.available(), true, 'the observed exit reopens the primary route');
+    } else {
+      assert.equal((await f.provider.search({ query: 'ordinary fallback' })).sources.length, 1);
+      assert.equal(f.calls.length, 2);
+    }
+  } finally {
+    t.mock.timers.reset();
+    if (close) { transport.close = close; await close(); await tick(); }
+    await f.core.dispose().catch(error => { if (error !== fault) throw error; });
+  }
+}
+for (const code of ['GROK_PROCESS_REAP_FAILED', 'GROK_CLOSE_ERROR']) {
+  test(`registered discovery and dispatch agree after MCP idle ${code}`, t => checkIdleFault(t, code));
+}
 
 test('来源保留顺序、过滤协议和 userinfo、去重并遵守 maxResults', () => {
   const payload = { content: '摘要', sources: [
@@ -200,4 +308,15 @@ test('queued chat searches run before waiting diagnostics without interrupting a
   await Promise.all([active, diagnosis, chat]);
   assert.deepEqual(order, ['active', 'chat', 'diagnosis']);
   await executor.dispose();
+});
+
+test('代理对序列在精确字符预算下保持单调二分且不因孤立高代理转义提前截断', () => {
+  const truncatedOverhead = JSON.stringify({ content: '', sources: [], truncated: true }).length;
+  // Each 🙂 is 2 UTF-16 code units in JSON string literal (no backslash escaping when paired),
+  // whereas an unpaired high surrogate expands to 6 chars (\ud83d). Budget fits exactly 10 emojis (20 code units).
+  const budget = truncatedOverhead + 80;
+  const result = mapSearchResult({ content: '🙂'.repeat(80), sources: [] }, { maxChars: budget });
+  assert.equal(result.truncated, true);
+  assert.equal(result.content, '🙂'.repeat(40));
+  assert.equal(JSON.stringify(result).length, budget);
 });

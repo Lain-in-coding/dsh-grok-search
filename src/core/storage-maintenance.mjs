@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { createControlIntentStore } from './control-intent-store.mjs';
@@ -14,11 +14,18 @@ const regularDirectory = path => {
   if (!entry || !entry.isDirectory() || entry.isSymbolicLink()) fail('CONTROL_STORAGE_PATH_UNSAFE', 'Expected an existing ordinary local directory.');
 };
 const readJson = path => {
-  const entry = exists(path);
+  const entry = lstatSync(path);
   if (!entry?.isFile() || entry.isSymbolicLink() || entry.size > 4 * 1024 * 1024) {
     fail('CONTROL_STORAGE_RECEIPT_INVALID', 'Storage receipt must be a bounded regular file.');
   }
-  return JSON.parse(readFileSync(path, 'utf8'));
+  const text = readFileSync(path, 'utf8');
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch { fail('CONTROL_STORAGE_RECEIPT_INVALID', 'Storage receipt must be valid JSON.'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    fail('CONTROL_STORAGE_RECEIPT_INVALID', 'Storage receipt must be a JSON object.');
+  }
+  return parsed;
 };
 const writeReceipt = (path, value) => {
   const stage = path + '.' + randomUUID() + '.tmp';
@@ -36,14 +43,36 @@ function assertOffline(record) {
   }
   fail('CONTROL_HOST_STILL_RUNNING', 'The recorded host process still exists. Exit DSH before converting storage.');
 }
-function pathsFor(profile) {
-  if (typeof profile !== 'string' || !isAbsolute(profile) || /^\\\\|^\/\//.test(profile)) {
+function localDirectory(value) {
+  const unsafe = () => fail('CONTROL_STORAGE_PATH_UNSAFE', 'An absolute local DSH profile directory is required.');
+  if (typeof value !== 'string' || value.includes('\0') || !isAbsolute(value)) unsafe();
+  if (process.platform === 'win32') {
+    const windows = value.replaceAll('/', '\\');
+    const localDrive = /^(?:\\\\\?\\)?[a-z]:\\/i;
+    if (!localDrive.test(windows)) unsafe();
+    const drivePath = windows.startsWith('\\\\?\\') ? windows.slice(4) : windows;
+    for (const part of drivePath.slice(3).split('\\')) {
+      if (part === '' || part === '.' || part === '..') continue;
+      if (/[<>:"|?*\x00-\x1f]/.test(part) || /[. ]$/.test(part)
+        || /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\.|$)/i.test(part)) unsafe();
+    }
+    // Normalization can remove the drive component of a namespaced path.
+    // Check again before stripping the namespace or touching the filesystem.
+    const normalized = normalize(windows + '\\');
+    if (!localDrive.test(normalized)) unsafe();
+    return resolve(normalized.startsWith('\\\\?\\') ? normalized.slice(4) : normalized);
+  }
+  if (value.startsWith('\\') || value.startsWith('//')) {
     fail('CONTROL_STORAGE_PATH_UNSAFE', 'An absolute local DSH profile directory is required.');
   }
-  regularDirectory(resolve(profile));
+  return resolve(value);
+}
+function pathsFor(profile) {
+  const requested = localDirectory(profile);
+  regularDirectory(requested);
   // macOS /var and /tmp are system aliases. Resolve above the explicitly
   // named ordinary profile; all subsequent moves stay in that physical root.
-  const root = realpathSync.native(resolve(profile));
+  const root = localDirectory(realpathSync.native(requested));
   const directory = join(root, 'control-intent.records');
   return { root, directory, legacyPath: join(root, 'control-intent.fixture.json'),
     transition: directory + '.transition.json' };
@@ -51,7 +80,15 @@ function pathsFor(profile) {
 export function runStorageMaintenance({
   profile, mode, expectedRevision, preparedDirectory, offline = false, fault = () => {},
 } = {}) {
+  const prepared = mode === 'activate-downgrade' || preparedDirectory !== undefined
+    ? localDirectory(preparedDirectory) : null;
+  if (prepared !== null && !/^control-intent\.compatible-[0-9a-f-]{36}$/.test(basename(prepared))) {
+    fail('CONTROL_STORAGE_PATH_UNSAFE', 'Use the prepared sibling directory returned by prepare-downgrade.');
+  }
   const paths = pathsFor(profile);
+  if (prepared !== null && relative(paths.root, dirname(prepared)) !== '') {
+    fail('CONTROL_STORAGE_PATH_UNSAFE', 'Use the prepared sibling directory returned by prepare-downgrade.');
+  }
   const store = () => createControlIntentStore({ directory: paths.directory,
     legacyPath: paths.legacyPath, trustedRoot: paths.root });
   if (mode === 'inspect') {
@@ -80,10 +117,6 @@ export function runStorageMaintenance({
       const target = join(paths.root, 'control-intent.compatible-' + randomUUID());
       const result = instance.exportCompatibleHistory({ targetDirectory: target });
       return { mode, ...result, next: 'activate-downgrade; then install the older plugin while DSH remains closed' };
-    }
-    const prepared = resolve(preparedDirectory ?? '');
-    if (dirname(prepared) !== paths.root || !/^control-intent\.compatible-[0-9a-f-]{36}$/.test(basename(prepared))) {
-      fail('CONTROL_STORAGE_PATH_UNSAFE', 'Use the prepared sibling directory returned by prepare-downgrade.');
     }
     regularDirectory(prepared);
     const receipt = readJson(join(prepared, 'conversion.json'));
@@ -173,9 +206,20 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     const fields = { '--profile': 'profile', '--mode': 'mode', '--expected-revision': 'expectedRevision',
       '--prepared-directory': 'preparedDirectory', '--offline': 'offline' };
     for (let index = 2; index < process.argv.length; index += 2) {
-      const key = fields[process.argv[index]], value = process.argv[index + 1];
+      const flag = process.argv[index], value = process.argv[index + 1];
+      const key = Object.hasOwn(fields, flag) ? fields[flag] : undefined;
       if (!key || value === undefined || Object.hasOwn(options, key)) fail('CONTROL_STORAGE_ARGUMENT', 'Expected unique named storage arguments.');
-      options[key] = key === 'expectedRevision' ? Number(value) : key === 'offline' ? value === 'true' : value;
+      if (key === 'expectedRevision') {
+        const maximum = String(Number.MAX_SAFE_INTEGER);
+        if (!/^(?:0|[1-9]\d*)$/.test(value) || value.length > maximum.length
+          || value.length === maximum.length && value > maximum) {
+          fail('CONTROL_STORAGE_ARGUMENT', 'expectedRevision must be a safe non-negative decimal integer.');
+        }
+        options[key] = Number(value);
+      } else if (key === 'offline') {
+        if (value !== 'true' && value !== 'false') fail('CONTROL_STORAGE_ARGUMENT', 'offline must be true or false.');
+        options[key] = value === 'true';
+      } else options[key] = value;
     }
     console.log(JSON.stringify(runStorageMaintenance(options), null, 2));
   } catch (error) {

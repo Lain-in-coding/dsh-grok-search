@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "packageVersion": "0.4.0",
-  "channel": "0.4.0 正式版本发布准备；latest 上传及 Release 仍需授权",
+  "packageVersion": "0.4.1",
+  "channel": "0.4.1 正式版本发布准备；实际发布状态以 npm latest 与 GitHub Release 为准",
   "admission": {
     "minimum": "0.2.1-rc.2",
     "includePrerelease": true,
@@ -11,7 +11,7 @@
     "automaticOfficialFallback": false,
     "runtimeInitializationRequired": true
   },
-  "verificationBaseline": "GitHub 局部修复基线已通过专项回归及 Windows rc.5 用户人工验收。后续发布前复审另做启停、配置身份、凭据显示、记录结算及缓存权限的定向修复和离线验证；各组合继续引用下列具名 0.4.0 基线，不把旧包矩阵或人工结果改写为本轮修复实测。",
+  "verificationBaseline": "0.4.1 功能候选的稳定性修复与 A 版图标已通过离线回归、浏览器检查、Windows rc.5 干净安装及用户人工验收，精确包身份见 candidate-041-manual-acceptance。各宿主组合仍引用具名 0.4.0 基线；正式升版包的交付与安装结果由包外精确哈希证据记录，不继承为完整矩阵实测。",
   "supportPolicy": "达到硬下限直接初始化服务；未知或未来版本不要求确认，不运行主动兼容预检。实际故障按对应功能处理，可选异常不撤销已运行核心；未明确停用时禁止自动回退官方搜索。未测试不限制用户尝试，也不表示该版本已实测。",
   "verificationLevels": {
     "planned": "保留的验收计划，不代表已经执行。",
@@ -421,13 +421,23 @@
     "Windows 与 macOS 独立 CLI/Web 不属于当前完整验收计划"
   ],
   "notTested": [
-    "发布前复审修复没有重跑完整宿主矩阵或重新进行用户人工验收；旧包结果按具名基线引用，新增修复以其定向回归结果为准。",
+    "0.4.1 功能候选已通过用户人工验收，未重跑完整宿主矩阵；历史结果按具名基线引用，正式升版包不自动继承候选包的人工验收身份。",
     "取消主动兼容预检、后续GitHub边界及发布前复审修复尚未做macOS实机复验；较早六版结果只属于引用基线。",
     "rc.4 Desktop按关键源码审查支持，不将该版本CLI/Web实测写成Windows或macOS发行包实测。",
     "原生Linux烟测不能替代WSL Ubuntu 22.04完整验收；其他系统和真实付费接口见historical.notTested。",
     "任意未来宿主没有相应实测证据时保持未测试，不因此阻止初始化或要求用户确认。"
   ],
   "verificationReferences": {
+    "candidate-041-manual-acceptance": {
+      "packageVersion": "0.4.0",
+      "packageSha256": "8f4d1c29e0d8de2818e3546162feb08ab3e3a8d41ebabcc79d40a6ddaa7237b0",
+      "platform": "win32-x64",
+      "host": "Desktop",
+      "dsh": "0.2.1-rc.5",
+      "date": "2026-11-19",
+      "userReportedPassed": true,
+      "scope": "0.4.1 功能候选，内部包仍编号 0.4.0，以本条哈希识别。59 文件干净原生安装及固定实例换包通过；用户确认人工验收完成、没有问题。正式 0.4.1 升版包另做交付与安装核验，不将该人工记录改写为新包实测。"
+    },
     "runtime-no-preflight-windows": {
       "packageVersion": "0.4.0",
       "packageSha256": "2b21014373cf0cf5d013471f3594da0024ea2fd9696d463223c07ceb4db393cf",

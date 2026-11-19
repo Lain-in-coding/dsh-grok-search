@@ -935,7 +935,7 @@ export function createControlIntentStore({
         if (publishedLatest.envelope.revision < latest) invalid('Control history moved backwards during maintenance.');
         let writer;
         try { writer = acquireOwnedLock(join(root, CONTROL_WRITE_LOCK), {
-          reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS,
+          reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS, now: clock().getTime(),
           ...(maintenanceLockTokens ? { token: maintenanceLockTokens.writer } : {}),
           onAcquired: owner => onMaintenanceLock({ name: CONTROL_WRITE_LOCK, owner }),
         }); }
@@ -998,7 +998,7 @@ export function createControlIntentStore({
     checkDirectory();
     let lock;
     try {
-      lock = acquireOwnedLock(join(root, CONTROL_WRITE_LOCK), { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS });
+      lock = acquireOwnedLock(join(root, CONTROL_WRITE_LOCK), { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS, now: clock().getTime() });
     } catch (error) {
       if (error.code === 'EEXIST') fail('CONTROL_STORAGE_BUSY', { retriable: true }, 'Control history is being committed or maintained; retry after it finishes.');
       throw error;

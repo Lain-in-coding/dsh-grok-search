@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Config, resolveRuntimeConfig } from '../src/core/product-config.mjs';
 import { createSearchConfigHook, checkRuntimeContracts, effectiveFetchProvider, selectedId } from '../src/core/product-control.mjs';
-import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
+import { ControlRecordError, createControlIntentStore } from '../src/core/control-intent-store.mjs';
 import { apply as applyBundle, Config as BundleConfig } from '../src/bundle.mjs';
 import { apply as applyCore, Config as CoreConfig } from '../src/index.mjs';
 import { apply as applyControl } from '../src/control.mjs';
 import { apply as applyRouteVerifier } from '../src/route-verifier.mjs';
+import { createCompatibilityGateway, COMPATIBILITY_DESCRIPTORS } from '../src/compatibility-service.mjs';
 import { createGithubIntegration } from '../src/core/github-host.mjs';
 import { createProgramController } from '../src/program.mjs';
 import { createGrokProvider } from '../src/provider.mjs';
@@ -326,6 +328,53 @@ function bootstrapFixture({ hostVersion = '0.2.1-rc.2', ready = true, overrides 
     contractCheckCalls: () => contractCheckCalls,
     settle: () => h.ctx.get('grokSearchBootstrap').settled() };
 }
+
+for (const stage of ['import', 'mount']) test(`compatibility RPC recovers its first ${stage} failure without retaining partial services`, async () => {
+  let loads = 0, mounts = 0, active = 0;
+  const delays = [];
+  const f = bootstrapFixture({ retryDelay: async ms => { delays.push(ms); }, overrides: {
+    compatibilityService: () => {
+      if (++loads === 1 && stage === 'import') throw new Error('temporary import failure');
+      return { name: 'compatibility-service', apply(child) {
+        mounts++;
+        assert.equal(active, 0, 'the previous registration must be retired before retry');
+        active++;
+        child.effect(() => () => { active--; });
+        child.provide('grokSearchCompatibilityRemote', { compatibilityReport() {} });
+        if (mounts === 1 && stage === 'mount') throw new Error('temporary mount failure');
+      } };
+    },
+  } });
+  f.start();
+  try {
+    await f.settle();
+    assert.equal(loads, 2);
+    assert.equal(mounts, stage === 'import' ? 1 : 2);
+    assert.equal(active, 1);
+    assert.equal(typeof f.ctx.get('grokSearchCompatibilityRemote')?.compatibilityReport, 'function');
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.deepEqual(delays, [1000]);
+  } finally { await f.ctx.dispose(); }
+  assert.equal(active, 0);
+});
+
+test('disposing bootstrap cancels a pending compatibility RPC registration retry', async () => {
+  const delay = deferred(), waiting = deferred();
+  let loads = 0;
+  const f = bootstrapFixture({ retryDelay: () => { waiting.resolve(); return delay.promise; }, overrides: {
+    compatibilityService: () => { loads++; throw new Error('temporary import failure'); },
+  } });
+  f.start();
+  const bootstrap = f.ctx.get('grokSearchBootstrap');
+  try {
+    await Promise.race([waiting.promise, bootstrap.settled()]);
+    await f.ctx.dispose();
+    delay.resolve();
+    await bootstrap.settled();
+    assert.equal(loads, 1);
+    assert.equal(f.ctx.get('grokSearchCompatibilityRemote'), undefined);
+  } finally { delay.resolve(); await f.ctx.dispose(); }
+});
 
 test('compatibility regression: scalar fetch selectors survive production core, acquisition, takeover and explicit release', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-compat-fetch-release-'));
@@ -1314,7 +1363,7 @@ test('unreadable required intent preserves both early protection hooks without i
     f.start();
     await f.settle();
     assert.equal(f.coordinator().report().phase, 'blocked');
-    assert.deepEqual(f.calls, ['load:settings', 'settings']);
+    assert.deepEqual(f.calls, ['load:settings', 'load:compatibilityService', 'settings']);
     assert.equal(f.coordinator().report().optionalFeatures.settings.available, true);
     assert.equal(typeof f.ctx.get('grokSearchSettings').snapshot, 'function');
     assert.equal(f.contractCheckCalls(), 0);
@@ -1352,6 +1401,204 @@ test('missing core imports preserve the root settings configPath and recovery wi
     assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => true),
       error => error.code.startsWith('COMPATIBILITY_'));
     assert.equal(f.web.searchProviderId, 'author', 'an unchanged author route is not permission to execute it');
+  } finally { await f.ctx.dispose(); }
+});
+
+function startupIntentFixture(stage, onAttempt, options = {}) {
+  const delays = [];
+  let creates = 0, attempts = 0;
+  const f = bootstrapFixture({ ...options,
+    retryDelay(ms) { delays.push(ms); return options.retryDelay?.(ms); },
+    storeFactory() {
+      creates++;
+      if (stage === 'create') onAttempt(++attempts);
+      return { ...f.store, read() {
+        if (stage === 'read') onAttempt(++attempts);
+        return f.store.read();
+      } };
+    },
+  });
+  return { ...f, delays, creates: () => creates, attempts: () => attempts };
+}
+
+function assertSingleStartup(f) {
+  for (const call of ['settings', 'load:appBoot', 'load:compatibilityService', 'verifier', 'recovery',
+    'program', 'core', 'control', 'maintenance']) {
+    assert.equal(f.calls.filter(value => value === call).length, 1, call);
+  }
+  assert.equal(f.coordinator().report().coreReady, true);
+  assert.equal(f.web.searchProviderId, 'grok-search');
+}
+
+for (const [stage, hostVersion, fault] of [
+  ['create', '0.4.0-beta.1', new ControlRecordError('CONTROL_STORAGE_BUSY')],
+  ['read', null, new ControlRecordError('CONTROL_COMMIT_INPUT_CHANGED', 'Inputs changed', { retriable: true })],
+]) test(`startup intent recovers automatically after the first ${stage} failure`, async () => {
+  const f = startupIntentFixture(stage, attempt => { if (attempt === 1) throw fault; }, { hostVersion });
+  try {
+    f.start();
+    assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => assert.fail('early search')),
+      error => error.code.startsWith('COMPATIBILITY_'));
+    await f.settle();
+    assert.deepEqual(f.delays, [1000]);
+    assert.equal(f.creates(), stage === 'create' ? 2 : 1);
+    assert.equal(f.coordinator().report().hostVersion, hostVersion);
+    assert.equal(f.coordinator().report().confirmationRequired, false);
+    assertSingleStartup(f);
+  } finally { await f.ctx.dispose(); }
+});
+
+test('startup intent exhaustion stays closed until concurrent manual rechecks recover the same root', async () => {
+  let locked = true;
+  const f = startupIntentFixture('read', () => { if (locked) throw new ControlRecordError('CONTROL_CAS_CONFLICT'); });
+  try {
+    f.start();
+    await f.settle();
+    const exhausted = f.coordinator().report(), attempts = f.attempts();
+    assert.equal(exhausted.phase, 'blocked');
+    assert.equal(f.calls.includes('program'), false);
+    assert.equal(f.web.searchProviderId, 'author');
+    locked = false;
+    const checks = Promise.all([f.coordinator().recheck(), f.coordinator().recheck()]);
+    await f.settle();
+    assertSingleStartup(f);
+    assert.ok((await checks).every(report => report.coreReady));
+    assert.deepEqual(f.delays, [1000, 3000]);
+    assert.equal(attempts, 3);
+    assert.equal(exhausted.code, 'COMPATIBILITY_CORE_UNAVAILABLE');
+    assert.equal(f.creates(), 1);
+  } finally { await f.ctx.dispose(); }
+});
+
+test('a manual startup intent recheck supersedes a sleeping automatic retry without duplicate mounts', async () => {
+  const delay = deferred();
+  const f = startupIntentFixture('create', attempt => { if (attempt === 1) throw new ControlRecordError('CONTROL_STORAGE_BUSY'); },
+    { retryDelay: () => delay.promise });
+  try {
+    f.start();
+    await turn();
+    assert.deepEqual(f.delays, [1000]);
+    const checks = Promise.all([f.coordinator().recheck(), f.coordinator().recheck()]);
+    await turn();
+    assert.equal(f.coordinator().report().coreReady, true);
+    delay.resolve();
+    await checks;
+    await f.settle();
+    assert.equal(f.creates(), 2);
+    assertSingleStartup(f);
+  } finally { delay.resolve(); await f.ctx.dispose(); }
+});
+
+test('exhausted startup intent reads remain recoverable through the registered secured compatibility gateway', async () => {
+  let locked = true;
+  const Gateway = createCompatibilityGateway({
+    Service: class {
+      constructor(child, key) { this.ctx = child; child.provide(key, this); }
+    },
+    RemoteError: class extends Error {
+      constructor(code, message) { super(message); this.code = code; }
+    },
+  });
+  const f = startupIntentFixture('read', () => { if (locked) throw new ControlRecordError('CONTROL_STORAGE_BUSY'); }, {
+    overrides: { compatibilityService: { name: 'compatibility-gateway', apply(child) { new Gateway(child); } } },
+  });
+  try {
+    f.start();
+    await f.settle();
+    const remote = f.ctx.get('grokSearchCompatibilityRemote');
+    assert.equal(typeof remote?.compatibilityReport, 'function', 'UI RPC must mount before the first successful ledger read');
+    assert.equal(remote.typertRemote.service, remote);
+    assert.equal(remote.typertRemote.serviceKey, 'grokSearchCompatibilityRemote');
+    await assert.rejects(remote.compatibilityReport(), { code: 'SETTINGS_AUTH_REQUIRED' });
+    await assert.rejects(remote.recheckCompatibility(), { code: 'SETTINGS_AUTH_REQUIRED' });
+    remote.ctx.invocation = { peer: { principal: { kind: 'owner' } }, signal: new AbortController().signal };
+    const before = await remote.compatibilityReport();
+    assert.equal(before.phase, 'blocked');
+    assert.equal(before.code, 'COMPATIBILITY_CORE_UNAVAILABLE');
+    assert.equal(before.coreReady, false);
+    await assert.rejects(remote.recheckCompatibility(), { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+    assert.equal(f.attempts(), 3, 'unauthorized RPCs must not start another retry round');
+    assert.equal(f.calls.includes('program'), false);
+    assert.equal(f.calls.includes('control'), false);
+    assert.equal(f.web.searchProviderId, 'author');
+    locked = false;
+    const request = { socket: { localAddress: '127.0.0.1', remoteAddress: '127.0.0.1' }, headers: {} };
+    const after = await f.ctx.waterfall('connection/request', request, null, () =>
+      Promise.all([remote.recheckCompatibility(), remote.recheckCompatibility()]));
+    await f.settle();
+    assert.ok(after.every(report => report.coreReady));
+    for (const [method, result] of [['compatibilityReport', before], ['recheckCompatibility', after[0]]]) {
+      assert.equal(COMPATIBILITY_DESCRIPTORS.find(row => row.method === method).result.create().safeParse(result).success, true);
+    }
+    assert.equal(f.ctx.get('grokSearchCompatibilityRemote'), remote, 'recovery must not remount the root gateway');
+    assert.deepEqual(f.delays, [1000, 3000]);
+    assertSingleStartup(f);
+  } finally { await f.ctx.dispose(); }
+});
+
+for (const completed of [false, true]) test(`startup intent retry respects a released record with completion=${completed}`, async () => {
+  const f = startupIntentFixture('read', attempt => { if (attempt === 1) throw new ControlRecordError('CONTROL_STORAGE_BUSY'); },
+    { initialRecord: { intent: { policy: 'released', release: { kind: 'intent-release-commit' },
+      releaseCompletion: completed ? { routeVerified: true } : null } } });
+  try {
+    f.start();
+    await f.settle();
+    assert.equal(f.calls.filter(value => value === 'recovery').length, 1);
+    assert.equal(f.calls.includes('program'), false);
+    assert.equal(f.coordinator().report().code, 'COMPATIBILITY_STOPPED');
+    assert.equal(f.web.searchProviderId, 'author');
+    await assert.rejects(f.coordinator().recheck(), { code: 'COMPATIBILITY_STOPPED' });
+  } finally { await f.ctx.dispose(); }
+});
+
+test('startup intent and subsequent core failures share the same two automatic retries', async () => {
+  const f = startupIntentFixture('create', attempt => { if (attempt === 1) throw new ControlRecordError('CONTROL_STORAGE_BUSY'); },
+    { overrides: { core: new Error('temporary module resolution failure') } });
+  try {
+    f.start();
+    await f.settle();
+    assert.deepEqual(f.delays, [1000, 3000]);
+    assert.equal(f.calls.filter(value => value === 'load:core').length, 2);
+    assert.equal(f.coordinator().report().code, 'COMPATIBILITY_CORE_UNAVAILABLE');
+    assert.equal(f.web.searchProviderId, 'author');
+  } finally { await f.ctx.dispose(); }
+});
+
+for (const action of ['stop', 'dispose']) test(`startup intent retry cannot mount after ${action}`, async () => {
+  const delay = deferred();
+  const f = startupIntentFixture('create', attempt => { if (attempt === 1) throw new ControlRecordError('CONTROL_STORAGE_BUSY'); },
+    { retryDelay: () => delay.promise });
+  try {
+    f.start();
+    const coordinator = f.coordinator(), bootstrap = f.ctx.get('grokSearchBootstrap');
+    await turn();
+    assert.deepEqual(f.delays, [1000]);
+    if (action === 'stop') coordinator.stop();
+    else await f.ctx.dispose();
+    await assert.rejects(coordinator.recheck(), { code: 'COMPATIBILITY_STOPPED' });
+    delay.resolve();
+    await bootstrap.settled();
+    assert.equal(f.creates(), 1);
+    assert.deepEqual(f.calls, ['load:settings', 'load:compatibilityService', 'settings']);
+    assert.equal(coordinator.report().phase, 'stopped');
+    assert.equal(f.web.searchProviderId, 'author');
+  } finally { delay.resolve(); await f.ctx.dispose(); }
+});
+
+test('a permanent startup intent fault stays blocked across status changes and manual recheck', async () => {
+  const f = startupIntentFixture('read', attempt => { if (attempt === 1) throw new ControlRecordError('CONTROL_RECORD_INVALID'); });
+  try {
+    f.start();
+    await f.settle();
+    const recheck = f.coordinator().recheck();
+    await f.ctx.parallel('internal/status');
+    await f.settle();
+    assert.equal(f.coordinator().report().phase, 'blocked');
+    assert.equal((await recheck).coreReady, false);
+    assert.equal((await f.coordinator().start()).phase, 'blocked');
+    assert.equal(f.attempts(), 1);
+    assert.deepEqual(f.delays, []);
+    assert.deepEqual(f.calls, ['load:settings', 'load:compatibilityService', 'settings']);
   } finally { await f.ctx.dispose(); }
 });
 
@@ -2147,4 +2394,120 @@ test('the cold config hook protects both known Cordis ABIs without a dynamic hos
   assert.equal(resolved.fetchProvider.get(), 'fetch');
   assert.equal(validations, 1);
   assert.deepEqual(raw, { searchProvider: 'author', fetchProvider: 'fetch' });
+});
+
+test('disabled GitHub read short-circuits getState without reading the control-intent store', async () => {
+  let storeReads = 0;
+  const baseRecord = { intent: { policy: 'required' } };
+  const f = bootstrapFixture({
+    githubEnabled: false,
+    initialRecord: baseRecord,
+    overrides: { github: { createGithubIntegration } },
+    storeFactory: () => ({
+      read: () => { storeReads++; return baseRecord; },
+      startMaintenance: () => {},
+    }),
+  });
+  try {
+    f.start();
+    await f.ctx.get('grokSearchBootstrap').settled();
+    const github = f.service('grokSearchGithub');
+    assert.ok(github);
+    const readsAfterBoot = storeReads;
+    github.sync();
+    assert.deepEqual(github.snapshot(), { enabled: false, registered: false, error: null });
+    assert.equal(storeReads, readsAfterBoot);
+  } finally {
+    await f.ctx.dispose();
+  }
+});
+
+test('hot-reload control refresh window rejects overlapping web_search with COMPATIBILITY_CHECKING without blocking core', async () => {
+  let refreshing = false;
+  const f = bootstrapFixture({
+    overrides: {
+      control: {
+        name: 'control',
+        async apply(child, options) {
+          if (!options.canAcquire()) throw new Error('unadmitted control');
+          f.web.searchProviderId = 'grok-search';
+          f.webFiber.effectiveConfig.searchProvider = { get: () => 'grok-search' };
+          child.provide('grokSearchControl', {
+            publicSnapshot: () => ({ phase: 'required' }),
+            refreshing: () => refreshing,
+            retryRelease: async () => {},
+            start: options.onStart,
+            async stop() { await options.onStop(); return { kind: 'released' }; },
+          });
+        },
+      },
+    },
+  });
+  try {
+    f.start();
+    await f.settle();
+    assert.equal(f.coordinator().report().coreReady, true);
+    // Simulate host hot-reload briefly resetting searchProvider while control.refresh() is actively re-acquiring.
+    refreshing = true;
+    f.web.searchProviderId = 'author';
+    f.webFiber.effectiveConfig.searchProvider = { get: () => 'author' };
+    let officialDispatched = false;
+    assert.throws(
+      () => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { officialDispatched = true; }),
+      { code: 'COMPATIBILITY_CHECKING' },
+    );
+    assert.equal(officialDispatched, false);
+    assert.equal(f.coordinator().report().coreReady, true, 'transient refresh window must not permanently block core');
+    // Once refresh finishes re-acquiring grok-search, searches proceed normally without manual recheck.
+    refreshing = false;
+    f.web.searchProviderId = 'grok-search';
+    f.webFiber.effectiveConfig.searchProvider = { get: () => 'grok-search' };
+    let routedDispatched = false;
+    f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { routedDispatched = true; });
+    assert.equal(routedDispatched, true);
+  } finally {
+    await f.ctx.dispose();
+  }
+});
+
+test('retriable control storage lock contention during initialize recovers within automatic retry budget', async () => {
+  let attempts = 0;
+  const delays = [];
+  const f = bootstrapFixture({
+    retryDelay: async ms => { delays.push(ms); },
+    overrides: {
+      control: {
+        name: 'control',
+        async apply(child, options) {
+          attempts++;
+          if (attempts === 1) {
+            throw Object.assign(new Error('Control storage writer lock busy'), {
+              code: 'CONTROL_STORAGE_BUSY',
+              retriable: true,
+            });
+          }
+          if (!options.canAcquire()) throw new Error('unadmitted control');
+          f.web.searchProviderId = 'grok-search';
+          f.webFiber.effectiveConfig.searchProvider = { get: () => 'grok-search' };
+          child.provide('grokSearchControl', {
+            publicSnapshot: () => ({ phase: 'required' }),
+            refreshing: () => false,
+            retryRelease: async () => {},
+            start: options.onStart,
+            async stop() { await options.onStop(); return { kind: 'released' }; },
+          });
+        },
+      },
+    },
+  });
+  try {
+    f.start();
+    await f.settle();
+    assert.equal(attempts, 2);
+    assert.deepEqual(delays, [1000]);
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.equal(f.coordinator().report().phase, 'ready');
+  } finally {
+    await f.ctx.dispose();
+  }
 });

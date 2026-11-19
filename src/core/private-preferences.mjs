@@ -89,7 +89,12 @@ export function createPrivatePreferences({ path, fault }) {
         const next = validate({ ...value, githubReadEnabled: Object.hasOwn(value, 'githubReadEnabled')
           ? value.githubReadEnabled : before.value.githubReadEnabled });
         const text = JSON.stringify(next, null, 2) + '\n';
-        if (before.revision === digest(text)) return { value: structuredClone(next), revision: before.revision };
+        const intendedRevision = digest(text);
+        if (before.revision === intendedRevision) {
+          const current = read();
+          if (current.revision !== expectedRevision) fail('PREFERENCES_CONFLICT', '插件偏好已被其他窗口修改，请重新读取。');
+          return current;
+        }
         stage = `${path}.${randomUUID()}.tmp`;
         const fd = openSync(stage, 'wx', 0o600);
         try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
@@ -98,9 +103,11 @@ export function createPrivatePreferences({ path, fault }) {
         renameSync(stage, path);
         published = true;
         fault?.('after-publish');
-        return read();
+        const current = read();
+        if (current.revision !== intendedRevision) fail('PREFERENCES_COMMIT_UNCERTAIN', '插件偏好写入后再次发生变化，请重新读取确认。');
+        return current;
       } catch (error) {
-        if (published) fail('PREFERENCES_COMMIT_UNCERTAIN', '插件偏好已写入，但回读未完成，请重新读取后确认。');
+        if (published && error?.code !== 'PREFERENCES_COMMIT_UNCERTAIN') fail('PREFERENCES_COMMIT_UNCERTAIN', '插件偏好已写入，但回读未完成，请重新读取后确认。');
         if (error instanceof GrokSearchError) throw error;
         fail('PREFERENCES_WRITE_FAILED', '无法保存插件偏好；原文件未由本次操作替换。');
       } finally {

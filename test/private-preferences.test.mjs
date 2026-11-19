@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, lstatSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -130,6 +131,16 @@ test('preference publication survives a vanished lock and never removes a replac
     assert.equal(existsSync(lock), replacement !== null);
     if (replacement) assert.equal(readFileSync(lock, 'utf8'), replacement);
   }
+});
+test('a post-publish external preference edit never becomes the receipt for a combined undo', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
+  const initial = createPrivatePreferences({ path }).snapshot().value;
+  const external = JSON.stringify({ ...initial, githubReadEnabled: true });
+  const store = createPrivatePreferences({ path, fault: stage => {
+    if (stage === 'after-publish') writeFileSync(path, external);
+  } });
+  assert.throws(() => store.save('missing', { ...initial, grokEnabled: false }), { code: 'PREFERENCES_COMMIT_UNCERTAIN' });
+  assert.equal(readFileSync(path, 'utf8'), external);
 });
 test('idempotent preference saves do not republish and oversized or invalid UTF-8 files fail closed', () => {
   const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');

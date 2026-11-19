@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, rmdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync, rmdirSync, statSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -113,7 +114,10 @@ test('virtual input data preserves approved HTML, CSS and all theme assets exact
 
 test('artifact checking accepts exact bytes and reports stale output without repairing it', t => {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-client-build-')), path = join(directory, 'client.js');
-  t.after(() => { rmSync(path, { force: true }); rmdirSync(directory); });
+  t.after(ctx => {
+    if (ctx?.passed === false || process.env.DSH_KEEP_TEST_FIXTURES === '1') return;
+    rmSync(path, { force: true }); rmdirSync(directory);
+  });
   writeFileSync(path, result.code);
   assert.doesNotThrow(() => checkClientArtifact(result.code, path));
   writeFileSync(path, 'stale client fixture\n');

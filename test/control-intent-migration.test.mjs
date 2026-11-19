@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync,
-  readdirSync, renameSync, statSync, symlinkSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, renameSync,
+  statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import test from 'node:test';
@@ -38,7 +39,7 @@ const sourceMarker = (raw, operationId) => ({ format: LEGACY_FORMAT, schemaVersi
   routeChanged: false, historicReleasePreserved: true });
 
 function fixture(t, { raw = encode(legacyIntent()), source = true } = {}) {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-control-migration-test-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-cm-'));
   const directory = join(root, 'control');
   const legacyPath = join(root, 'legacy-control.json');
   if (source) writeFileSync(legacyPath, raw, { flag: 'wx' });
@@ -984,7 +985,7 @@ test('temporary-profile CLI inspection is read-only and migration reports explic
 });
 
 test('temporary-profile CLI rejects ordinary, relative and linked paths without touching their source', t => {
-  const ordinary = temporaryProfile(t, 'dsh-control-migration-test-');
+  const ordinary = temporaryProfile(t, 'dsh-cm-');
   const dedicated = temporaryProfile(t);
   const raw = encode(legacyIntent());
   writeFileSync(ordinary.legacyPath, raw, { flag: 'wx' });

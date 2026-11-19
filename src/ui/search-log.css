@@ -134,13 +134,14 @@
   .qp-refresh.is-retry span{display:none}
 }
 @media (max-width:520px){
-  .dialog:has(#quotaPanel) .field{grid-template-columns:minmax(0,1fr);gap:6px}
-  .dialog:has(#quotaPanel) .f-label{padding-top:0}
-  .dialog:has(#quotaPanel) .dlg-head{flex-wrap:wrap;gap:8px}
-  .dialog:has(#quotaPanel) .dlg-titles{flex-basis:calc(100% - 84px)}
-  .dialog:has(#quotaPanel) .head-switch{margin-left:auto}
-  .dialog:has(#quotaPanel) .dlg-foot{flex-wrap:wrap}
-  .dialog:has(#quotaPanel) .foot-note{flex-basis:100%;order:2;text-align:left}
+  .dialog .field{grid-template-columns:minmax(0,1fr);gap:6px}
+  .dialog .f-label{padding-top:0}
+  .dialog .seg{flex-wrap:wrap}
+  .dialog .dlg-head{flex-wrap:wrap;gap:8px}
+  .dialog .dlg-titles{flex-basis:calc(100% - 84px)}
+  .dialog .head-switch{margin-left:auto}
+  .dialog .dlg-foot{flex-wrap:wrap}
+  .dialog .foot-note{flex-basis:100%;order:2;text-align:left}
 }
 
 

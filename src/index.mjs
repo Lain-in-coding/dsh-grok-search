@@ -54,13 +54,12 @@ export function apply(ctx, config, { WebError = ctx.get('grokSearchHostAdapter')
   };
   const releaseBarrier = createReleaseBarrier();
   const callRoutes = ctx.get('grokSearchCallRoutes');
-  const routed = createRoutedSearch({ grok: core.provider, sourceRouter, preferences, releaseBarrier,
+  const routed = createRoutedSearch({ grok: core.provider, canFallback: core.canFallback, sourceRouter, preferences, releaseBarrier,
     searchLog: ctx.get('grokSearchLog'),
     getConfig, budgetMs: config.budgetMs ?? 120_000, assertExecution, executionEpoch });
   const provider = {
     ...core.provider,
-    available: () => releaseBarrier.snapshot().state === 'active'
-      && routed.snapshot().accepting && (core.provider.available() || sourceRouter.snapshot().available),
+    available: routed.available,
     // The host passes only (request, signal); the origin is fixed here.
     search: (request, signal) => routed.search(request, signal, 'search', callRoutes?.capture() ?? null),
   };

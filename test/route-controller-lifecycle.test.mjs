@@ -716,6 +716,59 @@ test('an explicit draft reload cannot restore an authorization revoked while it 
   assert.equal(dialog.saving, false);
 });
 
+test('reloading a disabled tokenless GitHub draft follows fresh-panel consent defaults', async () => {
+  for (const id of ['github', 'tavily']) {
+    for (const enableDraft of [false, true]) {
+      const base = id === 'github' ? { enabled: false, token: '' }
+        : { enabled: false, keys: [''], url: '' };
+      const context = vm.createContext({
+        disposed: false, accessGeneration: 0, stateGeneration: 0, D: null,
+        S: { capabilities: { secretsAllowed: true }, prov: { [id]: base }, config: { fields: {} } },
+        META: { [id]: {} }, clone: structuredClone, dialogBusy: () => false, normCard,
+        configFields: () => ({}), fieldReadOnly: () => false,
+        closePop() {}, rowOf: () => null, showOverlay() {}, renderCard() {},
+        requestAnimationFrame() {}, initialFocus() {}, lockDialog() {}, quotaView: null,
+        acceptSnapshot(snapshot) { context.S.config = snapshot.config; },
+        operationError(error) { throw error; },
+        remote: { snapshot: async () => ({ config: { fields: {} } }), preferences: async () => ({}) },
+      });
+      vm.runInContext([
+        section('function isSet(', 'const isOn ='),
+        section('function openCard(', '/* ---------- 中继弹窗'),
+        section('async function reloadDialogDraft(', '// One retry for an unrelated external write.'),
+      ].join('\n'), context);
+      context.openCard(id);
+      const freshBase = structuredClone(context.D.base);
+      if (enableDraft) context.D.draft.enabled = true;
+      const expectedDraft = structuredClone(context.D.draft);
+      context.D.operationError = { code: 'CONFIG_CONFLICT' };
+      await context.reloadDialogDraft();
+      assert.deepEqual(context.D.base, freshBase);
+      assert.deepEqual(context.D.draft, expectedDraft);
+      assert.equal(context.D.orig, JSON.stringify(normCard(freshBase)));
+      assert.equal(context.D.operationError.code, 'CONFIG_RELOADED');
+    }
+  }
+});
+
+test('actual GitHub redirect and invalid-response codes have specific route and log explanations', () => {
+  const context = vm.createContext({});
+  vm.runInContext([
+    section('function normalizeCode(', 'function ingestRoute('),
+    section('const ERR_TEXT =', 'function failureHelp('),
+    'globalThis.describeError = errText;',
+  ].join('\n'), context);
+  for (const [code, status, text] of [
+    ['GITHUB_REDIRECT', '跳转', 'GitHub 资源已重定向，请使用当前资源的官方链接'],
+    ['GITHUB_RESPONSE_INVALID', '响应', 'GitHub 返回数据无效'],
+  ]) {
+    const result = context.failureInfo(code);
+    assert.equal(result.code, code);
+    assert.equal(result.status, status);
+    assert.equal(context.describeError(code), text);
+  }
+});
+
 test('a late ordering save failure cannot roll back a disposed settings DOM', async () => {
   let rejectSave;
   const context = vm.createContext({
@@ -734,3 +787,141 @@ test('a late ordering save failure cannot roll back a disposed settings DOM', as
   await saving;
   assert.equal(context.S.busy, false);
 });
+
+test('route state survives a remount only for the same settings connection', () => {
+  const memory = {}, firstRemote = {}, secondRemote = {};
+  const initialize = remote => vm.runInNewContext([
+    source.slice(source.indexOf('\n') + 1, source.indexOf('let disposed =')),
+    section('function blankProv()', 'function providersFrom('),
+    'S',
+  ].join('\n'), { memory, remote, SUPP: ['tavily'], clone: structuredClone });
+  const state = initialize(firstRemote);
+  state.lastRoute = { at: 9000, outcome: 'failed', served: 'tavily' };
+  state.lastRouteAt = 9000;
+  state.checked = { tavily: { 0: { status: 'failed', source: 'test' } } };
+  state.bad = { tavily: { 0: '401' } };
+  state.readDismissed = true;
+  vm.runInNewContext(section('Object.assign(memory, {', '// No cleartext draft/config'), {
+    memory, remote: firstRemote, S: state, clone: structuredClone,
+  });
+  const same = initialize(firstRemote);
+  assert.equal(same.lastRouteAt, 9000);
+  assert.equal(same.bad.tavily[0], '401');
+  const changed = initialize(secondRemote);
+  assert.equal(changed.lastRoute, null, 'A different server must not inherit a failed route.');
+  assert.equal(changed.lastRouteAt, 0, 'Its earlier clock must not suppress new route receipts.');
+  assert.equal(Object.keys(changed.checked).length, 0);
+  assert.equal(Object.keys(changed.bad).length, 0);
+  assert.equal(changed.readDismissed, false);
+});
+
+test('card preference completion cannot render or alter a replacement dialog after disposal', async () => {
+  for (const rejected of [false, true]) {
+    let finish, started;
+    const waiting = new Promise(resolve => { started = resolve; });
+    const mine = { id: 'grok', base: { enabled: true }, draft: { enabled: false }, saving: true };
+    const context = vm.createContext({
+      disposed: false, D: mine, S: { prov: { grok: mine.base } }, clone: structuredClone,
+      saveConfig: async () => ({ after: 'saved' }),
+      savePreference: () => new Promise((resolve, reject) => { finish = rejected ? reject : resolve; started(); }),
+      CRED: { grok: [] }, configFields: () => ({}), normCard,
+      closeDialog() { assert.fail('A disposed save must not close another dialog.'); },
+      syncAll() { assert.fail('A disposed save must not render.'); },
+      operationError() { assert.fail('A disposed save must not report to another dialog.'); },
+    });
+    vm.runInContext(section('async function commitCard(', 'async function clearArm('), context);
+    const saving = context.commitCard();
+    await waiting;
+    context.disposed = true;
+    context.D = { id: 'github' };
+    finish(rejected ? new Error('preference save failed') : {});
+    await saving;
+    assert.equal(mine.saving, true, 'The obsolete dialog is no longer owned by the callback.');
+  }
+});
+
+test('an invalidated hub reload releases the actual disabled controls', async () => {
+  const mine = { kind: 'hub', base: { timeout: 60 }, draft: { timeout: 65 } };
+  const control = element();
+  let resolveRead;
+  const context = vm.createContext({
+    disposed: false, D: mine, S: {}, accessGeneration: 0, stateGeneration: 0,
+    dialogBusy: () => false, clone: structuredClone,
+    lockDialog() { control.disabled = true; },
+    renderHub() { assert.equal(mine.saving, false); control.disabled = false; },
+    acceptSnapshot() { assert.fail('An obsolete reply must not be accepted.'); },
+    operationError(error) { throw error; },
+    remote: { snapshot: () => new Promise(resolve => { resolveRead = resolve; }), preferences: async () => ({}) },
+  });
+  vm.runInContext(section('async function reloadDialogDraft(', '// One retry for an unrelated external write.'), context);
+  const reloading = context.reloadDialogDraft();
+  assert.equal(control.disabled, true);
+  context.accessGeneration++;
+  resolveRead({});
+  await reloading;
+  assert.equal(context.S.busy, false);
+  assert.equal(mine.saving, false);
+  assert.equal(control.disabled, false, 'Closing or retrying must remain possible.');
+});
+
+for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED']) {
+  test('provider diagnostics stop on ' + code + ' without marking credentials as failed', async () => {
+    for (const rejected of [true, false]) {
+      const h = harness(), denied = [], requests = [], nodes = new Map();
+      Object.assign(h.context.S, { order: ['tavily'], checked: {}, providerBad: {} });
+      Object.assign(h.context, {
+        gen: 0, accessGeneration: 0, snapshotSignature: null, performance: { now: () => 0 },
+        logView: { cancel() {}, restrict: value => denied.push(value) },
+        $: selector => { if (!nodes.has(selector)) nodes.set(selector, element()); return nodes.get(selector); },
+        routeStatus: () => 'ready', grokOn: () => true, isOn: () => false, enabledSupp: () => ['tavily'],
+        META: { grok: { name: 'Grok' }, tavily: { name: 'Tavily' } }, SUPP: ['tavily'],
+        reduced: () => true, uuid: () => 'diagnostic-operation', normalizeCode: value => value, errText: value => value,
+        rowOf: () => element(), T: { trace: 1000 }, untestedCode: () => false,
+        renderHead() {}, renderSummary() {}, renderBanner() {}, syncRows() {}, pumpWires() {},
+        tickTestProgress() {}, clearToasts() {}, clearLit() {}, toast() {},
+        rememberCheck() { assert.fail('A settings access refusal must not become a failed credential check.'); },
+      });
+      h.context.remote.diagnoseProvider = async request => {
+        requests.push(request);
+        if (rejected) throw Object.assign(new Error('denied'), { code });
+        return { provider: request.provider, status: 'failed', code, message: 'denied', keys: [] };
+      };
+      vm.runInContext([
+        section('function denyPrivateAccess(', 'async function refresh('),
+        section('function cancelTest(', 'function cancelOwnedDiagnosis('),
+        section('async function runTest(', '/* ---------- Mount-local theme'),
+      ].join('\n'), h.context);
+      await h.context.runTest();
+      assert.equal(h.context.S.capabilities.secretsAllowed, false);
+      assert.deepEqual(denied, [code]);
+      assert.equal(requests.length, 1, 'Do not diagnose more sources after the connection refuses access.');
+      assert.equal(h.context.S.testing, false);
+      assert.equal(h.context.S.diagnosticOperation, null);
+      assert.equal(Object.keys(h.context.S.checked).length, 0);
+    }
+  });
+
+  test('GitHub preview rejection ' + code + ' revokes private UI access immediately', async () => {
+    const h = harness(), mine = h.open('github', { token: 'synthetic-token', enabled: true });
+    const outcome = element(), button = element(), denied = [];
+    mine.show.token = true;
+    Object.assign(h.context, {
+      accessGeneration: 0, snapshotSignature: null, uuid: () => 'preview-operation',
+      logView: { restrict: value => denied.push(value) },
+      renderCard() {},
+      $: selector => selector === '.search-result' ? outcome : null,
+    });
+    h.context.remote.previewGithubConnection = async () => { throw Object.assign(new Error('denied'), { code }); };
+    h.context.remote.cancelDiagnosis = async () => ({});
+    vm.runInContext([
+      section('function denyPrivateAccess(', 'async function refresh('),
+      section('async function testGithubDraft(', 'async function revealFor('),
+    ].join('\n'), h.context);
+    await h.context.testGithubDraft(button);
+    assert.equal(h.context.S.capabilities.secretsAllowed, false);
+    assert.equal(h.context.secretEpoch, 1);
+    assert.deepEqual(denied, [code]);
+    assert.equal(Object.keys(mine.show).length, 0);
+    assert.equal(mine.githubOperation, null);
+  });
+}

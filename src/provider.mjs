@@ -36,7 +36,10 @@ export function createGrokProvider({ configuration, sdkFactory, runQuery, execut
     },
   });
   return {
-    provider: { id: PROVIDER_ID, available: () => executableReady() && executor.snapshot().accepting,
+    // Missing executables fail before session admission and can use sources.
+    // A faulted executor rejects even before checking the executable.
+    canFallback: () => executor.snapshot().accepting && !(session?.exitPending() && executableReady()),
+    provider: { id: PROVIDER_ID, available: () => executableReady() && executor.snapshot().accepting && !session?.snapshot().faulted,
       search: (request, signal) => executor.search(request, signal) },
     snapshot: () => ({ ...executor.snapshot(), executableReady: executableReady(), session: session?.snapshot() ?? null }),
     async dispose() {

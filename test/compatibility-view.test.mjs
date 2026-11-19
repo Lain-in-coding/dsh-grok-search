@@ -460,3 +460,79 @@ test('compatibility RPC failure and recovery never recreate an existing settings
   assert.equal(h.routeDisposes(), 1);
   await dispose();
 });
+
+test('manual recheck preempts a poll after reopening on the same connection', async () => {
+  let resolveSlowPoll;
+  let recheckCalls = 0;
+  const memory = {};
+  const remote = {
+    compatibilityReport: async () => blocked(),
+    recheckCompatibility: async () => { recheckCalls++; return report(); },
+  };
+  const first = harness(remote, { memory });
+  await settle();
+  first.view.dispose();
+  remote.compatibilityReport = () => new Promise(resolve => { resolveSlowPoll = resolve; });
+  const h = harness(remote, { memory });
+  assert.equal(h.root.dataset.compatibilityPhase, 'blocked');
+  assert.equal(h.get('[data-compatibility-recheck]').disabled, false, 'background poll must not disable manual recheck button');
+
+  await Promise.resolve();
+  const rechecking = h.view.recheck();
+  await rechecking;
+  assert.equal(recheckCalls, 1);
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+
+  // Resolving the superseded slow poll later cannot overwrite the newer recheck state.
+  resolveSlowPoll(blocked());
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  h.view.dispose();
+});
+
+test('reopening without the original connection cannot show its cached block', async () => {
+  const offline = { compatibilityReport: async () => { throw new Error('offline'); } };
+  for (const next of [null, offline]) {
+    for (const rebindBeforeClose of [false, true]) {
+      const memory = {};
+      const first = harness({ compatibilityReport: async () => blocked() }, { memory });
+      await settle();
+      assert.equal(first.root.dataset.compatibilityPhase, 'blocked');
+      if (rebindBeforeClose) first.view.bind(next);
+      first.view.dispose();
+      const reopened = harness(next, { memory });
+      assert.equal(reopened.get('.compatibility-banner').hidden, true);
+      await settle();
+      assert.equal(reopened.root.dataset.compatibilityPhase, 'normal');
+      reopened.view.dispose();
+    }
+  }
+});
+
+test('rechecks at transport capacity leave the current report poll able to recover', async () => {
+  let finishPoll;
+  const rechecks = [];
+  const remote = { compatibilityReport: async () => blocked(),
+    recheckCompatibility: () => new Promise(resolve => rechecks.push(resolve)) };
+  const h = harness(remote);
+  await settle();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    void h.view.recheck();
+    await settle();
+    h.tick(20000);
+  }
+  remote.compatibilityReport = () => new Promise(resolve => { finishPoll = resolve; });
+  h.tick(5000);
+  await settle();
+  void h.view.recheck();
+  await settle();
+  assert.equal(rechecks.length, 2);
+  finishPoll(report());
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  assert.equal(h.root.getAttribute('aria-busy'), 'false');
+  for (const finish of rechecks) finish(blocked());
+  await settle();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  h.view.dispose();
+});

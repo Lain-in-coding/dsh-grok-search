@@ -85,6 +85,24 @@ const records = { records: [{ id: 'search-log-1', at: 1, q: 'private-query',
   kind: 'sources', served: 'tavily', ms: 1, calls: [], callsComplete: true }] };
 
 for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED']) {
+  test('log clear rejection ' + code + ' revokes private access without waiting for another poll', async () => {
+    const h = harness(async () => records, {
+      clearSearchLog: async () => { throw Object.assign(new Error('denied'), { code }); },
+    });
+    await h.view.read();
+    assert.equal(h.query(), 'private-query');
+    await h.view.clear();
+    assert.equal(h.denied(), 1);
+    assert.equal(h.S.capabilities.secretsAllowed, false);
+    assert.equal(h.query(), '');
+    assert.match(h.$('#logNote').textContent, new RegExp(code));
+    await h.view.read();
+    assert.equal(h.reads(), 1, 'No private read is sent after explicit denial.');
+    h.view.dispose();
+  });
+}
+
+for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED']) {
   test(`log rejection ${code} clears private content without clearing server history`, async () => {
     let failure = false;
     const h = harness(async () => {

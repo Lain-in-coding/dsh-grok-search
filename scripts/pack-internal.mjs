@@ -74,12 +74,12 @@ export async function packInternal(directory, options = {}) {
   if (!metadata?.filename || basename(metadata.filename) !== metadata.filename) throw new Error('打包输出缺少安全文件名。');
   if (metadata.name !== manifest.name || metadata.version !== manifest.version
     || metadata.filename !== `${manifest.name}-${manifest.version}.tgz`) throw new Error('压缩包身份与候选不一致。');
-  const allowed = path => ['package.json', 'README.md', 'cordis.patch.yml', 'support-matrix.json', 'LICENSE', 'src/bundle.mjs', 'src/program.mjs', 'src/index.mjs', 'src/provider.mjs', 'src/control.mjs', 'src/recovery.mjs', 'src/route-verifier.mjs', 'src/settings-ui.mjs', 'src/compatibility-service.mjs', 'src/typert.host.mjs', 'src/client.js'].includes(path)
+  const allowed = path => ['package.json', 'README.md', 'icon.png', 'cordis.patch.yml', 'support-matrix.json', 'LICENSE', 'src/bundle.mjs', 'src/program.mjs', 'src/index.mjs', 'src/provider.mjs', 'src/control.mjs', 'src/recovery.mjs', 'src/route-verifier.mjs', 'src/settings-ui.mjs', 'src/compatibility-service.mjs', 'src/typert.host.mjs', 'src/client.js'].includes(path)
     || ['locale/zh.json', 'locale/en.json', 'docs/plugin-detail.zh.md', 'docs/plugin-detail.en.md'].includes(path)
     || /^src\/core\/[a-z-]+\.mjs$/.test(path);
   const unexpected = metadata.files.filter(file => !allowed(file.path));
   if (unexpected.length) throw new Error('打包白名单失效：' + unexpected.map(file => file.path).join(', '));
-  for (const expected of ['package.json', 'README.md', 'cordis.patch.yml', 'support-matrix.json', 'LICENSE', 'src/bundle.mjs', 'src/program.mjs', 'src/index.mjs', 'src/provider.mjs', 'src/control.mjs', 'src/recovery.mjs', 'src/route-verifier.mjs', 'src/settings-ui.mjs', 'src/compatibility-service.mjs', 'src/typert.host.mjs', 'src/client.js', 'src/core/release-transaction.mjs', 'src/core/product-config.mjs', 'src/core/runtime-compat.mjs', 'src/core/compatibility-state.mjs', 'src/core/compatibility-contract.mjs', 'src/core/compatibility-cli.mjs', 'src/core/settings-contract.mjs']) {
+  for (const expected of ['package.json', 'README.md', manifest.icon, 'cordis.patch.yml', 'support-matrix.json', 'LICENSE', 'src/bundle.mjs', 'src/program.mjs', 'src/index.mjs', 'src/provider.mjs', 'src/control.mjs', 'src/recovery.mjs', 'src/route-verifier.mjs', 'src/settings-ui.mjs', 'src/compatibility-service.mjs', 'src/typert.host.mjs', 'src/client.js', 'src/core/release-transaction.mjs', 'src/core/product-config.mjs', 'src/core/runtime-compat.mjs', 'src/core/compatibility-state.mjs', 'src/core/compatibility-contract.mjs', 'src/core/compatibility-cli.mjs', 'src/core/settings-contract.mjs']) {
     if (!metadata.files.some(file => file.path === expected)) throw new Error('压缩包遗漏文件：' + expected);
   }
   for (const language of ['zh', 'en']) {

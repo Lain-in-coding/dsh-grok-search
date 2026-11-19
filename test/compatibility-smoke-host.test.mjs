@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import http from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import net from 'node:net';
@@ -35,11 +36,13 @@ const legacySnapshot = () => ({
 function temporary(t) {
   const parent = realpathSync(tmpdir()), prefix = 'dsh-compatibility-smoke-unit-';
   const root = mkdtempSync(join(parent, prefix));
-  t.after(() => {
+  t.after(ctx => {
     assert.equal(dirname(root), parent);
     assert.ok(basename(root).startsWith(prefix));
     assert.equal(lstatSync(root).isSymbolicLink(), false);
-    rmSync(root, { recursive: true });
+    if (ctx?.passed !== false && process.env.DSH_KEEP_TEST_FIXTURES !== '1') {
+      rmSync(root, { recursive: true });
+    }
   });
   return root;
 }

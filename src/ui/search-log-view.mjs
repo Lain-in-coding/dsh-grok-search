@@ -1142,6 +1142,11 @@ async function clearRemoteLog() {
     await remote.clearSearchLog({ sessionId: id });
     if (!disposed) toast('已清空当前插件的搜索记录', { tone: 'info' });
   } catch (error) {
+    logBaselined = false;
+    if (!disposed && (error?.code === 'SETTINGS_AUTH_REQUIRED' || error?.code === 'SETTINGS_SECURE_CONNECTION_REQUIRED')) {
+      restrict(error.code);
+      onPrivateAccessDenied?.(error);
+    }
     if (error?.code === 'SEARCH_LOG_VIEW_EXPIRED' && typeof remote.openSearchLog === 'function') sessionId = null;
     if (!disposed) toast('清空未确认，请稍后重试', { tone: 'info' });
   }

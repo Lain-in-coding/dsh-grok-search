@@ -6,6 +6,11 @@ import { NUM, normCard, normHub, validateHub, joinSentences } from './route-form
  * root/layer belong to this mount, never the host document's selector namespace.
  */
 export function createRouteController({ root, layer, remote, logos, sourceChain, memory = {}, logMemory = null, createSearchLogView, createQuotaView, dark = false }) {
+// Remount state belongs to one settings connection, not a different server or identity.
+if (memory.remote !== remote) {
+  for (const key of Object.keys(memory)) delete memory[key];
+  memory.remote = remote;
+}
 let disposed = false;
 let logView = null, quotaView = null;
 let controlRetrying = false;
@@ -422,7 +427,7 @@ async function reloadDialogDraft() {
     if (snapshot.config.error) throw Object.assign(new Error(snapshot.config.error.message), { code: snapshot.config.error.code });
     acceptSnapshot(snapshot, prefs);
     mine.base = clone(mine.kind === 'card' ? S.prov[mine.id] : S.hub);
-    if (mine.kind === 'card' && !isSet(mine.id, mine.base)) mine.base.enabled = true;
+    if (mine.kind === 'card' && mine.id !== 'github' && !isSet(mine.id, mine.base)) mine.base.enabled = true;
     mine.fields = clone(configFields());
     mine.configBaseline = clone(S.config);
     mine.draft = clone(mine.base);
@@ -438,7 +443,13 @@ async function reloadDialogDraft() {
     mine.saving = false;
     if (mine.kind === 'card') { renderCard(); void quotaView?.open(); } else renderHub();
   } catch (error) { if (D === mine) operationError(error, true); }
-  finally { S.busy = false; if (D === mine) mine.saving = false; }
+  finally {
+    S.busy = false;
+    if (!disposed && D === mine && mine.saving) {
+      mine.saving = false;
+      if (mine.kind === 'card') renderCard(); else renderHub();
+    }
+  }
 }
 // One retry for an unrelated external write. Never replace a newly edited
 // field with a stale whole-file snapshot; an undo deliberately never rebases.
@@ -489,6 +500,9 @@ async function saveConfig(build, baseline = null) {
 }
 async function savePreference(id, on) {
   const key = id === 'grok' ? 'grokEnabled' : 'githubReadEnabled';
+  const readEnabled = (prefs, targetId) => targetId === 'github'
+    ? prefs?.value?.githubReadEnabled === true : prefs?.value?.grokEnabled !== false;
+  const starting = S.prefs;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (disposed) return;
     try {
@@ -498,7 +512,8 @@ async function savePreference(id, on) {
         stateGeneration++;
         snapshotSignature = null;
         S.prefs = result;
-        S.prov[id].enabled = result.value[key] !== false;
+        if (S.prov?.grok) S.prov.grok.enabled = readEnabled(result, 'grok');
+        if (S.prov?.github) S.prov.github.enabled = readEnabled(result, 'github');
       }
       return result;
     } catch (error) {
@@ -508,6 +523,9 @@ async function savePreference(id, on) {
       stateGeneration++;
       snapshotSignature = null;
       S.prefs = current;
+      if (S.prov?.grok) S.prov.grok.enabled = readEnabled(current, 'grok');
+      if (S.prov?.github) S.prov.github.enabled = readEnabled(current, 'github');
+      if (readEnabled(current, id) !== readEnabled(starting, id)) throw error;
     }
   }
 }
@@ -566,7 +584,8 @@ async function restoreReceipt(receipt) {
   }
 }
 function normalizeCode(code) {
-  return String(code || 'UNKNOWN').replace(/^HTTP_/i, '').trim();
+  const raw = String(code || 'UNKNOWN').replace(/^HTTP_/i, '').trim();
+  return /^[\w./:-]{1,80}$/.test(raw) ? raw : 'UNKNOWN';
 }
 function ingestRoute(route, first = false) {
   if (!route || route.origin === 'test' || route.at <= S.lastRouteAt) return;
@@ -1373,7 +1392,9 @@ const NETWORK_ERRORS = {
   GITHUB_CURSOR_INVALID: ['续读', '续读位置已失效'], GITHUB_STATE_CHANGED: ['配置', '配置已变化，请重新读取'],
   GITHUB_DISABLED: ['停用', 'GitHub 读取已停用'], GITHUB_PERMISSION: ['权限', '读取工具被禁用或拒绝'],
   GITHUB_OUTPUT_LIMIT: ['上限', '输出空间不足'], GITHUB_CACHE_FULL: ['分段', '已到缓存边界，可续读'],
-  GITHUB_PAGINATION: ['分页', '分页异常，未完整读取'],
+  GITHUB_PAGINATION: ['分页', '分页异常，未完整读取'], GITHUB_URL_UNSUPPORTED: ['链接', '仅支持受支持的 GitHub 链接'],
+  GITHUB_REDIRECT: ['跳转', 'GitHub 资源已重定向，请使用当前资源的官方链接'], GITHUB_RESPONSE_INVALID: ['响应', 'GitHub 返回数据无效'],
+  GITHUB_FETCH_UNAVAILABLE: ['环境', '网页读取环境暂不可用'], GITHUB_SCOPE_REQUIRED: ['上下文', '读取调用上下文已失效'],
 };
 function failureInfo(code) {
   const value = normalizeCode(code).toUpperCase();
@@ -1496,7 +1517,7 @@ function renderBanner() {
       : unknownFallback() ? '来源未报告' : META[sv]?.name || '补充来源';
     const grokCode = codeOf('grok') || S.program?.error?.code;
     const rotates = sv && codeOf(sv).split('/').every((code) => TAVILY_ROTATE.has(code));
-    const part = sv && isPart(sv) ? `；${META[sv].name} 有 Key 返回 ${codeOf(sv)}${rotates ? '，可换用其他 Key' : '，各 Key 的验证结果单独保留'}` : '';
+    const part = sv && isPart(sv) ? `；${META[sv].name} 有 Key 返回 ${esc(codeOf(sv))}${rotates ? '，可换用其他 Key' : '，各 Key 的验证结果单独保留'}` : '';
     html = B('fallback', 'reroute', `Grok ${failureInfo(grokCode).status} · ${errText(grokCode)}，已静默回退到 ${observed}`,
       `搜索照常可用，${S.lastRoute?.provenance === 'source-label' ? '来源按返回结果确认' : '结果来自补充来源'}${part}。修好 Grok 后自动切回，不会回退官方搜索。`,
       btn('open:grok', '检查 Grok 配置') + btn('grok-off', '关闭 Grok'));
@@ -1524,9 +1545,9 @@ function renderBanner() {
     const auxKey = aux ? `${aux}:${codeOf(aux)}:${isBad(aux)}` : '';
     if (aux && S.auxDismissed !== auxKey) {
       const rotates = codeOf(aux).split('/').every((code) => TAVILY_ROTATE.has(code));
-      const title = isBad(aux) ? `${META[aux].name} 最近检查失败 · ${codeOf(aux)}` : `${META[aux].name} 部分 Key 返回 ${codeOf(aux)}${rotates ? '，其他 Key 可用' : ''}`;
+      const title = isBad(aux) ? `${META[aux].name} 最近检查失败 · ${esc(codeOf(aux))}` : `${META[aux].name} 部分 Key 返回 ${esc(codeOf(aux))}${rotates ? '，其他 Key 可用' : ''}`;
       html = B('soft', 'warn', title, `${errText(codeOf(aux))}。其余来源照常工作，搜索不受影响。`,
-        btn('open:' + aux, `检查 ${META[aux].name}`) + `<button type="button" class="icon-btn" data-act="dismiss-aux" data-k="${auxKey}" aria-label="关闭提示">${svg('x')}</button>`);
+        btn('open:' + aux, `检查 ${META[aux].name}`) + `<button type="button" class="icon-btn" data-act="dismiss-aux" data-k="${esc(auxKey)}" aria-label="关闭提示">${svg('x')}</button>`);
     } else if (!S.capabilities?.secretsAllowed) {
       html = B('info', 'lock', '当前连接仅显示脱敏配置', `${esc(S.capabilities?.reason || '请在已认证的本机直连或 HTTPS 连接下查看和保存 Key。')} 仍可在服务器端执行连通性测试。`);
     } else if (S.readBanner && !S.readDismissed) {
@@ -1925,7 +1946,7 @@ function resetClearConfirmation() {
   }
 }
 function lockDialog() {
-  $$('button, input', dlg).forEach((el) => { el.disabled = true; });
+  $$('button, input, select', dlg).forEach((el) => { el.disabled = true; });
 }
 function showOverlay() {
   hideStripTip();
@@ -2310,7 +2331,7 @@ function refreshDialog() {
   const fn = $('.foot-note', dlg);
   if (fn && !D.warned) {
     let base = D.kind === 'hub' ? '共享项写入配置，插件专属项只读' : '保存后写入共享配置，下次搜索生效';
-    if (D.kind === 'card' && D.id === 'grok' && dirty) {
+    if (D.kind === 'card' && (D.id === 'grok' || D.id === 'github') && dirty) {
       const a = normCard(D.draft), b = JSON.parse(D.orig);
       delete a.enabled; delete b.enabled;
       if (JSON.stringify(a) === JSON.stringify(b)) base = '启用开关只对 DSH 生效，不写入 config.toml';
@@ -2351,6 +2372,13 @@ dlg.addEventListener('input', (e) => {
   setDraft(t.dataset.k, t.value);
   if (D.id === 'github') {
     D.githubRevision = (D.githubRevision || 0) + 1;
+    if (D.githubOperation) {
+      const staleOp = D.githubOperation;
+      D.githubOperation = null;
+      void remote.cancelDiagnosis({ operationId: staleOp }).catch(() => {});
+      const testBtn = $('[data-a="test-github"]', dlg);
+      if (testBtn) { testBtn.disabled = dialogBusy(); testBtn.textContent = '测试连接'; }
+    }
     const outcome = $('.search-result', dlg);
     if (outcome) { outcome.hidden = true; outcome.textContent = ''; }
   }
@@ -2436,13 +2464,14 @@ async function testGithubDraft(button) {
     resultNode.dataset.tone = result.status === 'ok' ? 'ok' : 'err';
   } catch (error) {
     if (current()) {
+      if (denyPrivateAccess(error)) return;
       resultNode.dataset.tone = 'err';
       resultNode.textContent = `${error.code || '连接失败'} · ${error.message || '请稍后重试。'}`;
     }
   } finally {
-    if (D === mine) {
+    if (D === mine && mine.githubOperation === operationId) {
       mine.githubOperation = null;
-      button.disabled = false;
+      button.disabled = dialogBusy();
       button.textContent = '测试连接';
       if (!current()) { resultNode.hidden = true; resultNode.textContent = ''; }
     }
@@ -2653,6 +2682,7 @@ async function commitCard(draft = D.draft) {
   if (prefsChanged) {
     try { await savePreference(id, draft.enabled !== false); }
     catch (error) {
+      if (disposed || D !== mine) return;
       mine.saving = false;
       if (receipt) {
         mine.configBaseline = clone(S.config);
@@ -2669,6 +2699,7 @@ async function commitCard(draft = D.draft) {
       throw error;
     }
   }
+  if (disposed || D !== mine) return;
   const credentialsChanged = CRED[id].some(name => JSON.stringify(base[name]) !== JSON.stringify(draft[name]));
   if (credentialsChanged) reconcileChecks(id, previous, normCard(draft));
   mine.saving = false;
@@ -2677,7 +2708,7 @@ async function commitCard(draft = D.draft) {
   bump(rowOf(id));
   const changedMode = id === 'grok' && base.mode !== 'compat' && draft.mode === 'compat';
   toast(changedMode ? '已保存兼容网关 · 原 xAI Key 已删除并备份到配置历史'
-    : receipt ? `已保存 ${META[id].name} · 下次搜索生效，可点「测试搜索」验证`
+    : receipt ? `已保存 ${META[id].name} · 下次搜索生效，${id === 'github' ? '可在卡片内点「测试连接」验证' : '可点「测试连接」验证'}`
       : `已保存 ${META[id].name} 开关 · 仅对 DSH 生效`,
   { undo: cardUndo(receipt, id, base.enabled !== false, prefsChanged) });
 }
@@ -3139,6 +3170,12 @@ async function runTest() {
       const result = await request;
       if (!alive()) return;
       S.diagnosticOperation = null;
+      if (denyPrivateAccess(result)) {
+        cancelTest({ preserve: true });
+        syncAll(true);
+        toast(errText(result.code), { tone: 'warn' });
+        return;
+      }
       if (result.code === 'CONFIG_CONFLICT') {
         cancelTest();
         S.checked = {};
@@ -3241,7 +3278,8 @@ let pathOpening = false;
 function syncPathOpening() {
   $$('[data-open], [data-a="open-file"], [data-a="open-folder"], [data-act="open-file"]')
     .forEach(button => {
-      button.disabled = pathOpening || button.matches('[data-open="file"]') && !S.cfgExists;
+      button.disabled = pathOpening || dlg?.contains(button) && dialogBusy()
+        || button.matches('[data-open="file"], [data-a="open-file"]') && !S.cfgExists;
       if (pathOpening) button.setAttribute('aria-busy', 'true');
       else button.removeAttribute('aria-busy');
     });
@@ -3300,7 +3338,7 @@ function init() {
     T, jolts, faultPulses, syncBreak, travel, jolt, pulseFault, flashRow, flashNode, pumpWires, closePop,
     hideStripTip, toast, errText, rowOf, SVGNS, logMemory, onPrivateAccessDenied: denyPrivateAccess });
   quotaView = createQuotaView({ $, S, getDialog: () => D, dlg, active, DEF, SUPP, svg, EXT, esc, hidden,
-    reduced, dialogBusy, remote, uuid,
+    reduced, dialogBusy, remote, uuid, onPrivateAccessDenied: denyPrivateAccess,
     hideTip: () => { if (stripTipTarget?.matches('[data-quota-tip]')) hideStripTip(); } });
   listen(dlg, 'pointerover', event => {
     const tip = event.target.closest('[data-quota-tip]');

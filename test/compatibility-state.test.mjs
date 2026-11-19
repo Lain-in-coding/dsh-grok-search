@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import {
-  existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync,
+  renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -27,12 +28,14 @@ function fixture(t) {
   const root = realpathSync(tmpdir()), profileDir = mkdtempSync(join(root, 'dsh-compatibility-state-'));
   const path = join(profileDir, 'grok-search', 'compatibility-state.json');
   const stores = [];
-  t.after(() => {
+  t.after(ctx => {
     for (const store of stores) store.dispose();
     const target = resolve(profileDir);
     assert.equal(dirname(target), root);
     assert.ok(target.startsWith(root + sep) && target.includes('dsh-compatibility-state-'));
-    rmSync(target, { recursive: true, force: true });
+    if (ctx?.passed !== false && process.env.DSH_KEEP_TEST_FIXTURES !== '1') {
+      rmSync(target, { recursive: true, force: true });
+    }
   });
   const create = (options = {}) => {
     const store = createCompatibilityState({ profileDir, ...PAIR, ...options });

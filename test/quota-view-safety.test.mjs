@@ -16,10 +16,15 @@ function fixture(t, value, { id = 'tavily', key = 'synthetic-key', draftBase = n
     : { key, searchUrl: 'https://api.search.tinyfish.ai' };
   const dialog = { kind: 'card', id, base, draft: { ...base, ...(draftBase ? { url: draftBase } : {}) },
     configBaseline: { revision: 'revision', quotaRevision: 'quota' } };
-  const result = method => async request => { calls.push({ method, request }); return { value }; };
+  const S = { configRevision: 'revision', config: { quotaRevision: 'quota' }, capabilities: { secretsAllowed: true } };
+  const denials = [];
+  const result = method => async request => {
+    calls.push({ method, request });
+    return { value: typeof value === 'function' ? await value(request) : value };
+  };
   const view = createQuotaView({
     $: selector => selector === '#quotaSlot' ? slot : null, active: () => null,
-    S: { configRevision: 'revision', config: { quotaRevision: 'quota' }, capabilities: { secretsAllowed: true } },
+    S, onPrivateAccessDenied(error) { denials.push(error.code); S.capabilities.secretsAllowed = false; view.render(); },
     getDialog: () => dialog, dlg: {}, SUPP: ['tavily', 'exa', 'tinyfish', 'firecrawl'],
     DEF: { tavilyUrl: 'https://api.tavily.com', tfSearch: 'https://api.search.tinyfish.ai' },
     svg: () => '', EXT: value => value, esc: escape, reduced: () => true, dialogBusy: () => false,
@@ -27,7 +32,7 @@ function fixture(t, value, { id = 'tavily', key = 'synthetic-key', draftBase = n
       cancelDiagnosis: async () => {} },
   });
   t.after(() => view.dispose());
-  return { view, slot, calls };
+  return { view, slot, calls, dialog, S, denials };
 }
 
 test('malformed quota values never become HTML attributes or a misleading numeric zero', async t => {
@@ -68,4 +73,65 @@ test('default hidden predicate never forwards a masked saved key when a draft ch
   assert.equal(h.calls[0].method, 'draft');
   assert.deepEqual(h.calls[0].request.draft, { baseUrl: 'https://custom.example.test' });
   assert.equal(JSON.stringify(h.calls).includes(key), false);
+});
+
+for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED']) {
+  test(`quota RPC ${code} revokes private data across cached keys until a fresh read`, async t => {
+    let errorCode = null, balance = 142.75;
+    const h = fixture(t, () => {
+      if (errorCode) throw Object.assign(new Error('restricted'), { code: errorCode });
+      return { kind: 'wallet', balance };
+    });
+    h.dialog.base.keys.push('synthetic-second');
+    await h.view.open();
+    balance = 298.5;
+    await h.view.key(1);
+    assert.match(h.slot.innerHTML, /298\.5/);
+    errorCode = code;
+    await h.view.refresh();
+    assert.deepEqual(h.denials, [code]);
+    assert.match(h.slot.innerHTML, /data-state="restricted"/);
+    assert.doesNotMatch(h.slot.innerHTML, /298\.5/);
+
+    h.S.capabilities.secretsAllowed = true;
+    h.view.render();
+    assert.match(h.slot.innerHTML, /data-state="unreported"/);
+    errorCode = null; balance = 21;
+    const read = h.view.key(0);
+    assert.doesNotMatch(h.slot.innerHTML, /142\.75/);
+    await read;
+    assert.match(h.slot.innerHTML, /class="qp-value">21</);
+    assert.equal(h.calls.length, 4);
+  });
+}
+
+test('a restricted snapshot clears quota and a late reply cannot restore it after reauthorization', async t => {
+  let finish;
+  const h = fixture(t, () => h.calls.length === 1 ? { kind: 'wallet', balance: 71.25 }
+    : new Promise(resolve => { finish = resolve; }), { id: 'tinyfish' });
+  await h.view.open();
+  const reading = h.view.refresh();
+  h.S.capabilities.secretsAllowed = false;
+  h.view.render();
+  assert.match(h.slot.innerHTML, /data-state="restricted"/);
+  assert.doesNotMatch(h.slot.innerHTML, /71\.25/);
+  h.S.capabilities.secretsAllowed = true;
+  h.view.render();
+  finish({ kind: 'wallet', balance: 82.5 });
+  await reading;
+  assert.match(h.slot.innerHTML, /data-state="unreported"/);
+  assert.doesNotMatch(h.slot.innerHTML, /71\.25|82\.5/);
+});
+
+test('an upstream quota failure retains the last balance with a stale label', async t => {
+  const h = fixture(t, () => {
+    if (h.calls.length === 1) return { kind: 'wallet', balance: 18.5 };
+    throw Object.assign(new Error('rate limited'), { code: 'QUOTA_QUERY_FAILED',
+      details: { category: 'RATE_LIMIT', httpStatus: 429 } });
+  }, { id: 'tinyfish' });
+  await h.view.open();
+  await h.view.refresh();
+  assert.match(h.slot.innerHTML, /class="qp-value">18\.5</);
+  assert.match(h.slot.innerHTML, /刷新失败 · 上次结果 · HTTP 429/);
+  assert.deepEqual(h.denials, []);
 });

@@ -129,5 +129,5 @@ export async function apply(ctx) {
   // Missing host peers belong to the optional-module boundary, never a fake Service.
   const { Service } = await import('@deepseek-ai/cordis');
   const { RemoteError } = await import('@deepseek-ai/dsh-typert-protocol');
-  ctx.plugin(createCompatibilityGateway({ Service, RemoteError }));
+  await ctx.plugin(createCompatibilityGateway({ Service, RemoteError }));
 }

@@ -82,9 +82,16 @@ function describe(report) {
 }
 
 /** Shows only backend-confirmed compatibility states; transport errors stay invisible. */
-export function createCompatibilityView({ root, remote = null, parseReport, timers = globalThis,
+export function createCompatibilityView({ root, remote = null, parseReport, memory = null, timers = globalThis,
   reportTimeoutMs = 4000, recheckTimeoutMs = 20000, refreshIntervalMs = 5000 }) {
-  let disposed = false, generation = 0, pending = null, report = null, detailsOpen = false;
+  function bindCachedReport() {
+    if (!memory || typeof memory !== 'object') return null;
+    if (remote && memory.remote === remote) return memory.report ?? null;
+    memory.remote = remote;
+    memory.report = null;
+    return null;
+  }
+  let disposed = false, generation = 0, pending = null, report = bindCachedReport(), detailsOpen = false;
   let refreshTimer = null;
   const flights = new Set();
   const document = root.ownerDocument;
@@ -119,7 +126,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
     detailsButton.setAttribute('aria-expanded', String(detailsOpen));
     detailsButton.textContent = detailsOpen ? '收起详情' : '查看原因';
     recheckButton.hidden = typeof remote?.recheckCompatibility !== 'function';
-    recheckButton.disabled = Boolean(pending);
+    recheckButton.disabled = pending?.method === 'recheckCompatibility';
     recheckButton.setAttribute('aria-busy', String(pending?.method === 'recheckCompatibility'));
     recheckButton.textContent = pending?.method === 'recheckCompatibility' ? '正在检查…' : '重新检查';
   }
@@ -137,10 +144,12 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
     }, refreshIntervalMs);
   }
   function request(method, timeoutMs) {
-    if (disposed || !remote || pending) return pending?.task ?? Promise.resolve();
+    if (disposed || !remote) return Promise.resolve();
+    if (pending && (method !== 'recheckCompatibility' || pending.method === method)) return pending.task;
     if ([...flights].filter(item => item.generation === generation && item.method === method).length >= 2) {
       return Promise.resolve();
     }
+    timers.clearTimeout(pending?.timer);
     const mine = { method, generation, remote, timer: null, task: null };
     timers.clearTimeout(refreshTimer);
     refreshTimer = null;
@@ -162,6 +171,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
       const parsed = parseReport(value);
       if (JSON.stringify(describe(parsed)) !== JSON.stringify(describe(report))) detailsOpen = false;
       report = parsed;
+      if (memory?.remote === mine.remote) memory.report = parsed;
     }).catch(() => {
       // RPC failure is not evidence that the host or plugin is incompatible.
     }).finally(() => {
@@ -204,7 +214,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, time
       refreshTimer = null;
       pending = null;
       remote = next;
-      report = null;
+      report = bindCachedReport();
       detailsOpen = false;
       render();
       void refresh();

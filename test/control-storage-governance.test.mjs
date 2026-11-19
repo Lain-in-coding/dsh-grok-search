@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -13,7 +14,7 @@ import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
 
 const intent = reason => ({ schemaVersion: 1, policy: 'required', reason, release: null });
 const setup = (options = {}) => {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-control-governance-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-cg-'));
   return { root, directory: join(root, 'records'), ...options };
 };
 const writeRevisions = (store, count, start = 1) => {
@@ -110,11 +111,11 @@ test('a damaged checkpoint fails closed instead of silently reading old root rev
 });
 
 test('compatible downgrade export retains origin, current state and an explicit revision conversion receipt', () => {
-  const { directory } = setup();
+  const { root, directory } = setup();
   const store = createControlIntentStore({ directory, governance: true });
   writeRevisions(store, 53);
   const before = readFileSync(join(directory, 'checkpoint.json'));
-  const target = join(realpathSync(tmpdir()), `dsh-control-export-${randomUUID()}`);
+  const target = join(root, `dsh-control-export-${randomUUID()}`);
   const exported = store.exportCompatibleHistory({ targetDirectory: target });
   assert.equal(exported.revisions, 52);
   assert.equal(exported.firstRevision, 1);

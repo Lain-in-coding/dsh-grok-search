@@ -22,8 +22,9 @@ const failed = (category = 'UNREPORTED', details = {}) => new GrokSearchError('Q
   { category, ...details });
 
 /** A transient overlay: validates like Save, but never writes a config/history file. */
-export function quotaDraftConfiguration({ provider, keyIndex = 0, effective, draft }) {
-  if (!Object.hasOwn(sourceSpec, provider) || provider === 'github') throw failed('CONFIG');
+export function quotaDraftConfiguration({ provider, keyIndex = 0, effective = {}, draft }) {
+  if (!Object.hasOwn(sourceSpec, provider) || provider === 'github'
+    || !effective || typeof effective !== 'object' || Array.isArray(effective)) throw failed('CONFIG');
   if (draft === undefined) return { config: effective, keyIndex };
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)
     || Object.keys(draft).some(key => !['baseUrl', 'apiKey'].includes(key))) throw failed('CONFIG');
@@ -50,7 +51,7 @@ export function quotaDraftConfiguration({ provider, keyIndex = 0, effective, dra
 export async function queryAccountQuota({ provider, keyIndex = 0, config, signal, fetchImpl = globalThis.fetch }) {
   if (!['tavily', 'exa', 'firecrawl', 'tinyfish'].includes(provider)) throw failed('CONFIG');
   if (provider === 'exa') return { value: null, supported: false };
-  const fields = config?.fields ?? config ?? {};
+  const fields = config?.effective ?? config?.fields ?? config ?? {};
   const get = key => fields[key] && typeof fields[key] === 'object' ? fields[key].value : fields[key];
   const spec = sourceSpec[provider];
   const rawKey = String(get(spec.key) ?? '');

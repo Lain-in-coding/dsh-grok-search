@@ -7,6 +7,44 @@ import { createToolBudgetController, checkToolBudgetContracts } from '../src/cor
 const BUDGET_MS = 90_000;
 const AUTHOR_CONFIG = { search: true, searchTimeoutMs: 60_000, fetchTimeoutMs: 23_000, fetch: false };
 
+test('budget admission skips unrelated and disabled fibers before evaluating configuration', async t => {
+  for (const kind of ['other-runtime', 'other-module', 'disabled', 'removed', 'missing-uid']) await t.test(kind, async () => {
+    const hooks = new Map();
+    const runtime = { name: kind === 'other-runtime' ? 'other' : 'tool-web', fibers: new Set() };
+    const fiber = { uid: kind === 'removed' ? null : kind === 'missing-uid' ? undefined : 1,
+      runtime, entry: { options: { name: kind === 'other-module' ? 'other' : '@deepseek-ai/dsh-tool-web',
+        disabled: kind === 'disabled' } },
+      get effectiveConfig() { assert.fail('non-target configuration was evaluated'); } };
+    runtime.fibers.add(fiber);
+    const ctx = { registry: new Map([['runtime', runtime]]), on: (name, callback) => hooks.set(name, callback) };
+    assert.deepEqual(checkToolBudgetContracts(ctx, BUDGET_MS), { checked: 0 });
+    const controller = createToolBudgetController({ ctx, budgetMs: BUDGET_MS, required: () => true });
+    try { await controller.acquire(); assert.equal(controller.snapshot().owned, 0); }
+    finally { await controller.release(); }
+  });
+});
+
+test('search-disabled budget checks and hooks read only the enable flag', async t => {
+  for (const modern of [false, true]) for (const wrapped of [false, true]) await t.test(`${modern}/${wrapped}`, async () => {
+    const hooks = new Map();
+    const config = { search: wrapped ? { get: () => false } : false,
+      get fetchTimeoutMs() { assert.fail('disabled search read an unrelated getter'); } };
+    const runtime = { name: 'tool-web', fibers: new Set() };
+    const fiber = { uid: 1, runtime, state: 2, config,
+      entry: { options: { name: '@deepseek-ai/dsh-tool-web', config } } };
+    if (modern) { fiber.effectiveConfig = config; fiber.resolveConfig = () => {}; }
+    runtime.fibers.add(fiber);
+    const ctx = { registry: new Map([['tool-web', runtime]]), on: (name, callback) => hooks.set(name, callback) };
+    assert.deepEqual(checkToolBudgetContracts(ctx, BUDGET_MS), { checked: 0 });
+    const controller = createToolBudgetController({ ctx, budgetMs: BUDGET_MS, required: () => true });
+    try {
+      assert.equal(hooks.get('internal/config').call(fiber, modern ? fiber : config, () => config), config);
+      await controller.acquire();
+      assert.equal(controller.snapshot().owned, 0);
+    } finally { await controller.release(); }
+  });
+});
+
 test('budget contract candidates validate without publishing a lease or enabling a disabled tool', () => {
   const runtime = { name: 'tool-web', fibers: new Set(),
     Config: { '~standard': { version: 1, validate: value => ({ value: { ...value } }) } } };
@@ -139,6 +177,20 @@ function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, sett
 
 for (const modern of [false, true]) {
   const label = modern ? 'modern raw/effective config' : 'legacy resolved config';
+
+  test(`${label}: settlement and release skip getters after search is disabled`, async () => {
+    const disabled = { search: { get: () => false },
+      get searchTimeoutMs() { assert.fail('disabled search read its old lease'); } };
+    for (const duringUpdate of [true, false]) {
+      const setDisabled = fiber => { fiber[modern ? 'effectiveConfig' : 'config'] = disabled; };
+      const h = fixture({ modern, afterUpdate: ({ fiber }) => { if (duringUpdate) setDisabled(fiber); } });
+      await h.controller.acquire();
+      if (!duringUpdate) setDisabled(h.fiber);
+      await h.controller.release();
+      assert.equal(h.calls.length, 1);
+      assert.equal(h.controller.snapshot().owned, 0);
+    }
+  });
 
   test(`${label}: early hooks leave budgets unchanged until admitted and release is never gated`, async () => {
     let admitted = false;
@@ -350,3 +402,41 @@ for (const modern of [false, true]) {
     assert.equal(h.controller.snapshot().owned, 0);
   });
 }
+
+test('modern reactive getter-wrapped fiber.config clones and acquires budget lease without DataCloneError', async () => {
+  const rawWrapped = Object.fromEntries(Object.entries(AUTHOR_CONFIG).map(([k, v]) => [k, { get: () => v }]));
+  let current = { ...AUTHOR_CONFIG };
+  const runtime = {
+    name: 'tool-web',
+    fibers: new Set(),
+    Config: { '~standard': { version: 1, validate: value => ({ value: { ...value } }) } },
+  };
+  const hooks = new Map();
+  const ctx = {
+    registry: new Map([['tool-web', runtime]]),
+    on(event, fn) { hooks.set(event, fn); },
+  };
+  const fiber = {
+    uid: 1,
+    state: 2,
+    runtime,
+    config: rawWrapped,
+    resolveConfig: () => {},
+    get effectiveConfig() { return current; },
+    async update(candidate) {
+      current = hooks.get('internal/config').call(fiber, fiber, () => ({ ...plainFrom(candidate) }));
+    },
+    async await() {},
+    entry: { options: { name: '@deepseek-ai/dsh-tool-web', config: rawWrapped } },
+  };
+  function plainFrom(obj) {
+    return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, typeof v?.get === 'function' ? v.get() : v]));
+  }
+  runtime.fibers.add(fiber);
+  const controller = createToolBudgetController({ ctx, budgetMs: BUDGET_MS, required: () => true });
+  await controller.acquire();
+  assert.equal(current.searchTimeoutMs, BUDGET_MS);
+  assert.equal(controller.snapshot().owned, 1);
+  await controller.release();
+  assert.equal(controller.snapshot().owned, 0);
+});

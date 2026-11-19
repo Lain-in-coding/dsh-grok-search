@@ -283,9 +283,9 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     return { provider: source.id, ...summary, keyCount: keys.length, elapsedMs, keys };
   };
 
-  const diagnoseGithub = async (signal, configuration) => {
+  const diagnoseGithub = async (signal, configuration, remainingMs = () => Infinity) => {
     const { config, prefs } = current(configuration);
-    if (prefs.githubEnabled === false) {
+    if (prefs.githubEnabled === false || prefs.githubReadEnabled === false) {
       return { provider: 'github', status: 'disabled', code: 'DISABLED', message: '已停用，测试时跳过。', keyCount: 0, elapsedMs: 0, keys: [] };
     }
     const token = text(config.github_token);
@@ -294,7 +294,8 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
         message: '尚未配置 GitHub Token，测试时跳过。', keyCount: 0, elapsedMs: 0, keys: [] };
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(sourceFailure('SOURCE_TIMEOUT', 'GitHub 请求超时。')), GITHUB_METADATA_TIMEOUT_MS);
+    const timeoutMs = Math.min(GITHUB_METADATA_TIMEOUT_MS, Math.max(1, remainingMs()));
+    const timer = setTimeout(() => controller.abort(sourceFailure('SOURCE_TIMEOUT', 'GitHub 请求超时。')), timeoutMs);
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     const started = performance.now();
     const elapsed = () => Math.round(performance.now() - started);
@@ -343,8 +344,9 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
           code: cancelled ? 'CANCELLED' : 'TIMEOUT' });
         throw error;
       }
+      if (last.status === 'ok') return { ...last, keyIndex, operation: offset ? 'retry' : 'search' };
       onCall?.({ provider: source.id, keyIndex, operation: offset ? 'retry' : 'search',
-        result: last.status === 'ok' ? 'ok' : 'failed', code: last.code, charge: last.charge });
+        result: 'failed', code: last.code, charge: last.charge });
       if (last.status === 'failed' && last.keyScoped && offset + 1 < count) continue;
       return last;
     }
@@ -373,8 +375,20 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
       return results;
     },
     async diagnoseProvider(provider, { signal, configuration, schedule } = {}) {
-      if (provider === 'github') return schedule
-        ? schedule(activeSignal => diagnoseGithub(activeSignal, configuration), signal) : diagnoseGithub(signal, configuration);
+      if (provider === 'github') {
+        const { config, prefs } = current(configuration);
+        if (prefs.githubEnabled === false || prefs.githubReadEnabled === false || !text(config.github_token) || !schedule) {
+          return diagnoseGithub(signal, configuration);
+        }
+        const started = performance.now();
+        try {
+          return await schedule((activeSignal, remainingMs) => diagnoseGithub(activeSignal, configuration, remainingMs), signal);
+        } catch (error) {
+          if (signal?.aborted || !['GROK_TIMEOUT', 'GROK_QUEUE_TIMEOUT'].includes(error?.code)) throw error;
+          return { provider: 'github', status: 'failed', code: error.code, message: error.message,
+            keyCount: 1, elapsedMs: Math.round(performance.now() - started), keys: [] };
+        }
+      }
       const { sources, config } = current(configuration);
       const source = sources.find(item => item.id === provider);
       if (!source) throw new GrokSearchError('SOURCE_UNKNOWN', '未知补充来源。');
@@ -399,7 +413,8 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
         throw new GrokSearchError('SOURCE_NOT_CONFIGURED', '没有已开启且填写了 API Key 的补充来源。');
       }
       const fallbackSources = Number.isSafeInteger(config.fallback_sources) && config.fallback_sources > 0 ? config.fallback_sources : 5;
-      const limit = Math.max(1, Math.min(Number.isSafeInteger(maxResults) && maxResults > 0 ? maxResults : 5, fallbackSources));
+      const requestedResults = Number.isSafeInteger(maxResults) && maxResults >= 0 ? Math.min(maxResults, fallbackSources) : Math.min(5, fallbackSources);
+      const limit = Math.max(1, requestedResults);
       const deadline = performance.now() + Math.min(requestTimeout(config), remainingMs ? remainingMs() : Infinity);
       const failures = [];
       for (const [index, source] of available.entries()) {
@@ -413,12 +428,16 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
         const outcome = await searchSource(source, query, limit, { signal, deadline: sourceDeadline, onCall, onProgress });
         if (outcome.status === 'ok') {
           const maxChars = config.response_max_chars === undefined ? 45_000 : Math.min(500_000, config.response_max_chars);
-          const mapped = mapSearchResult({ content: '', sources: outcome.sources }, { maxResults: limit, maxChars });
-          if (mapped.sources.length === 0) {
+          const mapped = mapSearchResult({ content: '', sources: outcome.sources }, { maxResults: requestedResults, maxChars });
+          if (requestedResults > 0 && outcome.sources.length > 0 && mapped.sources.length === 0) {
+            onCall?.({ provider: source.id, keyIndex: outcome.keyIndex ?? 0, operation: outcome.operation ?? 'search',
+              result: 'failed', code: 'OUTPUT_LIMIT', charge: outcome.charge });
             failures.push({ provider: source.id, code: 'OUTPUT_LIMIT',
               message: '回复字符上限无法容纳搜索链接，请调大上限。' });
             continue;
           }
+          onCall?.({ provider: source.id, keyIndex: outcome.keyIndex ?? 0, operation: outcome.operation ?? 'search',
+            result: 'ok', code: outcome.code, charge: outcome.charge });
           Object.defineProperties(mapped, {
             search_provider: { value: source.id }, fallback_used: { value: true }, fallback_reason: { value: reason },
             diagnostic: { value: { provider: source.id, failures } },

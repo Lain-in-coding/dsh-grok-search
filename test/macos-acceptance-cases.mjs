@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { dirname, join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -1037,4 +1038,41 @@ test('frozen explicit test entry includes the complete macOS acceptance cases', 
   const entry = readFileSync(join(root, 'test/compatibility-evidence.test.mjs'), 'utf8');
   assert.ok(entry.includes("import './macos-acceptance-cases.mjs';"), 'Existing explicit suite must import all macOS cases.');
   assert.equal(existsSync(join(root, 'test/macos-acceptance.test.mjs')), false);
+});
+
+test('macOS delivery includes every local reusable workflow and the shared tooling test closure', async () => {
+  const workflows = new Set(ACCEPTANCE_WORKFLOW_FILES);
+  for (const file of workflows) {
+    const text = readFileSync(join(root, file), 'utf8');
+    for (const match of text.matchAll(/uses:\s*\.\/(\.github\/workflows\/[^\s]+\.yml)/g)) {
+      assert.ok(workflows.has(match[1]), 'Unselected reusable workflow: ' + match[1]);
+    }
+  }
+  for (const path of ['test/remaining-scripts-audit-cases.mjs', 'test/delivery-tooling-cases.mjs']) {
+    assert.ok(PUBLIC_MACOS_SUPPORT_FILES.includes(path), 'Unselected acceptance test: ' + path);
+  }
+  const selected = new Set([...ACCEPTANCE_TOOL_FILES, ...PUBLIC_MACOS_SUPPORT_FILES]);
+  for (const file of ['b2-control-desktop.mjs', 'b2-product-install.mjs', 'verify-search-log-host.mjs',
+    'verify-acceptance-sources.mjs', 'verify-native-update.mjs', 'verify-rc5-user-path.mjs',
+    'compare-settings-desktop-performance.mjs', 'b2-plugin-manager-desktop.mjs']) {
+    assert.ok(selected.has('scripts/' + file), 'Unselected tooling source fixture: ' + file);
+  }
+  const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  assert.match(manifest.scripts['test:all'], /npm run test:acceptance/);
+  assert.ok(manifest.scripts['test:acceptance'].includes('test/deferred-desktop.test.mjs'));
+  assert.ok(readFileSync(join(root, 'test/remaining-scripts-audit-cases.mjs'), 'utf8').includes("import './delivery-tooling-cases.mjs'"));
+  const result = await build({ absWorkingDir: root, entryPoints: ['test/remaining-scripts-audit-cases.mjs'],
+    outdir: 'unused-delivery-test-closure', bundle: true, platform: 'node', format: 'esm', packages: 'external',
+    treeShaking: false, metafile: true, write: false, logLevel: 'silent' });
+  for (const path of Object.keys(result.metafile.inputs).map(value => value.replaceAll('\\', '/'))) {
+    assert.ok(selected.has(path) || packagedSource(path), 'Unselected tooling dependency: ' + path);
+  }
+  const source = temporary();
+  for (const path of [...ACCEPTANCE_TOOL_FILES, ...ACCEPTANCE_WORKFLOW_FILES, 'package-lock.json', '.npmrc']) {
+    mkdirSync(dirname(join(source, path)), { recursive: true }); writeFileSync(join(source, path), 'fixture');
+  }
+  const before = await acceptanceVerifierIdentity(product, source);
+  writeFileSync(join(source, '.github/workflows/macos-beta-gate.yml'), 'changed fixture');
+  assert.notEqual((await acceptanceVerifierIdentity(product, source)).sha256, before.sha256);
+  assert.equal(existsSync(join(root, 'unused-delivery-test-closure')), false);
 });

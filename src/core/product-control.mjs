@@ -171,10 +171,11 @@ export async function checkRuntimeContracts(ctx, { assertCurrent = () => {}, sel
 export function readSelection(ctx) {
   const path = join(ctx.profileContext.dir, 'package.json');
   const text = readFileSync(path, 'utf8');
-  const manifest = JSON.parse(text);
-  const bundles = manifest.dsh?.profile?.bundles;
+  let manifest;
+  try { manifest = JSON.parse(text); } catch { throw new ControlRecordError('CONTROL_SELECTION_INVALID'); }
+  const bundles = manifest?.dsh?.profile?.bundles;
   if (!Array.isArray(bundles) || bundles.some(name => typeof name !== 'string' || name.length === 0)) {
-    throw new Error('CONTROL_SELECTION_INVALID');
+    throw new ControlRecordError('CONTROL_SELECTION_INVALID');
   }
   return { path, bundles, sha256: createHash('sha256').update(text).digest('hex') };
 }

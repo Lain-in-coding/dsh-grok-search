@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync, realpathSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, realpathSync, readFileSync, unlinkSync } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { Worker } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

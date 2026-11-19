@@ -3,9 +3,10 @@ import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
-  readdirSync, realpathSync, statSync, symlinkSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync,
+  symlinkSync, writeFileSync,
 } from 'node:fs';
+import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -31,7 +32,7 @@ const envelope = (overrides = {}) => ({
 });
 
 function fixture(t) {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-control-intent-test-'));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-ci-'));
   t.diagnostic(`Retained fixture: ${root}`);
   return { root, directory: join(root, 'control') };
 }

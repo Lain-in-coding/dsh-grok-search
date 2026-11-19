@@ -2658,10 +2658,10 @@ async function linuxWorker(options) {
         check('linux-settings-no-owner-denied', [401, 403].includes(unauthenticated.status));
         check('linux-settings-dialog-open', await click('.row[data-id=grok] .row-main'));
         await waitForRenderer(renderer, current => current.evaluate(`Boolean(${q('input[data-k=model]')})`));
-        check('linux-settings-key-hidden-in-input', await renderer.evaluate(`${q('input[data-k=key')}?.value === ''`));
+        check('linux-settings-key-hidden-in-input', await renderer.evaluate(`${q('input[data-k=key]')}?.value === ''`));
         check('linux-settings-eye-click', await click('[data-a=eye][data-k=key]'));
-        await waitForRenderer(renderer, current => current.evaluate(`${q('input[data-k=key')}?.type === 'text'
-          && ${q('input[data-k=key')}?.value === ${JSON.stringify(GROK_TEST_API_KEY)}`));
+        await waitForRenderer(renderer, current => current.evaluate(`${q('input[data-k=key]')}?.type === 'text'
+          && ${q('input[data-k=key]')}?.value === ${JSON.stringify(GROK_TEST_API_KEY)}`));
         check('linux-settings-reveal-pristine', await renderer.evaluate(`${q('[data-a=save]')}?.disabled === true`));
         check('linux-settings-fill-model', await renderer.evaluate(`(() => {
           const input=${q('input[data-k=model]')}; if (!input) return false;

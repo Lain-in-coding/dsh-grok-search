@@ -56,10 +56,17 @@ export function decodeGrokResult(result) {
 
 // 以序列化结果计预算，避免转义字符使实际结果超过上限。
 function shorten(value, accepts) {
+  const isPairSplit = index => index > 0 && index < value.length
+    && /[\uD800-\uDBFF]/.test(value[index - 1]) && /[\uDC00-\uDFFF]/.test(value[index]);
   let low = 0, high = value.length;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
-    if (accepts(value.slice(0, middle))) low = middle; else high = middle - 1;
+    const probe = isPairSplit(middle) ? middle + 1 : middle;
+    if (accepts(value.slice(0, probe))) low = probe;
+    else {
+      high = middle - 1;
+      if (isPairSplit(high)) high--;
+    }
   }
   if (low > 0 && /[\uD800-\uDBFF]/.test(value[low - 1])) low--;
   return value.slice(0, low);

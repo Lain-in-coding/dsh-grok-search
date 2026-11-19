@@ -57,19 +57,24 @@ async function pageTarget(port, timeoutMs) {
 export async function connectRenderer(port, { timeoutMs = 20_000, requestTimeoutMs = 15_000 } = {}) {
   const target = await pageTarget(port, timeoutMs);
   const socket = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Renderer CDP WebSocket timed out.')), timeoutMs);
-    socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-    socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Renderer CDP WebSocket failed.')); }, { once: true });
-  }).catch(error => {
-    socket.close();
-    throw error;
-  });
   let serial = 0;
   const pending = new Map();
+  let disconnected = null, rejectOpen, openTimer;
+  const disconnect = error => {
+    if (disconnected) return;
+    disconnected = error;
+    clearTimeout(openTimer);
+    rejectOpen?.(error);
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+    try { socket.close(); } catch { /* Preserve the original disconnect reason. */ }
+  };
+  socket.addEventListener('close', () => disconnect(new Error('Renderer CDP WebSocket closed.')), { once: true });
+  socket.addEventListener('error', () => disconnect(new Error('Renderer CDP WebSocket failed.')), { once: true });
   const consoleEntries = [];
   const exceptions = [];
   socket.addEventListener('message', event => {
+    if (disconnected) return;
     const message = JSON.parse(String(event.data));
     if (message.method === 'Runtime.exceptionThrown') {
       const detail = message.params.exceptionDetails;
@@ -89,7 +94,14 @@ export async function connectRenderer(port, { timeoutMs = 20_000, requestTimeout
     if (message.error) waiter.reject(new Error(message.error.message));
     else waiter.resolve(message.result);
   });
+  await new Promise((resolve, reject) => {
+    rejectOpen = reject;
+    openTimer = setTimeout(() => disconnect(new Error('Renderer CDP WebSocket timed out.')), timeoutMs);
+    socket.addEventListener('open', resolve, { once: true });
+  }).finally(() => { clearTimeout(openTimer); rejectOpen = null; });
   const send = (method, params = {}) => new Promise((resolve, reject) => {
+    if (!disconnected && socket.readyState !== 1) disconnect(new Error('Renderer CDP WebSocket closed.'));
+    if (disconnected) { reject(disconnected); return; }
     const id = ++serial;
     const timer = setTimeout(() => {
       if (!pending.delete(id)) return;
@@ -100,10 +112,11 @@ export async function connectRenderer(port, { timeoutMs = 20_000, requestTimeout
       resolve(value) { clearTimeout(timer); resolve(value); },
       reject(error) { clearTimeout(timer); reject(error); },
     });
-    socket.send(JSON.stringify({ id, method, params }));
+    try { socket.send(JSON.stringify({ id, method, params })); }
+    catch (error) { disconnect(error); }
   });
   try { await send('Runtime.enable'); }
-  catch (error) { socket.close(); throw error; }
+  catch (error) { disconnect(error); throw error; }
   const evaluate = async expression => {
     const result = await send('Runtime.evaluate', {
       expression,
@@ -123,7 +136,7 @@ export async function connectRenderer(port, { timeoutMs = 20_000, requestTimeout
     evaluate,
     consoleEntries,
     exceptions,
-    close() { socket.close(); },
+    close() { disconnect(new Error('Renderer CDP WebSocket closed.')); },
   });
 }
 

@@ -124,7 +124,8 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
   if (!VERIFIED_GROK_VERSIONS.includes(version)) throw new GrokSearchError('GROK_VERSION_UNVERIFIED', `Grok ${version} 尚未通过当前插件的兼容验证。`);
   const programBytes = readFileSync(actual);
   const after = statSync(actual);
-  if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs || stat.ctimeMs !== after.ctimeMs) {
+  if (stat.dev !== after.dev || stat.ino !== after.ino || stat.size !== after.size
+    || stat.mtimeMs !== after.mtimeMs || stat.ctimeMs !== after.ctimeMs) {
     throw new GrokSearchError('GROK_PROGRAM_CHANGED', 'Grok 程序在验证期间发生变化，请重试。');
   }
   return { path: actual, version, sha256: createHash('sha256').update(programBytes).digest('hex') };

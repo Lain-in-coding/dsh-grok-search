@@ -1,0 +1,58 @@
+name: Private Grok Backend Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/grok-responses-backend]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2025
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: linux-x64
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_HOME: ${{ github.workspace }}/artifacts/grok-backend-cargo
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24"
+      - name: Verify native macOS arm64 runner
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: test "$(uname -m)" = arm64
+      - name: Install the manifest-pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -LiteralPath backend/manifest.json -Raw | ConvertFrom-Json
+          rustup toolchain install $manifest.rustToolchain --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust toolchain installation failed.' }
+      - name: Check archive and pin contracts
+        run: node --test scripts/build-grok-backend.test.mjs
+      - name: Build and test the pinned patched backend
+        run: node scripts/build-grok-backend.mjs --platform ${{ matrix.platform }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: grok-backend-${{ matrix.platform }}
+          path: |
+            artifacts/grok-backend-dist/*.tar.gz
+            artifacts/grok-backend-dist/*.tar.gz.sha256
+            artifacts/grok-backend-dist/*.tar.gz.build.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

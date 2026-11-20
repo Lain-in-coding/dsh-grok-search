@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.26-dsh.1",
+  "upstream": {
+    "repository": "https://github.com/Episkey-G/GrokSearch-rs",
+    "commit": "be5fe87db22939de9405a7e9c70b1e43f7151214",
+    "sourceUrl": "https://codeload.github.com/Episkey-G/GrokSearch-rs/tar.gz/be5fe87db22939de9405a7e9c70b1e43f7151214",
+    "sourceSha256": "c64d6083af0e6e790d9afe3f630837eac3849c0d0601298cb03ee5c2738083a6",
+    "archiveRoot": "GrokSearch-rs-be5fe87db22939de9405a7e9c70b1e43f7151214",
+    "cargoVersion": "0.1.25"
+  },
+  "patch": {
+    "file": "grok-search-rs.patch",
+    "sha256": "92824c705dc9b8e47fc083a3d419d3de8b9c611ad6ac674102fc43590425eb22"
+  },
+  "rustToolchain": "1.90.0",
+  "platforms": {
+    "windows-x64": {
+      "os": "win32",
+      "arch": "x64",
+      "target": "x86_64-pc-windows-msvc",
+      "packageName": "@dsh-grok-search/backend-windows-x64",
+      "archive": "grok-backend-0.1.26-dsh.1-windows-x64.tar.gz",
+      "executable": "grok-search-rs.exe"
+    },
+    "macos-arm64": {
+      "os": "darwin",
+      "arch": "arm64",
+      "target": "aarch64-apple-darwin",
+      "packageName": "@dsh-grok-search/backend-macos-arm64",
+      "archive": "grok-backend-0.1.26-dsh.1-macos-arm64.tar.gz",
+      "executable": "grok-search-rs"
+    },
+    "linux-x64": {
+      "os": "linux",
+      "arch": "x64",
+      "target": "x86_64-unknown-linux-gnu",
+      "packageName": "@dsh-grok-search/backend-linux-x64",
+      "archive": "grok-backend-0.1.26-dsh.1-linux-x64.tar.gz",
+      "executable": "grok-search-rs"
+    }
+  }
+}

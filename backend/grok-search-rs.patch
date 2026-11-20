@@ -1,0 +1,1265 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a5e1e68..36a2f11 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "grok-search-rs"
+-version = "0.1.25"
++version = "0.1.26-dsh.1"
+ edition = "2021"
+ rust-version = "1.78"
+ description = "Rust MCP server for Grok web search and Tavily-backed source retrieval"
+diff --git a/Cargo.lock b/Cargo.lock
+index d15a1d1..788d7a0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -317,7 +317,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "grok-search-rs"
+-version = "0.1.25"
++version = "0.1.26-dsh.1"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+diff --git a/src/error.rs b/src/error.rs
+index eec05c2..37643b0 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -1,7 +1,141 @@
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
+ use thiserror::Error;
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum FailureProtocol {
++    Responses,
++    ChatCompletions,
++}
++
++impl FailureProtocol {
++    pub fn for_label(label: &str) -> Option<Self> {
++        match label {
++            "Grok Responses" => Some(Self::Responses),
++            "OpenAI-compatible" => Some(Self::ChatCompletions),
++            _ => None,
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum FailureStage {
++    Request,
++    Response,
++    Parse,
++    Result,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum FailureReason {
++    AuthError,
++    RateLimited,
++    ModelNotFound,
++    ToolUnsupported,
++    InvalidRequest,
++    UpstreamError,
++    NetworkError,
++    Timeout,
++    ParseError,
++    ContentEmpty,
++    SourcesEmpty,
++}
++
++/// Diagnostics contain only local enums, status, and allowlisted codes.
++/// Never retain remote messages, URLs, headers, or credentials here.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct FailureData {
++    schema_version: u8,
++    provider: String,
++    protocol: FailureProtocol,
++    stage: FailureStage,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    http_status: Option<u16>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    upstream_code: Option<String>,
++    reason: FailureReason,
++}
++
++impl FailureData {
++    pub fn new(protocol: FailureProtocol, stage: FailureStage, reason: FailureReason) -> Self {
++        Self {
++            schema_version: 1,
++            provider: "grok".into(),
++            protocol,
++            stage,
++            http_status: None,
++            upstream_code: None,
++            reason,
++        }
++    }
++
++    pub fn with_status(mut self, status: u16) -> Self {
++        self.http_status = Some(status);
++        self
++    }
++
++    pub fn upstream(protocol: FailureProtocol, status: Option<u16>, raw: &Value) -> Self {
++        let code = raw
++            .pointer("/error/code")
++            .or_else(|| raw.pointer("/response/error/code"))
++            .or_else(|| raw.get("code"))
++            .and_then(Value::as_str)
++            .map(|code| code.trim().to_ascii_lowercase());
++        let known = code.as_deref().and_then(|code| {
++            let reason = match code {
++                "auth_error" | "invalid_api_key" | "authentication_error" | "permission_denied" => {
++                    FailureReason::AuthError
++                }
++                "rate_limited"
++                | "rate_limit_exceeded"
++                | "rate_limit_error"
++                | "insufficient_quota" => FailureReason::RateLimited,
++                "model_not_found" => FailureReason::ModelNotFound,
++                "tool_unsupported" | "unsupported_tool" | "unsupported_tools" => {
++                    FailureReason::ToolUnsupported
++                }
++                "invalid_request"
++                | "invalid_request_error"
++                | "unsupported_parameter"
++                | "context_length_exceeded" => FailureReason::InvalidRequest,
++                "upstream_error"
++                | "server_error"
++                | "internal_server_error"
++                | "service_unavailable" => FailureReason::UpstreamError,
++                _ => return None,
++            };
++            Some((code.to_string(), reason))
++        });
++        let mut data = Self::new(
++            protocol,
++            FailureStage::Response,
++            match status {
++                Some(401 | 403) => FailureReason::AuthError,
++                Some(429) => FailureReason::RateLimited,
++                Some(400 | 422) => FailureReason::InvalidRequest,
++                _ => FailureReason::UpstreamError,
++            },
++        );
++        data.http_status = status;
++        if let Some((code, reason)) = known {
++            data.upstream_code = Some(code);
++            data.reason = reason;
++        }
++        data
++    }
++}
++
+ #[derive(Debug, Error)]
+ pub enum GrokSearchError {
++    #[error("{source}")]
++    WithData {
++        source: Box<GrokSearchError>,
++        data: FailureData,
++    },
+     #[error("missing required config: {0}")]
+     MissingConfig(&'static str),
+     #[error("invalid params: {0}")]
+@@ -19,9 +153,35 @@ pub enum GrokSearchError {
+ }
+ 
+ impl GrokSearchError {
++    pub fn with_data(self, data: FailureData) -> Self {
++        if self.data().is_some() {
++            self
++        } else {
++            Self::WithData {
++                source: Box::new(self),
++                data,
++            }
++        }
++    }
++
++    pub fn data(&self) -> Option<&FailureData> {
++        match self {
++            Self::WithData { data, .. } => Some(data),
++            _ => None,
++        }
++    }
++
++    pub fn legacy(&self) -> &Self {
++        match self {
++            Self::WithData { source, .. } => source.legacy(),
++            _ => self,
++        }
++    }
++
+     /// JSON-RPC 2.0 error code mapping. See https://www.jsonrpc.org/specification#error_object
+     pub fn code(&self) -> i32 {
+         match self {
++            GrokSearchError::WithData { source, .. } => source.code(),
+             // -32700 Parse error: invalid JSON
+             GrokSearchError::Parse(_) => -32700,
+             // -32602 Invalid params
+diff --git a/src/model/tool.rs b/src/model/tool.rs
+index 4f732ec..f47cc19 100644
+--- a/src/model/tool.rs
++++ b/src/model/tool.rs
+@@ -30,6 +30,8 @@ pub struct WebSearchOutput {
+     pub search_provider: String,
+     pub fallback_used: bool,
+     pub fallback_reason: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub primary_failure: Option<crate::error::FailureData>,
+     /// True when the response budget trimmed inline source content. The cache
+     /// keeps the full text — recover via `get_sources` or `web_fetch`.
+     pub truncated: bool,
+diff --git a/src/mcp.rs b/src/mcp.rs
+index 8a90993..4af56f3 100644
+--- a/src/mcp.rs
++++ b/src/mcp.rs
+@@ -5,6 +5,10 @@ use serde_json::{json, Value};
+ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+ use tokio::task::JoinSet;
+ 
++#[cfg(test)]
++#[path = "dsh_tests.rs"]
++mod dsh_tests;
++
+ /// Requests handled at once. Unbounded fan-out would let one runaway client
+ /// drive the upstream into the rate limits this concurrency exists to relieve.
+ /// Excess requests wait rather than being refused: queueing is the right answer
+@@ -120,7 +124,11 @@ pub(crate) async fn handle_message(service: &SearchService, request: Value) -> O
+             .await
+             .unwrap_or_else(|err| {
+                 let code = err.code() as i64;
+-                error_response(id, code, err.to_string())
++                let mut response = error_response(id, code, err.to_string());
++                if let Some(data) = err.data() {
++                    response["error"]["data"] = json!(data);
++                }
++                response
+             }),
+     )
+ }
+diff --git a/src/adapters/grok_responses_response.rs b/src/adapters/grok_responses_response.rs
+index 8600fb3..a05af8d 100644
+--- a/src/adapters/grok_responses_response.rs
++++ b/src/adapters/grok_responses_response.rs
+@@ -1,5 +1,7 @@
+ use crate::adapters::sources::{dedupe_sources, extract_inline_bracket_citations};
+-use crate::error::{GrokSearchError, Result};
++use crate::error::{
++    FailureData, FailureProtocol, FailureReason, FailureStage, GrokSearchError, Result,
++};
+ use crate::model::search::SearchResponse;
+ use crate::model::source::Source;
+ use serde_json::Value;
+@@ -35,7 +37,12 @@ pub fn parse_grok_responses(raw: &Value) -> Result<SearchResponse> {
+     if content.is_empty() && sources.is_empty() {
+         return Err(GrokSearchError::Parse(
+             "Grok Responses payload did not contain text or sources".to_string(),
+-        ));
++        )
++        .with_data(FailureData::new(
++            FailureProtocol::Responses,
++            FailureStage::Result,
++            FailureReason::ContentEmpty,
++        )));
+     }
+ 
+     Ok(SearchResponse { content, sources })
+@@ -50,8 +57,15 @@ fn collect_output_item(item: &Value, text_parts: &mut Vec<String>, sources: &mut
+ 
+     if let Some(content) = item.get("content").and_then(Value::as_array) {
+         for block in content {
+-            if let Some(text) = block.get("text").and_then(Value::as_str) {
+-                push_nonempty(text_parts, text);
++            // Untyped legacy messages remain supported. Typed reasoning/tool
++            // items can contribute evidence, but never answer prose.
++            if matches!(
++                item.get("type").and_then(Value::as_str),
++                None | Some("message")
++            ) {
++                if let Some(text) = block.get("text").and_then(Value::as_str) {
++                    push_nonempty(text_parts, text);
++                }
+             }
+             if let Some(annotations) = block.get("annotations") {
+                 collect_sources_from_value(annotations, sources);
+@@ -61,6 +75,9 @@ fn collect_output_item(item: &Value, text_parts: &mut Vec<String>, sources: &mut
+             }
+         }
+     }
++    if let Some(search_sources) = item.get("search_sources") {
++        collect_sources_from_value(search_sources, sources);
++    }
+ }
+ 
+ fn collect_sources_from_value(value: &Value, sources: &mut Vec<Source>) {
+diff --git a/src/adapters/chat_completions_response.rs b/src/adapters/chat_completions_response.rs
+index b438234..d420ce2 100644
+--- a/src/adapters/chat_completions_response.rs
++++ b/src/adapters/chat_completions_response.rs
+@@ -1,5 +1,7 @@
+ use crate::adapters::sources::{dedupe_sources, extract_inline_bracket_citations};
+-use crate::error::{GrokSearchError, Result};
++use crate::error::{
++    FailureData, FailureProtocol, FailureReason, FailureStage, GrokSearchError, Result,
++};
+ use crate::model::search::SearchResponse;
+ use crate::model::source::Source;
+ use serde_json::Value;
+@@ -51,7 +53,12 @@ pub fn parse_chat_completions(raw: &Value) -> Result<SearchResponse> {
+     if content.is_empty() && sources.is_empty() {
+         return Err(GrokSearchError::Parse(
+             "chat/completions response is empty and has no sources".to_string(),
+-        ));
++        )
++        .with_data(FailureData::new(
++            FailureProtocol::ChatCompletions,
++            FailureStage::Result,
++            FailureReason::ContentEmpty,
++        )));
+     }
+ 
+     Ok(SearchResponse { content, sources })
+diff --git a/src/providers/http.rs b/src/providers/http.rs
+index ab52e2a..26ad82e 100644
+--- a/src/providers/http.rs
++++ b/src/providers/http.rs
+@@ -2,7 +2,9 @@ use reqwest::{Client, Response};
+ use serde_json::Value;
+ use std::time::Duration;
+ 
+-use crate::error::{GrokSearchError, Result};
++use crate::error::{
++    FailureData, FailureProtocol, FailureReason, FailureStage, GrokSearchError, Result,
++};
+ 
+ /// Build a tuned `reqwest::Client`. The same client is shared across providers
+ /// so TLS sessions and keep-alive connections can be reused between providers
+@@ -218,6 +220,24 @@ async fn send_json(
+     label: &str,
+ ) -> std::result::Result<Value, HttpFailure> {
+     let mut response = request.send().await.map_err(|err| {
++        if let Some(protocol) = FailureProtocol::for_label(label) {
++            let (error, reason) = if err.is_timeout() {
++                (
++                    GrokSearchError::Timeout(format!("{label} request timed out")),
++                    FailureReason::Timeout,
++                )
++            } else {
++                (
++                    GrokSearchError::Provider(format!("{label} request failed")),
++                    FailureReason::NetworkError,
++                )
++            };
++            return HttpFailure::transport(error.with_data(FailureData::new(
++                protocol,
++                FailureStage::Request,
++                reason,
++            )));
++        }
+         HttpFailure::transport(if err.is_timeout() {
+             GrokSearchError::Timeout(format!("{label} request timed out: {err}"))
+         } else {
+@@ -236,16 +256,38 @@ async fn send_json(
+     if status.is_success() && content_type.starts_with("text/event-stream") {
+         return read_sse_json(&mut response, label)
+             .await
++            .map_err(|err| primary_response_failure(err, label, status.as_u16()))
+             .map_err(HttpFailure::transport);
+     }
+ 
+     let bytes = response.bytes().await.map_err(|err| {
++        if let Some(protocol) = FailureProtocol::for_label(label) {
++            let reason = if err.is_timeout() {
++                FailureReason::Timeout
++            } else {
++                FailureReason::NetworkError
++            };
++            return HttpFailure::transport(
++                GrokSearchError::Provider(format!("{label} body read failed")).with_data(
++                    FailureData::new(protocol, FailureStage::Response, reason)
++                        .with_status(status.as_u16()),
++                ),
++            );
++        }
+         HttpFailure::transport(GrokSearchError::Provider(format!(
+             "{label} body read failed: {err}"
+         )))
+     })?;
+ 
+     if !status.is_success() {
++        if let Some(protocol) = FailureProtocol::for_label(label) {
++            let raw = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
++            return Err(HttpFailure {
++                status: Some(status.as_u16()),
++                error: GrokSearchError::Provider(format!("{label} returned HTTP {status}"))
++                    .with_data(FailureData::upstream(protocol, Some(status.as_u16()), &raw)),
++            });
++        }
+         let text = String::from_utf8_lossy(&bytes);
+         return Err(HttpFailure {
+             status: Some(status.as_u16()),
+@@ -253,11 +295,61 @@ async fn send_json(
+         });
+     }
+ 
+-    serde_json::from_slice(&bytes).map_err(|err| {
+-        HttpFailure::transport(GrokSearchError::Parse(format!(
+-            "invalid {label} JSON: {err}"
+-        )))
+-    })
++    let raw = serde_json::from_slice(&bytes).map_err(|err| {
++        HttpFailure::transport(primary_response_failure(
++            GrokSearchError::Parse(format!("invalid {label} JSON: {err}")),
++            label,
++            status.as_u16(),
++        ))
++    })?;
++    if let Some(protocol) = FailureProtocol::for_label(label) {
++        if primary_error_payload(&raw) {
++            return Err(HttpFailure::transport(
++                GrokSearchError::Provider(format!("{label} response failed"))
++                    .with_data(FailureData::upstream(protocol, Some(status.as_u16()), &raw)),
++            ));
++        }
++    }
++    Ok(raw)
++}
++
++fn primary_error_payload(raw: &Value) -> bool {
++    raw.get("error").is_some_and(|error| !error.is_null())
++        || matches!(
++            raw.get("status").and_then(Value::as_str),
++            Some("failed" | "incomplete")
++        )
++        || matches!(
++            raw.get("type").and_then(Value::as_str),
++            Some("error" | "response.failed" | "response.incomplete")
++        )
++}
++
++fn primary_response_failure(error: GrokSearchError, label: &str, status: u16) -> GrokSearchError {
++    let Some(protocol) = FailureProtocol::for_label(label) else {
++        return error;
++    };
++    if let GrokSearchError::WithData { source, data } = error {
++        return source.with_data(data.with_status(status));
++    }
++    let (safe, stage, reason) = match error {
++        GrokSearchError::Parse(_) => (
++            GrokSearchError::Parse(format!("invalid {label} response")),
++            FailureStage::Parse,
++            FailureReason::ParseError,
++        ),
++        GrokSearchError::Timeout(_) => (
++            GrokSearchError::Timeout(format!("{label} response timed out")),
++            FailureStage::Response,
++            FailureReason::Timeout,
++        ),
++        _ => (
++            GrokSearchError::Provider(format!("{label} response read failed")),
++            FailureStage::Response,
++            FailureReason::NetworkError,
++        ),
++    };
++    safe.with_data(FailureData::new(protocol, stage, reason).with_status(status))
+ }
+ 
+ async fn read_sse_json(response: &mut Response, label: &str) -> Result<Value> {
+@@ -267,11 +359,13 @@ async fn read_sse_json(response: &mut Response, label: &str) -> Result<Value> {
+     let mut last_json = None;
+     let mut chat_metadata = None;
+ 
+-    while let Some(chunk) = response
+-        .chunk()
+-        .await
+-        .map_err(|err| GrokSearchError::Provider(format!("{label} stream read failed: {err}")))?
+-    {
++    while let Some(chunk) = response.chunk().await.map_err(|err| {
++        if FailureProtocol::for_label(label).is_some() && err.is_timeout() {
++            GrokSearchError::Timeout(format!("{label} stream read timed out"))
++        } else {
++            GrokSearchError::Provider(format!("{label} stream read failed: {err}"))
++        }
++    })? {
+         buffer.extend_from_slice(&chunk);
+ 
+         while let Some((event, rest)) = split_sse_event(&buffer) {
+@@ -393,6 +487,15 @@ fn process_sse_event(
+ 
+     let value: Value = serde_json::from_str(data)
+         .map_err(|err| GrokSearchError::Parse(format!("invalid {label} SSE JSON: {err}")))?;
++    if let Some(protocol) = FailureProtocol::for_label(label) {
++        if primary_error_payload(&value) || value.get("response").is_some_and(primary_error_payload)
++        {
++            return Err(GrokSearchError::Provider(format!(
++                "{label} stream ended with upstream failure"
++            ))
++            .with_data(FailureData::upstream(protocol, None, &value)));
++        }
++    }
+     collect_stream_delta(&value, output_text, chat_content);
+     accumulate_chat_metadata(chat_metadata, &value);
+ 
+diff --git a/src/providers/grok.rs b/src/providers/grok.rs
+index 22311c9..1857188 100644
+--- a/src/providers/grok.rs
++++ b/src/providers/grok.rs
+@@ -1,7 +1,7 @@
+ use crate::adapters::grok_responses_request::to_grok_responses_payload;
+ use crate::adapters::grok_responses_response::parse_grok_responses;
+ use crate::credentials::{CredentialProvider, StaticApiKeyCredential};
+-use crate::error::Result;
++use crate::error::{FailureData, FailureProtocol, FailureReason, FailureStage, Result};
+ use crate::model::search::{SearchRequest, SearchResponse};
+ use crate::providers::http::{build_client, post_json};
+ use reqwest::Client;
+@@ -76,8 +76,21 @@ impl GrokResponsesProvider {
+ 
+     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
+         let payload =
+-            to_grok_responses_payload(request, self.require_web_search, self.include_x_search)?;
+-        let token = self.credential.bearer_token().await?;
++            to_grok_responses_payload(request, self.require_web_search, self.include_x_search)
++                .map_err(|err| {
++                    err.with_data(FailureData::new(
++                        FailureProtocol::Responses,
++                        FailureStage::Request,
++                        FailureReason::InvalidRequest,
++                    ))
++                })?;
++        let token = self.credential.bearer_token().await.map_err(|err| {
++            err.with_data(FailureData::new(
++                FailureProtocol::Responses,
++                FailureStage::Request,
++                FailureReason::AuthError,
++            ))
++        })?;
+         let raw = post_json(
+             &self.client,
+             &self.endpoint(),
+diff --git a/src/service.rs b/src/service.rs
+index 7279d39..e5df814 100644
+--- a/src/service.rs
++++ b/src/service.rs
+@@ -7,7 +7,9 @@ use uuid::Uuid;
+ use crate::cache::SourceCache;
+ use crate::config::{AuthMode, Config};
+ use crate::credentials::{OAuthCredential, StaticApiKeyCredential};
+-use crate::error::{GrokSearchError, Result};
++use crate::error::{
++    FailureData, FailureProtocol, FailureReason, FailureStage, GrokSearchError, Result,
++};
+ use crate::model::search::{
+     ContentBlock, SearchFilters, SearchMessage, SearchRequest, SearchResponse, SearchTool,
+ };
+@@ -795,6 +797,7 @@ impl SearchService {
+                         },
+                         raw,
+                         grok_error_reason(&err),
++                        err.data().cloned(),
+                         include_content,
+                     )
+                     .await;
+@@ -802,8 +805,29 @@ impl SearchService {
+         };
+ 
+         if let Some(reason) = grok_unverifiable_reason(&response) {
++            let protocol = match self.config.transport {
++                crate::config::Transport::Responses => FailureProtocol::Responses,
++                crate::config::Transport::ChatCompletions => FailureProtocol::ChatCompletions,
++            };
++            let failure = FailureData::new(
++                protocol,
++                FailureStage::Result,
++                if response.content.trim().is_empty() {
++                    FailureReason::ContentEmpty
++                } else {
++                    FailureReason::SourcesEmpty
++                },
++            );
+             return self
+-                .finalize_fallback(deadline, session_id, response, raw, reason, include_content)
++                .finalize_fallback(
++                    deadline,
++                    session_id,
++                    response,
++                    raw,
++                    reason,
++                    Some(failure),
++                    include_content,
++                )
+                 .await;
+         }
+ 
+@@ -858,6 +882,7 @@ impl SearchService {
+             search_provider: "grok_responses".to_string(),
+             fallback_used: false,
+             fallback_reason: None,
++            primary_failure: None,
+             truncated,
+         })
+     }
+@@ -976,6 +1001,7 @@ impl SearchService {
+         response: SearchResponse,
+         raw: RawSources,
+         reason: &str,
++        primary_failure: Option<FailureData>,
+         include_content: bool,
+     ) -> Result<WebSearchOutput> {
+         let RawSources {
+@@ -1006,27 +1032,29 @@ impl SearchService {
+             // holds. Testing the config directly rather than inferring it from
+             // an empty source list is what keeps that true when the providers
+             // also came back empty.
+-            return Err(GrokSearchError::Provider(
+-                if self.config.fallback_sources == 0 {
+-                    // Providers that were consulted still get to say what they
+-                    // saw; when the budget alone is at fault there are no notes
+-                    // and nothing to append.
+-                    let detail = if notes.is_empty() {
+-                        String::new()
+-                    } else {
+-                        format!(" ({})", source_diagnosis(&notes))
+-                    };
+-                    format!(
++            let error = GrokSearchError::Provider(if self.config.fallback_sources == 0 {
++                // Providers that were consulted still get to say what they
++                // saw; when the budget alone is at fault there are no notes
++                // and nothing to append.
++                let detail = if notes.is_empty() {
++                    String::new()
++                } else {
++                    format!(" ({})", source_diagnosis(&notes))
++                };
++                format!(
+                         "web_search returned no sources: {reason}, and the fallback source budget is 0 (GROK_SEARCH_FALLBACK_SOURCES), so nothing from the source fan-out can survive{detail}. Raise that budget to get evidence on this path; no change of query can help while it is 0."
+                     )
+-                } else {
+-                    format!(
++            } else {
++                format!(
+                         "web_search returned no sources: {reason}, and the source fallback produced nothing ({}). {}",
+                         source_diagnosis(&notes),
+                         fallback_remediation(&notes)
+                     )
+-                },
+-            ));
++            });
++            return Err(match primary_failure {
++                Some(data) => error.with_data(data),
++                None => error,
++            });
+         }
+ 
+         // D-03: the degraded path enriches eagerly — one-hand evidence is most
+@@ -1086,6 +1114,7 @@ impl SearchService {
+             search_provider: "source_fallback".to_string(),
+             fallback_used: true,
+             fallback_reason: Some(reason.to_string()),
++            primary_failure,
+             truncated,
+         })
+     }
+@@ -2139,7 +2168,7 @@ fn fallback_label(origin: Option<&'static str>) -> String {
+ /// sub-parsing HTTP status codes out of `Provider(String)` would be fragile.
+ /// `Provider` (and any other variant) preserves the legacy `grok_provider_error`.
+ fn grok_error_reason(err: &GrokSearchError) -> &'static str {
+-    match err {
++    match err.legacy() {
+         GrokSearchError::Timeout(_) => "grok_timeout",
+         GrokSearchError::OAuth(_) => "grok_auth_error",
+         GrokSearchError::Parse(_) => "grok_parse_error",
+diff --git a/src/dsh_tests.rs b/src/dsh_tests.rs
+new file mode 100644
+index 0000000..0ec808d
+--- /dev/null
++++ b/src/dsh_tests.rs
+@@ -0,0 +1,560 @@
++use super::handle_message;
++use crate::adapters::grok_responses_response::parse_grok_responses;
++use crate::error::{
++    FailureData, FailureProtocol, FailureReason, FailureStage, GrokSearchError, Result,
++};
++use crate::model::search::SearchFilters;
++use crate::model::source::{FetchedPage, Source};
++use crate::providers::grok::GrokResponsesProvider;
++use crate::providers::http::post_json;
++use crate::service::{AiProvider, SearchService, SourceProvider};
++use async_trait::async_trait;
++use reqwest::Client;
++use serde_json::{json, Value};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpListener;
++
++const SECRET: &str = "remote-text-header-key-must-not-escape";
++
++async fn stub(
++    status: u16,
++    content_type: &str,
++    body: String,
++    delay: Duration,
++) -> (String, tokio::task::JoinHandle<Value>) {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let url = format!("http://{}", listener.local_addr().unwrap());
++    let content_type = content_type.to_string();
++    let task = tokio::spawn(async move {
++        let (mut socket, _) = listener.accept().await.unwrap();
++        let mut bytes = Vec::new();
++        let body_start;
++        loop {
++            let mut chunk = [0; 4096];
++            let n = socket.read(&mut chunk).await.unwrap();
++            assert_ne!(n, 0);
++            bytes.extend_from_slice(&chunk[..n]);
++            if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
++                let headers = String::from_utf8_lossy(&bytes[..at]);
++                let len = headers
++                    .lines()
++                    .find_map(|line| {
++                        let (name, value) = line.split_once(':')?;
++                        name.eq_ignore_ascii_case("content-length")
++                            .then(|| value.trim().parse::<usize>().unwrap())
++                    })
++                    .unwrap();
++                if bytes.len() >= at + 4 + len {
++                    body_start = at + 4;
++                    break;
++                }
++            }
++        }
++        let payload = serde_json::from_slice(&bytes[body_start..]).unwrap();
++        tokio::time::sleep(delay).await;
++        let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Secret: {SECRET}\r\n\r\n{body}", body.len());
++        let _ = socket.write_all(response.as_bytes()).await;
++        payload
++    });
++    (url, task)
++}
++
++struct Evidence {
++    sources: usize,
++    calls: Arc<AtomicUsize>,
++}
++
++#[async_trait]
++impl SourceProvider for Evidence {
++    async fn search_sources(&self, _: &str, _: usize, _: &SearchFilters) -> Result<Vec<Source>> {
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        Ok((0..self.sources)
++            .map(|i| Source::new(format!("https://evidence.example/{i}"), "tavily"))
++            .collect())
++    }
++    async fn fetch(&self, _: &str) -> Result<FetchedPage> {
++        panic!("inline fetch was disabled")
++    }
++    async fn map(&self, _: &str, _: usize) -> Result<Vec<Source>> {
++        panic!("unexpected map")
++    }
++}
++
++async fn invoke(ai: Arc<dyn AiProvider>, sources: usize, budget: usize) -> (Value, usize) {
++    let calls = Arc::new(AtomicUsize::new(0));
++    let service = SearchService::fake_custom(
++        Some(ai),
++        Arc::new(Evidence {
++            sources,
++            calls: calls.clone(),
++        }),
++        None,
++        [("GROK_SEARCH_FALLBACK_SOURCES", budget.to_string())],
++    );
++    let response = handle_message(&service, json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
++        "params":{"name":"web_search","arguments":{"query":"test","extra_sources":0,"include_content":false}}}))
++        .await.unwrap();
++    (response, calls.load(Ordering::SeqCst))
++}
++
++fn provider(url: &str, timeout: Duration) -> Arc<dyn AiProvider> {
++    Arc::new(GrokResponsesProvider::with_client(
++        Client::builder()
++            .no_proxy()
++            .timeout(timeout)
++            .build()
++            .unwrap(),
++        url,
++        "test-only-key",
++        true,
++        false,
++    ))
++}
++
++async fn roundtrip(
++    status: u16,
++    content_type: &str,
++    body: String,
++    sources: usize,
++) -> (Value, Value, usize) {
++    let (url, server) = stub(status, content_type, body, Duration::ZERO).await;
++    let (response, calls) = invoke(provider(&url, Duration::from_secs(3)), sources, 2).await;
++    (response, server.await.unwrap(), calls)
++}
++
++fn data(reason: &str, stage: &str) -> Value {
++    json!({"schemaVersion":1,"provider":"grok","protocol":"responses","stage":stage,"reason":reason})
++}
++
++fn envelope(response: &Value) -> Value {
++    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
++}
++
++#[test]
++fn dsh_upstream_code_union_is_normalized_and_unknown_values_are_omitted() {
++    let groups: &[(&str, &[&str])] = &[
++        (
++            "auth_error",
++            &[
++                "auth_error",
++                "invalid_api_key",
++                "authentication_error",
++                "permission_denied",
++            ],
++        ),
++        (
++            "rate_limited",
++            &[
++                "rate_limited",
++                "rate_limit_exceeded",
++                "rate_limit_error",
++                "insufficient_quota",
++            ],
++        ),
++        ("model_not_found", &["model_not_found"]),
++        (
++            "tool_unsupported",
++            &["tool_unsupported", "unsupported_tool", "unsupported_tools"],
++        ),
++        (
++            "invalid_request",
++            &[
++                "invalid_request",
++                "invalid_request_error",
++                "unsupported_parameter",
++                "context_length_exceeded",
++            ],
++        ),
++        (
++            "upstream_error",
++            &[
++                "upstream_error",
++                "server_error",
++                "internal_server_error",
++                "service_unavailable",
++            ],
++        ),
++    ];
++    assert_eq!(
++        groups.iter().map(|(_, codes)| codes.len()).sum::<usize>(),
++        20
++    );
++    for (reason, codes) in groups {
++        for code in *codes {
++            let actual = serde_json::to_value(FailureData::upstream(
++                FailureProtocol::Responses, Some(404),
++                &json!({"error":{"code":format!(" {} ", code.to_ascii_uppercase()),"message":SECRET}}),
++            )).unwrap();
++            let mut expected = data(reason, "response");
++            expected["httpStatus"] = json!(404);
++            expected["upstreamCode"] = json!(code);
++            assert_eq!(actual, expected);
++        }
++    }
++    for code in [
++        json!(SECRET),
++        json!("toString"),
++        json!("invalid_api_key-extra"),
++        json!(401),
++        json!({}),
++        Value::Null,
++    ] {
++        let actual = serde_json::to_value(FailureData::upstream(
++            FailureProtocol::Responses,
++            Some(422),
++            &json!({"error":{"code":code,"type":"api_error","message":SECRET}}),
++        ))
++        .unwrap();
++        let mut expected = data("invalid_request", "response");
++        expected["httpStatus"] = json!(422);
++        assert_eq!(actual, expected);
++    }
++    assert!(serde_json::from_value::<FailureData>(data(SECRET, "response")).is_err());
++}
++
++#[tokio::test]
++async fn dsh_http_failures_survive_empty_fallback_and_mcp_without_remote_text() {
++    for (status, code, expected, normalized) in [
++        (401, None, "auth_error", None),
++        (
++            403,
++            Some("invalid_api_key"),
++            "auth_error",
++            Some("invalid_api_key"),
++        ),
++        (429, None, "rate_limited", None),
++        (422, None, "invalid_request", None),
++        (
++            404,
++            Some(" MODEL_NOT_FOUND "),
++            "model_not_found",
++            Some("model_not_found"),
++        ),
++        (
++            400,
++            Some("unsupported_tool"),
++            "tool_unsupported",
++            Some("unsupported_tool"),
++        ),
++        (503, Some(SECRET), "upstream_error", None),
++    ] {
++        let (response, request, calls) = roundtrip(
++            status,
++            "application/json",
++            json!({"error":{"message":SECRET,"type":"api_error","code":code}}).to_string(),
++            0,
++        )
++        .await;
++        let mut expected_data = data(expected, "response");
++        expected_data["httpStatus"] = json!(status);
++        if let Some(code) = normalized {
++            expected_data["upstreamCode"] = json!(code);
++        }
++        assert_eq!(response["error"]["data"], expected_data);
++        assert_eq!(response["error"]["code"], -32001);
++        assert!(response["error"]["message"]
++            .as_str()
++            .unwrap()
++            .starts_with("provider error: web_search returned no sources:"));
++        assert!(!response.to_string().contains(SECRET));
++        assert_eq!(request["tools"][0]["type"], "web_search");
++        assert_eq!(calls, 1, "supplementary provider must be called only once");
++    }
++}
++
++#[tokio::test]
++async fn dsh_successful_fallback_keeps_primary_failure_and_evidence() {
++    let (response, _, calls) = roundtrip(
++        404,
++        "application/json",
++        json!({"error":{"code":"model_not_found","message":SECRET}}).to_string(),
++        1,
++    )
++    .await;
++    let out = envelope(&response);
++    assert_eq!(out["fallback_used"], true);
++    assert_eq!(out["fallback_reason"], "grok_provider_error");
++    assert_eq!(out["primary_failure"]["reason"], "model_not_found");
++    assert_eq!(out["primary_failure"]["httpStatus"], 404);
++    assert_eq!(out["sources_count"], 1);
++    assert_eq!(out["sources"][0]["url"], "https://evidence.example/0");
++    assert_eq!(calls, 1);
++    assert!(!response.to_string().contains(SECRET));
++}
++
++#[tokio::test]
++async fn dsh_zero_fallback_budget_keeps_original_data() {
++    let (url, server) = stub(
++        422,
++        "application/json",
++        json!({"error":{"message":SECRET}}).to_string(),
++        Duration::ZERO,
++    )
++    .await;
++    let (response, calls) = invoke(provider(&url, Duration::from_secs(3)), 1, 0).await;
++    assert_eq!(response["error"]["data"]["httpStatus"], 422);
++    assert_eq!(response["error"]["data"]["reason"], "invalid_request");
++    assert!(response["error"]["message"]
++        .as_str()
++        .unwrap()
++        .contains("budget is 0"));
++    assert_eq!(calls, 0);
++    server.await.unwrap();
++}
++
++#[tokio::test]
++async fn dsh_parse_failures_and_sse_terminal_errors_survive_mcp() {
++    for (content_type, body, stage, reason, code) in [
++        (
++            "application/json",
++            format!("invalid-json-{SECRET}"),
++            "parse",
++            "parse_error",
++            None,
++        ),
++        (
++            "text/event-stream",
++            format!("data: invalid-json-{SECRET}\n\n"),
++            "parse",
++            "parse_error",
++            None,
++        ),
++        (
++            "text/event-stream",
++            format!(
++                "data: {}\n\n",
++                json!({"type":"response.failed","response":{"error":{"code":"model_not_found","message":SECRET}}})
++            ),
++            "response",
++            "model_not_found",
++            Some("model_not_found"),
++        ),
++        (
++            "text/event-stream",
++            format!(
++                "data: {}\n\n",
++                json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":SECRET}}})
++            ),
++            "response",
++            "upstream_error",
++            None,
++        ),
++        (
++            "text/event-stream",
++            format!(
++                "data: {}\n\n",
++                json!({"type":"error","code":"rate_limit_exceeded","message":SECRET})
++            ),
++            "response",
++            "rate_limited",
++            Some("rate_limit_exceeded"),
++        ),
++        (
++            "application/json",
++            json!({"error":{"code":"model_not_found","message":SECRET}}).to_string(),
++            "response",
++            "model_not_found",
++            Some("model_not_found"),
++        ),
++    ] {
++        let (response, _, _) = roundtrip(200, content_type, body, 0).await;
++        let mut expected = data(reason, stage);
++        expected["httpStatus"] = json!(200);
++        if let Some(code) = code {
++            expected["upstreamCode"] = json!(code);
++        }
++        assert_eq!(response["error"]["data"], expected);
++        assert!(!response.to_string().contains(SECRET));
++    }
++}
++
++#[tokio::test]
++async fn dsh_transport_and_timeout_remain_request_failures() {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let url = format!("http://{}", listener.local_addr().unwrap());
++    let reset = tokio::spawn(async move {
++        let (socket, _) = listener.accept().await.unwrap();
++        drop(socket);
++    });
++    let (response, _) = invoke(provider(&url, Duration::from_secs(1)), 0, 2).await;
++    assert_eq!(response["error"]["data"], data("network_error", "request"));
++    reset.await.unwrap();
++    let (url, server) = stub(
++        200,
++        "application/json",
++        "{}".into(),
++        Duration::from_millis(150),
++    )
++    .await;
++    let (response, _) = invoke(provider(&url, Duration::from_millis(40)), 0, 2).await;
++    assert_eq!(response["error"]["data"], data("timeout", "request"));
++    assert!(response["error"]["message"]
++        .as_str()
++        .unwrap()
++        .contains("grok_timeout"));
++    server.await.unwrap();
++}
++
++#[test]
++fn dsh_search_sources_preserve_metadata_dedup_citations_and_exclude_reasoning() {
++    let parsed = parse_grok_responses(&json!({"output_text":"Answer [[1]](https://inline.example/)","output":[
++        {"type":"reasoning","content":[{"text":"private reasoning"}],"search_sources":[{"uri":"https://tool.example/","title":"Useful title","snippet":"Snippet","publishedDate":"2026-11-20"}]},
++        {"type":"web_search_call","action":{"sources":[{"url":"https://action.example/"}]},"content":[{"text":"tool internals"}]},
++        {"type":"message","content":[{"text":"Answer [[1]](https://inline.example/)","annotations":[{"url":"https://annotation.example/"}],"citations":["https://block.example/"]}],
++            "search_sources":["https://tool.example/", "", {"url":"https://sparse.example/"}]}
++    ],"citations":[{"url":"https://top.example/"}]})).unwrap();
++    assert_eq!(parsed.content, "Answer [[1]](https://inline.example/)");
++    assert_eq!(parsed.sources.len(), 7);
++    assert_eq!(parsed.sources[0].title.as_deref(), Some("Useful title"));
++    assert_eq!(parsed.sources[0].description.as_deref(), Some("Snippet"));
++    assert_eq!(
++        parsed.sources[0].published_date.as_deref(),
++        Some("2026-11-20")
++    );
++    assert!(parsed
++        .sources
++        .iter()
++        .all(|s| s.provider == "grok_responses"));
++}
++
++#[tokio::test]
++async fn dsh_real_responses_sources_are_successful_for_json_and_completed_sse() {
++    let raw = json!({"output":[{"type":"message","content":[{"type":"output_text","text":"Verified"}],
++        "search_sources":[{"url":"https://native.example/"}]}]});
++    for (ct, body) in [
++        ("application/json", raw.to_string()),
++        (
++            "text/event-stream",
++            format!(
++                "data: {}\n\n",
++                json!({"type":"response.completed","response":raw})
++            ),
++        ),
++    ] {
++        let (response, _, calls) = roundtrip(200, ct, body, 0).await;
++        let out = envelope(&response);
++        assert_eq!(out["content"], "Verified");
++        assert_eq!(out["sources_count"], 1);
++        assert_eq!(out["fallback_used"], false);
++        assert!(out.get("primary_failure").is_none());
++        assert_eq!(calls, 1);
++    }
++}
++
++#[tokio::test]
++async fn dsh_unverifiable_results_report_the_correct_result_failure() {
++    for (raw, reason, fallback) in [
++        (json!({"output_text":"Unverified"}), "sources_empty", 0),
++        (
++            json!({"output":[{"type":"web_search_call","search_sources":["https://evidence.example/"]}]}),
++            "content_empty",
++            1,
++        ),
++        (json!({"output":[]}), "content_empty", 0),
++    ] {
++        let (response, _, _) = roundtrip(200, "application/json", raw.to_string(), 0).await;
++        let actual = if fallback == 1 {
++            envelope(&response)["primary_failure"].clone()
++        } else {
++            response["error"]["data"].clone()
++        };
++        assert_eq!(actual, data(reason, "result"));
++    }
++}
++
++#[tokio::test]
++async fn dsh_supplementary_http_behavior_is_unchanged() {
++    let (url, server) = stub(
++        429,
++        "application/json",
++        "supplementary detail".into(),
++        Duration::ZERO,
++    )
++    .await;
++    let client = Client::builder().no_proxy().build().unwrap();
++    let error = post_json(&client, &url, "test", &json!({}), "Tavily")
++        .await
++        .unwrap_err();
++    assert!(error.data().is_none());
++    assert_eq!(error.code(), -32001);
++    assert!(error.to_string().contains("supplementary detail"));
++    server.await.unwrap();
++}
++
++#[test]
++fn dsh_legacy_error_codes_and_messages_are_unchanged_by_data() {
++    for (error, code) in [
++        (GrokSearchError::Provider("failure".into()), -32001),
++        (GrokSearchError::Timeout("failure".into()), -32002),
++        (GrokSearchError::Parse("failure".into()), -32700),
++    ] {
++        let message = error.to_string();
++        let wrapped = error.with_data(FailureData::new(
++            FailureProtocol::Responses,
++            FailureStage::Parse,
++            FailureReason::ParseError,
++        ));
++        assert_eq!(wrapped.code(), code);
++        assert_eq!(wrapped.to_string(), message);
++    }
++}
++
++#[tokio::test]
++async fn dsh_chat_completions_failure_and_result_use_the_chat_protocol() {
++    use crate::providers::openai_compatible::OpenAICompatProvider;
++    for (status, body, reason) in [
++        (
++            404,
++            json!({"error":{"code":"model_not_found","message":SECRET}}),
++            "model_not_found",
++        ),
++        (200, json!({"choices":[]}), "content_empty"),
++    ] {
++        let (url, server) =
++            stub(status, "application/json", body.to_string(), Duration::ZERO).await;
++        let ai = Arc::new(OpenAICompatProvider::with_client(
++            Client::builder().no_proxy().build().unwrap(),
++            url,
++            "test-key",
++            "model",
++            true,
++        ));
++        let (response, _) = invoke(ai, 0, 2).await;
++        assert_eq!(response["error"]["data"]["protocol"], "chat_completions");
++        assert_eq!(response["error"]["data"]["reason"], reason);
++        assert!(!response.to_string().contains(SECRET));
++        server.await.unwrap();
++    }
++}
++
++#[tokio::test]
++async fn dsh_body_read_failure_retains_response_stage_and_status() {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let url = format!("http://{}", listener.local_addr().unwrap());
++    let server = tokio::spawn(async move {
++        let (mut socket, _) = listener.accept().await.unwrap();
++        let mut request = [0; 4096];
++        socket.read(&mut request).await.unwrap();
++        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{}").await.unwrap();
++    });
++    let (response, _) = invoke(provider(&url, Duration::from_secs(2)), 0, 2).await;
++    let mut expected = data("network_error", "response");
++    expected["httpStatus"] = json!(200);
++    assert_eq!(response["error"]["data"], expected);
++    server.await.unwrap();
++}
++
++#[test]
++fn dsh_existing_annotation_metadata_keeps_precedence_over_duplicate_search_sources() {
++    let parsed = parse_grok_responses(
++        &json!({"output":[{"type":"message","content":[{"text":"Answer",
++        "annotations":[{"url":"https://same.example/","title":"Existing"}]}],
++        "search_sources":[{"url":"https://same.example/"}]}]}),
++    )
++    .unwrap();
++    assert_eq!(parsed.sources.len(), 1);
++    assert_eq!(parsed.sources[0].title.as_deref(), Some("Existing"));
++}
+diff --git a/tests/sse_bug_repro.rs b/tests/sse_bug_repro.rs
+index a3121b5..43d0567 100644
+--- a/tests/sse_bug_repro.rs
++++ b/tests/sse_bug_repro.rs
+@@ -323,9 +323,13 @@ data: {\"type\":\"response.failed\",\"error\":{\"message\":\"upstream failed\"}}
+     .expect_err("terminal response.failed event should surface as provider error");
+ 
+     assert!(
+-        err.to_string().contains("response.failed") && err.to_string().contains("upstream failed"),
++        err.to_string().contains("stream ended") && !err.to_string().contains("upstream failed"),
+         "unexpected error: {err}"
+     );
++    assert_eq!(
++        serde_json::to_value(err.data()).unwrap()["reason"],
++        "upstream_error"
++    );
+ }
+ 
+ #[tokio::test]

@@ -1,5 +1,6 @@
 // Offline MCP peer for the Grok smoke helper. Never contacts an upstream service.
 import { createInterface } from 'node:readline';
+import { appendFileSync } from 'node:fs';
 
 const mode = process.argv[2] ?? 'structured';
 const diagnosticEnvironment = Object.fromEntries([
@@ -53,24 +54,16 @@ lines.on('line', line => {
     return;
   }
   if (request.method !== 'tools/call') return;
-  if (initialized && mode.startsWith('doctor-')) {
+  if (process.env.FIXTURE_CALL_LOG) appendFileSync(process.env.FIXTURE_CALL_LOG, request.params.name + '\n');
+  if (initialized && mode === 'primary-error') {
     if (request.params.name === 'web_search') {
-      send({ jsonrpc: '2.0', id: request.id, error: { code: -32001,
-        message: 'provider error: web_search returned no sources: grok_provider_error, and the fallback source budget is 0 (GROK_SEARCH_FALLBACK_SOURCES).' } });
+      send({ jsonrpc: '2.0', id: request.id, error: JSON.parse(process.env.FIXTURE_RPC_ERROR) });
       return;
     }
     if (request.params.name === 'doctor') {
-      if (mode === 'doctor-hang') return;
-      if (mode === 'doctor-unsupported') {
-        send({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'never-retain-this-secret' } });
-        return;
-      }
-      const detail = mode === 'doctor-spoof' ? 'arbitrary text HTTP 401 never-retain-this-secret'
-        : 'provider error: Grok Responses returned HTTP 401 Unauthorized: never-retain-this-secret';
-      const payload = { grok: { reachable: mode === 'doctor-reachable', detail } };
-      result(request.id, mode === 'doctor-text'
-        ? { content: [{ type: 'text', text: JSON.stringify(payload) }] }
-        : { content: [], structuredContent: payload });
+      // A later diagnostic can disagree with the failed primary request.
+      result(request.id, { content: [], structuredContent: { grok: { reachable: false,
+        detail: 'provider error: Grok Responses returned HTTP 404 Not Found: never-retain-this-secret' } } });
       return;
     }
   }
@@ -127,6 +120,13 @@ lines.on('line', line => {
     payload.fallback_reason = 'grok_sources_empty';
     payload.sources = [{ ...payload.sources[0], provider: `${provider}_fallback` }];
   }
+  if (mode.startsWith('primary-fallback')) {
+    payload.search_provider = 'source_fallback';
+    payload.fallback_used = true;
+    payload.fallback_reason = 'grok_provider_error';
+    payload.sources = [{ ...payload.sources[0], provider: 'tavily_fallback' }];
+    payload.primary_failure = JSON.parse(process.env.FIXTURE_PRIMARY_FAILURE);
+  }
   if (mode === 'stderr') process.stderr.write('api_key=never-retain-this-secret\n'.repeat(10_000));
   if (mode === 'malformed-result') payload.sources = 'not-an-array';
   if (mode === 'empty-sources') payload.sources = [];
@@ -134,7 +134,7 @@ lines.on('line', line => {
   if (mode === 'long-sources') payload.sources = [{ url: 'https://g.test/' + 'x'.repeat(400) }];
   answered = true;
   const response = { content: [{ type: 'text', text: JSON.stringify(payload) }] };
-  if (mode !== 'text-json') response.structuredContent = payload;
+  if (mode !== 'text-json' && mode !== 'primary-fallback-text') response.structuredContent = payload;
   if (mode === 'coalesced') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'offline fixture notification' } }) + '\n' + JSON.stringify({ jsonrpc: '2.0', id: request.id, result: response }) + '\n');
   } else if (mode === 'diagnostic-environment' && request.params.arguments.query === 'hold-before-diagnosis') {

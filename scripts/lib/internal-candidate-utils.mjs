@@ -10,7 +10,14 @@ export const project = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 export const sha256 = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 export function freshRun(prefix = 'internal-candidate') {
   const runId = new Date().toISOString().replaceAll(':', '-') + '-' + process.pid;
-  const directory = join(project, 'artifacts', prefix, runId);
+  const artifactRoot = process.env.DSH_VALIDATION_ARTIFACT_ROOT;
+  // Compare normalized and resolved paths to reject relative (including drive-relative) overrides.
+  if (artifactRoot !== undefined && (!artifactRoot || artifactRoot.includes('\0')
+    || resolve(artifactRoot) !== join(artifactRoot, '.'))) {
+    throw new Error('DSH_VALIDATION_ARTIFACT_ROOT must be an absolute path.');
+  }
+  const directory = artifactRoot === undefined
+    ? join(project, 'artifacts', prefix, runId) : join(artifactRoot, prefix, runId);
   if (existsSync(directory)) throw new Error('运行目录已存在，拒绝覆盖。');
   mkdirSync(directory, { recursive: true });
   return { runId, directory };

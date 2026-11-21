@@ -46,6 +46,8 @@ export const PUBLIC_MACOS_SUPPORT_FILES = Object.freeze([
   '.gitattributes', '.npmrc', 'package-lock.json', 'scripts/pack-internal.mjs', 'scripts/compatibility-watch.mjs', 'scripts/b3-cli-web.mjs',
   'test/compatibility-evidence.test.mjs', 'test/macos-acceptance-cases.mjs', 'test/retained-session-cases.mjs', 'test/helpers/temp-fixture.mjs',
   'test/remaining-scripts-audit-cases.mjs', 'test/delivery-tooling-cases.mjs',
+  'test/private-ci-tooling-cases.mjs', 'scripts/prepare-private-ci.mjs', 'scripts/verify-market-install.mjs',
+  'scripts/b2-control-host.mjs', 'scripts/verify-market-desktop-ui.mjs', 'scripts/readme-demos.mjs',
   // Audit cases also read these helpers as source instead of importing them.
   'scripts/b2-control-desktop.mjs', 'scripts/b2-product-install.mjs', 'scripts/verify-search-log-host.mjs',
   'scripts/verify-acceptance-sources.mjs', 'scripts/verify-native-update.mjs', 'scripts/verify-rc5-user-path.mjs',

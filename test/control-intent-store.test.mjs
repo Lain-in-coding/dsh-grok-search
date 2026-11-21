@@ -144,6 +144,45 @@ test('an absent store reads as null without creating a storage directory', t => 
   assert.equal(existsSync(directory), false);
 });
 
+test('schema v1 release completions before relative counters remain readable and migratable', async t => {
+  for (const counted of [true, false]) await t.test(counted ? 'zero total' : 'optional total omitted', sub => {
+    const { root, directory } = fixture(sub), operationId = randomUUID(), completionOperationId = randomUUID();
+    const at = '2026-10-20T00:00:00.000Z';
+    const lease = { hostId: randomUUID(), pid: 1234, uid: 7, entryId: 'web',
+      moduleName: '@deepseek-ai/dsh-web', provider: 'grok-search' };
+    const prior = requiredIntent({ lease, acquisition: { authorSearchProvider: 'author-search' } });
+    // The original B2 producer used a zero lifetime count, before baseline/delta fields existed.
+    const release = { explicit: true, committedAt: at, kind: 'intent-release-commit',
+      operationId, hostId: lease.hostId, pid: lease.pid, author: 'author-search',
+      routeChanged: false, routeVerified: false };
+    const intent = { ...prior, policy: 'released', priorIntent: prior, release,
+      pause: { confirmed: true, reason: 'explicit-user-release', observedAt: at },
+      releaseCompletion: { kind: 'explicit-release-completion', operationId: completionOperationId,
+        releaseOperationId: operationId, completedAt: at, routeBefore: 'grok-search',
+        routeChanged: true, routeVerified: true,
+        routeEvidence: { atAuthor: true, routeChanged: true, fetchPreserved: true,
+          dependenciesPreserved: true, actualSearchProvider: 'author-search',
+          ...(counted ? { originalSearchCalls: 0 } : {}) },
+        recordCommit: { kind: 'explicit-release-completion', operationId: completionOperationId,
+          previousRevision: 2, nextRevision: 3 } } };
+    const first = encode(envelope({ intent: prior }));
+    const { releaseCompletion: _completion, ...pending } = intent;
+    const second = encode(envelope({ revision: 2, previousSha256: sha256(first), operationId, intent: pending }));
+    const third = encode(envelope({ revision: 3, previousSha256: sha256(second),
+      operationId: completionOperationId, intent }));
+    seed(directory, [[revisionName(1), first], [revisionName(2), second], [revisionName(3), third]]);
+    assert.deepEqual(createControlIntentStore({ directory }).read().intent, intent);
+
+    const legacyPath = join(root, 'legacy.json'), raw = encode(intent);
+    writeFileSync(legacyPath, raw, { flag: 'wx' });
+    const migrated = createControlIntentStore({ directory: join(root, 'migrated'), legacyPath });
+    migrated.migrateLegacy({ expectedRevision: 0, expectedLegacySha256: sha256(raw), operationId: randomUUID() });
+    const { migration, ...restored } = migrated.read().intent;
+    assert.deepEqual(restored, intent);
+    assert.deepEqual(Buffer.from(migration.sourceBase64, 'base64'), raw);
+  });
+});
+
 function withReadCounter(work) {
   const original = fs.readFileSync, originalParse = JSON.parse;
   const state = { revisionReads: 0, envelopeParses: 0 };
@@ -385,6 +424,19 @@ test('publication retains unique complete staging files hardlinked to immutable 
     'before-stage-write', 'before-publish', 'after-publish',
   ]);
   assert.deepEqual(store.read(), second);
+});
+
+test('modified staging bytes cannot publish a control revision that fails its own readback', t => {
+  const { directory } = fixture(t);
+  const store = createControlIntentStore({ directory });
+  const before = store.compareAndSwap({ expectedRevision: 0, intent: requiredIntent() });
+  const changed = createControlIntentStore({ directory, fault(point, { stagePath }) {
+    if (point === 'before-publish') writeFileSync(stagePath, '{}');
+  } });
+  expectCode(() => changed.compareAndSwap({ expectedRevision: before.revision,
+    intent: requiredIntent({ reason: 'must remain unpublished' }) }), 'CONTROL_RECORD_INVALID');
+  assert.deepEqual(store.read(), before);
+  assert.equal(existsSync(join(directory, revisionName(2))), false);
 });
 
 test('stale revisions cannot overwrite an explicit release or create another staging file', t => {

@@ -41,32 +41,59 @@ function classifyEmptySearch(error) {
     ? failure(reason, EMPTY_SEARCH_REASONS[reason]) : error;
 }
 
-function primaryDoctorFailure(result) {
-  // v0.1.26 web_search drops the HTTP status, but doctor preserves it. Parse
-  // only its fixed prefix; never forward the body, URL, credential or free text.
-  let payload = result?.structuredContent;
-  if (!payload) {
-    const texts = result?.content?.filter(block => block.type === 'text');
-    if (texts?.length !== 1) return null;
-    try { payload = JSON.parse(texts[0].text); } catch { return null; }
-  }
-  if (payload?.grok?.reachable !== false || typeof payload.grok.detail !== 'string') return null;
-  const detail = payload.grok.detail;
-  const match = /^provider error: (?:Grok Responses|OpenAI-compatible) returned HTTP ([45]\d{2})(?:\s|:|$)/.exec(detail);
-  if (match) {
-    const status = Number(match[1]);
-    const message = status === 401 ? 'API Key 无效或鉴权失败'
-      : status === 403 ? '接口访问被拒绝，请检查账户、模型或权限'
-        : status === 429 ? '接口请求受限，请检查限流或额度'
-          : status === 402 ? '账户额度或计费受限'
-            : [404, 405].includes(status) ? '接口路径或协议不匹配'
-              : [400, 422].includes(status) ? '请求参数或模型不受支持'
-                : status >= 500 ? '上游服务异常' : '上游拒绝请求';
-    return new GrokSearchError(`HTTP_${status}`, `${message}（HTTP ${status}）。`, { httpStatus: status, evidence: 'primary-doctor' });
-  }
-  return detail.startsWith('upstream timeout:') ? failure('grok_timeout', EMPTY_SEARCH_REASONS.grok_timeout)
-    : /^provider error: (?:Grok Responses|OpenAI-compatible) request failed:/.test(detail)
-      ? failure('GROK_NETWORK_ERROR', '无法连接 Grok 接口，请检查网络、代理或证书。') : null;
+const PRIMARY_FAILURE_FIELDS = new Set(['schemaVersion', 'provider', 'protocol', 'stage', 'httpStatus', 'upstreamCode', 'reason']);
+const PRIMARY_UPSTREAM_CODES = new Set([
+  'invalid_api_key', 'authentication_error', 'auth_error', 'permission_denied', 'insufficient_quota',
+  'rate_limit_exceeded', 'rate_limited', 'rate_limit_error', 'model_not_found',
+  'tool_unsupported', 'unsupported_tool', 'unsupported_tools',
+  'unsupported_parameter', 'invalid_request', 'invalid_request_error', 'context_length_exceeded',
+  'server_error', 'internal_server_error', 'upstream_error', 'service_unavailable',
+]);
+const PRIMARY_FAILURE_REASONS = Object.freeze({
+  auth_error: ['grok_auth_error', EMPTY_SEARCH_REASONS.grok_auth_error],
+  rate_limited: ['grok_provider_error', 'Grok 接口请求受限，请检查限流或额度。'],
+  model_not_found: ['grok_provider_error', 'Grok 模型或路由不存在，请检查模型名称和服务商路由配置。'],
+  tool_unsupported: ['grok_provider_error', '当前 Grok 模型或路由不支持搜索工具。'],
+  invalid_request: ['grok_provider_error', 'Grok 请求参数不受支持，请检查模型和搜索工具配置。'],
+  upstream_error: ['grok_provider_error', 'Grok 上游接口调用失败，请检查服务状态与配置。'],
+  network_error: ['GROK_NETWORK_ERROR', '无法连接 Grok 接口，请检查网络、代理或证书。'],
+  timeout: ['grok_timeout', EMPTY_SEARCH_REASONS.grok_timeout],
+  parse_error: ['grok_parse_error', EMPTY_SEARCH_REASONS.grok_parse_error],
+  content_empty: ['grok_content_empty', EMPTY_SEARCH_REASONS.grok_content_empty],
+  sources_empty: ['grok_sources_empty', EMPTY_SEARCH_REASONS.grok_sources_empty],
+});
+
+function primaryFailureDetails(data) {
+  // Treat the extension atomically: unknown versions/fields/values retain the
+  // legacy diagnosis. Copy only bounded protocol values, never remote text.
+  if (!isRecord(data) || ![Object.prototype, null].includes(Object.getPrototypeOf(data))
+    || Object.keys(data).some(key => !PRIMARY_FAILURE_FIELDS.has(key))
+    || ['schemaVersion', 'provider', 'protocol', 'stage', 'reason'].some(key => !Object.hasOwn(data, key))
+    || data.schemaVersion !== 1 || data.provider !== 'grok'
+    || !['responses', 'chat_completions'].includes(data.protocol)
+    || !['request', 'response', 'parse', 'result'].includes(data.stage)
+    || typeof data.reason !== 'string' || !Object.hasOwn(PRIMARY_FAILURE_REASONS, data.reason)) return null;
+  if (Object.hasOwn(data, 'httpStatus') && (!Number.isInteger(data.httpStatus) || data.httpStatus < 200 || data.httpStatus > 599)) return null;
+  if (Object.hasOwn(data, 'upstreamCode') && !PRIMARY_UPSTREAM_CODES.has(data.upstreamCode)) return null;
+  return { schemaVersion: 1, provider: 'grok', protocol: data.protocol, stage: data.stage, reason: data.reason,
+    ...(Object.hasOwn(data, 'httpStatus') ? { httpStatus: data.httpStatus } : {}),
+    ...(Object.hasOwn(data, 'upstreamCode') ? { upstreamCode: data.upstreamCode } : {}), evidence: 'primary-request' };
+}
+
+export function primaryFailureError(data) {
+  const details = primaryFailureDetails(data);
+  if (!details) return null;
+  const [code, message] = PRIMARY_FAILURE_REASONS[details.reason];
+  // Successful headers can still carry a failed response/SSE body. Preserve
+  // their status as evidence without turning the failure into an HTTP_200 code.
+  const httpFailure = details.httpStatus >= 400;
+  return new GrokSearchError(httpFailure ? `HTTP_${details.httpStatus}` : code,
+    httpFailure ? `${message}（HTTP ${details.httpStatus}）` : message, details);
+}
+
+function classifySearchFailure(error) {
+  const legacy = classifyEmptySearch(error);
+  return legacy === error ? error : primaryFailureError(error.data) ?? legacy;
 }
 
 // 继承模式只传系统、代理及已知上游变量；配置文件由子进程自行读取。
@@ -382,7 +409,7 @@ export async function runMcpSearch({
     if (sdkFactory === defaultSdkFactory) sdkEntry = import.meta.resolve('@modelcontextprotocol/client');
     budget();
     if (typeof sdk.Client !== 'function' || typeof sdk.ReadBuffer !== 'function' || typeof sdk.serializeMessage !== 'function') throw failure('GROK_SDK_UNSUPPORTED', 'MCP SDK 缺少所需公开接口，请检查依赖版本。');
-    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.4.1' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
+    client = new sdk.Client({ name: 'dsh-grok-search', version: '0.4.2' }, { capabilities: {}, versionNegotiation: { mode: 'legacy' } });
     connection.client = client;
     // 所有可能拒绝的 framing 参数先校验，再启动本次进程。
     const buffer = new sdk.ReadBuffer({ maxBufferSize: maxMessageBytes + 1 });
@@ -410,37 +437,44 @@ export async function runMcpSearch({
     } catch (caught) {
       activeSignal.throwIfAborted();
       if (transport?.failure) throw transport.failure;
-      const classified = classifyEmptySearch(caught);
-      if (request.testPrimary === true && classified?.code === 'grok_provider_error') {
-        // This child is primary-only: all source switches and both fan-out
-        // budgets were disabled when it was created. A bounded diagnostic
-        // cannot spend supplementary quota or turn failure into search success.
-        try {
-          assertConfiguration();
-          const detail = primaryDoctorFailure(await race(client.callTool({ name: 'doctor', arguments: {} },
-            { ...options(), timeout: Math.min(10_000, budget()) })));
-          if (detail) throw detail;
-        } catch (doctorError) {
-          activeSignal.throwIfAborted();
-          if (transport?.failure) throw transport.failure;
-          if (doctorError instanceof GrokSearchError) throw doctorError;
-          // Older/unsupported doctors retain the original, honest diagnosis.
-        }
-      }
-      throw classified;
+      // Report this request only; a doctor probe can spend another request
+      // and return an unrelated status that hides the original failure.
+      throw classifySearchFailure(caught);
     }
     budget();
     const total = payload.sources_count ?? payload.total_sources ?? payload.sources.length;
     const missing = total - payload.sources.length;
-    const capacity = request.maxResults === undefined ? missing : Math.min(missing, request.maxResults - payload.sources.length);
     if (missing > 0) payload = { ...payload, truncated: true };
+    result = mapSearchResult(payload, { maxResults: request.maxResults, maxChars });
+    // Cached offsets count raw rows; the requested cap counts usable retained links.
+    const recoveryCapacity = () => request.maxResults === undefined ? total - payload.sources.length
+      : Math.min(total - payload.sources.length, request.maxResults - result.sources.length);
+    let capacity = recoveryCapacity();
     if (missing > 0 && capacity > 0 && typeof payload.session_id === 'string' && payload.session_id && remainingMs() > 0) {
       sourceRecovery = 'attempted';
       try {
-        const extra = decodeGrokResult(await race(client.callTool({ name: 'get_sources', arguments: { session_id: payload.session_id, offset: payload.sources.length, limit: capacity } }, options())));
-        budget();
-        payload = { ...payload, sources: [...payload.sources, ...extra.sources], truncated: (payload.truncated ?? false) || (extra.truncated ?? false) || payload.sources.length + extra.sources.length < total };
-        sourceRecovery = 'completed';
+        let offset = payload.sources.length;
+        while (capacity > 0) {
+          const extra = decodeGrokResult(await race(client.callTool({ name: 'get_sources', arguments: { session_id: payload.session_id, offset, limit: capacity } }, options())));
+          budget();
+          const next = offset + extra.sources.length;
+          if (extra.session_id !== undefined && extra.session_id !== payload.session_id
+            || extra.offset !== undefined && extra.offset !== offset
+            || extra.total_sources !== undefined && extra.total_sources !== total
+            || extra.sources.length > capacity || next > total
+            || extra.next_offset != null && extra.next_offset !== next) {
+            throw failure('GROK_INVALID_RESULT', 'Grok 来源分页元数据不一致，请检查程序版本。');
+          }
+          payload = { ...payload, sources: [...payload.sources, ...extra.sources], truncated: true };
+          result = mapSearchResult(payload, { maxResults: request.maxResults, maxChars });
+          capacity = recoveryCapacity();
+          if (!extra.sources.length) { sourceRecovery = 'partial'; break; }
+          offset = next;
+          sourceRecovery = capacity === 0 ? 'completed' : 'partial';
+          // Older backends may omit cursors. Only an explicit next page can
+          // authorize another cached read; never repeat an empty page.
+          if (extra.next_offset == null) break;
+        }
       } catch (caught) {
         activeSignal.throwIfAborted();
         if (transport?.failure) throw transport.failure;
@@ -466,11 +500,16 @@ export async function runMcpSearch({
       try { await closeConnection(connection, cleanupMs, error); }
       catch (caught) { if (error === undefined || caught?.code === 'GROK_PROCESS_REAP_FAILED') error = caught; }
     }
+    // Cancellation can arrive while cleanup is awaited; an unproven exit still owns the slot.
+    if (activeSignal.aborted && error?.code !== 'GROK_PROCESS_REAP_FAILED') error = activeSignal.reason;
   }
-  // fallback_reason is a stable grok-search-rs identifier (grok_auth_error,
-  // grok_timeout, ...); safeLabel keeps any free text out of diagnostics.
-  const diagnostic = { serverVersion, sdkEntry, searchProvider: safeLabel(payload?.search_provider), fallbackUsed: payload?.fallback_used ?? null,
-    fallbackReason: safeLabel(payload?.fallback_reason),
+  // Accept protocol identifiers, not arbitrary token-shaped upstream text.
+  const primaryFailure = payload?.fallback_used === true ? primaryFailureDetails(payload.primary_failure) : null;
+  const diagnostic = { serverVersion, sdkEntry,
+    searchProvider: ['grok_responses', 'openai_compatible', 'source_fallback'].includes(payload?.search_provider) ? payload.search_provider : null,
+    fallbackUsed: payload?.fallback_used ?? null,
+    fallbackReason: typeof payload?.fallback_reason === 'string' && Object.hasOwn(EMPTY_SEARCH_REASONS, payload.fallback_reason) ? payload.fallback_reason : null,
+    ...(primaryFailure ? { primaryFailure } : {}),
     sourceProvenance: searchSourceProvenance(result?.sources),
     sourceRecovery, elapsedMs: Math.round(performance.now() - started), ...(transport?.diagnostic?.() ?? { exited: true, childPid: null }) };
   if (error !== undefined) {

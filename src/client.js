@@ -806,11 +806,20 @@
               { code: "SETTINGS_SAVE_UNAVAILABLE" }
             );
           }
+          const path = S.config.path, identity = S.config.quotaRevision;
+          const epoch = secretEpoch, accessAtStart = accessGeneration;
           const result = await remote.saveWithIdentity({
             expectedRevision: revision,
-            configIdentity: S.config.quotaRevision,
+            configIdentity: identity,
             updates
           });
+          const matches = (value, target) => value?.path === target?.path && value?.revision === target?.revision && value?.quotaRevision === target?.quotaRevision;
+          if (!disposed && (accessAtStart !== accessGeneration || result.config.path !== path || !matches(S.config, result.config) && (epoch !== secretEpoch || !matches(S.config, { path, revision, quotaRevision: identity })))) {
+            throw Object.assign(
+              new Error("配置可能已写入，但当前配置或连接已变化；请重新读取确认，不要重复保存。"),
+              { code: "CONFIG_COMMIT_UNCERTAIN" }
+            );
+          }
           if (!disposed) updateConfig(result.config, Object.keys(updates));
           return {
             before: revision,
@@ -839,11 +848,18 @@
       for (let attempt = 0; attempt < 2; attempt++) {
         if (disposed) return;
         try {
+          const revision = S.prefs.revision, accessAtStart = accessGeneration;
           const result = await remote.savePreferences({
-            expectedRevision: S.prefs.revision,
+            expectedRevision: revision,
             value: { ...S.prefs.value, [key]: on }
           });
           if (!disposed) {
+            if (accessAtStart !== accessGeneration || S.prefs.revision !== revision && S.prefs.revision !== result.revision) {
+              throw Object.assign(
+                new Error("插件开关可能已保存，但当前状态或连接已变化；请重新读取确认，不要重复操作。"),
+                { code: "PREFERENCES_COMMIT_UNCERTAIN" }
+              );
+            }
             stateGeneration++;
             snapshotSignature = null;
             S.prefs = result;
@@ -921,12 +937,21 @@
       if (typeof remote.restoreConfigWithIdentity !== "function") {
         throw Object.assign(new Error(unavailable), { code: "SETTINGS_RESTORE_UNAVAILABLE" });
       }
+      const epoch = secretEpoch, accessAtStart = accessGeneration;
       try {
-        return await remote.restoreConfigWithIdentity({
+        const result = await remote.restoreConfigWithIdentity({
           expectedRevision: receipt.after,
           configIdentity: receipt.quotaRevision,
           revision: receipt.before
         });
+        const matches = (target) => S.config?.path === target.path && S.config?.revision === target.revision && S.config?.quotaRevision === target.quotaRevision;
+        if (!disposed && (accessAtStart !== accessGeneration || result.config.path !== receipt.path || !matches(result.config) && (epoch !== secretEpoch || !matches({ path: receipt.path, revision: receipt.after, quotaRevision: receipt.quotaRevision })))) {
+          throw Object.assign(
+            new Error("配置可能已恢复，但当前配置或连接已变化；请重新读取确认，不要重复撤销。"),
+            { code: "CONFIG_COMMIT_UNCERTAIN" }
+          );
+        }
+        return result;
       } catch (error) {
         if (/METHOD_NOT_FOUND|method[./_]not[./_]found|^SETTINGS_UNAVAILABLE$/i.test(error?.code || "")) {
           throw Object.assign(new Error(unavailable), { code: error.code });
@@ -944,6 +969,7 @@
       S.lastRoute = clone(route);
       if (route.grokCode !== "DISABLED" && grokOn()) {
         rememberCheck("grok", 0, route.grokCode ? normalizeCode(route.grokCode) : "", "search", route.at);
+        if (route.grokCode) rememberPrimaryFailure(route.primaryFailure);
       }
       if (SUPP.includes(route.served) && route.provenance !== "source-label") {
         delete S.providerBad[route.served];
@@ -1848,6 +1874,7 @@ ${dots.map((d) => d.tip).join("\n")}
       if (value === "GROK_VERSION_UNVERIFIED") return "此版本尚未通过插件验证；不会擅自升级或覆盖已有安装。";
       if (value === "OUTPUT_LIMIT") return "调大「回复字符上限」以容纳搜索链接；此结果不表示 Key 失效。";
       if (value === "GROK_CACHE_DAMAGED") return "在 Grok Search Rs 设置中点击「重新准备」；只恢复插件私有程序，不改共享配置或全局安装。";
+      if (value === "GROK_PROGRAM_CHANGED") return "检查程序文件；未指定路径时可「重新准备」，指定路径时请重新检测。";
       if (value === "GROK_CACHE_PATH_INVALID") return "检查插件缓存目录及链接；不会绕过路径检查或修改其他位置。";
       if (value === "GROK_CACHE_ACCESS_DENIED") return "检查插件缓存目录的读写权限后重新检测。";
       if (value.startsWith("GROK_DOWNLOAD_") || value.startsWith("GROK_ARCHIVE_")) return "检查网络或程序缓存，在 Grok Search Rs 设置中重新检测。";
@@ -1856,6 +1883,23 @@ ${dots.map((d) => d.tip).join("\n")}
       if (NETWORK_ERRORS[value]) return "核对 Base URL、网络或代理设置。";
       if (Number(value) >= 500) return "上游服务异常，可稍后重试。";
       return "检查接口配置或服务端返回详情，不能仅凭此错误判断 Key 失效。";
+    }
+    function rememberPrimaryFailure(details) {
+      if (details?.evidence !== "primary-request" || details?.provider !== "grok" || !["responses", "chat_completions"].includes(details.protocol) || !S.checked.grok?.[0]) return;
+      const copy = {
+        model_not_found: "该模型或路由不存在，请核对模型名称及服务商路由配置。",
+        tool_unsupported: "该模型或路由不支持所请求的搜索工具，请联系服务商确认联网支持。",
+        invalid_request: "上游拒绝了本次请求；请核对模型和搜索工具支持，不能据此判断 Key 失效。",
+        upstream_error: "本次搜索请求的上游服务异常；请检查服务状态。"
+      };
+      if (Object.hasOwn(copy, details.reason)) {
+        S.checked.grok[0].primaryHelp = copy[details.reason];
+        S.checked.grok[0].primaryCode = S.bad.grok;
+      }
+    }
+    function primaryHelp(id, code) {
+      const record = id === "grok" ? S.checked.grok?.[0] : null;
+      return record?.primaryCode === normalizeCode(code) ? record.primaryHelp : "";
     }
     function rowFault(id) {
       if (S.loading || !S.plugin || !isOn(id)) return null;
@@ -1881,7 +1925,7 @@ ${dots.map((d) => d.tip).join("\n")}
       const text = faults.length === 1 ? faults[0].text : `${faults.length} 个 Key ${reasons.length === 1 ? reasons[0] : "不可用"}`;
       const details = faults.map((f) => {
         const key = id === "tavily" && slots.length > 1 ? `Key ${f.slot + 1}：` : "";
-        return `${key}${f.status} · ${f.text}。${failureHelp(f.code)}`;
+        return `${key}${f.status} · ${f.text}。${primaryHelp(id, f.code) || failureHelp(f.code)}`;
       });
       if (id === "tavily" && faults.length < slots.length) {
         const verified = slots.some((slot) => savedCheck(id, slot).tone === "ok");
@@ -2653,7 +2697,7 @@ ${dots.map((d) => d.tip).join("\n")}
       return [{ k, val: (base[k] || "").trim(), code: v }];
     }
     function healthMsg(id, code, summary = false) {
-      const base = joinSentences(`${summary ? "" : "最近一次检查："}${failureInfo(code).status} · ${errText(code)}`, failureHelp(code));
+      const base = joinSentences(`${summary ? "" : "最近一次检查："}${failureInfo(code).status} · ${errText(code)}`, primaryHelp(id, code) || failureHelp(code));
       if (id === "grok") return base + (summary && grokOn() && S.lastRoute?.outcome === "ok" && S.lastRoute.fallbackUsed === true ? "\n搜索已静默回退到补充来源" : "");
       if (id === "tavily") return base + (!TAVILY_ROTATE.has(code) ? "；正常搜索遇到此错误不会换 Key，逐项测试仍独立检查其他 Key" : isBad("tavily") ? "" : "；其他 Key 的检查结果单独保留");
       return base + "；正常搜索可继续尝试后续来源";
@@ -3278,7 +3322,7 @@ ${dots.map((d) => d.tip).join("\n")}
         return;
       }
       const mine = D, id = mine.id;
-      const updates = Object.fromEntries(Object.values(CARD_FIELDS[id]).filter((key) => mine.fields[key]?.source === "file" && !mine.fields[key]?.readOnly).map((key) => [key, null]));
+      const updates = Object.fromEntries(Object.entries(CARD_FIELDS[id]).filter(([name, key]) => !fieldReadOnly(name) && mine.fields[key]?.source === "file" && !mine.fields[key]?.readOnly).map(([, key]) => [key, null]));
       if (!Object.keys(updates).length) {
         toast("没有可清除的文件配置；环境变量和只读认证保持不变。", { tone: "info" });
         resetClearConfirmation();
@@ -3337,7 +3381,7 @@ ${dots.map((d) => d.tip).join("\n")}
       const head = `<header class="dlg-head">${tile(id, 40)}<div class="dlg-titles"><h2 id="dlgTitle">${m.name}</h2><p class="dlg-sub"><span>${subText(id)}</span><a class="dlg-link" href="${m.link}" target="_blank" rel="noopener noreferrer">${EXT(m.linkText)}</a></p></div>${ctl}<button type="button" class="icon-btn" data-a="close" aria-label="关闭">${svg("x")}</button></header>`;
       const locked = !S.capabilities?.secretsAllowed ? note("当前连接仅支持脱敏查看。请使用已认证的本机直连或 HTTPS 连接查看和保存 Key。") : "";
       const body = `<div class="dlg-body">${locked}<form class="dlg-form" novalidate>${FIELDS[id](p)}<div id="quotaSlot"></div></form><div class="note search-result" role="status" aria-live="polite" aria-atomic="true" hidden></div></div>`;
-      const clearable = Object.values(CARD_FIELDS[id]).some((key) => D.fields[key]?.source === "file" && !D.fields[key]?.readOnly);
+      const clearable = Object.entries(CARD_FIELDS[id]).some(([name, key]) => !fieldReadOnly(name) && D.fields[key]?.source === "file" && !D.fields[key]?.readOnly);
       const clearBtn = clearable ? `<button type="button" class="btn btn-ghost btn-sm btn-danger" data-a="clear"${S.capabilities?.secretsAllowed ? "" : " disabled"}>清除配置</button>` : "";
       const foot = `<footer class="dlg-foot">${clearBtn}<span class="foot-note"></span><button type="button" class="btn btn-sm grow" data-a="cancel">取消</button><button type="button" class="btn btn-primary btn-sm grow" data-a="save">保存</button></footer>`;
       dlg.innerHTML = head + body + foot;
@@ -3422,7 +3466,7 @@ ${dots.map((d) => d.tip).join("\n")}
         path: S.program?.program?.path || S.program?.error?.message || "正在自动检测，无需填写路径"
       };
       const version = S.program?.program?.version ? "v" + S.program.program.version : programPhase();
-      const repair = S.program?.canRepair === true || S.program?.error?.code === "GROK_CACHE_DAMAGED";
+      const repair = !S.program?.configuration?.executable && (S.program?.canRepair === true || S.program?.error?.code === "GROK_CACHE_DAMAGED");
       const hit = ["manual", "loader"].includes(source) ? 0 : ["path", "npm", "cargo"].includes(source) ? 1 : source === "private-cache" ? 2 : -1;
       const order = ["插件设置里的程序路径（只读）", "系统 PATH、npm 或 Cargo 的已有安装", "缺失时下载到插件私有缓存"].map((t, i) => `<li class="${i === hit ? "is-hit" : ""}">${t}${i === hit ? " · 当前使用" : ""}</li>`).join("");
       const cfgTag = S.cfgExists ? '<span class="tag" data-tone="agent">已存在</span>' : '<span class="tag" data-tone="warn">首次保存时创建</span>';
@@ -3488,6 +3532,8 @@ ${dots.map((d) => d.tip).join("\n")}
       try {
         const program = await (repair ? remote.repairProgram() : remote.prepareProgram());
         if (disposed || D !== mine) return;
+        stateGeneration++;
+        snapshotSignature = null;
         S.program = program;
         renderHead();
         toast(`${programPhase()} · ${programSource()}${program.program?.version ? " v" + program.program.version : ""}`, { tone: "info" });
@@ -3697,8 +3743,15 @@ ${dots.map((d) => d.tip).join("\n")}
       "GROK_QUEUE_FULL",
       "GROK_SEARCH_STOPPING",
       "SETTINGS_DIAGNOSIS_CANCELLED",
-      "SETTINGS_DIAGNOSIS_BUSY"
-    ].includes(code);
+      "SETTINGS_DIAGNOSIS_BUSY",
+      "SETTINGS_UNAVAILABLE",
+      "SETTINGS_OPERATION_FAILED",
+      "SOURCE_UNAVAILABLE",
+      "GROK_UNAVAILABLE",
+      "GITHUB_UNAVAILABLE",
+      "GROK_PROGRAM_UNAVAILABLE",
+      "GITHUB_TOOL_REGISTRATION_FAILED"
+    ].includes(code) || /^gateway[/.]/i.test(code);
     function flashRow(id) {
       const r = typeof id === "string" ? rowOf(id) : id;
       if (!r || reduced()) return;
@@ -3796,10 +3849,10 @@ ${dots.map((d) => d.tip).join("\n")}
             return;
           }
           S.testProgress.completed++;
-          delete S.providerBad[id];
           row.classList.remove("is-searching");
           results.push(result);
           const skipped = ["disabled", "not-configured"].includes(result.status) || untestedCode(result.code);
+          if (!skipped) delete S.providerBad[id];
           const entries = result.keys?.length ? result.keys : slots.map((slot) => ({ keyIndex: slot, ...result }));
           for (const entry of entries) {
             const index = entry.keyIndex ?? 0;
@@ -3813,11 +3866,12 @@ ${dots.map((d) => d.tip).join("\n")}
             if (!untested) {
               rememberCheck(id, index, code, "test");
               S.checked[id][index].status = entry.status;
+              if (id === "grok" && code) rememberPrimaryFailure(entry.primaryFailure);
             }
           }
           if (id === "grok") primaryFailed = result.status === "failed";
           if (SUPP.includes(id) && result.status === "ok") supplementaryReady = true;
-          if (result.status === "failed") tr.failedSources.push(id);
+          if (result.status === "failed" && !skipped) tr.failedSources.push(id);
           live();
           if (skipped && untestedCode(result.code)) {
             toast(`${META[id].name}：${errText(result.code)}，未验证 Key。`, { tone: "info" });
@@ -3858,7 +3912,7 @@ ${dots.map((d) => d.tip).join("\n")}
         if (unfinished) tr.done.text = `测试未完成 · ${unfinished} 项未完整验证 · ${seconds} 秒`;
         if (searchAttempted && github) tr.done.text += ` · GitHub ${github.status === "ok" ? "可用" : "未通过"}`;
         live();
-        const failures = searchResults.filter((result) => result.status === "failed").map((result) => `${META[result.provider].name} ${normalizeCode(result.code)} · ${errText(result.code)}`);
+        const failures = searchResults.filter((result) => result.status === "failed" && !untestedCode(result.code)).map((result) => `${META[result.provider].name} ${normalizeCode(result.code)} · ${errText(result.code)}`);
         $("#announcer").textContent = joinSentences(
           unfinished ? "部分项目未完成，不能据此判定 Key 失效" : "已检查全部开启的来源与 Key",
           tr.done.text,
@@ -6430,6 +6484,7 @@ ${dots.map((d) => d.tip).join("\n")}
     "COMPATIBILITY_ROUTE_UNCONFIRMED",
     "COMPATIBILITY_BUDGET_UNCONFIRMED",
     "COMPATIBILITY_CORE_UNAVAILABLE",
+    "COMPATIBILITY_BLOCKED",
     "CONTROL_SEARCH_SELECTION_CONFLICT"
   ]);
   var OPTIONAL_LABELS = Object.freeze({
@@ -6472,7 +6527,7 @@ ${dots.map((d) => d.tip).join("\n")}
         tone: "err",
         title: "核心搜索暂不可用",
         text: transient ? "搜索组件启动失败，可以重新尝试；不会转交官方搜索。" : code === "CONTROL_SEARCH_SELECTION_CONFLICT" ? "搜索来源设置在接管期间发生变化；插件未覆盖当前配置，也未转交官方搜索。" : belowMinimum ? `当前 DSH 低于插件最低版本 ${report.minimumVersion || "0.2.1-rc.2"}，搜索已暂停；不会转交官方搜索。` : "搜索已暂停，当前不会转交官方搜索。",
-        detail: transient ? "配置仍可编辑。重新检查将重试未完成的启动步骤。" : code === "CONTROL_SEARCH_SELECTION_CONFLICT" ? "请检查当前搜索来源设置，再重新检查并接管。" : belowMinimum ? `宿主版本：${report.hostVersion || "无法识别"} · 插件版本：${report.pluginVersion || "无法识别"}` : "搜索接管未完成，可以重新检查；已有配置会保留。"
+        detail: transient ? "配置仍可编辑。重新检查将重试未完成的启动步骤。" : code === "COMPATIBILITY_BLOCKED" ? "搜索启动被安全检查阻止。请检查宿主日志中的错误码，修复后重新启用插件；已有配置会保留。" : code === "CONTROL_SEARCH_SELECTION_CONFLICT" ? "请检查当前搜索来源设置，再重新检查并接管。" : belowMinimum ? `宿主版本：${report.hostVersion || "无法识别"} · 插件版本：${report.pluginVersion || "无法识别"}` : "搜索接管未完成，可以重新检查；已有配置会保留。"
       };
     }
     if (report?.phase === "degraded" && code === "COMPATIBILITY_OPTIONAL_UNAVAILABLE") {

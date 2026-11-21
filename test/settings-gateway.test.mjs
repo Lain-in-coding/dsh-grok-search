@@ -863,6 +863,22 @@ test('diagnostic completion rejects a new configuration path even if both files 
   await assert.rejects(gateway.diagnoseProvider({ provider: 'tavily' }), { code: 'CONFIG_CONFLICT' });
 });
 
+test('legacy full diagnosis rejects results from a configuration replaced during the request', async () => {
+  for (const changedPath of [false, true]) {
+    const services = new Map();
+    const gateway = diagnosticGateway({ services, sourceRouter: {
+      diagnose: async () => {
+        const path = join(gateway.profileContext.dir, changedPath ? 'other.toml' : 'config.toml');
+        if (changedPath) services.set('grokSearchProgram', { snapshot: () => ({ configPath: path }) });
+        else writeFileSync(path, 'grok_model = "changed-during-diagnosis"\n');
+        return [{ provider: 'exa', ok: true, status: 'ok', code: 'OK', message: 'ok' }];
+      },
+    } });
+    await assert.rejects(gateway.diagnose(), { code: 'CONFIG_CONFLICT' });
+    assert.equal(gateway.diagnostics.size, 0);
+  }
+});
+
 test('diagnostic completion notices changed environment configuration without a file revision change', async () => {
   const previous = process.env.TAVILY_API_KEY;
   try {
@@ -1029,6 +1045,74 @@ test('settings disposal cancels work even when no core supplied a cancellation r
   await rejected;
   assert.equal(aborted, true);
   assert.equal(gateway.diagnostics.size, 0);
+});
+
+test('settings disposal cancels a test search with or without the optional core', async () => {
+  for (const withCore of [false, true]) {
+    let dispose, observedSignal, complete;
+    const search = (_request, signal) => {
+      observedSignal = signal;
+      return new Promise((resolve, reject) => {
+        complete = resolve;
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    };
+    const gateway = diagnosticGateway({
+      core: withCore ? { testSearch: search } : null,
+      sourceRouter: { search: request => search(request, request.signal) },
+      effect: setup => { dispose = setup(); },
+    });
+    const task = gateway.testSearch({ query: 'offline lifecycle probe' });
+    const rejection = assert.rejects(task, { code: 'SETTINGS_DIAGNOSIS_CANCELLED' });
+    dispose();
+    if (!observedSignal?.aborted) complete({ sources: [], search_provider: 'tavily' });
+    await rejection;
+    assert.equal(observedSignal?.aborted, true, 'The admitted search must be cancelled when its settings owner leaves.');
+    assert.equal(gateway.diagnostics.size, 0);
+  }
+});
+
+test('a disposed settings gateway rejects old references before reading or mutating dependencies', async () => {
+  let dispose;
+  const gateway = diagnosticGateway({ effect: setup => { dispose = setup(); } });
+  gateway._store = () => { assert.fail('Disposed settings must not open configuration'); };
+  gateway.preferenceStore = {
+    snapshot() { assert.fail('Disposed settings must not read preferences'); },
+    save() { assert.fail('Disposed settings must not write preferences'); },
+  };
+  dispose();
+  for (const operation of [() => gateway.snapshot(), () => gateway.preferences(),
+    () => gateway.savePreferences({ expectedRevision: 'missing', value: { grokEnabled: false } })]) {
+    await assert.rejects(operation(), { code: 'SETTINGS_UNAVAILABLE' });
+  }
+});
+
+test('settings disposal rejects a pending program response even while root security remains alive', async () => {
+  let dispose, complete;
+  const services = new Map([['grokSearchProgram', {
+    prepare: () => new Promise(resolve => { complete = resolve; }),
+  }]]);
+  const gateway = diagnosticGateway({ services, effect: setup => { dispose = setup(); } });
+  const task = gateway.prepareProgram();
+  dispose();
+  complete({ phase: 'ready' });
+  await assert.rejects(task, { code: 'SETTINGS_UNAVAILABLE' });
+});
+
+test('a settings secret response rechecks owner authorization before leaving the RPC boundary', async () => {
+  let owner = true;
+  const services = new Map([['grokSearchConnectionSecurity', {
+    requireOwner() {
+      if (!owner) throw new GrokSearchError('SETTINGS_AUTH_REQUIRED', 'Synthetic owner revoked');
+    },
+    requireSecret() {},
+  }]]);
+  const gateway = diagnosticGateway({ services });
+  gateway._store = () => ({ reveal: () => ({ value: 'synthetic-private-value', source: 'file', readOnly: false }) });
+  const task = gateway.reveal({ key: 'grok_api_key' });
+  owner = false;
+  await assert.rejects(task, error => error.code === 'SETTINGS_AUTH_REQUIRED'
+    && !JSON.stringify(error).includes('synthetic-private-value'));
 });
 
 test('unexpected diagnostic dependency errors fail rather than becoming a stopping result', async () => {
@@ -1359,6 +1443,20 @@ test('snapshot carries the last route and plugin facts through the strict codec'
   assert.deepEqual(snapshotCodec().parse(empty), empty);
 }));
 
+test('internal primary failure evidence cannot invalidate the legacy settings snapshot codec', async () => withIsolatedHome(async () => {
+  const evidence = { schemaVersion: 1, provider: 'grok', protocol: 'chat_completions', stage: 'response',
+    reason: 'model_not_found', httpStatus: 404, upstreamCode: 'model_not_found', evidence: 'primary-request' };
+  const route = { at: 1, origin: 'search', outcome: 'ok', served: 'tavily', grokCode: 'HTTP_404',
+    fallbackUsed: true, failures: [], primaryFailure: evidence };
+  const { gateway } = viewGateway({ core: { routeSnapshot: () => route } });
+  const snapshot = await gateway.snapshot();
+  assert.deepEqual(snapshotCodec().parse(snapshot), snapshot);
+  assert.equal(snapshot.route.grokCode, 'HTTP_404');
+  assert.equal(snapshot.route.served, 'tavily');
+  assert.equal(snapshot.route.primaryFailure, undefined, 'Internal evidence must not widen the cached legacy wire contract.');
+  assert.deepEqual(route.primaryFailure, evidence, 'Redaction must not mutate the core route receipt.');
+}));
+
 test('snapshot reports an environment-selected config file', async () => withoutConfigEnv(async () => {
   const { gateway, path } = viewGateway({});
   process.env.GROK_SEARCH_CONFIG = path;
@@ -1561,3 +1659,35 @@ test('restoreConfigWithIdentity syncs GitHub credential state and rejects concur
   assert.equal(githubSynced, 2, 'restoring config must immediately sync GitHub token/cursor state');
   assert.equal(restored.config.fields.grok_model.value, 'before');
 }));
+
+
+test('Grok diagnosis retains safe original Responses error through the settings gateway', async () => {
+  const details = { schemaVersion: 1, provider: 'grok', protocol: 'responses', stage: 'response',
+    httpStatus: 404, upstreamCode: 'model_not_found', reason: 'model_not_found', evidence: 'primary-request' };
+  for (const fallback of [false, true]) {
+    const gateway = diagnosticGateway({ core: { testGrok: async () => {
+      if (fallback) return { sources: [{ url: 'https://example.com' }], diagnostic: {
+        fallbackUsed: true, fallbackReason: 'grok_provider_error', primaryFailure: details } };
+      throw new GrokSearchError('HTTP_404', 'untrusted raw upstream body', details);
+    } } });
+    const result = await gateway.diagnoseProvider({ provider: 'grok' });
+    assert.equal(result.code, 'HTTP_404');
+    assert.equal(result.httpStatus, 404);
+    assert.equal(result.evidence, 'primary-request');
+    assert.match(result.message, /模型或路由不存在/);
+    assert.doesNotMatch(result.message, /untrusted|接口路径/);
+    assert.deepEqual(result.primaryFailure, details);
+  }
+});
+
+test('Grok diagnosis never labels unvalidated error details as a doctor or primary request', async () => {
+  const gateway = diagnosticGateway({ core: { testGrok: async () => {
+    throw new GrokSearchError('HTTP_422', 'secret upstream text', { httpStatus: 422, evidence: 'primary-request',
+      reason: 'model_not_found', secret: 'do not expose' });
+  } } });
+  const result = await gateway.diagnoseProvider({ provider: 'grok' });
+  assert.equal(result.code, 'HTTP_422');
+  assert.equal(result.primaryFailure, undefined);
+  assert.equal(result.evidence, undefined);
+  assert.doesNotMatch(JSON.stringify(result), /secret upstream|do not expose/);
+});

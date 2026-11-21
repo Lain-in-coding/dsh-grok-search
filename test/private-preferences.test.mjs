@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, lstatSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -55,6 +55,42 @@ test('permission errors cannot silently reset disabled preference choices', () =
     const store = createPrivatePreferences({ path: resolve('synthetic-inaccessible-preferences.json') });
     assert.throws(store.snapshot, error => error.code === 'PREFERENCES_READ_FAILED'
       && !error.message.includes('private-path'));
+  `], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+});
+
+test('existing private preferences remain usable through a directory alias', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-pref-'));
+  const outside = join(root, 'outside'), directory = join(root, 'grok-search');
+  mkdirSync(outside);
+  const initial = createPrivatePreferences({ path: join(root, 'defaults.json') }).snapshot().value;
+  writeFileSync(join(outside, 'preferences.json'), JSON.stringify({ ...initial, githubReadEnabled: true }));
+  symlinkSync(outside, directory, process.platform === 'win32' ? 'junction' : 'dir');
+  const path = join(directory, 'preferences.json'), store = createPrivatePreferences({ path });
+  const before = store.snapshot();
+  assert.equal(before.value.githubReadEnabled, true);
+  const saved = store.save(before.revision, { ...before.value, grokEnabled: false });
+  assert.equal(saved.value.grokEnabled, false);
+  assert.equal(saved.value.githubReadEnabled, true);
+  assert.deepEqual(JSON.parse(readFileSync(join(outside, 'preferences.json'), 'utf8')), saved.value);
+  assert.equal(lstatSync(directory).isSymbolicLink(), true);
+});
+
+test('preference directory permission failures use a stable write error without leaking its path', () => {
+  const moduleUrl = new URL('../src/core/private-preferences.mjs', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { resolve } from 'node:path';
+    import { createPrivatePreferences } from ${JSON.stringify(moduleUrl)};
+    fs.lstatSync = () => { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); };
+    fs.mkdirSync = () => { throw Object.assign(new Error('/private/preferences'), { code: 'EACCES' }); };
+    syncBuiltinESMExports();
+    const store = createPrivatePreferences({ path: resolve('synthetic-inaccessible-preferences.json') });
+    assert.throws(() => store.save('missing', store.snapshot().value), error =>
+      error.code === 'PREFERENCES_WRITE_FAILED' && !error.message.includes('/private/preferences'));
   `], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
   assert.ifError(child.error);
   assert.equal(child.status, 0, child.stderr);
@@ -142,6 +178,34 @@ test('a post-publish external preference edit never becomes the receipt for a co
   assert.throws(() => store.save('missing', { ...initial, grokEnabled: false }), { code: 'PREFERENCES_COMMIT_UNCERTAIN' });
   assert.equal(readFileSync(path, 'utf8'), external);
 });
+test('modified preference staging cannot grant permissions before readback detects the change', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-pref-')), path = join(directory, 'preferences.json');
+  const initial = createPrivatePreferences({ path }).snapshot().value;
+  const store = createPrivatePreferences({ path, fault: point => {
+    if (point !== 'before-publish') return;
+    const stage = readdirSync(directory).find(name => name.endsWith('.tmp'));
+    writeFileSync(join(directory, stage), JSON.stringify({ ...initial, githubReadEnabled: true }));
+  } });
+  assert.throws(() => store.save('missing', { ...initial, grokEnabled: false }),
+    { code: 'PREFERENCES_PATH_UNSAFE' });
+  assert.equal(existsSync(path), false);
+});
+
+test('a replaced preference staging file is preserved on a failed publication', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-pref-')), path = join(directory, 'preferences.json');
+  let replacement;
+  const store = createPrivatePreferences({ path, fault: point => {
+    if (point !== 'before-publish') return;
+    replacement = join(directory, readdirSync(directory).find(name => name.endsWith('.tmp')));
+    renameSync(replacement, replacement + '.original');
+    writeFileSync(replacement, 'external-stage', { flag: 'wx' });
+    throw new Error('publication interrupted');
+  } });
+  assert.throws(() => store.save('missing', store.snapshot().value), { code: 'PREFERENCES_WRITE_FAILED' });
+  assert.equal(readFileSync(replacement, 'utf8'), 'external-stage');
+  assert.equal(existsSync(path), false);
+});
+
 test('idempotent preference saves do not republish and oversized or invalid UTF-8 files fail closed', () => {
   const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
   const initial = createPrivatePreferences({ path });

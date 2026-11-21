@@ -14,9 +14,9 @@ import {
 import { installProgramFetchBoundary, programEnvironment } from '../scripts/compatibility-program-host.mjs';
 import { unpackPlatformArchive, verifyArchiveIntegrity } from '../src/core/program-install.mjs';
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
-function setup(resolveProgram) {
+function setup(resolveProgram, configuration = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-program-controller-'));
-  return createProgramController({ configuration: {}, directory: root, env: () => ({ HOME: root }), resolveProgram });
+  return createProgramController({ configuration, directory: root, env: () => ({ HOME: root }), resolveProgram });
 }
 const program = { found: true, path: process.execPath, version: '0.1.26', source: 'test-only', sha256: '0'.repeat(64) };
 
@@ -99,6 +99,58 @@ test('cache recovery is explicit, deduplicated and remains retryable after a fai
     assert.equal(manager.execution().executable, program.path);
   } finally { await manager.dispose(); }
 });
+test('an unpinned program change enables explicit repair without silently preparing a replacement', async () => {
+  const attempts = [];
+  const manager = setup(async ({ repair }) => {
+    attempts.push(repair);
+    if (!repair) throw new GrokSearchError('GROK_PROGRAM_CHANGED', 'program content changed');
+    return program;
+  });
+  try {
+    await assert.rejects(manager.prepare(), { code: 'GROK_PROGRAM_CHANGED' });
+    assert.equal(manager.snapshot().canRepair, true);
+    assert.deepEqual(attempts, [false]);
+    assert.throws(manager.execution, { code: 'GROK_PROGRAM_CHANGED' });
+    const recovered = await manager.repair();
+    assert.deepEqual(attempts, [false, true]);
+    assert.equal(recovered.phase, 'ready');
+    assert.equal(recovered.canRepair, false);
+  } finally { await manager.dispose(); }
+});
+for (const code of ['GROK_PROGRAM_CHANGED', 'GROK_CACHE_DAMAGED']) {
+  test(`an explicitly configured executable never offers private repair (${code})`, async () => {
+    let calls = 0;
+    const manager = setup(async () => { calls++; throw new GrokSearchError(code, 'configured program failed'); },
+      { executable: process.execPath });
+    try {
+      await assert.rejects(manager.prepare(), { code });
+      assert.equal(manager.snapshot().canRepair, false);
+      await assert.rejects(manager.repair(), { code: 'GROK_CACHE_REPAIR_UNAVAILABLE' });
+      assert.equal(calls, 1);
+    } finally { await manager.dispose(); }
+  });
+}
+for (const code of ['GROK_CACHE_PATH_INVALID', 'GROK_CACHE_ACCESS_DENIED', 'GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED']) {
+  test(`program-change repair stops retrying after a protected failure (${code})`, async () => {
+    const failure = new GrokSearchError(code, 'protected repair failure');
+    let calls = 0;
+    const manager = setup(async ({ repair }) => {
+      calls++;
+      if (!repair) throw new GrokSearchError('GROK_PROGRAM_CHANGED', 'program content changed');
+      throw failure;
+    });
+    try {
+      await assert.rejects(manager.prepare(), { code: 'GROK_PROGRAM_CHANGED' });
+      assert.equal(manager.snapshot().canRepair, true);
+      await assert.rejects(manager.repair(), error => error === failure);
+      assert.equal(manager.snapshot().canRepair, false);
+      await assert.rejects(manager.repair(), {
+        code: code.endsWith('REAP_FAILED') ? code : 'GROK_CACHE_REPAIR_UNAVAILABLE',
+      });
+      assert.equal(calls, 2);
+    } finally { await manager.dispose(); }
+  });
+}
 
 test('official program verifier arguments require explicit package and native binary hashes for each case', () => {
   const root = mkdtempSync(join(tmpdir(), 'dsh-program-verifier-args-'));

@@ -1071,6 +1071,80 @@ test('host boundaries preserve caller cancellation identity and keep local timeo
   }
 });
 
+test('intercepted GitHub reads retain both host and fetch cancellation signals', async t => {
+  for (const owner of ['host', 'fetch']) await t.test(owner, async () => {
+    const host = new AbortController(), fetch = new AbortController();
+    const reason = new Error(`synthetic ${owner} cancellation`);
+    let sent, requests = 0, originalCalls = 0;
+    const started = new Promise(resolve => { sent = resolve; });
+    const f = await hostFixture({ fetch: (_input, init) => {
+      requests++;
+      if (requests > 1) return Promise.resolve(response([]));
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+        sent(() => resolve(response(root)));
+      });
+    } });
+    const exec = { name: 'web_fetch', arguments: { url }, agent: { session: { id: 'host-session' } },
+      callId: `separate-signal-${owner}`, signal: host.signal };
+    const caller = { tools: f.tools, fiber: { uid: 1, runtime: { name: 'tool-web' },
+      entry: { options: { name: '@deepseek-ai/dsh-tool-web' } }, config: { fetch: true } } };
+    const pending = f.events.get('tools/execute')[0](exec, () => {
+      const service = f.events.get('internal/get')[0](caller, 'web', undefined, () => ({
+        fetch() { originalCalls++; assert.fail('GitHub must not use the original provider'); },
+      }));
+      return service.fetch({ url }, fetch.signal);
+    });
+    const rejection = assert.rejects(pending, failure => failure === reason);
+    try {
+      const finish = await started;
+      (owner === 'host' ? host : fetch).abort(reason);
+      // A late reply proves whether host cancellation reached the reader.
+      finish();
+      await rejection;
+      assert.equal(requests, 1, 'cancellation must not fetch later discussion pages');
+      assert.equal(originalCalls, 0);
+      assert.equal(f.github.reader.snapshot().resources, 0);
+    } finally {
+      host.abort(reason); fetch.abort(reason);
+      await pending.catch(() => {});
+      await f.dispose();
+    }
+  });
+});
+
+test('GitHub cancellation after retrieval rejects delivery at both host entry points', async () => {
+  for (const name of ['github_read', 'web_fetch']) {
+    const controller = new AbortController();
+    const reason = new Error('synthetic cancellation before host delivery');
+    let f;
+    f = await hostFixture({ getCapabilities: () => {
+      if (f?.github.reader.snapshot().resources > 0 && f.github.reader.snapshot().active === 0) {
+        controller.abort(reason);
+      }
+      return { githubRead: true, githubFetch: true };
+    } });
+    try {
+      await assert.rejects(f.run({ name, arguments: { url }, agent: { session: { id: 'host-session' } },
+        callId: `late-cancel-${name}`, signal: controller.signal }), failure => failure === reason);
+    } finally { await f.dispose(); }
+  }
+});
+
+test('the GitHub host pipeline rejects cancellation after the reader has completed', async () => {
+  const controller = new AbortController(), reason = new Error('synthetic host pipeline cancellation');
+  const f = await hostFixture();
+  const exec = { name: 'github_read', arguments: { url }, agent: { session: { id: 'host-session' } },
+    callId: 'cancelled-host-pipeline', signal: controller.signal };
+  try {
+    await assert.rejects(f.events.get('tools/execute')[0](exec, async () => {
+      const result = await f.github.definition.execute(exec.arguments, exec);
+      controller.abort(reason);
+      return result;
+    }), failure => failure === reason);
+  } finally { await f.dispose(); }
+});
+
 test('pagination Link header allows next inside target URLs like vercel/next.js while rejecting malformed rel=next', async () => {
   const nextJsUrl = 'https://github.com/vercel/next.js/issues/1';
   const finalPage = fixture(0, {

@@ -67,8 +67,24 @@ function start(runtime, folder, initialize, fault = null) {
       throw new Error('Host startup timed out.');
     },
     async close() {
-      if (!state.stopped) { try { await host.request('close'); } catch (error) { state.closeError = error.message; child.kill('SIGKILL'); } }
-      await state.closed;
+      const wait = async () => {
+        let deadline;
+        try { return await Promise.race([state.closed.then(() => true),
+          new Promise(resolve => { deadline = setTimeout(() => resolve(false), 5000); })]); }
+        finally { clearTimeout(deadline); }
+      };
+      if (!state.stopped) {
+        try {
+          await host.request('close');
+          if (!await wait()) throw new Error('Host did not exit after its close reply.');
+        } catch (error) {
+          state.closeError = error.message; state.forced = true; child.kill('SIGKILL');
+        }
+      }
+      if (!await wait()) { clearTimeout(timer); throw new Error('Host did not exit during bounded cleanup.'); }
+      assert.ok(!state.closeError && !state.timedOut && !state.forced, 'Host required abnormal cleanup.');
+      assert.equal(state.exitCode, 0, 'Host exit code must be zero.');
+      assert.equal(state.signal, null, 'Host must exit without a kill signal.');
     },
   };
   hosts.push(host);
@@ -216,7 +232,10 @@ try {
   }
 } catch (error) { fatal = { message: error.message, stack: error.stack }; }
 finally {
-  for (const host of hosts) await host.close();
+  for (const host of hosts) {
+    try { await host.close(); }
+    catch (error) { fatal ??= { message: error.message, stack: error.stack }; }
+  }
   for (const [index, host] of hosts.entries()) {
     const { closed: _closed, pending: _pending, ...record } = host.state;
     writeJson(join(directory, 'host-' + index + '-execution.json'), safe(record));

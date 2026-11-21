@@ -66,7 +66,7 @@ export function createToolRouteContext({ capacity = 20, searchLog = null, now = 
         entry.elapsedMs = Math.max(0, now() - entry.at);
         const reported = failure ?? result?.error?.info ?? result?.error;
         const cancelled = exec.signal?.aborted === true && isCancellation(exec.signal.reason, true)
-          && (!reported || isCancellation(reported));
+          && (!reported || rejected && failure === exec.signal.reason || isCancellation(reported));
         entry.failed = !cancelled && (rejected || result?.isError === true || exec.signal?.aborted === true);
         entry.cancelled = cancelled;
         for (const route of entry.routes) if (route.outcome === 'running') {

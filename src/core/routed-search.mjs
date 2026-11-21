@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { GrokSearchError, isCancellation } from './errors.mjs';
+import { GrokSearchError, isCancellation, isRecord } from './errors.mjs';
+import { primaryFailureError } from './mcp-search.mjs';
 import { SEARCH_EXECUTION, SEARCH_SNAPSHOT, SEARCH_DIAGNOSTIC, capturedExecution, searchConfigValues } from './search-config.mjs';
 import { createSearchExecutor } from './search-executor.mjs';
 import { assertSearchReferences, mapSearchResult, searchSourceProvenance } from './result-map.mjs';
@@ -13,6 +14,17 @@ const codeOf = error => typeof error?.code === 'string' && CODE.test(error.code)
 const failureRows = list => (Array.isArray(list) ? list : []).slice(0, 8)
   .map(item => ({ provider: String(item?.provider ?? ''), code: codeOf(item) }))
   .filter(item => SOURCES.has(item.provider));
+const primaryDiagnosticFailure = details => {
+  if (!isRecord(details) || details.evidence !== 'primary-request') return null;
+  const { evidence, ...data } = details;
+  return primaryFailureError(data);
+};
+const nativeFallbackFailure = diagnostic => {
+  if (diagnostic?.fallbackUsed !== true) return null;
+  return primaryDiagnosticFailure(diagnostic.primaryFailure) ?? new GrokSearchError(
+    typeof diagnostic.fallbackReason === 'string' && /^grok_(?:auth_error|timeout|parse_error|provider_error|content_empty|sources_empty)$/.test(diagnostic.fallbackReason)
+      ? diagnostic.fallbackReason : 'grok_provider_error', 'Grok 主搜索未成功，当前结果来自备用来源。');
+};
 
 /**
  * Grok first; when it fails, is switched off or not ready, the shared
@@ -57,10 +69,10 @@ export function createRoutedSearch({ grok, canFallback = () => true, sourceRoute
     // *_fallback labels identify suppliers of retained results, not attempts.
     const served = fallback.length === 1 ? fallback[0] : provenance.resultProviders.length === 1
       && provenance.resultProviders[0] === 'grok' && provenance.resultProvidersComplete ? 'grok' : 'grok-sources';
-    return diagnostic.fallbackUsed === true
+    const primary = nativeFallbackFailure(diagnostic);
+    return primary
       ? { outcome: 'ok', served, fallbackUsed: true, failures: [], ...details,
-        grokCode: typeof diagnostic.fallbackReason === 'string' && CODE.test(diagnostic.fallbackReason)
-          ? diagnostic.fallbackReason : 'grok_provider_error' }
+        grokCode: primary.code, ...(primary.details ? { primaryFailure: primary.details } : {}) }
       : { outcome: 'ok', served: 'grok', grokCode: null, fallbackUsed: false, failures: [], ...details };
   };
   const tracked = async work => {
@@ -125,7 +137,7 @@ export function createRoutedSearch({ grok, canFallback = () => true, sourceRoute
           throw error;
         }
       }
-      let primary;
+      let primary, primaryDetails;
       const stage = new AbortController();
       const workMs = Math.max(0, remainingMs());
       const reserve = available ? Math.min(30_000, workMs / 4) : 0;
@@ -164,10 +176,11 @@ export function createRoutedSearch({ grok, canFallback = () => true, sourceRoute
         }
         if (signal?.aborted) throw signal.reason;
         primary = error;
+        primaryDetails = primaryDiagnosticFailure(error?.details)?.details;
       } finally { clearTimeout(stageTimer); }
       if (!available) {
         record(origin, { outcome: 'failed', served: null, grokCode: codeOf(primary), fallbackUsed: false,
-          failures: [], code: codeOf(primary) });
+          failures: [], code: codeOf(primary), ...(primaryDetails ? { primaryFailure: primaryDetails } : {}) });
         throw primary instanceof GrokSearchError ? primary
           : new GrokSearchError('GROK_SEARCH_FAILED', 'Grok 查询失败，请检查程序和配置。');
       }
@@ -176,14 +189,14 @@ export function createRoutedSearch({ grok, canFallback = () => true, sourceRoute
         const result = await sourceRouter.search({ ...sourceInput, reason: 'grok-unavailable' });
         signal?.throwIfAborted();
         const output = bounded(result, maxChars, request.maxResults);
-        record(origin, fromSources(result, codeOf(primary)));
+        record(origin, { ...fromSources(result, codeOf(primary)), ...(primaryDetails ? { primaryFailure: primaryDetails } : {}) });
         return output;
       } catch (fallbackError) {
         // A zero fallback budget is not a source failure: nothing was sent, so
         // the Grok failure itself remains the outcome, as with no source at all.
         if (fallbackError?.code === 'FALLBACK_SOURCES_ZERO' && !signal?.aborted) {
           record(origin, { outcome: 'failed', served: null, grokCode: codeOf(primary), fallbackUsed: false,
-            failures: [], code: codeOf(primary) });
+            failures: [], code: codeOf(primary), ...(primaryDetails ? { primaryFailure: primaryDetails } : {}) });
           throw primary instanceof GrokSearchError ? primary
             : new GrokSearchError('GROK_SEARCH_FAILED', 'Grok 查询失败，请检查程序和配置。');
         }
@@ -192,10 +205,12 @@ export function createRoutedSearch({ grok, canFallback = () => true, sourceRoute
         if (fallbackError?.code === 'SOURCE_ALL_FAILED' && Array.isArray(fallbackError.details?.failures)) {
           fallbackError.details.failures.unshift({ provider: 'grok',
             code: typeof primary?.code === 'string' ? primary.code : 'GROK_SEARCH_FAILED',
-            message: primary instanceof GrokSearchError ? primary.message : 'Grok 查询失败。' });
+            message: primary instanceof GrokSearchError ? primary.message : 'Grok 查询失败。',
+            ...(primaryDetails ? { primaryFailure: primaryDetails } : {}) });
         }
         if (!signal?.aborted) record(origin, { outcome: 'failed', served: null, grokCode: codeOf(primary),
           fallbackUsed: false, code: codeOf(fallbackError),
+          ...(primaryDetails ? { primaryFailure: primaryDetails } : {}),
           failures: failureRows(fallbackError?.details?.failures).filter(item => item.provider !== 'grok') });
         throw fallbackError;
       }
@@ -213,6 +228,8 @@ export function createRoutedSearch({ grok, canFallback = () => true, sourceRoute
       const captured = { ...request, ...(execution ? { [SEARCH_EXECUTION]: execution } : {}) };
       return request.testPrimary
         ? grok.search(captured, signal).then(result => {
+          const primary = nativeFallbackFailure(result.diagnostic);
+          if (primary) throw primary;
           const output = bounded(result, maxChars, request.maxResults);
           assertSearchReferences(result, output, request.maxResults);
           return { sources: output.sources, diagnostic: output.diagnostic ?? null };

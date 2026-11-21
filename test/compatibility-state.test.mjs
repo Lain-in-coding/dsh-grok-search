@@ -144,6 +144,7 @@ test('invalid, oversized, unknown-schema, duplicate and invalid UTF-8 state neve
     { schemaVersion: 1, generation: 1, pairs: [{ ...row, confirmed: 'yes' }] },
     { schemaVersion: 1, generation: 1, pairs: [row, row] },
     { schemaVersion: 1, generation: 1, pairs: [{ ...row, confirmed: false, notified: false }] },
+    { schemaVersion: 1, generation: 1, pairs: [{ ...row, confirmed: true, notified: false }] },
     { schemaVersion: 1, generation: 0, pairs: [row] },
   ]) {
     write(value);

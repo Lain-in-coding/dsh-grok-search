@@ -11,6 +11,7 @@ import { SETTINGS_DESCRIPTORS as descriptors, REMOTE_SERVICE } from './core/sett
 import { SEARCH_SNAPSHOT } from './core/search-config.mjs';
 import { createConfigLocationOpener } from './core/config-opener.mjs';
 import { validateSearchQuery } from './core/search-query.mjs';
+import { primaryFailureError } from './core/mcp-search.mjs';
 
 export const name = 'dsh-grok-search-settings-ui';
 export const inject = [
@@ -46,6 +47,13 @@ const grokMessage = code => code === 'HTTP_401' ? 'API Key 无效或鉴权失败
   : /^HTTP_[45]\d{2}$/.test(code) ? `Grok 接口返回 HTTP ${code.slice(5)}，请核对对应的接口、权限或服务状态。`
     : code === 'GROK_NETWORK_ERROR' ? '无法连接 Grok 接口，请检查网络、代理或证书。'
       : GROK_MESSAGES[code] ?? 'Grok 查询失败，请检查程序和配置。';
+const primaryDiagnosis = details => {
+  if (details?.evidence !== 'primary-request') return null;
+  const { evidence, ...data } = details;
+  const failure = primaryFailureError(data);
+  return failure ? { code: failure.code, message: failure.message, primaryFailure: failure.details,
+    ...(failure.details.httpStatus === undefined ? {} : { httpStatus: failure.details.httpStatus }), evidence } : null;
+};
 // A short form for the route view; the full path stays in `path`.
 const displayPath = path => {
   const home = homedir();
@@ -79,6 +87,7 @@ class GrokSearchSettingsGateway extends Service {
     this.preferenceStore = createPrivatePreferences({
       path: join(this.profileContext.dir, 'grok-search', 'preferences.json'),
     });
+    this.disposed = false;
     this.diagnostics = new Map();
     this.cancelledDiagnostics = new Map();
     this.configOpener = createConfigLocationOpener();
@@ -90,6 +99,7 @@ class GrokSearchSettingsGateway extends Service {
       }
     };
     ctx.effect?.(() => () => {
+      this.disposed = true;
       cancel();
       this.configOpener.dispose();
       this.cancelledDiagnostics.clear();
@@ -104,6 +114,7 @@ class GrokSearchSettingsGateway extends Service {
   get callRoutes() { return this.ctx.get?.('grokSearchCallRoutes') ?? null; }
 
   _owner() {
+    if (this.disposed) throw new GrokSearchError('SETTINGS_UNAVAILABLE', '插件设置已卸载，请重新打开插件页。');
     if (!this.security) throw new GrokSearchError('SETTINGS_SECURE_CONNECTION_REQUIRED', '设置安全服务未加载，请重新加载插件。');
     this.security.requireOwner(this.ctx);
   }
@@ -194,13 +205,18 @@ class GrokSearchSettingsGateway extends Service {
       error: { code: 'CONTROL_SETTINGS_UNAVAILABLE', message: '搜索控制组件当前未加载。' },
     };
     const program = this.program?.snapshot?.() ?? null;
+    const observedRoute = captured ? this.core?.routeSnapshot?.(captured) ?? null : null;
+    const route = observedRoute ? { ...observedRoute } : null;
+    // Older hosts cache this strict result schema; internal evidence belongs
+    // to the diagnostic endpoint, not the legacy settings snapshot.
+    if (route) delete route.primaryFailure;
     return {
       ...control,
       control,
       program,
       config,
       capabilities: this._capabilities(),
-      route: captured ? this.core?.routeSnapshot?.(captured) ?? null : null,
+      route,
       plugin: {
         budgetMs: typeof this.core?.budgetMs === 'number' ? this.core.budgetMs : null,
         programConfigured: program?.configuration?.executable === true,
@@ -338,7 +354,17 @@ class GrokSearchSettingsGateway extends Service {
     this._owner();
     const sourceRouter = this.sourceRouter;
     if (!sourceRouter?.diagnose) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
-    return this._diagnosisWork({}, signal => sourceRouter.diagnose({ signal }));
+    const captured = this._store().readSnapshot(), identity = this._quotaRevision(captured);
+    const preferences = this.preferenceStore.snapshot();
+    return this._diagnosisWork({}, async signal => {
+      const result = await sourceRouter.diagnose({ signal });
+      const current = this._store().readSnapshot();
+      if (current.snapshot.revision !== captured.snapshot.revision || this._quotaRevision(current) !== identity
+        || this.preferenceStore.snapshot().revision !== preferences.revision) {
+        throw new GrokSearchError('CONFIG_CONFLICT', '配置已更新，本次结果不再用于当前配置；请重新测试。');
+      }
+      return result;
+    });
   }
 
   async diagnoseProvider(request = {}) {
@@ -478,7 +504,8 @@ class GrokSearchSettingsGateway extends Service {
       // that answer is not evidence that the Grok key or model works.
       if (diagnostic.fallbackUsed === true) {
         const code = typeof diagnostic.fallbackReason === 'string' ? diagnostic.fallbackReason : 'grok_provider_error';
-        return { ...base, status: 'failed', code, message: grokMessage(code), elapsedMs: elapsed() };
+        return { ...base, status: 'failed', code, message: grokMessage(code),
+          ...primaryDiagnosis(diagnostic.primaryFailure), elapsedMs: elapsed() };
       }
       const count = Array.isArray(result?.sources) ? result.sources.length : 0;
       return count > 0
@@ -488,8 +515,7 @@ class GrokSearchSettingsGateway extends Service {
       if (signal?.aborted) throw signal.reason;
       const code = typeof error?.code === 'string' ? error.code : 'GROK_SEARCH_FAILED';
       return { ...base, status: 'failed', code, message: grokMessage(code), elapsedMs: elapsed(),
-        ...(Number.isInteger(error?.details?.httpStatus) ? { httpStatus: error.details.httpStatus,
-          evidence: 'primary-doctor' } : {}) };
+        ...primaryDiagnosis(error?.details) };
     }
   }
 
@@ -500,18 +526,19 @@ class GrokSearchSettingsGateway extends Service {
     if (!core?.testSearch && !sourceRouter?.search) {
       throw new GrokSearchError('SOURCE_UNAVAILABLE', '搜索测试当前不可用。');
     }
-    const signal = this.ctx.invocation?.signal;
     // The routed search already falls back through the shared source chain and
     // honours the release barrier; retrying the sources here would spend their
     // quota twice, hide the Grok failure and bypass a stopping barrier.
-    const result = core?.testSearch
-      ? await core.testSearch({ query: request.query, maxResults: 5 }, signal)
-      : await sourceRouter.search({ query: request.query, maxResults: 5, signal });
-    return {
-      sources: result.sources,
-      fallbackUsed: result.fallback_used === true,
-      provider: result.search_provider ?? null,
-    };
+    return this._diagnosisWork({}, async signal => {
+      const result = core?.testSearch
+        ? await core.testSearch({ query: request.query, maxResults: 5 }, signal)
+        : await sourceRouter.search({ query: request.query, maxResults: 5, signal });
+      return {
+        sources: result.sources,
+        fallbackUsed: result.fallback_used === true,
+        provider: result.search_provider ?? null,
+      };
+    });
   }
 
   async preferences() {
@@ -651,7 +678,9 @@ for (const descriptor of descriptors) {
           throw new GrokSearchError('SETTINGS_REQUEST_INVALID', '设置请求格式无效，请刷新插件页后重试。');
         }
       }
-      return await implementation.apply(self, args);
+      const value = await implementation.apply(self, args);
+      self._owner();
+      return value;
     } catch (error) {
       if (self.ctx.invocation?.signal?.aborted) throw self.ctx.invocation.signal.reason;
       if (error instanceof GrokSearchError) throw new RemoteError(error.code, error.message, jsonDetails(error.details));

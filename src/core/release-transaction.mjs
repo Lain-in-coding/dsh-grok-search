@@ -124,6 +124,20 @@ async function finishExplicitRelease({ store, record, owner, controller, reason,
   assertLease(prior.lease, owner);
   let restore;
   try {
+    const current = store.read();
+    if (current?.intent.policy !== 'released' || current.intent.release?.operationId !== releaseOperationId) {
+      fail('CONTROL_CAS_CONFLICT', 'The committed release intent changed before route restoration.');
+    }
+    if (current.intent.releaseCompletion) {
+      return Object.freeze({ kind: 'already-released', recordCommitted: false, completionCommitted: true,
+        inFlightInvalidated: true, drainSettled: true,
+        routeChanged: current.intent.releaseCompletion.routeChanged === true,
+        routeVerified: current.intent.releaseCompletion.routeVerified === true,
+        operationId: releaseOperationId, envelope: current });
+    }
+    if (current.revision !== record.revision || current.operationId !== record.operationId) {
+      fail('CONTROL_CAS_CONFLICT', 'The committed release record changed before route restoration.');
+    }
     restore = await controller.restore({ reason, operationId: releaseOperationId, owner: clone(owner),
       previousIntent: clone(prior), releaseIntent: clone(record.intent) });
   } catch (error) {
@@ -241,13 +255,13 @@ export async function commitExplicitRelease({ store, owner, controller, reason =
         routeVerified: before.intent.releaseCompletion.routeVerified === true,
         operationId, envelope: before });
     }
-    return finishExplicitRelease({ store, record: before, owner, controller, reason, now,
-      releaseOperationId: operationId });
+    assertReleaseRecord(before.intent, operationId);
   }
-  if (before.intent.pause?.confirmed === true || before.intent.release !== null) {
+  const resuming = before.intent.policy === 'released';
+  if (!resuming && (before.intent.pause?.confirmed === true || before.intent.release !== null)) {
     fail('CONTROL_RELEASE_CONFLICT', 'A confirmed pause or existing release blocks this release.');
   }
-  assertLease(before.intent.lease, owner);
+  assertLease(resuming ? before.intent.priorIntent.lease : before.intent.lease, owner);
 
   let invalidated = false, drained = false;
   try {
@@ -265,7 +279,7 @@ export async function commitExplicitRelease({ store, owner, controller, reason =
     }
     drained = true;
   } catch (error) {
-    const outcome = Object.freeze(releaseOutcome({ operationId, recordCommitted: false,
+    const outcome = Object.freeze(releaseOutcome({ operationId, recordCommitted: resuming,
       completionCommitted: false, inFlightInvalidated: invalidated, drainSettled: drained, error }));
     if (error instanceof ControlRecordError) {
       error.releaseOutcome = outcome;
@@ -276,6 +290,34 @@ export async function commitExplicitRelease({ store, owner, controller, reason =
     wrapped.cause = error;
     wrapped.releaseOutcome = outcome;
     throw wrapped;
+  }
+
+  // A durable intent proves the earlier drain, not this retry's live cleanup.
+  if (resuming) {
+    try {
+      const current = store.read();
+      if (current?.intent.policy !== 'released' || current.intent.release?.operationId !== operationId) {
+        fail('CONTROL_CAS_CONFLICT', 'The release intent changed while the current controller drained.');
+      }
+      if (current.intent.releaseCompletion) {
+        return Object.freeze({ kind: 'already-released', recordCommitted: false, completionCommitted: true,
+          inFlightInvalidated: true, drainSettled: true,
+          routeChanged: current.intent.releaseCompletion.routeChanged === true,
+          routeVerified: current.intent.releaseCompletion.routeVerified === true,
+          operationId, envelope: current });
+      }
+      if (current.revision !== before.revision || current.operationId !== before.operationId) {
+        fail('CONTROL_CAS_CONFLICT', 'The release record changed while the current controller drained.');
+      }
+    } catch (error) {
+      if (error instanceof ControlRecordError) error.releaseOutcome = Object.freeze(releaseOutcome({
+        operationId, recordCommitted: true, completionCommitted: false,
+        inFlightInvalidated: true, drainSettled: true, error,
+      }));
+      throw error;
+    }
+    return finishExplicitRelease({ store, record: before, owner, controller, reason, now,
+      releaseOperationId: operationId });
   }
 
   const release = {

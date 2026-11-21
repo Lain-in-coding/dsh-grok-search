@@ -6,6 +6,7 @@ import { COMPATIBILITY_REPORT, COMPATIBILITY_DESCRIPTORS } from '../src/core/com
 import { createSettingsCodec } from '../src/core/settings-codec.mjs';
 import { createSourceChain } from '../src/core/source-chain.mjs';
 import { createCompatibilityView } from '../src/ui/compatibility-view.mjs';
+import { createRuntimeCompatibility } from '../src/core/runtime-compat.mjs';
 
 const report = overrides => ({
   schemaVersion: 1, hostVersion: '0.2.2-rc.3', pluginVersion: '0.4.0', channel: 'rc',
@@ -111,6 +112,21 @@ test('confirmed core block has actionable text and never implies official search
   assert.match(h.get('[data-compatibility-text]').textContent, /不会转交官方搜索/);
   assert.equal(h.get('[data-compatibility-recheck]').hidden, true, 'missing RPC is not presented as an action');
   h.view.dispose();
+});
+
+test('a backend block caused by an unreadable startup ledger stays visible without a consent gate', async () => {
+  const coordinator = createRuntimeCompatibility({ hostVersion: '0.2.2-rc.3', pluginVersion: '0.4.0' });
+  coordinator.block('CONTROL_RECORD_INVALID');
+  assert.equal(coordinator.report().code, 'COMPATIBILITY_BLOCKED');
+  const h = harness({ compatibilityReport: coordinator.report });
+  try {
+    await settle();
+    assert.equal(h.root.dataset.compatibilityPhase, 'blocked');
+    assert.equal(h.get('.compatibility-banner').hidden, false);
+    assert.match(h.get('[data-compatibility-text]').textContent, /不会转交官方搜索/);
+    assert.match(h.get('[data-compatibility-detail]').textContent, /日志.*修复/);
+    assert.doesNotMatch(h.root.innerHTML, /accept-risk|data-compatibility-confirm/);
+  } finally { h.view.dispose(); coordinator.stop(); }
 });
 
 test('actual startup failure offers a retry without blaming the host version', async () => {

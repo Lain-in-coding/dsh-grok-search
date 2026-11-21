@@ -243,6 +243,22 @@ test('history restore requires current revision and original bytes match exactly
   assert.throws(() => store.restore({ expectedRevision: restored.revision, revision: '../config' }), code('CONFIG_HISTORY_INVALID'));
 });
 
+test('history restore rejects corrupt UTF-8 bytes even when decoding recreates the expected text hash', () => {
+  const original = '# preserved \uFFFD\ngrok_model = "before"\n';
+  const { store, path, historyDirectory } = setup(original);
+  const before = store.snapshot();
+  const saved = store.save({ expectedRevision: before.revision, updates: { grok_model: 'after' } });
+  const committed = readFileSync(path);
+  const damaged = Buffer.concat([Buffer.from('# preserved '), Buffer.from([0xff]), Buffer.from('\ngrok_model = "before"\n')]);
+  assert.equal(damaged.toString('utf8'), original);
+  assert.notEqual(createHash('sha256').update(damaged).digest('hex'), before.revision);
+  const history = join(historyDirectory, before.revision + '.toml');
+  writeFileSync(history, damaged);
+  assert.throws(() => store.restore({ expectedRevision: saved.revision, revision: before.revision }), code('CONFIG_HISTORY_INVALID'));
+  assert.deepEqual(readFileSync(path), committed);
+  assert.deepEqual(readFileSync(history), damaged);
+});
+
 test('deleting a value retains its user comment and falls back to defaults', () => {
   const { store, path } = setup('grok_model = "custom" # user comment\ngrok_api_key = "key"\n');
   store.save({ expectedRevision: store.snapshot().revision, updates: { grok_model: null, grok_api_key: null } });

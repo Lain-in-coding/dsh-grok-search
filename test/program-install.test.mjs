@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
 import { gzipSync } from 'node:zlib';
 import fs, { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
@@ -36,7 +38,8 @@ const validRows = () => [
 ];
 const integrity = data => 'sha512-' + createHash('sha512').update(data).digest('base64');
 function fixture({ latest = VERSION, archive = tar(validRows()), mutateMetadata, failOfficial = false,
-  redirect = null, failOfficialArchive = false, handshakeFailure = false, failAll = false, handshake } = {}) {
+  redirect = null, failOfficialArchive = false, handshakeFailure = false, failAll = false, handshake,
+  inspect: inspectImpl } = {}) {
   const directory = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-test-'));
   const urls = [], versions = [];
   const fetchImpl = async url => {
@@ -57,8 +60,9 @@ function fixture({ latest = VERSION, archive = tar(validRows()), mutateMetadata,
     }
     return new Response('', { status: 404 });
   };
-  const inspect = async path => {
+  const inspect = async (path, options) => {
     versions.push(path);
+    if (inspectImpl) return inspectImpl(path, options);
     return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
   };
   return { directory, urls, versions, installer: createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64', fetchImpl, inspect,
@@ -127,6 +131,9 @@ test('package identity and declared platform are verified', () => {
     rows[0].body = JSON.stringify({ ...manifest, ...patch });
     assert.throws(() => unpackPlatformArchive(tar(rows), PLATFORM), error => error.code === 'GROK_ARCHIVE_METADATA');
   }
+  const rows = validRows();
+  rows[0].body = 'null';
+  assert.throws(() => unpackPlatformArchive(tar(rows), PLATFORM), { code: 'GROK_ARCHIVE_METADATA' });
 });
 test('missing program is installed privately and cached, with a receipt', async () => {
   const { installer, directory, urls } = fixture();
@@ -161,11 +168,13 @@ test('known mirror CDN redirect is permitted without relaxing arbitrary origins'
   assert.equal((await installer.install()).version, VERSION);
   assert.ok(urls.includes('https://cdn.npmmirror.com/fixture.tgz'));
 });
-test('untrusted redirect is rejected before fetching its target', async () => {
-  const { installer, urls } = fixture({ redirect: 'https://example.invalid/fixture.tgz' });
-  await assert.rejects(installer.install(), error => error.code === 'GROK_DOWNLOAD_ORIGIN');
-  assert.ok(urls.every(url => !url.includes('example.invalid')));
-});
+for (const redirect of ['https://example.invalid/fixture.tgz', 'https://[invalid']) {
+  test(`invalid or untrusted redirect is rejected before fetching ${redirect}`, async () => {
+    const { installer, urls } = fixture({ redirect });
+    await assert.rejects(installer.install(), { code: 'GROK_DOWNLOAD_ORIGIN' });
+    assert.ok(!urls.includes(redirect));
+  });
+}
 for (const [label, init, expectedCode] of [
   ['HTTP failure', { status: 503 }, 'GROK_DOWNLOAD_HTTP'],
   ['oversized Content-Length', { headers: { 'content-length': String(1_048_577) } }, 'GROK_DOWNLOAD_SIZE'],
@@ -196,13 +205,93 @@ test('failed handshake never promotes the prepared binary', async () => {
   assert.equal(existsSync(join(directory, 'active.json')), false);
   assert.deepEqual(readdirSync(directory), [], 'exited, uncommitted candidate is cleaned');
 });
-test('an uncertain validation process retains its candidate files', async () => {
-  const { installer, directory } = fixture({ handshake: async () => {
-    throw Object.assign(new Error('not reaped'), { code: 'GROK_PROCESS_REAP_FAILED', diagnostic: { exited: false } });
+for (const code of ['GROK_PROGRAM_CHANGED', 'SYNTHETIC_INSPECTION_FAILURE']) {
+  test(`confirmed inspection exit cleans repeated candidates without deleting active or historical files (${code})`, async () => {
+    let failInspection = false;
+    const failure = Object.assign(new Error('inspection failed after close'), { code });
+    Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited: true }) });
+    const { installer, directory, versions } = fixture({ inspect: async path => {
+      if (failInspection) throw failure;
+      return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
+    } });
+    const installed = await installer.install();
+    const active = readFileSync(join(directory, 'active.json')), binary = readFileSync(installed.path);
+    const history = join(directory, `${VERSION}-historical`);
+    mkdirSync(history);
+    writeFileSync(join(history, 'grok-search-rs.exe'), 'historical-owned-by-another-attempt');
+    writeFileSync(join(directory, 'unrelated.txt'), 'preserved');
+    const names = readdirSync(directory).sort();
+    failInspection = true;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await assert.rejects(installer.install(), error => error === failure);
+      assert.equal(existsSync(versions.at(-1)), false);
+      assert.deepEqual(readdirSync(directory).sort(), names);
+      assert.deepEqual(readFileSync(join(directory, 'active.json')), active);
+      assert.deepEqual(readFileSync(installed.path), binary);
+      assert.equal(readFileSync(join(history, 'grok-search-rs.exe'), 'utf8'), 'historical-owned-by-another-attempt');
+      assert.equal(readFileSync(join(directory, 'unrelated.txt'), 'utf8'), 'preserved');
+    }
+  });
+}
+test('confirmed inspection exit removes its binary but preserves unknown files in the candidate directory', async () => {
+  const failure = new GrokSearchError('GROK_PROGRAM_CHANGED', 'changed after close');
+  Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited: true }) });
+  let unknown;
+  const { installer, directory, versions } = fixture({ inspect: async path => {
+    unknown = join(path, '..', 'unknown.txt');
+    writeFileSync(unknown, 'not-installer-owned');
+    throw failure;
   } });
-  await assert.rejects(installer.install(), { code: 'GROK_PROCESS_REAP_FAILED' });
+  await assert.rejects(installer.install(), error => error === failure);
+  assert.equal(existsSync(versions[0]), false);
+  assert.equal(readFileSync(unknown, 'utf8'), 'not-installer-owned');
+  assert.deepEqual(readdirSync(join(unknown, '..')), ['unknown.txt']);
   assert.equal(existsSync(join(directory, 'active.json')), false);
-  assert.equal(readdirSync(directory).filter(name => name.startsWith(VERSION + '-')).length, 1);
+  assert.equal(existsSync(join(directory, '.install.lock')), false);
+});
+for (const [label, code, exited] of [
+  ['missing exit fact', 'GROK_PROGRAM_CHANGED', undefined],
+  ['unconfirmed close', 'GROK_PROGRAM_REAP_FAILED', false],
+  ['non-boolean exit fact', 'GROK_PROGRAM_CHANGED', 'true'],
+]) {
+  test(`failed inspection retains its candidate without explicit confirmed exit (${label})`, async () => {
+    const failure = new GrokSearchError(code, 'inspection exit is unconfirmed');
+    if (exited !== undefined) Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited }) });
+    const { installer, directory, versions } = fixture({ inspect: async () => { throw failure; } });
+    await assert.rejects(installer.install(), error => error === failure);
+    assert.equal(readFileSync(versions[0], 'utf8'), 'offline-native-binary-fixture');
+    assert.equal(readdirSync(directory).length, 1);
+    assert.equal(existsSync(join(directory, 'active.json')), false);
+    assert.equal(existsSync(join(directory, '.install.lock')), false);
+  });
+}
+for (const [label, handshake] of [
+  ['thrown error', async () => {
+    throw Object.assign(new Error('not reaped'), { code: 'GROK_PROCESS_REAP_FAILED', diagnostic: { exited: false } });
+  }],
+  ['exit result', async () => ({ version: VERSION, toolsDeclared: true, exited: false })],
+]) {
+  test(`an uncertain validation process retains its candidate files (${label})`, async () => {
+    const { installer, directory } = fixture({ handshake });
+    await assert.rejects(installer.install(), { code: 'GROK_PROCESS_REAP_FAILED' });
+    assert.equal(existsSync(join(directory, 'active.json')), false);
+    assert.equal(readdirSync(directory).filter(name => name.startsWith(VERSION + '-')).length, 1);
+  });
+}
+test('binary mutation during the official backend handshake cannot replace an existing active record', async () => {
+  let mutate = false;
+  const { installer, directory } = fixture({ handshake: async ({ executable }) => {
+    if (mutate) writeFileSync(executable, 'changed-during-handshake');
+    return { version: VERSION, toolsDeclared: true, exited: true };
+  } });
+  const installed = await installer.install();
+  const record = readFileSync(join(directory, 'active.json'));
+  const bytes = readFileSync(installed.path);
+  mutate = true;
+  await assert.rejects(installer.install(), { code: 'GROK_PROGRAM_CHANGED' });
+  assert.deepEqual(readFileSync(join(directory, 'active.json')), record);
+  assert.deepEqual(readFileSync(installed.path), bytes);
+  assert.equal(existsSync(join(directory, '.install.lock')), false);
 });
 test('progress observer errors cannot invalidate a completed installation', async () => {
   const { installer } = fixture();
@@ -280,6 +369,118 @@ for (const code of ['EACCES', 'EPERM']) test(`existing cache ${code} access deni
   }
 });
 
+for (const code of ['EACCES', 'EPERM']) {
+  test(`readable private cache with ${code} spawn denial preserves bytes and disables repair`, async () => {
+    const { installer, directory } = fixture();
+    const installed = await installer.install(), binaryBytes = readFileSync(installed.path);
+    const recordPath = join(directory, 'active.json'), recordBytes = readFileSync(recordPath);
+    writeFileSync(installed.path, Buffer.from('4d5a0000', 'hex'));
+    const record = JSON.parse(recordBytes);
+    record.sha256 = createHash('sha256').update(readFileSync(installed.path)).digest('hex');
+    writeFileSync(recordPath, JSON.stringify(record));
+    const originalSpawn = childProcess.spawn, children = [];
+    const cause = Object.assign(new Error('synthetic-private-spawn-denial'), { code });
+    let downloads = 0;
+    const checking = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64',
+      fetchImpl: async () => { downloads++; assert.fail('Permission failure must not download.'); } });
+    const manager = createProgramController({ directory, installer: checking, configuration: {},
+      env: () => ({ HOME: directory, USERPROFILE: directory, PATH: '' }) });
+    const beforeBinary = readFileSync(installed.path), beforeRecord = readFileSync(recordPath);
+    childProcess.spawn = () => {
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+      children.push(child);
+      queueMicrotask(() => { child.emit('error', cause); child.emit('close', -1, null); });
+      return child;
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(manager.prepare(), error => {
+        assert.equal(error.code, 'GROK_CACHE_ACCESS_DENIED');
+        assert.equal(error.cause, cause);
+        return true;
+      });
+      assert.equal(manager.snapshot().canRepair, false);
+      await assert.rejects(manager.repair(), { code: 'GROK_CACHE_REPAIR_UNAVAILABLE' });
+      assert.equal(downloads, 0);
+      assert.deepEqual(readFileSync(installed.path), beforeBinary);
+      assert.deepEqual(readFileSync(recordPath), beforeRecord);
+    } finally {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+      for (const child of children) { child.stdout.destroy(); child.stderr.destroy(); }
+      await manager.dispose();
+      writeFileSync(installed.path, binaryBytes);
+      writeFileSync(recordPath, recordBytes);
+    }
+  });
+}
+
+for (const code of ['EACCES', 'EPERM']) {
+  test(`newly downloaded program with ${code} execution denial reports permissions and disables repair`, async () => {
+    const cause = Object.assign(new Error('synthetic-private-first-execution-denial'), { code });
+    const failure = new GrokSearchError('GROK_PROGRAM_START_FAILED', 'version process could not start');
+    Object.defineProperty(failure, 'cause', { value: cause });
+    Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited: true }) });
+    const { installer, directory, versions } = fixture({ inspect: async () => { throw failure; } });
+    const manager = createProgramController({ directory, installer, configuration: {},
+      env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: '' }) });
+    try {
+      await assert.rejects(manager.prepare(), error => {
+        assert.equal(error.code, 'GROK_CACHE_ACCESS_DENIED');
+        assert.equal(error.cause, cause);
+        assert.equal(JSON.stringify(error).includes('synthetic-private-first-execution-denial'), false);
+        return true;
+      });
+      assert.equal(manager.snapshot().canRepair, false);
+      assert.equal(versions.length, 1);
+      assert.equal(existsSync(versions[0]), false, 'confirmed spawn failure cleans only its incomplete install');
+      assert.deepEqual(readdirSync(directory), []);
+      await assert.rejects(manager.repair(), { code: 'GROK_CACHE_REPAIR_UNAVAILABLE' });
+      assert.equal(versions.length, 1);
+    } finally { await manager.dispose(); }
+  });
+}
+
+for (const code of ['EACCES', 'EPERM']) for (const stage of ['root', 'binary', 'activation']) {
+  test(`cache repair ${stage} ${code} preserves the old record and disables futile repair`, async () => {
+    const { installer, directory } = fixture();
+    const before = damagedCache(directory), recordPath = join(directory, 'active.json');
+    const manager = createProgramController({ directory, installer, configuration: {},
+      env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: '' }) });
+    await assert.rejects(manager.prepare(), { code: 'GROK_CACHE_DAMAGED' });
+    assert.equal(manager.snapshot().canRepair, true);
+    const operation = { root: 'mkdirSync', binary: 'openSync', activation: 'renameSync' }[stage];
+    const original = fs[operation];
+    const cause = Object.assign(new Error('synthetic-private-cache-write-denial'), { code });
+    let hits = 0;
+    fs[operation] = (...args) => {
+      const matches = stage === 'root' ? args[0] === directory
+        : stage === 'binary' ? String(args[0]).endsWith('grok-search-rs.exe') : args[1] === recordPath;
+      if (matches) { hits++; throw cause; }
+      return original(...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(manager.repair(), error => {
+        assert.equal(error.code, 'GROK_CACHE_ACCESS_DENIED');
+        assert.equal(error.cause, cause);
+        assert.equal(JSON.stringify(error).includes('synthetic-private-cache-write-denial'), false);
+        return true;
+      });
+      assert.equal(hits, 1);
+      assert.equal(manager.snapshot().canRepair, false);
+      await assert.rejects(manager.repair(), { code: 'GROK_CACHE_REPAIR_UNAVAILABLE' });
+      assert.equal(hits, 1);
+      assert.equal(readFileSync(recordPath, 'utf8'), before);
+      assert.equal(readFileSync(join(directory, 'damaged', 'grok-search-rs.exe'), 'utf8'), 'damaged-never-executed');
+    } finally {
+      fs[operation] = original;
+      syncBuiltinESMExports();
+      await manager.dispose();
+    }
+  });
+}
+
 test('cache inspection preserves an unreaped verification failure over caller cancellation', async () => {
   const { installer, directory } = fixture();
   await installer.install();
@@ -290,6 +491,26 @@ test('cache inspection preserves an unreaped verification failure over caller ca
     inspect: async () => { controller.abort(reason); throw failure; } });
   await assert.rejects(checking.active({ signal: controller.signal }), caught => caught === failure);
 });
+for (const [code, exited] of [
+  ['GROK_PROGRAM_CHANGED', undefined], ['GROK_PROGRAM_CHANGED', false],
+  ['GROK_PROGRAM_REAP_FAILED', false], ['GROK_PROCESS_REAP_FAILED', false],
+]) {
+  test(`cache repair requires confirmed inspection exit for a changed program (${code}, ${exited})`, async () => {
+    const { installer, directory } = fixture();
+    const installed = await installer.install();
+    const record = readFileSync(join(directory, 'active.json')), binary = readFileSync(installed.path);
+    const names = readdirSync(directory).sort();
+    const failure = new GrokSearchError(code, 'inspection exit is unconfirmed');
+    if (exited !== undefined) Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited }) });
+    const checking = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64',
+      fetchImpl: async () => assert.fail('unconfirmed inspection exit must not start another installation'),
+      inspect: async () => { throw failure; } });
+    await assert.rejects(checking.repair(), error => error === failure);
+    assert.deepEqual(readdirSync(directory).sort(), names);
+    assert.deepEqual(readFileSync(join(directory, 'active.json')), record);
+    assert.deepEqual(readFileSync(installed.path), binary);
+  });
+}
 
 function damagedCache(directory, missing = false) {
   mkdirSync(join(directory, 'damaged'));
@@ -399,6 +620,85 @@ test('the real controller and resolver recover a damaged private cache without r
     assert.equal(readFileSync(configPath, 'utf8'), configuration);
   } finally { await manager.dispose(); }
 });
+test('explicit controller repair recovers content changed during active inspection and preserves the old directory', async () => {
+  let activePath;
+  let changes = 0;
+  const failure = new GrokSearchError('GROK_PROGRAM_CHANGED', 'content changed during inspection');
+  Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited: true }) });
+  const { installer, directory, urls } = fixture({ inspect: async path => {
+    if (path === activePath) {
+      changes++;
+      writeFileSync(path, 'changed-during-version-inspection');
+      throw failure;
+    }
+    return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
+  } });
+  activePath = (await installer.install()).path;
+  const active = readFileSync(join(directory, 'active.json')), binary = readFileSync(activePath);
+  const manager = createProgramController({ directory, installer, configuration: {},
+    env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: '' }) });
+  try {
+    await assert.rejects(manager.prepare(), error => error === failure);
+    assert.equal(manager.snapshot().canRepair, true);
+    assert.deepEqual(readFileSync(join(directory, 'active.json')), active);
+    assert.equal(urls.length, 2, 'detection must not silently install another program');
+    // Restore test-owned bytes so repair itself observes a change during inspection.
+    writeFileSync(activePath, binary);
+    const recovered = await manager.repair();
+    assert.equal(changes, 2);
+    assert.equal(recovered.phase, 'ready');
+    assert.equal(recovered.canRepair, false);
+    assert.notEqual(recovered.program.path, activePath);
+    assert.equal(recovered.program.version, VERSION);
+    assert.equal(readFileSync(activePath, 'utf8'), 'changed-during-version-inspection');
+    assert.equal((await installer.active()).path, recovered.program.path);
+    assert.equal(urls.length, 4);
+    assert.ok(urls.every(url => !url.endsWith('/latest')));
+  } finally { await manager.dispose(); }
+});
+test('a changed automatically discovered program permits explicit private preparation and is never overwritten', async () => {
+  const { installer, directory, urls } = fixture();
+  const external = mkdtempSync(join(tmpdir(), 'dsh-changed-discovery-'));
+  const binary = join(external, 'grok-search-rs.exe');
+  writeFileSync(binary, 'external-program');
+  const failure = new GrokSearchError('GROK_PROGRAM_CHANGED', 'external content changed after close');
+  Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited: true }) });
+  const manager = createProgramController({ directory, installer, configuration: {},
+    env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: external }),
+    resolveProgram: options => resolveGrokProgram({ ...options, platform: 'win32', arch: 'x64', inspect: async path => {
+      assert.equal(path, realpathSync(binary));
+      writeFileSync(binary, 'external-changed-during-inspection');
+      throw failure;
+    } }) });
+  try {
+    await assert.rejects(manager.prepare(), { code: 'GROK_PROGRAM_CHANGED' });
+    assert.equal(manager.snapshot().canRepair, true);
+    assert.deepEqual(urls, []);
+    const recovered = await manager.repair();
+    assert.equal(recovered.phase, 'ready');
+    assert.equal(recovered.program.source, 'private-cache');
+    assert.ok(recovered.program.path.startsWith(directory));
+    assert.equal(readFileSync(binary, 'utf8'), 'external-changed-during-inspection');
+    assert.equal(urls.length, 2);
+  } finally { await manager.dispose(); }
+});
+for (const selection of ['configured', 'override']) {
+  test(`explicit ${selection} program change never consults or overwrites the private cache during repair`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-explicit-changed-'));
+    const binary = join(root, 'grok-search-rs.exe');
+    writeFileSync(binary, 'explicit-original');
+    const failure = new GrokSearchError('GROK_PROGRAM_CHANGED', 'explicit program changed');
+    await assert.rejects(resolveGrokProgram({ [selection]: binary, repair: true, platform: 'win32', arch: 'x64',
+      inspect: async () => { throw failure; },
+      installer: {
+        active() { assert.fail('explicit paths must not inspect the private cache'); },
+        repair() { assert.fail('explicit paths must not repair the private cache'); },
+        install() { assert.fail('explicit paths must not install another program'); },
+      } }), error => error === failure);
+    assert.equal(readFileSync(binary, 'utf8'), 'explicit-original');
+    assert.deepEqual(readdirSync(root), ['grok-search-rs.exe']);
+  });
+}
 test('stale lock is never reclaimed automatically', async () => {
   const { installer, directory } = fixture();
   writeFileSync(join(directory, '.install.lock'), 'other-owner');

@@ -337,6 +337,23 @@ test('each source filters unsafe URLs before applying the result limit', async (
   }
 });
 
+test('TinyFish retains later usable links when early rows are duplicated or exceed the output budget', async t => {
+  for (const mode of ['duplicate', 'output-budget']) await t.test(mode, async () => {
+    const first = { url: 'https://example.invalid/first' }, recovered = { url: 'https://example.invalid/recovered' };
+    const rows = mode === 'duplicate' ? [first, first, recovered]
+      : [{ url: 'https://example.invalid/' + 'x'.repeat(400) }, recovered];
+    const config = { ...baseConfig(), source_providers: ['tinyfish'], tinyfish_api_key: 'synthetic-tinyfish-key',
+      ...(mode === 'output-budget' ? { response_max_chars: 120 } : {}) };
+    const { instance, calls } = router({ config, fetchImpl: async () => json({ results: rows }) });
+    const result = await instance.search({ query: 'later usable sources', maxResults: mode === 'duplicate' ? 2 : 1 });
+    assert.deepEqual(result.sources.map(source => source.url),
+      (mode === 'duplicate' ? [first, recovered] : [recovered]).map(source => source.url));
+    assert.equal(result.search_provider, 'tinyfish');
+    assert.equal(result.truncated, true);
+    assert.equal(calls.length, 1);
+  });
+});
+
 test('invalid URLs from every source fail explicitly instead of returning empty success', async () => {
   const { instance } = router({ fetchImpl: async () => json({ results: ['https://[invalid'] }) });
   await assert.rejects(instance.search({ query: 'offline URL validation' }), error =>
@@ -559,4 +576,16 @@ test('maxResults: 0 probes upstream with minimum valid limit and returns empty s
   assert.equal(events.length, 1);
   assert.equal(events[0].result, 'failed');
   assert.equal(events[0].code, 'OUTPUT_LIMIT');
+});
+
+
+test('network diagnostics retain known transport codes but never arbitrary token-shaped causes', async () => {
+  const { instance } = router({ config: without(baseConfig(), 'exa', 'firecrawl', 'tinyfish'),
+    fetchImpl: async () => { throw Object.assign(new TypeError('private upstream body'), {
+      cause: { code: 'TOKEN_SHAPED_PRIVATE_VALUE' },
+    }); } });
+  const result = await instance.diagnoseProvider('tavily');
+  assert.equal(result.code, 'NETWORK');
+  assert.equal(result.keys[0].cause, undefined);
+  assert.doesNotMatch(JSON.stringify(result), /TOKEN_SHAPED_PRIVATE_VALUE|private upstream body/);
 });

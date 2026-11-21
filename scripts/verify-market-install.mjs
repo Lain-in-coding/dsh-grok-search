@@ -9,7 +9,9 @@ import { randomUUID } from 'node:crypto';
 import { prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
-import { cleanEnvironment, freshRun, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
+import { freshRun, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
+import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
+import { stopPreviewService } from './lib/browser-gates.mjs';
 
 // New, credential-free profiles only. This uses the released market's real
 // install adapter and official Desktop manager, not the market's visual shell
@@ -34,7 +36,9 @@ for (const mode of onlyMode ? [onlyMode] : modes) {
     private: true, type: 'module', dependencies: {},
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } } }));
   writeFileSync(join(control.profile, 'cordis.patch.yml'),
-    '- id: desktop-product-telemetry\n  disabled: true\n- id: product-analytics\n  config:\n    enabled: false\n- id: llm-deepseek-account\n  disabled: true\n- id: llm-deepseek\n  config:\n    apiKeyEnv: DSH_PROBE_UNUSED_KEY\n');
+    JSON.stringify([desktopWorkspacePatch(folder), { id: 'desktop-product-telemetry', disabled: true },
+      { id: 'product-analytics', config: { enabled: false } }, { id: 'llm-deepseek-account', disabled: true },
+      { id: 'llm-deepseek', config: { apiKeyEnv: 'DSH_PROBE_UNUSED_KEY' } }]));
   const configPath = join(folder, 'user/.config/grok-search-rs/config.toml');
   mkdirSync(join(configPath, '..'), { recursive: true });
   writeFileSync(configPath, '# Isolated install verification; no credentials.\n');
@@ -42,7 +46,7 @@ for (const mode of onlyMode ? [onlyMode] : modes) {
   await new Promise(done => reservation.listen(0, '127.0.0.1', done));
   const port = reservation.address().port;
   await new Promise(done => reservation.close(done));
-  const env = cleanEnvironment(folder, { DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
+  const { env } = prepareDesktopAcceptanceEnvironment(folder, { DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
     DSH_DESKTOP_PRIMARY_RUNTIME_DIR: control.primaryRuntime, DSH_DESKTOP_PNPM_ENTRY: control.pnpmEntry,
     GROK_SEARCH_CONFIG: configPath, DSH_PROBE_UNUSED_KEY: 'unused-offline', DSH_TELEMETRY_DISABLED: '1',
     npm_config_registry: 'https://registry.npmjs.org/', NODE_OPTIONS: '--network-family-autoselection-attempt-timeout=2000' });
@@ -50,8 +54,11 @@ for (const mode of onlyMode ? [onlyMode] : modes) {
     '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + port, '--lang=zh-CN'],
   { cwd: folder, env, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout.resume(); child.stderr.resume();
-  let ended = false, renderer;
-  const closed = new Promise(done => child.once('close', code => { ended = true; done(code); }));
+  let ended = false, renderer, exitCode, signal, spawnError, forced = false;
+  child.on('error', cause => { spawnError ??= cause; });
+  const closed = new Promise(done => child.once('close', (code, receivedSignal) => {
+    ended = true; exitCode = code; signal = receivedSignal; done();
+  }));
   const requestId = randomUUID();
   console.log(JSON.stringify({ mode, phase: 'starting', profile: 'new-isolated' }));
   try {
@@ -71,6 +78,7 @@ for (const mode of onlyMode ? [onlyMode] : modes) {
       // The market's own logger and journal also stay in this disposable profile.
       const previous = { ...process.env };
       try {
+        for (const key of Object.keys(process.env)) if (!Object.hasOwn(env, key)) delete process.env[key];
         Object.assign(process.env, env);
         const { createOfficialDesktopRuntime } = await import(pathToFileURL(resolve(marketDirectory, 'lib/official-desktop.js')));
         const { installTargetFor } = await import(pathToFileURL(resolve(marketDirectory, 'lib/sources.js')));
@@ -106,16 +114,36 @@ for (const mode of onlyMode ? [onlyMode] : modes) {
   } catch (error) {
     results.push({ mode, expectedVersionInstalled: false, error: String(error.message).replaceAll(folder, '<ISOLATED>').slice(0, 500) });
   } finally {
-    renderer?.close();
+    const errors = [];
+    const record = cause => errors.push(String(cause.message).replaceAll(folder, '<ISOLATED>').slice(0, 500));
+    try { renderer?.close(); } catch (cause) { record(cause); }
     if (!ended) {
       try { await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 }); }
-      catch { if (!ended) child.kill(); }
+      catch (cause) {
+        record(cause);
+        if (!ended) {
+          forced = true;
+          try { await stopPreviewService({ child, closed, get exited() { return ended; } }); }
+          catch (cleanup) { record(cleanup); }
+        }
+      }
     }
-    await closed;
+    if (spawnError) record(spawnError);
+    if (!ended || exitCode !== 0 || signal != null || forced) record(new Error('Isolated Desktop did not exit normally.'));
+    results.at(-1).process = { ended, exitCode, signal, forced, errors };
+    if (errors.length) process.exitCode = 1;
   }
 }
-assert.deepEqual([sha256(runtime.executable), sha256(runtime.archivePath)], before);
+let originalProgramUnchanged = false, integrityError = null;
+try {
+  originalProgramUnchanged = [sha256(runtime.executable), sha256(runtime.archivePath)].every((hash, index) => hash === before[index]);
+  if (!originalProgramUnchanged) throw new Error('Official Desktop files changed during verification.');
+} catch (cause) {
+  integrityError = String(cause.message).replaceAll(root, '<ISOLATED>').slice(0, 500);
+  process.exitCode = 1;
+}
 writeJson(join(run.directory, 'summary.json'), { runId: run.runId, results,
+  originalProgramUnchanged, integrityError,
   scope: 'published-0.2.0-official-Desktop-manager-and-released-market-1.73.12-adapter',
   marketVisualShellVerified: false, marketRouteVersionPinningVerified: false,
   freshReleasePolicyModified: false, sharedConfigRead: false, paidSearchRequests: 0, published: false });

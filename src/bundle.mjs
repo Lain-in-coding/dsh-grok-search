@@ -358,7 +358,8 @@ export function apply(ctx, configuration, { load = loadModule,
     if (!value) return Promise.resolve();
     value.suspended = true;
     value.abort.abort(unavailable('COMPATIBILITY_STOPPED'));
-    value.github?.invalidate();
+    try { Promise.resolve(value.github?.invalidate()).catch(backgroundError); }
+    catch (error) { backgroundError(error); }
     const task = Promise.allSettled([cancelResource(value, 'core'), cancelResource(value, 'program')])
       .then(results => {
         const failure = results.find(result => result.status === 'rejected');
@@ -376,7 +377,7 @@ export function apply(ctx, configuration, { load = loadModule,
     value.disposal = (async () => {
       const results = await Promise.allSettled([
         suspendGeneration(value),
-        Promise.resolve().then(() => value.budgets?.release()),
+        Promise.resolve().then(() => value.budgets?.release()).catch(backgroundError),
       ]);
       const failure = results.find(result => result.status === 'rejected');
       if (canDispose) {

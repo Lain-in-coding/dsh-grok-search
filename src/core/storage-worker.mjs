@@ -46,7 +46,7 @@ export function createStorageMaintenanceWorker({
       task.pending = null;
       task.latest = result;
       for (const listener of task.listeners) {
-        try { listener(result); } catch {}
+        try { Promise.resolve(listener(result)).catch(() => {}); } catch {}
       }
       resolve(result);
       const again = task.again; task.again = false;

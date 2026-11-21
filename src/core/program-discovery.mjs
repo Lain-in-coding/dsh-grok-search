@@ -58,8 +58,19 @@ export function discoverGrokCandidates({ override, configured, env = process.env
   return rows;
 }
 
-export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000,
-  env = process.env, platform = process.platform } = {}) {
+export async function inspectGrokProgram(executable, options = {}) {
+  const processState = { exited: true };
+  try { return await inspectProgram(executable, options, processState); }
+  catch (error) {
+    if (error && typeof error === 'object' && Object.isExtensible(error) && !Object.hasOwn(error, 'diagnostic')) {
+      Object.defineProperty(error, 'diagnostic', { value: Object.freeze({ exited: processState.exited }) });
+    }
+    throw error;
+  }
+}
+
+async function inspectProgram(executable, { signal, timeoutMs = 5_000,
+  env = process.env, platform = process.platform } = {}, processState) {
   if (typeof executable !== 'string' || !isAbsolute(executable) || executable.includes('\0')) {
     throw new GrokSearchError('GROK_PROGRAM_PATH_INVALID', 'Grok 程序必须使用绝对路径。');
   }
@@ -76,17 +87,23 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
     Object.defineProperty(error, 'cause', { value: cause, writable: true, configurable: true });
     throw error;
   }
-  const descriptor = openSync(actual, 'r'), magic = Buffer.alloc(4);
-  try { readSync(descriptor, magic, 0, 4, 0); } finally { closeSync(descriptor); }
+  const programBytes = readFileSync(actual), before = statSync(actual);
+  if (stat.dev !== before.dev || stat.ino !== before.ino || stat.size !== before.size
+    || programBytes.length !== stat.size) {
+    throw new GrokSearchError('GROK_PROGRAM_CHANGED', 'Grok 程序在验证期间发生变化，请重试。');
+  }
+  const magic = programBytes.subarray(0, 4);
   const native = platform === 'win32' ? magic.subarray(0, 2).toString('ascii') === 'MZ'
     : platform === 'linux' ? magic.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))
       : ['cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca', 'feedfacf', 'cffaedfe'].includes(magic.toString('hex'));
   if (!native) throw new GrokSearchError('GROK_PROGRAM_NOT_NATIVE', '检测到启动脚本，请选择 Grok 原生可执行程序。');
+  const expectedHash = createHash('sha256').update(programBytes).digest('hex');
   const environment = Object.fromEntries(Object.entries(env).filter(([key]) =>
     /^(PATH|SYSTEMROOT|WINDIR|SYSTEMDRIVE|TEMP|TMP|TMPDIR|LANG|LC_ALL)$/i.test(key)));
   const version = await new Promise((resolveVersion, reject) => {
     let output = '', failed, timer, killTimer, settled = false;
     const child = spawn(actual, ['--version'], { env: environment, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    processState.exited = false;
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
@@ -103,10 +120,11 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
     const abort = () => stop(signal.reason);
     signal?.addEventListener('abort', abort, { once: true });
     timer = setTimeout(() => stop(new GrokSearchError('GROK_PROGRAM_TIMEOUT', 'Grok 版本检查超时。')), timeoutMs);
-    child.on('error', () => {
+    child.on('error', cause => {
       const error = new GrokSearchError('GROK_PROGRAM_START_FAILED', '无法启动 Grok 版本检查。');
+      Object.defineProperty(error, 'cause', { value: cause, writable: true, configurable: true });
       // A failed kill also emits error; only a missing pid proves spawn failed.
-      if (child.pid === undefined) finish(error); else stop(error);
+      if (child.pid === undefined) { processState.exited = true; finish(error); } else stop(error);
     });
     child.stdout.on('data', bytes => {
       if (output.length + bytes.length > 8192) { stop(new GrokSearchError('GROK_PROGRAM_OUTPUT_INVALID', '程序版本输出异常。')); return; }
@@ -114,6 +132,7 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
     });
     child.stderr.resume(); // Never retain upstream error text or credentials.
     child.once('close', code => {
+      processState.exited = true;
       if (failed) return finish(failed);
       const match = /^grok-search-rs (\d+\.\d+\.\d+(?:-[\w.-]+)?)\s*$/.exec(output);
       if (code !== 0 || !match) return finish(new GrokSearchError('GROK_PROGRAM_IDENTITY_INVALID', '所选程序不是可识别的 grok-search-rs。'));
@@ -122,13 +141,16 @@ export async function inspectGrokProgram(executable, { signal, timeoutMs = 5_000
     if (signal?.aborted) abort();
   });
   if (!VERIFIED_GROK_VERSIONS.includes(version)) throw new GrokSearchError('GROK_VERSION_UNVERIFIED', `Grok ${version} 尚未通过当前插件的兼容验证。`);
-  const programBytes = readFileSync(actual);
+  const afterBytes = readFileSync(actual);
   const after = statSync(actual);
+  const actualHash = createHash('sha256').update(afterBytes).digest('hex');
+  // Status timestamps can change on reads or execution. Compare file identity
+  // and content instead, including replacements that preserve size and mtime.
   if (stat.dev !== after.dev || stat.ino !== after.ino || stat.size !== after.size
-    || stat.mtimeMs !== after.mtimeMs || stat.ctimeMs !== after.ctimeMs) {
+    || afterBytes.length !== stat.size || expectedHash !== actualHash) {
     throw new GrokSearchError('GROK_PROGRAM_CHANGED', 'Grok 程序在验证期间发生变化，请重试。');
   }
-  return { path: actual, version, sha256: createHash('sha256').update(programBytes).digest('hex') };
+  return { path: actual, version, sha256: actualHash };
 }
 
 function isUnixLauncher(path) {

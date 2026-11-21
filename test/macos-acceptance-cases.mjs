@@ -1048,13 +1048,15 @@ test('macOS delivery includes every local reusable workflow and the shared tooli
       assert.ok(workflows.has(match[1]), 'Unselected reusable workflow: ' + match[1]);
     }
   }
-  for (const path of ['test/remaining-scripts-audit-cases.mjs', 'test/delivery-tooling-cases.mjs']) {
+  for (const path of ['test/remaining-scripts-audit-cases.mjs', 'test/delivery-tooling-cases.mjs',
+    'test/private-ci-tooling-cases.mjs', 'scripts/prepare-private-ci.mjs']) {
     assert.ok(PUBLIC_MACOS_SUPPORT_FILES.includes(path), 'Unselected acceptance test: ' + path);
   }
   const selected = new Set([...ACCEPTANCE_TOOL_FILES, ...PUBLIC_MACOS_SUPPORT_FILES]);
   for (const file of ['b2-control-desktop.mjs', 'b2-product-install.mjs', 'verify-search-log-host.mjs',
     'verify-acceptance-sources.mjs', 'verify-native-update.mjs', 'verify-rc5-user-path.mjs',
-    'compare-settings-desktop-performance.mjs', 'b2-plugin-manager-desktop.mjs']) {
+    'compare-settings-desktop-performance.mjs', 'b2-plugin-manager-desktop.mjs', 'verify-market-install.mjs',
+    'b2-control-host.mjs', 'verify-market-desktop-ui.mjs', 'readme-demos.mjs']) {
     assert.ok(selected.has('scripts/' + file), 'Unselected tooling source fixture: ' + file);
   }
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));

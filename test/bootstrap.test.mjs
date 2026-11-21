@@ -2123,6 +2123,53 @@ test('reprovided services cannot start another program before the detached gener
   } finally { release.resolve(); await detached; await f.ctx.dispose(); }
 });
 
+test('optional timeout restoration failure does not block retiring and replacing a search generation', async () => {
+  const f = bootstrapFixture();
+  let updates = 0;
+  const runtime = { name: 'tool-web', fibers: new Set() };
+  const author = { search: true, searchTimeoutMs: 10_000, fetchTimeoutMs: 15_000 };
+  const fiber = { uid: 950, state: 2, runtime, config: { ...author },
+    entry: { options: { name: '@deepseek-ai/dsh-tool-web', config: { ...author } } },
+    async update(value) {
+      if (++updates > 1) throw Object.assign(new Error('optional budget unavailable'), { code: 'TEST_BUDGET_RELEASE' });
+      this.config = f.ctx.waterfall(this, 'internal/config', value, () => value);
+    },
+    async await() {},
+  };
+  runtime.fibers.add(fiber);
+  try {
+    f.start();
+    await f.settle();
+    const owner = f.service('grokSearchControl');
+    for (const scope of f.scopes) scope.registry.set('tool-web', runtime);
+    await f.ctx.get('grokSearchBudgets').acquire();
+    assert.equal(f.ctx.get('grokSearchBudgets').snapshot().owned, 1);
+    f.coordinator().beginEpoch();
+    await f.settle();
+    assert.equal(f.coordinator().report().coreReady, true);
+    assert.notEqual(f.service('grokSearchControl'), owner);
+    assert.equal(f.calls.filter(call => call === 'program').length, 2);
+  } finally { await f.ctx.dispose(); }
+});
+
+test('a failed optional GitHub invalidation still drains the core and allows explicit stop', async () => {
+  const f = bootstrapFixture({ githubEnabled: true, overrides: {
+    github: { createGithubIntegration: () => ({
+      invalidate() { throw new Error('optional GitHub invalidation failed'); }, sync() {},
+      snapshot: () => ({ enabled: true, registered: true, error: null }),
+    }) },
+  } });
+  try {
+    f.start();
+    await f.settle();
+    assert.equal(f.coordinator().report().coreReady, true);
+    const outcome = await f.service('grokSearchControl').stop();
+    assert.equal(outcome.kind, 'released');
+    assert.ok(f.calls.includes('core-dispose'));
+    assert.equal(f.web.searchProviderId, 'author');
+  } finally { await f.ctx.dispose(); }
+});
+
 test('enabled GitHub intent survives revoked capabilities and runtime disposal without original fetch fallback', async () => {
   const nextCore = deferred();
   nextCore.promise.catch(() => {});

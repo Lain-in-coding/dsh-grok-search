@@ -8,7 +8,9 @@ import { randomUUID } from 'node:crypto';
 import { candidateRuntime } from './lib/candidate-runtime.mjs';
 import { prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
-import { cleanEnvironment, freshRun, redact, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
+import { freshRun, redact, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
+import { stopPreviewService } from './lib/browser-gates.mjs';
+import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
 
 // Visible, separately controlled, fresh Desktop profile for marketplace UI QA.
 // No real user profile or keys are read. Only explicitly supplied published
@@ -24,6 +26,7 @@ const run = freshRun('market-desktop-ui-021');
 const folder = join(tmpdir(), 'dsh-deferred-desktop-market-ui-' + run.runId);
 prepareDesktopFixture(runtime.executable, folder, { pluginManagerEntries: true, liveHmr: true, versionedControlRecord: true });
 const control = JSON.parse(readFileSync(join(folder, 'local-control.json'), 'utf8'));
+writeFileSync(join(control.profile, 'cordis.patch.yml'), JSON.stringify([desktopWorkspacePatch(folder)]));
 const before = [runtime.executable, runtime.archivePath, control.pnpmEntry].map(sha256);
 const configPath = join(folder, 'synthetic-shared-config.toml');
 const programFolder = join(folder, 'program');
@@ -31,7 +34,7 @@ mkdirSync(programFolder);
 const program = join(programFolder, 'grok-search-rs.exe');
 copyFileSync(resolve(grokArgument), program);
 const controlToken = randomUUID(), checks = [];
-let renderer, child, closed, ended = false, finalizing = false, exitCode, forced = false, error = null, initial;
+let renderer, child, closed, ended = false, finalizing = false, exitCode, signal, forced = false, error = null, initial;
 async function rpc(method, args = {}) {
   return renderer.evaluate(`(async () => {
     const method=${JSON.stringify('pluginManager/' + method)};
@@ -62,18 +65,38 @@ async function finish() {
   if (finalizing) return;
   finalizing = true;
   try {
-    if (renderer && !ended) { await snapshot('final'); await requestDesktopShutdown(control.port, closed, { timeoutMs: 25_000 }); }
+    if (child && !ended) {
+      if (renderer) await snapshot('final');
+      await requestDesktopShutdown(control.port, closed, { timeoutMs: 25_000 });
+    }
   } catch (cause) {
     error ??= { message: String(cause.message).replaceAll(folder, '<ISOLATED>').slice(0, 400) };
-    if (child && !ended) { forced = true; child.kill(); await closed; }
+    if (child && !ended) {
+      forced = true;
+      try { await stopPreviewService({ child, closed, get exited() { return ended; } }); }
+      catch (cleanup) { error.cleanupMessage = String(cleanup.message).replaceAll(folder, '<ISOLATED>').slice(0, 400); }
+    }
   } finally {
-    renderer?.close();
-    writeJson(join(run.directory, 'summary.json'), { runId: run.runId, hostVersion: runtime.app.version,
-      marketTarballSha256: sha256(marketTar), productReceiptSha256: productReceipt.sha256, checks,
-      originalProgramUnchanged: [runtime.executable, runtime.archivePath, control.pnpmEntry].every((p, i) => sha256(p) === before[i]),
-      error, exitCode, forced, paidSearchRequests: 0, publicRegistryModified: false, published: false });
-    console.log(JSON.stringify({ phase: 'finished', runId: run.runId, error, exitCode, forced }));
-    server.closeAllConnections(); server.close();
+    try { renderer?.close(); }
+    catch (cause) { error ??= { message: String(cause.message).replaceAll(folder, '<ISOLATED>').slice(0, 400) }; }
+    if (child && (!ended || exitCode !== 0 || signal != null || forced)) error ??= { message: 'Isolated Desktop did not exit normally.' };
+    process.exitCode = error ? 1 : 0;
+    try {
+      let originalProgramUnchanged = false;
+      try { originalProgramUnchanged = [runtime.executable, runtime.archivePath, control.pnpmEntry].every((p, i) => sha256(p) === before[i]); }
+      catch (cause) { error ??= { message: String(cause.message).replaceAll(folder, '<ISOLATED>').slice(0, 400) }; }
+      if (!originalProgramUnchanged) error ??= { message: 'Official Desktop files changed during verification.' };
+      process.exitCode = error ? 1 : 0;
+      writeJson(join(run.directory, 'summary.json'), { runId: run.runId, hostVersion: runtime.app.version,
+        marketTarballSha256: sha256(marketTar), productReceiptSha256: productReceipt.sha256, checks,
+        originalProgramUnchanged, error, exitCode, signal, forced, paidSearchRequests: 0, publicRegistryModified: false, published: false });
+      console.log(JSON.stringify({ phase: 'finished', runId: run.runId, error, exitCode, signal, forced }));
+    } catch (cause) {
+      process.exitCode = 1;
+      throw cause;
+    } finally {
+      try { server.closeAllConnections(); } finally { server.close(); }
+    }
   }
 }
 const server = createServer(async (request, response) => {
@@ -99,19 +122,22 @@ try {
   await new Promise(done => portReservation.listen(0, '127.0.0.1', done));
   control.port = portReservation.address().port;
   await new Promise(done => portReservation.close(done));
-  const env = cleanEnvironment(folder, { DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
+  const { env } = prepareDesktopAcceptanceEnvironment(folder, { DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
     DSH_DESKTOP_PRIMARY_RUNTIME_DIR: control.primaryRuntime, DSH_DESKTOP_PNPM_ENTRY: control.pnpmEntry,
     DSH_DESKTOP_FIXTURE_TOKEN: control.token, DSH_DESKTOP_FIXTURE_ADDRESS_FILE: join(folder, 'probe-address.json'),
     DSH_DESKTOP_OPEN_DEVTOOLS: '0', DSH_B2_CONTROL_RECORD: '1', DSH_B2_PRODUCT_COUNTER: '1',
     DSH_DESKTOP_OFFLINE_SENTINEL: 'isolated-not-a-real-key', GROK_SEARCH_CONFIG: configPath,
-    PATH: `${programFolder};${join(process.env.SystemRoot ?? 'C:/Windows', 'System32')}`,
     npm_config_registry: 'https://registry.npmjs.org/', NODE_OPTIONS: '--network-family-autoselection-attempt-timeout=2000',
     DSH_PRODUCT_ANALYTICS_OTLP_URL: 'http://127.0.0.1:9' });
+  env.PATH = programFolder + ';' + env.PATH;
   child = spawn(control.electron, [runtime.archivePath, '--user-data-dir=' + control.userData,
     '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + control.port, '--lang=zh-CN'],
   { cwd: folder, env, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.once('error', cause => { error ??= { message: String(cause.message).replaceAll(folder, '<ISOLATED>').slice(0, 400) }; });
   child.stdout.resume(); child.stderr.resume();
-  closed = new Promise(done => child.once('close', code => { ended = true; exitCode = code; done(code); }));
+  closed = new Promise(done => child.once('close', (code, receivedSignal) => {
+    ended = true; exitCode = code; signal = receivedSignal; done(code);
+  }));
   renderer = await connectRenderer(control.port, { timeoutMs: 60_000, requestTimeoutMs: 200_000 });
   await waitForRenderer(renderer, current => current.evaluate('document.readyState==="complete" && !!document.querySelector(\'button[aria-label="插件"]\')'), { timeoutMs: 60_000 });
   const installation = await rpc('installBundle', { spec: marketTar, options: { registry: 'https://registry.npmjs.org/',

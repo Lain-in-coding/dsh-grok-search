@@ -412,6 +412,20 @@ test('product owner explicit stop releases the route and records completion', as
   assert.deepEqual(createProductStore(ctx).read(), after);
 });
 
+test('an optional timeout cleanup failure does not prevent explicit search route release', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  ctx.provide('grokSearchBudgets', { release: async () => {
+    throw Object.assign(new Error('optional timeout update failed'), { code: 'TEST_BUDGET_RELEASE' });
+  } });
+  try {
+    await applyControl(ctx);
+    const result = await ctx.get('grokSearchControl').stop('stop-with-unavailable-budget');
+    assert.equal(result.kind, 'released');
+    assert.equal(result.completionCommitted, true);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+  } finally { ctx.dispose(); }
+});
+
 test('a fresh enabled owner reacquires a completed release and preserves immutable history', async () => {
   const ctx = makeContext({ originalCalls: 0 });
   await applyControl(ctx);
@@ -479,6 +493,64 @@ test('disposing a reactivation waiting on storage leaves the completed release u
     assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
     assert.equal(ctx.get('grokSearchControl').publicSnapshot().phase, 'disposed');
   } finally { lock.release(); await starting.catch(() => {}); ctx.dispose(); }
+});
+
+test('acquisition rechecks live authorization and author inputs after waiting for storage', async t => {
+  for (const change of ['selection', 'admission', 'epoch', 'web-owner', 'fetch', 'dependencies']) {
+    await t.test(change, async () => {
+      const ctx = makeContext({ originalCalls: 0 }), waiting = deferred();
+      const store = createProductStore(ctx, { deferMaintenance: true });
+      const prior = createRequiredRecord(ctx, store, randomUUID());
+      const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+      let admitted = true, current = true;
+      const starting = applyControl(ctx, {
+        store: { ...store, compareAndSwapAsync(request) {
+          waiting.resolve();
+          return store.compareAndSwapAsync(request);
+        } },
+        canAcquire: () => admitted, isCurrent: () => current, keepAliveOnFailure: true,
+      });
+      try {
+        await waiting.promise;
+        const entry = ctx.loader.entries()[0];
+        if (change === 'selection') writeProfile(ctx, ['different-bundle']);
+        else if (change === 'admission') admitted = false;
+        else if (change === 'epoch') current = false;
+        else if (change === 'web-owner') entry.fiber.uid++;
+        else if (change === 'fetch') {
+          entry.fiber.config.fetchProvider = 'different-fetch';
+          entry.options.config.fetchProvider = 'different-fetch';
+          ctx.get('web').fetchProviderId = 'different-fetch';
+        } else entry.options.inject = { changedDependency: {} };
+        lock.release();
+        await starting;
+        assert.deepEqual(store.read(), prior, 'a waiting owner cannot commit cached authorization');
+        assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+        assert.equal(ctx.get('grokSearchControl').snapshot().phase, 'incomplete');
+      } finally { lock.release(); await starting.catch(() => {}); ctx.dispose(); }
+    });
+  }
+});
+
+test('acquisition does not take over a release committed before its write returns', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  const store = createProductStore(ctx, { deferMaintenance: true });
+  let released;
+  const concurrent = { ...store, async compareAndSwapAsync(request) {
+    const required = await store.compareAndSwapAsync(request);
+    released = store.compareAndSwap({ expectedRevision: required.revision, intent: {
+      ...required.intent, policy: 'released', priorIntent: required.intent,
+      release: { explicit: true, committedAt: new Date().toISOString(),
+        kind: 'intent-release-commit', operationId: randomUUID(), counterBaseline: 0 },
+    } });
+    return required;
+  } };
+  try {
+    await applyControl(ctx, { store: concurrent, keepAliveOnFailure: true });
+    assert.deepEqual(store.read(), released);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+    assert.equal(ctx.get('grokSearchControl').snapshot().phase, 'incomplete');
+  } finally { ctx.dispose(); }
 });
 
 test('product control stop prelude failure is recorded and retryable', async () => {

@@ -63,7 +63,7 @@ export function unpackPlatformArchive(archive, { packageName, version, platform 
   let manifest;
   try { manifest = JSON.parse(files.get('package/package.json').toString('utf8')); }
   catch { fail('GROK_ARCHIVE_METADATA', '平台包清单无效。'); }
-  if (manifest.name !== packageName || manifest.version !== version || manifest.scripts
+  if (!manifest || manifest.name !== packageName || manifest.version !== version || manifest.scripts
     || !Array.isArray(manifest.os) || !manifest.os.includes(platform)) fail('GROK_ARCHIVE_METADATA', '平台包身份、版本或系统不匹配。');
   const executable = files.get('package/bin/' + filename);
   if (!executable.length) fail('GROK_ARCHIVE_CONTENT', '平台包没有可执行程序。');
@@ -148,7 +148,8 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       await response.body?.cancel();
       const location = response.headers.get('location');
       if (!location) fail('GROK_DOWNLOAD_ORIGIN', '下载跳转缺少目标地址。');
-      url = new URL(location, url).href;
+      try { url = new URL(location, url).href; }
+      catch { fail('GROK_DOWNLOAD_ORIGIN', '下载跳转地址无效。'); }
     }
     fail('GROK_DOWNLOAD_ORIGIN', '下载跳转次数超过限制。');
   };
@@ -189,7 +190,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       if (lstatSync(path).size > 50 * 1024 * 1024) throw new Error();
       if (sha256(readFileSync(path)) !== record.sha256) fail('GROK_CACHE_DAMAGED', '私有 Grok 程序校验失败，请重新准备。');
       const result = await inspect(path, { signal, platform });
-      if (result.version !== record.version) throw new Error();
+      if (result.version !== record.version || result.sha256 !== record.sha256) throw new Error();
       return { ...result, source: 'private-cache', found: true };
     } catch (error) {
       if (['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error?.code)) throw error;
@@ -216,14 +217,14 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     const timer = setTimeout(() => controller.abort(new GrokSearchError('GROK_DOWNLOAD_TIMEOUT', '准备 Grok 程序超时，请重试。')), 120_000);
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     pending = (async () => {
-      combined.throwIfAborted();
-      checkCacheRoot();
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      checkCacheRoot();
       const lock = join(directory, '.install.lock');
       let ownedLock;
       let incomplete = null, staged = null, published = false, validationExited = true;
       try {
+        combined.throwIfAborted();
+        checkCacheRoot();
+        mkdirSync(directory, { recursive: true, mode: 0o700 });
+        checkCacheRoot();
         try { ownedLock = acquireOwnedLock(lock, { reclaimStaleAfterMs: 30 * 60 * 1000 }); }
         catch (error) {
           if (error.code === 'EEXIST') fail('GROK_INSTALL_BUSY', '另一个实例正在准备程序，或上次准备被中断。');
@@ -284,8 +285,12 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         const protocol = await handshake({ executable: path, signal: combined,
           configPath: join(folder, 'handshake-config-not-created.toml'), envOverrides });
         validationExited = protocol.exited === true;
-        if (protocol.version !== version || protocol.toolsDeclared !== true || protocol.exited !== true) {
+        if (!validationExited) fail('GROK_PROCESS_REAP_FAILED', '程序握手进程未确认退出，未启用。');
+        if (protocol.version !== version || protocol.toolsDeclared !== true) {
           fail('GROK_PROTOCOL_UNVERIFIED', '下载程序的 MCP 握手或回收验证未通过，未启用。');
+        }
+        if (lstatSync(path).isSymbolicLink() || sha256(readFileSync(path)) !== checked.sha256) {
+          fail('GROK_PROGRAM_CHANGED', '程序在握手期间发生变化，未启用。');
         }
         const record = { schemaVersion: 1, version, executable: `${id}/${unpacked.filename}`,
           sha256: sha256(unpacked.executable), integrity: data.dist.integrity, registry: resolved.origin, downloadRegistry,
@@ -303,6 +308,13 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         return { ...checked, source: 'private-cache', found: true };
       } catch (error) {
         if (error.diagnostic?.exited === true) validationExited = true;
+        const permissionCause = ['EACCES', 'EPERM'].includes(error.code) ? error
+          : ['EACCES', 'EPERM'].includes(error.cause?.code) ? error.cause : null;
+        if (permissionCause) {
+          const denied = new GrokSearchError('GROK_CACHE_ACCESS_DENIED', '没有读取、写入或执行程序缓存的权限，请检查目录权限。');
+          Object.defineProperty(denied, 'cause', { value: permissionCause, writable: true, configurable: true });
+          error = denied;
+        }
         throw error;
       } finally {
         if (!published && staged) { try { unlinkSync(staged); } catch { /* An uncertain stage is never activated. */ } }
@@ -323,7 +335,8 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     } catch (error) {
       // Repair content damage only. Unsafe paths, access denial and uncertain
       // process ownership must retain their original errors.
-      if (error.code !== 'GROK_CACHE_DAMAGED') throw error;
+      if (error.code !== 'GROK_CACHE_DAMAGED'
+        && !(error.code === 'GROK_PROGRAM_CHANGED' && error.diagnostic?.exited === true)) throw error;
     }
     // Both first installation and explicit repair use a verified version.
     return install({ signal, onProgress, version: VERIFIED_GROK_VERSIONS.at(-1) });
@@ -332,6 +345,8 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
 }
 
 export async function resolveGrokProgram({ installer, signal, onProgress, repair = false, ...discovery } = {}) {
+  // Explicit selections never consult, replace or upgrade the private cache.
+  if (discovery.override || discovery.configured) return findExistingGrok({ ...discovery, signal });
   let discoveryError = null;
   try {
     const existing = await findExistingGrok({ ...discovery, signal });

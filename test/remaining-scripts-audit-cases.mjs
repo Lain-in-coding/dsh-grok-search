@@ -1,7 +1,8 @@
 import test from 'node:test';
 import './delivery-tooling-cases.mjs';
+import './private-ci-tooling-cases.mjs';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -9,6 +10,7 @@ import { runInNewContext } from 'node:vm';
 import { EventEmitter } from 'node:events';
 import semver from 'semver';
 import { cleanEnvironment } from '../scripts/lib/internal-candidate-utils.mjs';
+import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from '../scripts/lib/desktop-acceptance-environment.mjs';
 import { readUpgradePackage } from '../scripts/verify-search-log-upgrade.mjs';
 
 const source = name => readFileSync(new URL(`../scripts/${name}`, import.meta.url), 'utf8');
@@ -42,6 +44,117 @@ test('B2 Desktop launch drops inherited credentials and redirects the process ho
   }
   assert.equal(env.DSH_HOME, join(folder, 'dsh-home'));
   assert.equal(parent.HOME, 'synthetic-production-home');
+});
+
+test('market adapter sees only isolated environment and restores the parent on success or failure', async () => {
+  const text = source('verify-market-install.mjs');
+  const setup = section(text, '      const previous =', '        const { createOfficialDesktopRuntime }');
+  const restore = section(text, '      } finally {\n        for (const key', '\n    } else outcome');
+  for (const fails of [false, true]) {
+    const parent = { HOME: 'synthetic-parent-home', GROK_SEARCH_API_KEY: 'synthetic-parent-key',
+      TAVILY_API_KEY: 'synthetic-tavily-key', NODE_OPTIONS: '--require=synthetic-preload' };
+    const before = { ...parent };
+    const isolated = { HOME: 'synthetic-isolated-home', DSH_HOME: 'synthetic-isolated-profile' };
+    const failure = new Error('synthetic-adapter-failure');
+    const run = runInNewContext(`(async () => { ${setup} await observe(); ${restore} })()`, {
+      process: { env: parent }, env: isolated,
+      async observe() {
+        assert.deepEqual(parent, isolated);
+        parent.ADAPTER_TEMP = 'synthetic-created-value';
+        await Promise.resolve();
+        if (fails) throw failure;
+      },
+    });
+    if (fails) await assert.rejects(run, error => error === failure);
+    else await run;
+    assert.deepEqual(parent, before);
+  }
+});
+
+test('market tools isolate native Documents before preparing their child environment', () => {
+  for (const script of ['verify-market-install.mjs', 'verify-market-desktop-ui.mjs']) {
+    const folder = mkdtempSync(join(tmpdir(), 'dsh-deferred-desktop-market-environment-'));
+    const control = { profile: join(folder, 'dsh-home', 'profiles', 'desktop') };
+    mkdirSync(control.profile, { recursive: true });
+    const text = source(script);
+    const begin = text.indexOf("writeFileSync(join(control.profile, 'cordis.patch.yml'),");
+    const end = text.indexOf(';', begin);
+    assert.ok(begin >= 0 && end > begin);
+    runInNewContext(text.slice(begin, end + 1), { writeFileSync, join, control, folder, desktopWorkspacePatch });
+    const patch = JSON.parse(readFileSync(join(control.profile, 'cordis.patch.yml'), 'utf8'));
+    assert.equal(patch.find(row => row.id === 'workspace-controller')?.config.documentsDirectory,
+      join(folder, 'user', 'Documents'));
+    const { env, paths } = prepareDesktopAcceptanceEnvironment(folder);
+    assert.equal(env.HOME, paths.home);
+    assert.equal(env.DSH_HOME, paths.dshHome);
+    assert.equal(Object.hasOwn(env, 'GROK_SEARCH_API_KEY'), false);
+    assert.ok(text.includes('const { env } = prepareDesktopAcceptanceEnvironment(folder,'));
+  }
+});
+
+test('market install cleanup records every abnormal exit and stays bounded without a renderer', async () => {
+  const text = source('verify-market-install.mjs');
+  const begin = text.indexOf('  } finally {', text.indexOf('  } catch (error) {\n    results.push'));
+  const end = text.indexOf('\n  }\n}', begin);
+  assert.ok(begin >= 0 && end > begin);
+  const body = text.slice(begin + '  } finally {'.length, end);
+  for (const mode of ['normal', 'nonzero', 'signal', 'renderer-error', 'cdp-error', 'unreaped', 'spawn-error']) {
+    const stopped = [], results = [{ mode, error: 'synthetic primary install failure' }];
+    const context = {
+      child: { kill() {} }, closed: mode === 'unreaped' ? new Promise(() => {}) : Promise.resolve(),
+      ended: ['nonzero', 'signal', 'spawn-error'].includes(mode), exitCode: mode === 'nonzero' ? 17 : mode === 'signal' ? null : 0,
+      signal: mode === 'signal' ? 'SIGKILL' : null, forced: false,
+      spawnError: mode === 'spawn-error' ? new Error('synthetic spawn failure') : null,
+      renderer: mode === 'cdp-error' ? null : { close() { if (mode === 'renderer-error') throw new Error('synthetic renderer close failure'); } },
+      port: 12345, folder: 'fixture-folder', mode, results, process: { exitCode: 0 },
+      async requestDesktopShutdown() {
+        if (['cdp-error', 'unreaped'].includes(mode)) throw new Error('synthetic CDP failure');
+        context.ended = true;
+      },
+      async stopPreviewService(service) {
+        stopped.push(service.child);
+        if (mode === 'unreaped') throw new Error('synthetic bounded cleanup failure');
+        context.ended = true; context.exitCode = null; context.signal = 'SIGTERM';
+      },
+    };
+    let timer;
+    try {
+      await Promise.race([runInNewContext(`(async () => { ${body} })()`, context),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Cleanup waited without a bound.')), 250); })]);
+    } finally { clearTimeout(timer); }
+    assert.equal(results[0].error, 'synthetic primary install failure');
+    assert.ok(results[0].process, 'Host shutdown must be part of the receipt.');
+    assert.equal(results[0].process.ended, mode !== 'unreaped');
+    assert.equal(results[0].process.exitCode, context.exitCode);
+    assert.equal(results[0].process.errors.length === 0, mode === 'normal');
+    assert.equal(context.process.exitCode, mode === 'normal' ? 0 : 1);
+    assert.equal(stopped.length, ['cdp-error', 'unreaped'].includes(mode) ? 1 : 0);
+  }
+});
+
+test('market install preserves measured results when final host integrity fails', () => {
+  const text = source('verify-market-install.mjs');
+  const begin = text.indexOf('let originalProgramUnchanged = false, integrityError = null;');
+  assert.ok(begin >= 0);
+  for (const mode of ['normal', 'changed', 'unreadable']) {
+    const written = [], measurements = [{ mode: 'fixture', installedVersion: '0.2.0' }];
+    const context = {
+      runtime: { executable: 'fixture-runtime', archivePath: 'fixture-asar' },
+      before: ['fixture-hash', 'fixture-hash'], root: 'fixture-root', results: measurements,
+      run: { runId: 'fixture', directory: 'fixture-evidence' }, join, assert, process: { exitCode: 0 },
+      sha256(path) {
+        if (mode === 'unreadable') throw new Error('synthetic unreadable host');
+        return mode === 'changed' && path === 'fixture-runtime' ? 'changed-hash' : 'fixture-hash';
+      },
+      writeJson(path, value) { written.push(value); }, console: { log() {} },
+    };
+    runInNewContext(text.slice(begin), context);
+    assert.equal(written.length, 1);
+    assert.equal(written[0].results, measurements);
+    assert.equal(written[0].originalProgramUnchanged, mode === 'normal');
+    assert.equal(Boolean(written[0].integrityError), mode !== 'normal');
+    assert.equal(context.process.exitCode, mode === 'normal' ? 0 : 1);
+  }
 });
 
 test('product install evidence never includes the child environment or proxy credentials', () => {
@@ -101,6 +214,121 @@ test('search log evidence rejects an already-closed abnormal host', async () => 
     });
     if (code === 0) assert.equal(await host.close(), '');
     else await assert.rejects(host.close(), /exit/i);
+  }
+});
+
+test('control host close rejects nonzero, killed, timed-out or missing exit without leaving timers', async () => {
+  const body = section(source('b2-control-host.mjs'), 'function start(', '\nfunction storeAt(');
+  for (const mode of ['normal', 'nonzero', 'signal', 'missing-exit', 'timeout', 'unreaped']) {
+    const child = new EventEmitter();
+    const timers = new Set();
+    const later = (fn, ms) => { const timer = setTimeout(() => { timers.delete(timer); fn(); }, ms >= 5000 && ms < 60000 ? 1 : ms); timers.add(timer); return timer; };
+    const clear = timer => { timers.delete(timer); clearTimeout(timer); };
+    Object.assign(child, { stdout: new EventEmitter(), stderr: new EventEmitter(),
+      send(message) {
+        if (message.op !== 'close' || mode === 'timeout') return;
+        queueMicrotask(() => {
+          child.emit('message', { type: 'reply', id: message.id, ok: true, value: true });
+          if (!['missing-exit', 'unreaped'].includes(mode)) child.emit('close', mode === 'nonzero' ? 17 : mode === 'signal' ? null : 0,
+            mode === 'signal' ? 'SIGKILL' : null);
+        });
+      },
+      kill(signal) { if (mode !== 'unreaped') queueMicrotask(() => child.emit('close', null, signal)); return true; },
+    });
+    const start = runInNewContext(body + '\nstart;', {
+      spawn: () => child, mkdirSync() {}, cleanEnvironment: () => ({}), sanitize: value => value,
+      join, project: 'fixture-project', hosts: [], sequence: 0, setTimeout: later, clearTimeout: clear, assert,
+    });
+    const host = start({ executable: 'fixture-runtime', archivePath: 'fixture-asar' }, 'fixture-profile', false);
+    if (mode === 'normal') await host.close();
+    else await assert.rejects(host.close(), /exit|abnormal/i);
+    assert.equal(host.state.stopped, mode !== 'unreaped');
+    assert.equal(timers.size, 0, 'Every owned timer must be cleared after exit.');
+  }
+});
+
+test('control host final evidence preserves cleanup failure while closing every owned host', async () => {
+  const text = source('b2-control-host.mjs');
+  const begin = text.lastIndexOf('finally {\n  for (const host of hosts)');
+  assert.ok(begin >= 0);
+  const body = text.slice(begin + 'finally {'.length, text.lastIndexOf('\n}'));
+  let closes = 0;
+  const written = [];
+  const context = { hosts: [0, 17].map(exitCode => ({
+    state: { exitCode, closed: Promise.resolve(), pending: new Map() },
+    async close() { closes++; if (exitCode !== 0) throw new Error('synthetic abnormal exit'); },
+  })), fatal: null, results: [{ status: 'pass', version: 'fixture', scenario: 'fixture' }],
+  directory: 'fixture-evidence', runId: 'fixture-run', project: 'fixture-project', join, safe: value => value,
+  sha256: () => 'fixture-hash', writeJson: (path, value) => written.push({ path, value }),
+  console: { log() {} }, process: { exitCode: 0 },
+  };
+  await runInNewContext(`(async () => { ${body} })()`, context);
+  assert.equal(closes, 2);
+  assert.equal(written.length, 3);
+  assert.equal(written.at(-1).value.status, 'fail');
+  assert.equal(context.process.exitCode, 1);
+  assert.equal(written.at(-1).value.fatal.message, 'synthetic abnormal exit');
+});
+
+test('market UI cleanup reaps its child even without a renderer and records abnormal shutdown', async () => {
+  const body = section(source('verify-market-desktop-ui.mjs'), 'async function finish() {', '\nconst server =');
+  for (const mode of ['normal', 'cdp-failure', 'unreaped']) {
+    const original = { message: 'synthetic connection failure' };
+    const child = {};
+    const written = [], stopped = [];
+    const context = { finalizing: false, renderer: null, child, ended: false, exitCode: undefined, signal: null,
+      error: original, forced: false, closed: Promise.resolve(0), folder: 'fixture-folder',
+      control: { port: 12345, pnpmEntry: 'fixture-pnpm' }, runtime: { app: { version: 'fixture' }, executable: 'fixture-runtime', archivePath: 'fixture-asar' },
+      before: ['fixture-hash', 'fixture-hash', 'fixture-hash'], run: { runId: 'fixture', directory: 'fixture-evidence' },
+      productReceipt: { sha256: 'fixture-product' }, marketTar: 'fixture-market', checks: [], join,
+      sha256: () => 'fixture-hash', writeJson: (path, value) => written.push(value),
+      console: { log() {} }, process: { exitCode: 0 }, server: { closeAllConnections() {}, close() {} },
+      snapshot() { throw new Error('No renderer may be used.'); },
+      async requestDesktopShutdown() {
+        if (mode !== 'normal') throw new Error('synthetic CDP failure');
+        context.ended = true; context.exitCode = 0;
+      },
+      async stopPreviewService(service) {
+        stopped.push(service.child);
+        if (mode === 'unreaped') throw new Error('synthetic reap failure');
+        context.ended = true; context.exitCode = null;
+      },
+    };
+    const finish = runInNewContext(body + '\nfinish;', context);
+    await finish();
+    assert.equal(written[0].error, original, 'Primary startup failure must not be overwritten.');
+    assert.equal(context.process.exitCode, 1);
+    if (mode === 'normal') assert.equal(stopped.length, 0);
+    else assert.deepEqual(stopped, [child]);
+    if (mode === 'unreaped') assert.equal(original.cleanupMessage, 'synthetic reap failure');
+  }
+});
+
+test('market UI finish closes its server and rejects renderer, integrity and receipt failures', async () => {
+  const body = section(source('verify-market-desktop-ui.mjs'), 'async function finish() {', '\nconst server =');
+  for (const mode of ['normal', 'renderer-error', 'changed-host', 'unreadable-host', 'receipt-error', 'signal']) {
+    const events = [], written = [], fault = new Error('synthetic ' + mode);
+    const context = {
+      finalizing: false, renderer: { close() { events.push('renderer'); if (mode === 'renderer-error') throw fault; } },
+      child: {}, ended: true, exitCode: mode === 'signal' ? null : 0, signal: mode === 'signal' ? 'SIGKILL' : null,
+      forced: false, error: null, folder: 'fixture-folder', control: { pnpmEntry: 'fixture-pnpm' },
+      runtime: { app: { version: 'fixture' }, executable: 'fixture-runtime', archivePath: 'fixture-asar' },
+      before: ['fixture-hash', 'fixture-hash', 'fixture-hash'], run: { runId: 'fixture', directory: 'fixture-evidence' },
+      productReceipt: { sha256: 'fixture-product' }, marketTar: 'fixture-market', checks: [], join,
+      sha256(path) {
+        if (mode === 'unreadable-host' && path === 'fixture-runtime') throw fault;
+        return mode === 'changed-host' && path === 'fixture-runtime' ? 'changed-hash' : 'fixture-hash';
+      },
+      writeJson(path, value) { events.push('receipt'); if (mode === 'receipt-error') throw fault; written.push(value); },
+      console: { log() {} }, process: { exitCode: 0 },
+      server: { closeAllConnections() { events.push('connections'); }, close() { events.push('server'); } },
+    };
+    const finish = runInNewContext(body + '\nfinish;', context);
+    if (mode === 'receipt-error') await assert.rejects(finish(), error => error === fault);
+    else await finish();
+    assert.ok(events.includes('connections') && events.includes('server'), 'Receipt and renderer failures must still close the control server.');
+    assert.equal(context.process.exitCode, mode === 'normal' ? 0 : 1);
+    if (mode !== 'receipt-error') assert.equal(Boolean(written[0].error), mode !== 'normal');
   }
 });
 

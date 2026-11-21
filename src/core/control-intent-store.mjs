@@ -1,6 +1,6 @@
 import {
   closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync,
-  readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync,
+  readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync, fstatSync,
 } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -134,10 +134,30 @@ export function validateControlIntent(intent) {
     const completion = intent.releaseCompletion;
     if (intent.policy !== 'released' || intent.release === null || !object(completion)
       || completion.kind !== 'explicit-release-completion' || !UUID.test(completion.operationId)
-      || !UUID.test(completion.releaseOperationId) || !time(completion.completedAt)
+      || !UUID.test(completion.releaseOperationId) || completion.releaseOperationId !== intent.release?.operationId
+      || !time(completion.completedAt)
       || typeof completion.routeChanged !== 'boolean' || completion.routeVerified !== true
       || !object(completion.routeEvidence) || !object(completion.recordCommit)) {
       invalid('Explicit release completion evidence is invalid.');
+    }
+    if (intent.release.kind === 'intent-release-commit') {
+      const evidence = completion.routeEvidence;
+      const acquisition = intent.priorIntent?.acquisition ?? {};
+      const author = Object.hasOwn(acquisition, 'authorSearchProvider') ? acquisition.authorSearchProvider
+        : intent.release.author;
+      // Early schema v1 producers used an optional zero lifetime count, without a relative window.
+      const counterVerified = intent.release.counterBaseline === undefined && completion.counterBaseline === undefined
+        && evidence.originalSearchBaseline === undefined && evidence.originalSearchDelta === undefined
+        ? evidence.originalSearchCalls === undefined || evidence.originalSearchCalls === 0
+        : Number.isSafeInteger(evidence.originalSearchBaseline) && evidence.originalSearchBaseline >= 0
+          && evidence.originalSearchCalls === evidence.originalSearchBaseline && evidence.originalSearchDelta === 0;
+      if (evidence.atAuthor !== true || evidence.fetchPreserved !== true
+        || evidence.dependenciesPreserved !== true
+        || author !== undefined && evidence.actualSearchProvider !== author
+        || !counterVerified
+        || evidence.routeChanged !== undefined && evidence.routeChanged !== completion.routeChanged) {
+        invalid('Explicit release completion contradicts its verified route evidence.');
+      }
     }
   }
   if (intent.migration !== undefined) validateMigration(intent.migration);
@@ -1029,7 +1049,7 @@ export function createControlIntentStore({
     if (bytes.length > MAX_BYTES) invalid('Control revision exceeds maximum size, including preserved raw migration bytes.');
     const stagePath = join(root, `stage-${randomUUID()}.json`);
     const targetPath = join(root, filename(candidate.revision));
-    let published = false;
+    let published = false, stageIdentity;
     try {
       assertDirectories(root, boundary);
       mkdirSync(root, { recursive: true });
@@ -1037,7 +1057,10 @@ export function createControlIntentStore({
       fault('before-stage-write', { expectedRevision, operationId, stagePath, targetPath });
       sourceCheck();
       const fd = openSync(stagePath, 'wx', 0o600);
-      try { writeFileSync(fd, bytes); fsyncSync(fd); }
+      try {
+        stageIdentity = fstatSync(fd);
+        writeFileSync(fd, bytes); fsyncSync(fd);
+      }
       finally { closeSync(fd); }
       fault('before-publish', { expectedRevision, operationId, stagePath, targetPath });
       sourceCheck();
@@ -1048,6 +1071,12 @@ export function createControlIntentStore({
         }
       }
       assertCurrent();
+      const staged = stat(stagePath);
+      if (!staged?.isFile() || staged.isSymbolicLink()
+        || staged.dev !== stageIdentity.dev || staged.ino !== stageIdentity.ino
+        || !readBytes(stagePath).equals(bytes)) {
+        invalid('Control staging identity or bytes changed before publication.');
+      }
       // This exclusive namespace publication, not the earlier read, is the CAS linearization point.
       try { linkSync(stagePath, targetPath); }
       catch (error) {

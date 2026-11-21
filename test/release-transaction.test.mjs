@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -125,6 +125,90 @@ test('completion CAS failure preserves the release intent and retries the same o
   assert.equal(retry.completionCommitted, true);
   assert.equal(store.read().revision, before.revision + 2);
   assert.equal(store.read().intent.releaseCompletion.routeVerified, true);
+});
+
+test('an incomplete release retry drains the current controller before touching the route', async t => {
+  const { store } = fixture(t);
+  const operationId = randomUUID();
+  const first = await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller([], { async restore() { throw new Error('route temporarily unavailable'); } }) });
+  assert.equal(first.completionCommitted, false);
+  const beforeRetry = store.read(), events = [];
+  let finishDrain;
+  const drained = new Promise(resolve => { finishDrain = resolve; });
+  const pending = commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller(events, { async drain() {
+      events.push('drain');
+      await drained;
+      return { settled: true, remaining: 0 };
+    } }) });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(events, ['invalidate', 'drain']);
+    assert.deepEqual(store.read(), beforeRetry);
+    finishDrain();
+    assert.equal((await pending).kind, 'released');
+    assert.deepEqual(events, ['invalidate', 'drain', 'restore', 'verify']);
+    assert.equal(store.read().revision, beforeRetry.revision + 1);
+  } finally { finishDrain(); await pending.catch(() => {}); }
+});
+
+test('a failed retry drain preserves the committed release intent without claiming completion', async t => {
+  const { store } = fixture(t);
+  const operationId = randomUUID();
+  await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller([], { async restore() { throw new Error('route temporarily unavailable'); } }) });
+  const beforeRetry = store.read(), events = [];
+  await assert.rejects(commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller(events, { async drain() {
+      events.push('drain');
+      throw new ControlRecordError('CONTROL_RELEASE_DRAIN_TIMEOUT', 'current cleanup has not settled');
+    } }) }), error => {
+    assert.equal(error.code, 'CONTROL_RELEASE_DRAIN_TIMEOUT');
+    assert.equal(error.releaseOutcome.recordCommitted, true);
+    assert.equal(error.releaseOutcome.completionCommitted, false);
+    assert.equal(error.releaseOutcome.drainSettled, false);
+    return true;
+  });
+  assert.deepEqual(events, ['invalidate', 'drain']);
+  assert.deepEqual(store.read(), beforeRetry);
+});
+
+test('a retry cannot restore an old release after another owner commits during drain', async t => {
+  const { store } = fixture(t), operationId = randomUUID();
+  await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller([], { async restore() { throw new Error('route unavailable'); } }) });
+  const before = store.read(), events = [];
+  let changed;
+  const pending = commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller(events, { async drain() {
+      events.push('drain');
+      changed = store.compareAndSwap({ expectedRevision: before.revision,
+        intent: requiredIntent({ lease: owner({ hostId: OTHER_HOST_ID }) }) });
+      return { settled: true, remaining: 0 };
+    } }) });
+  await assert.rejects(pending, { code: 'CONTROL_CAS_CONFLICT' });
+  assert.deepEqual(events, ['invalidate', 'drain']);
+  assert.deepEqual(store.read(), changed);
+});
+
+test('a concurrent completion during retry drain is reused without another route restore', async t => {
+  const { store } = fixture(t), operationId = randomUUID();
+  await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller([], { async restore() { throw new Error('route unavailable'); } }) });
+  const events = [];
+  let completed;
+  const outcome = await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller(events, { async drain() {
+      events.push('drain');
+      await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0,
+        controller: controller([]) });
+      completed = store.read();
+      return { settled: true, remaining: 0 };
+    } }) });
+  assert.equal(outcome.completionCommitted, true);
+  assert.deepEqual(events, ['invalidate', 'drain']);
+  assert.deepEqual(store.read(), completed);
 });
 
 test('a concurrent recovery completion of the same release is reported as released', async t => {
@@ -275,6 +359,58 @@ test('malformed release transaction metadata is rejected before publication', t 
       operationId: 'not-a-uuid', hostId: HOST_ID, pid: 1234, routeChanged: false, routeVerified: false } });
   assert.throws(() => store.compareAndSwap({ expectedRevision: 1, intent }),
     error => error instanceof ControlRecordError && error.code === 'CONTROL_RECORD_INVALID');
+});
+
+test('completion for another release operation is corrupt evidence, never already released', async t => {
+  const { directory, store } = fixture(t), operationId = randomUUID();
+  await commitExplicitRelease({ store, owner: owner(), operationId, counterBaseline: 0, controller: controller([]) });
+  const current = store.read();
+  const intent = { ...current.intent, releaseCompletion: {
+    ...current.intent.releaseCompletion, releaseOperationId: randomUUID(),
+  } };
+  assert.throws(() => store.compareAndSwap({ expectedRevision: current.revision, intent }),
+    { code: 'CONTROL_RECORD_INVALID' });
+  writeFileSync(join(directory, `v${String(current.revision).padStart(12, '0')}.json`),
+    JSON.stringify({ ...current, intent }) + '\n');
+  assert.throws(() => store.read(), { code: 'CONTROL_RECORD_INVALID' });
+});
+
+test('completion evidence must agree with its claimed verified author route and zero dispatches', async t => {
+  for (const evidence of [
+    { atAuthor: false }, { fetchPreserved: false }, { dependenciesPreserved: false },
+    { actualSearchProvider: 'different-owner' }, { originalSearchCalls: 1 },
+  ]) await t.test(Object.keys(evidence)[0], async sub => {
+    const { directory, store } = fixture(sub);
+    await commitExplicitRelease({ store, owner: owner(), counterBaseline: 0, controller: controller([]) });
+    const current = store.read();
+    const intent = { ...current.intent, releaseCompletion: { ...current.intent.releaseCompletion,
+      routeEvidence: { ...current.intent.releaseCompletion.routeEvidence, ...evidence },
+    } };
+    assert.throws(() => store.compareAndSwap({ expectedRevision: current.revision, intent }),
+      { code: 'CONTROL_RECORD_INVALID' });
+    writeFileSync(join(directory, `v${String(current.revision).padStart(12, '0')}.json`),
+      JSON.stringify({ ...current, intent }) + '\n');
+    assert.throws(() => store.read(), { code: 'CONTROL_RECORD_INVALID' });
+  });
+});
+
+test('release cannot restore a route superseded before its intent publication returns', async t => {
+  const { store } = fixture(t), operationId = randomUUID(), events = [];
+  let superseded;
+  const changed = { ...store, async compareAndSwapAsync(request) {
+    const committed = await store.compareAndSwapAsync(request);
+    if (request.intent.release && !request.intent.releaseCompletion) {
+      superseded = store.compareAndSwap({ expectedRevision: committed.revision,
+        intent: requiredIntent({ reason: 'superseding-owner', lease: owner({ hostId: OTHER_HOST_ID }) }) });
+    }
+    return committed;
+  } };
+  const result = await commitExplicitRelease({ store: changed, owner: owner(), operationId, counterBaseline: 0,
+    controller: controller(events) });
+  assert.equal(result.kind, 'incomplete');
+  assert.equal(result.error.code, 'CONTROL_CAS_CONFLICT');
+  assert.deepEqual(events, ['invalidate', 'drain']);
+  assert.deepEqual(store.read(), superseded);
 });
 
 test('the release transaction core is an explicit package export', () => {

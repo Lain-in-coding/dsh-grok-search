@@ -114,7 +114,7 @@ function validateDocument(value) {
   const keys = new Set();
   for (const row of value.pairs) {
     const key = pairKey(row);
-    if (keys.has(key) || !row.confirmed && !row.notified) {
+    if (keys.has(key) || !row.notified) {
       fail('COMPATIBILITY_STATE_INVALID', 'Compatibility state contains duplicate or empty entries.');
     }
     keys.add(key);

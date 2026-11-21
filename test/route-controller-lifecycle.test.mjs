@@ -368,6 +368,34 @@ test('hub validation uses the runtime fallback and response character ranges', (
   }
 });
 
+test('missing optional services or a broken settings connection never count as a credential check', () => {
+  const context = vm.createContext({});
+  vm.runInContext(section('const untestedCode =', 'function flashRow(') + '\nglobalThis.unchecked = untestedCode;', context);
+  for (const code of ['SOURCE_UNAVAILABLE', 'GROK_UNAVAILABLE', 'GITHUB_UNAVAILABLE',
+    'GROK_PROGRAM_UNAVAILABLE', 'GITHUB_TOOL_REGISTRATION_FAILED', 'SETTINGS_UNAVAILABLE',
+    'SETTINGS_OPERATION_FAILED', 'gateway/method_not_found']) {
+    assert.equal(context.unchecked(code), true, code);
+  }
+  for (const code of ['HTTP_401', 'GROK_NETWORK_ERROR', 'HTTP_503']) assert.equal(context.unchecked(code), false, code);
+});
+
+test('clearing a read-only authentication card cannot delete its shared file fields', async () => {
+  const h = harness(), requests = [];
+  const mine = h.open('grok', { authReadOnly: true, enabled: true, url: 'https://readonly.example', model: 'readonly-model', key: '' });
+  mine.fields = { grok_api_url: { source: 'file', readOnly: false }, grok_model: { source: 'file', readOnly: false } };
+  Object.assign(h.context, {
+    servingSupp: () => null, toast() {},
+    saveConfig: async updates => { requests.push(updates); return null; },
+  });
+  vm.runInContext(section('async function clearArm(', '/* 右上角开关'), h.context);
+  const button = element();
+  await h.context.clearArm(button);
+  await h.context.clearArm(button);
+  assert.equal(requests.length, 0);
+  assert.equal(h.context.D, mine);
+  assert.equal(mine.clearing, false);
+});
+
 test('destination drafts cannot cross a known config path or effective identity change with identical file bytes', async () => {
   for (const changed of [{ path: '/config-b.toml' }, { quotaRevision: 'effective-b' }]) {
     const baseline = { path: '/config-a.toml', revision: 'same-file-hash', quotaRevision: 'effective-a', exists: true,
@@ -406,7 +434,7 @@ test('new saves use the existing effective identity and never call the legacy en
   const saved = { ...config, revision: 'saved', quotaRevision: 'effective-saved' };
   const requests = [];
   const context = vm.createContext({
-    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    S: { config }, disposed: false, secretEpoch: 0, accessGeneration: 0, clone: structuredClone, updateConfig() {},
     remote: {
       save() { assert.fail('The new UI must not dispatch unguarded saves'); },
       saveWithIdentity: async request => { requests.push(request); return { config: saved }; },
@@ -423,12 +451,55 @@ test('new saves use the existing effective identity and never call the legacy en
   assert.equal(receipt.after, saved.revision);
 });
 
+test('a late save reply cannot replace a configuration switched while it was pending', async () => {
+  const before = { path: '/config-a.toml', revision: 'before', quotaRevision: 'effective-a', exists: true, fields: {} };
+  const saved = { ...before, revision: 'saved', quotaRevision: 'effective-saved' };
+  const other = { ...before, path: '/config-b.toml', quotaRevision: 'effective-b' };
+  let complete, updates = 0;
+  const context = vm.createContext({
+    disposed: false, accessGeneration: 0, secretEpoch: 0, S: { config: before }, clone: structuredClone,
+    updateConfig(config) { updates++; context.S.config = config; },
+    remote: { saveWithIdentity: () => new Promise(resolve => { complete = resolve; }) },
+  });
+  vm.runInContext(section('async function saveConfig(', 'async function savePreference('), context);
+  const task = context.saveConfig({ grok_model: 'saved-to-a' });
+  const rejection = assert.rejects(task, { code: 'CONFIG_COMMIT_UNCERTAIN' });
+  context.S.config = other;
+  context.secretEpoch++;
+  complete({ config: saved });
+  await rejection;
+  assert.equal(updates, 0);
+  assert.equal(context.S.config, other);
+});
+
+test('a late private switch reply cannot replace newer preference state', async () => {
+  const before = { revision: 'before', value: { grokEnabled: true, githubReadEnabled: false } };
+  const saved = { revision: 'saved', value: { grokEnabled: false, githubReadEnabled: false } };
+  const current = { revision: 'newer', value: { grokEnabled: true, githubReadEnabled: true } };
+  let complete;
+  const context = vm.createContext({
+    disposed: false, accessGeneration: 0, stateGeneration: 0, snapshotSignature: null,
+    S: { prefs: before, prov: { grok: { enabled: true }, github: { enabled: false } } },
+    remote: { savePreferences: () => new Promise(resolve => { complete = resolve; }) },
+  });
+  vm.runInContext(section('async function savePreference(', 'function configUndo('), context);
+  const task = context.savePreference('grok', false);
+  const rejection = assert.rejects(task, { code: 'PREFERENCES_COMMIT_UNCERTAIN' });
+  context.S.prefs = current;
+  context.S.prov.github.enabled = true;
+  complete(saved);
+  await rejection;
+  assert.equal(context.S.prefs, current);
+  assert.equal(context.S.prov.grok.enabled, true);
+  assert.equal(context.S.prov.github.enabled, true);
+});
+
 function undoHarness({ changed = {}, failure = null, missing = false } = {}) {
   const receipt = { before: 'before', after: 'saved', path: '/config.toml', quotaRevision: 'effective-saved', undo: true };
   const config = { path: receipt.path, revision: receipt.after, quotaRevision: receipt.quotaRevision, ...changed };
   const requests = [], errors = [], preferences = [], updates = [];
   const context = vm.createContext({
-    disposed: false, S: { config, busy: false, capabilities: { secretsAllowed: true } },
+    disposed: false, secretEpoch: 0, accessGeneration: 0, S: { config, busy: false, capabilities: { secretsAllowed: true } },
     updateConfig: value => updates.push(value), operationError: error => errors.push(error), syncAll() {}, toast() {},
     savePreference: async (...args) => preferences.push(args),
     remote: {
@@ -491,12 +562,35 @@ test('an unpolled undo target change or missing new endpoint cannot fall back or
   }
 });
 
+test('a late restore reply cannot replace the current target or proceed to the private switch', async () => {
+  for (const card of [false, true]) {
+    const h = undoHarness();
+    let complete;
+    h.context.clone = structuredClone;
+    h.context.accessGeneration = 0;
+    h.context.secretEpoch = 0;
+    h.context.remote.restoreConfigWithIdentity = () => new Promise(resolve => { complete = resolve; });
+    const undo = card ? h.context.cardUndo(h.receipt, 'grok', false, true) : h.context.configUndo(h.receipt);
+    const task = undo();
+    const current = { ...h.context.S.config, path: '/changed-target.toml', quotaRevision: 'changed-effective' };
+    h.context.S.config = current;
+    h.context.secretEpoch++;
+    complete({ config: { path: h.receipt.path, revision: 'restored', quotaRevision: 'restored-effective' } });
+    await task;
+    assert.equal(h.updates.length, 0);
+    assert.equal(h.preferences.length, 0);
+    assert.equal(h.errors.at(-1)?.code, 'CONFIG_COMMIT_UNCERTAIN');
+    assert.equal(h.context.S.config, current);
+    assert.equal(h.context.S.busy, false);
+  }
+});
+
 test('a missing identity-aware save endpoint fails without legacy fallback or a config retry', async () => {
   for (const missing of [true, false]) {
     const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', fields: {} };
     let guardedCalls = 0;
     const context = vm.createContext({
-      S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+      S: { config }, disposed: false, secretEpoch: 0, accessGeneration: 0, clone: structuredClone, updateConfig() {},
       refresh() { assert.fail('An unavailable endpoint is not a revision conflict'); },
       remote: {
         save() { assert.fail('The legacy endpoint cannot weaken identity checking'); },
@@ -528,7 +622,7 @@ test('a conflict retry cannot rebase a draft across a different config path or e
       return { config: { ...config, revision: 'saved' } };
     };
     const context = vm.createContext({
-      S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+      S: { config }, disposed: false, secretEpoch: 0, accessGeneration: 0, clone: structuredClone, updateConfig() {},
       refresh: async () => { context.S.config = { ...config, ...change }; },
       remote: { save: dispatch, saveWithIdentity: dispatch },
     });
@@ -542,7 +636,7 @@ test('a comment-only config conflict can retry once with the unchanged effective
   const config = { path: '/config.toml', revision: 'before', quotaRevision: 'effective-before', fields: {} };
   const requests = [];
   const context = vm.createContext({
-    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    S: { config }, disposed: false, secretEpoch: 0, accessGeneration: 0, clone: structuredClone, updateConfig() {},
     refresh: async () => { context.S.config = { ...config, revision: 'comment-edit' }; },
     remote: { saveWithIdentity: async request => {
       requests.push(request);
@@ -562,7 +656,7 @@ test('disposing during a preference conflict reread prevents a retry and late st
   let resolveRead, reading;
   const started = new Promise(resolve => { reading = resolve; });
   const context = vm.createContext({
-    S: { prefs: before, prov: { grok: { enabled: true } } }, disposed: false,
+    S: { prefs: before, prov: { grok: { enabled: true } } }, disposed: false, accessGeneration: 0,
     remote: {
       savePreferences: async request => {
         requests.push(request);
@@ -589,7 +683,7 @@ test('disposing during a config conflict reread prevents a new save request', as
   let resolveRead, reading;
   const started = new Promise(resolve => { reading = resolve; });
   const context = vm.createContext({
-    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    S: { config }, disposed: false, secretEpoch: 0, accessGeneration: 0, clone: structuredClone, updateConfig() {},
     refresh: () => new Promise(resolve => { resolveRead = resolve; reading(); }),
     remote: { saveWithIdentity: async request => {
       requests.push(request);
@@ -612,7 +706,7 @@ test('an earlier settings poll cannot replace a successful config save', async (
   const saved = { ...before, revision: 'saved', fields: { grok_model: { value: 'after' } } };
   let resolveRead;
   const context = vm.createContext({
-    disposed: false, accessGeneration: 0, stateGeneration: 0, readTask: null, drag: null,
+    disposed: false, secretEpoch: 0, accessGeneration: 0, stateGeneration: 0, readTask: null, drag: null,
     snapshotSignature: null, logView: null, S: { config: before }, clone: structuredClone,
     CARD_FIELDS: {}, acceptSnapshot(snapshot) { context.S.config = snapshot.config; },
     syncAll() {}, denyPrivateAccess() {},
@@ -659,6 +753,30 @@ test('an earlier settings poll cannot replace a successful preference save', asy
   resolveRead({});
   await reading;
   assert.equal(context.S.prefs, saved);
+});
+
+test('an earlier settings poll cannot replace a successful program preparation', async () => {
+  const before = { phase: 'discovering', program: null }, ready = { phase: 'ready', program: { version: '0.1.26' } };
+  let complete;
+  const context = vm.createContext({
+    disposed: false, accessGeneration: 0, stateGeneration: 0, readTask: null, drag: null,
+    snapshotSignature: null, logView: null, D: { kind: 'hub' }, S: { program: before },
+    dialogBusy: () => false, acceptSnapshot(snapshot) { context.S.program = snapshot.program; },
+    syncAll() {}, denyPrivateAccess() {}, renderHead() {}, renderHub() {}, toast() {},
+    programPhase: () => 'ready', programSource: () => 'private-cache',
+    remote: { snapshot: () => new Promise(resolve => { complete = resolve; }), preferences: async () => ({}),
+      prepareProgram: async () => ready },
+  });
+  vm.runInContext([
+    section('async function refresh(', 'function schedulePoll('),
+    section('async function redetect(', 'async function commitHub('),
+  ].join('\n'), context);
+  const reading = context.refresh();
+  await context.redetect(element());
+  assert.equal(context.S.program, ready);
+  complete({ program: before });
+  await reading;
+  assert.equal(context.S.program, ready);
 });
 
 test('a stale settings poll still revokes private access without restoring old config', async () => {
@@ -925,3 +1043,19 @@ for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIR
     assert.equal(mine.githubOperation, null);
   });
 }
+
+
+test('primary model-route help survives a diagnostic but is cleared by a newer check', () => {
+  const context = vm.createContext({ S: { checked: { grok: { 0: { source: 'test' } } }, bad: { grok: '404' } },
+    normalizeCode: code => String(code).replace(/^HTTP_/i, ''), Date });
+  vm.runInContext(section('function rememberPrimaryFailure(', 'function rowFault('), context);
+  vm.runInContext(section('function rememberCheck(', 'function reconcileChecks('), context);
+  context.rememberPrimaryFailure({ evidence: 'primary-request', provider: 'grok', protocol: 'responses', reason: 'model_not_found' });
+  assert.match(context.primaryHelp('grok', 'HTTP_404'), /模型或路由不存在/);
+  assert.equal(context.primaryHelp('exa', '404'), '');
+  assert.equal(context.primaryHelp('grok', '401'), '');
+  context.rememberCheck('grok', 0, '404', 'search');
+  assert.equal(context.primaryHelp('grok', '404'), '');
+  context.rememberPrimaryFailure({ evidence: 'primary-request', provider: 'grok', protocol: 'responses', reason: 'secret remote body' });
+  assert.equal(context.primaryHelp('grok', '404'), '');
+});

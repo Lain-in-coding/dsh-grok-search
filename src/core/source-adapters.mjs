@@ -101,8 +101,8 @@ const sourceSpec = Object.freeze({
       url: withQuery(base, { query }),
       init: { method: 'GET', headers: { 'X-API-Key': key } },
     }),
-    read: (body, limit) => (Array.isArray(body?.results) ? body.results : [])
-      .map(item => normalizeItem(item, 'tinyfish', { snippet: ['snippet'], date: ['date'] })).filter(Boolean).slice(0, limit),
+    read: body => (Array.isArray(body?.results) ? body.results : [])
+      .map(item => normalizeItem(item, 'tinyfish', { snippet: ['snippet'], date: ['date'] })),
   }),
   firecrawl: Object.freeze({
     url: 'firecrawl_api_url', key: 'firecrawl_api_key', enabled: 'firecrawl_enabled',
@@ -170,9 +170,15 @@ async function readBoundedJson(response, signal) {
   catch { throw sourceFailure('SOURCE_INVALID_RESPONSE', '服务返回的不是有效 JSON。'); }
 }
 
+const NETWORK_CODES = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
+  'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'ERR_TLS_CERT_ALTNAME_INVALID', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+]);
 const safeCauseCode = error => {
   const code = error?.cause?.code ?? error?.code;
-  return typeof code === 'string' && /^[A-Z0-9_]{2,40}$/.test(code) ? code : null;
+  return NETWORK_CODES.has(code) ? code : null;
 };
 
 function classify(error) {

@@ -3,7 +3,7 @@ const CORE_FAULTS = new Set([
   'COMPATIBILITY_CORE_SHAPE', 'COMPATIBILITY_ABI_UNSUPPORTED',
   'COMPATIBILITY_CONTRACT_FAILED', 'COMPATIBILITY_PROBE_INVALID',
   'COMPATIBILITY_ROUTE_UNCONFIRMED',
-  'COMPATIBILITY_BUDGET_UNCONFIRMED', 'COMPATIBILITY_CORE_UNAVAILABLE',
+  'COMPATIBILITY_BUDGET_UNCONFIRMED', 'COMPATIBILITY_CORE_UNAVAILABLE', 'COMPATIBILITY_BLOCKED',
   'CONTROL_SEARCH_SELECTION_CONFLICT',
 ]);
 const OPTIONAL_LABELS = Object.freeze({
@@ -56,6 +56,8 @@ function describe(report) {
         : '搜索已暂停，当前不会转交官方搜索。',
       detail: transient
         ? '配置仍可编辑。重新检查将重试未完成的启动步骤。'
+        : code === 'COMPATIBILITY_BLOCKED'
+        ? '搜索启动被安全检查阻止。请检查宿主日志中的错误码，修复后重新启用插件；已有配置会保留。'
         : code === 'CONTROL_SEARCH_SELECTION_CONFLICT'
         ? '请检查当前搜索来源设置，再重新检查并接管。'
         : belowMinimum

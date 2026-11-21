@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
@@ -165,6 +166,7 @@ for (const code of ['EACCES', 'EPERM']) test(`program inspection retains the ori
     await assert.rejects(inspectGrokProgram(binary), error => {
       assert.equal(error.code, 'GROK_PROGRAM_MISSING');
       assert.equal(error.cause, cause);
+      assert.equal(error.diagnostic.exited, true);
       assert.equal(Object.getOwnPropertyDescriptor(error, 'cause').enumerable, false);
       assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(error)), 'cause'), false);
       assert.equal(error.message.includes('synthetic-private-access'), false);
@@ -239,8 +241,11 @@ for (const closes of [true, false]) test(`a failed version-process kill waits fo
     if (closes) {
       child.emit('close', null, 'SIGKILL');
       assert.equal(await pending, reason);
+      assert.equal(reason.diagnostic.exited, true);
     } else {
-      assert.equal((await pending).code, 'GROK_PROGRAM_REAP_FAILED');
+      const failure = await pending;
+      assert.equal(failure.code, 'GROK_PROGRAM_REAP_FAILED');
+      assert.equal(failure.diagnostic.exited, false);
     }
   } finally {
     child.emit('close', null, 'SIGKILL');
@@ -261,3 +266,157 @@ test('resolver preserves unreaped version-process failures even when the caller 
     installer: { active() { assert.fail('must not inspect another process'); }, install() { assert.fail('must not install'); } },
   }), caught => caught === failure);
 });
+
+test('explicit override and configured paths are authoritative without consulting the private installer', async () => {
+  const root = setup(), manual = makeFile(join(root, 'manual.exe')), configured = makeFile(join(root, 'configured.exe'));
+  const installer = {
+    active: () => assert.fail('explicit selection must not read the private cache'),
+    install: () => assert.fail('explicit selection must not install'),
+    repair: () => assert.fail('explicit selection must not repair'),
+  };
+  for (const selection of [{ override: manual, configured }, { configured }]) {
+    const result = await resolveGrokProgram({ ...selection, installer, repair: true,
+      inspect: async path => ({ path, version: '0.1.26' }) });
+    assert.equal(result.path, selection.override ?? configured);
+    assert.equal(result.source, selection.override ? 'manual' : 'loader');
+    const error = Object.assign(new Error('invalid explicit program'), { code: 'GROK_VERSION_UNVERIFIED' });
+    await assert.rejects(resolveGrokProgram({ ...selection, installer, inspect: async () => { throw error; } }), failure => failure === error);
+  }
+});
+
+async function withVersionProcess(run, onSpawn = () => {}, output = 'grok-search-rs 0.1.26\n') {
+  const originalSpawn = childProcess.spawn;
+  const children = [];
+  try {
+    childProcess.spawn = path => {
+      const child = Object.assign(new EventEmitter(), {
+        pid: 12345, stdout: new PassThrough(), stderr: new PassThrough(),
+      });
+      children.push(child);
+      child.kill = () => { queueMicrotask(() => child.emit('close', null, 'SIGKILL')); return true; };
+      queueMicrotask(() => {
+        onSpawn(path);
+        child.stdout.end(output);
+        child.stderr.end();
+        child.emit('close', 0, null);
+      });
+      return child;
+    };
+    syncBuiltinESMExports();
+    return await run();
+  } finally {
+    for (const child of children) { child.stdout.destroy(); child.stderr.destroy(); }
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
+}
+
+function inspectionBinary() {
+  const binary = realpathSync(makeFile(join(setup(), nativeBinary)));
+  const magic = Buffer.from(process.platform === 'win32' ? '4d5a0000'
+    : process.platform === 'linux' ? '7f454c46' : 'cffaedfe', 'hex');
+  writeFileSync(binary, Buffer.concat([magic, Buffer.from('same-size-native-fixture')]));
+  chmodSync(binary, 0o700);
+  return binary;
+}
+
+for (const timestamp of ['ctimeMs', 'mtimeMs']) {
+  test(`unchanged program content remains usable when execution updates only ${timestamp}`, async () => {
+    const binary = inspectionBinary(), originalStat = fs.statSync;
+    const expectedHash = createHash('sha256').update(fs.readFileSync(binary)).digest('hex');
+    let executed = false;
+    fs.statSync = (path, ...args) => {
+      const value = originalStat(path, ...args);
+      if (path === binary && executed) value[timestamp] += 1_000;
+      return value;
+    };
+    syncBuiltinESMExports();
+    try {
+      await withVersionProcess(async () => {
+        const checked = await inspectGrokProgram(binary);
+        assert.equal(checked.version, '0.1.26');
+        assert.equal(checked.sha256, expectedHash);
+      }, () => { executed = true; });
+    } finally {
+      fs.statSync = originalStat;
+      syncBuiltinESMExports();
+    }
+  });
+}
+
+test('same-size content replacement is rejected even when every original status field is reported unchanged', async () => {
+  const binary = inspectionBinary(), originalStat = fs.statSync;
+  const original = originalStat(binary);
+  fs.statSync = (path, ...args) => path === binary ? original : originalStat(path, ...args);
+  syncBuiltinESMExports();
+  try {
+    await withVersionProcess(() => assert.rejects(inspectGrokProgram(binary), error => {
+      assert.equal(error.code, 'GROK_PROGRAM_CHANGED');
+      assert.equal(error.diagnostic.exited, true);
+      return true;
+    }), () => {
+      const bytes = fs.readFileSync(binary);
+      bytes[bytes.length - 1] ^= 1;
+      writeFileSync(binary, bytes);
+      fs.utimesSync(binary, original.atime, original.mtime);
+    });
+  } finally {
+    fs.statSync = originalStat;
+    syncBuiltinESMExports();
+  }
+});
+
+test('a different file at the same executable path is rejected even with identical bytes', async () => {
+  const binary = inspectionBinary();
+  await withVersionProcess(() => assert.rejects(inspectGrokProgram(binary), error => {
+    assert.equal(error.code, 'GROK_PROGRAM_CHANGED');
+    assert.equal(error.diagnostic.exited, true);
+    return true;
+  }), () => {
+    const replacement = binary + '.replacement';
+    writeFileSync(replacement, fs.readFileSync(binary));
+    chmodSync(replacement, 0o700);
+    fs.renameSync(replacement, binary);
+  });
+});
+
+test('invalid version output retains confirmed process exit without exposing its output', async () => {
+  const binary = inspectionBinary();
+  await withVersionProcess(() => assert.rejects(inspectGrokProgram(binary), error => {
+    assert.equal(error.code, 'GROK_PROGRAM_IDENTITY_INVALID');
+    assert.equal(error.diagnostic.exited, true);
+    assert.equal(Object.getOwnPropertyDescriptor(error, 'diagnostic').enumerable, false);
+    assert.equal(Object.isFrozen(error.diagnostic), true);
+    assert.equal(JSON.stringify(error).includes('private-upstream-output'), false);
+    return true;
+  }), () => {}, 'private-upstream-output\n');
+});
+
+for (const code of ['EACCES', 'EPERM']) {
+  test(`a readable program whose spawn is denied retains ${code} and confirms no child exists`, async () => {
+    const binary = inspectionBinary(), originalSpawn = childProcess.spawn;
+    const cause = Object.assign(new Error('synthetic-private-spawn-denial'), { code, path: binary });
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), kill: () => assert.fail('No child exists to terminate.'),
+    });
+    try {
+      childProcess.spawn = () => {
+        queueMicrotask(() => { child.emit('error', cause); child.emit('close', -1, null); });
+        return child;
+      };
+      syncBuiltinESMExports();
+      await assert.rejects(inspectGrokProgram(binary), error => {
+        assert.equal(error.code, 'GROK_PROGRAM_START_FAILED');
+        assert.equal(error.cause, cause);
+        assert.equal(error.diagnostic.exited, true);
+        assert.equal(Object.getOwnPropertyDescriptor(error, 'cause').enumerable, false);
+        assert.equal(JSON.stringify(error).includes('synthetic-private-spawn-denial'), false);
+        return true;
+      });
+    } finally {
+      child.stdout.destroy(); child.stderr.destroy();
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    }
+  });
+}

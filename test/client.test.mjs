@@ -841,3 +841,75 @@ test('empty or malformed identities never schedule a trace read', async t => {
     assert.equal(reads,0);
   }finally{t.mock.timers.reset();}
 });
+
+test('route browser verifies the current source build without writing the generated artifact', {
+  skip: !process.argv.includes('--route-browser'), timeout: 180_000,
+}, async () => {
+  const { spawn } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { mkdtempTracked } = await import('./helpers/temp-fixture.mjs');
+  const { chromium } = await import('playwright');
+  const { assertBrowserResult, stopPreviewService } = await import('../scripts/lib/browser-gates.mjs');
+  const project = dirname(dirname(fileURLToPath(import.meta.url)));
+  const generated = readFileSync(join(project, 'src/client.js'));
+  const child = spawn(process.execPath, ['scripts/ui-route-preview.mjs'], {
+    cwd: project, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const service = { child, exited: false };
+  service.closed = new Promise(resolve => child.once('close', () => { service.exited = true; resolve(); }));
+  let context, deadline;
+  try {
+    const origin = await new Promise((resolve, reject) => {
+      let output = '';
+      const timer = setTimeout(() => reject(new Error('Route preview readiness timed out.')), 20_000);
+      const fail = error => { clearTimeout(timer); reject(error); };
+      child.once('error', fail);
+      child.once('exit', code => fail(new Error(`Route preview exited before readiness (${code}).`)));
+      child.stderr.resume();
+      child.stdout.on('data', chunk => {
+        output = (output + chunk).slice(-4096);
+        const match = /"origin":"(http:\/\/127\.0\.0\.1:\d+)"/.exec(output);
+        if (match) { clearTimeout(timer); resolve(match[1]); }
+      });
+    });
+    // Use the installed system browser with an isolated, disposable profile.
+    context = await chromium.launchPersistentContext(mkdtempTracked(join(tmpdir(), 'dsh-route-browser-')), {
+      channel: 'chrome', headless: true, viewport: { width: 1440, height: 1000 },
+    });
+    const external = [], pageErrors = [];
+    await context.route('**/*', route => {
+      const url = route.request().url();
+      if (url === origin + '/src/client.js') {
+        return route.fulfill({ status: 200, contentType: 'text/javascript; charset=utf-8', body: clientSource });
+      }
+      if (url === origin || url.startsWith(origin + '/') || !/^https?:/.test(url)) return route.continue();
+      external.push(new URL(url).origin);
+      return route.abort('blockedbyclient');
+    });
+    const page = context.pages()[0];
+    page.setDefaultTimeout(15_000);
+    page.on('pageerror', error => pageErrors.push(String(error)));
+    await page.goto(origin);
+    await page.waitForFunction(() => Boolean(window.harness));
+    const execute = vm.runInNewContext(`(${readFileSync(join(project, 'test/ui-route-browser.js'), 'utf8')})`, {
+      console, setTimeout, clearTimeout, URL, Buffer, performance,
+    });
+    const result = await Promise.race([execute(page), new Promise((_, reject) => {
+      deadline = setTimeout(() => reject(new Error('Route browser suite timed out.')), 150_000);
+    })]);
+    assertBrowserResult(result);
+    assert.deepEqual(pageErrors, []);
+    assert.deepEqual(external, []);
+    assert.deepEqual(readFileSync(join(project, 'src/client.js')), generated);
+    console.log('ROUTE_BROWSER_SOURCE ' + JSON.stringify({
+      assertionsPassed: result.passed, sourceBuildSha256: createHash('sha256').update(clientSource).digest('hex'),
+      generatedArtifactUnchanged: true, upstreamRequests: 0, desktopVerified: false,
+    }));
+  } finally {
+    clearTimeout(deadline);
+    try { await context?.close(); } finally { await stopPreviewService(service); }
+  }
+});

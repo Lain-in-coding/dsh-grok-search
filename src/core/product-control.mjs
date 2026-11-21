@@ -572,7 +572,10 @@ export function createProductReleaseController({ ctx, priorIntent, core, routeVe
       return { settled: true, remaining: 0 };
     },
     async restore() {
-      await ctx.get?.('grokSearchBudgets')?.release();
+      try { await ctx.get?.('grokSearchBudgets')?.release(); }
+      catch {
+        ctx.logger?.warn?.('dsh-grok-search: optional search timeout restoration failed.');
+      }
       const restored = await restoreAuthorRoute(routeContext, priorIntent);
       const author = priorIntent?.acquisition?.authorSearchProvider ?? null;
       return { ...restored, routeBefore,

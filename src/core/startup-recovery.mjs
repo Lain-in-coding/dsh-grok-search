@@ -126,6 +126,10 @@ export async function completeDeferredStartup({ store, observe, verifyRoute, res
   if (!Number.isSafeInteger(counterBaseline) || counterBaseline < 0) fail('CONTROL_ROUTE_COUNTER_REQUIRED');
   let routeChanged = false;
   if (restoreRoute) {
+    const current = store.read();
+    if (current?.revision !== before.revision || current.operationId !== before.operationId) {
+      fail('CONTROL_CAS_CONFLICT');
+    }
     const restored = await restoreRoute({ priorIntent: prior, observation });
     signal?.throwIfAborted();
     if (!restored || typeof restored.routeChanged !== 'boolean') fail('CONTROL_RECOVERY_RESTORE_INVALID');
@@ -216,6 +220,10 @@ export async function completeReleaseRecovery({ store, observe, restoreRoute, ve
   }
   const counterBaseline = observation.observer?.counter?.calls;
   if (!Number.isSafeInteger(counterBaseline) || counterBaseline < 0) fail('CONTROL_ROUTE_COUNTER_REQUIRED');
+  const current = store.read();
+  if (current?.revision !== before.revision || current.operationId !== before.operationId) {
+    fail('CONTROL_CAS_CONFLICT');
+  }
   const restored = await restoreRoute({ priorIntent, observation, counterBaseline });
   signal?.throwIfAborted();
   if (!restored || typeof restored.routeChanged !== 'boolean') fail('CONTROL_RECOVERY_RESTORE_INVALID');

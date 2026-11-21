@@ -861,6 +861,47 @@ async page => {
     await close();
 
     await state('returning');
+    await page.evaluate(() => {
+      window.harness.inject({ grok_auth_mode: 'oauth', grok_api_url: 'https://readonly.example.test', grok_model: 'readonly-model' });
+      window.harness.refresh();
+    });
+    await page.waitForFunction(() => window.harness.state.snapshot.config.fields.grok_auth_mode.value === 'oauth');
+    await card('grok');
+    check('read-only authentication card does not expose a destructive clear action',
+      await page.locator('[data-a=clear]').count(), 0);
+    await close();
+
+    await state('returning');
+    await page.evaluate(() => window.harness.configure({ diagnostics: {
+      grok: ['GROK_UNAVAILABLE'], tavily: ['SOURCE_UNAVAILABLE', 'SOURCE_UNAVAILABLE'],
+      exa: ['SOURCE_UNAVAILABLE'], github: ['GITHUB_UNAVAILABLE'],
+    } }));
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.waitForFunction(() => document.querySelector('[data-dsg-route]').shadowRoot
+      .querySelector('#testBtn').textContent.includes('测试连接'));
+    check('missing optional services never mark a key as failed',
+      await page.locator('.s-dot[data-tone=err]').count(), 0);
+    check('missing optional service diagnostics remain explicitly incomplete',
+      (await page.locator('.s-end').textContent()).includes('测试未完成'));
+    check('missing optional services produce no credential failure badges',
+      await page.locator('.row.has-fault').count(), 0);
+
+    await state('returning');
+    await page.evaluate(() => {
+      window.harness.configure({ program: { phase: 'discovering', program: null }, snapshotDelay: 700 });
+      window.harness.refresh();
+    });
+    await page.waitForFunction(() => window.harness.state.calls.filter(call => call.method === 'snapshot').length > 1);
+    await page.locator('#nodeHub').click();
+    await page.locator('[data-a=redetect]').click();
+    await page.waitForFunction(() => window.harness.state.calls.some(call => call.method === 'prepareProgram'));
+    await page.waitForTimeout(850);
+    check('an earlier settings poll cannot erase a completed program preparation',
+      (await page.locator('#hubMeta').textContent()).includes('v0.1.26'));
+    await close();
+
+    await state('returning');
     await page.evaluate(() => window.harness.configure({ delay: 800,
       openError: { code: 'CONFIG_OPEN_UNAVAILABLE', message: 'Windows 系统打开工具不存在，请复制路径后手动打开。' } }));
     await page.locator('.rc-foot [data-open=file]').click();
@@ -930,6 +971,43 @@ async page => {
     check('healthy program still uses the compatible detection RPC',
       await read(() => window.harness.state.calls.some(call => call.method === 'prepareProgram')));
     await close();
+    await state('returning');
+    await page.evaluate(() => {
+      window.harness.configure({ program: { phase: 'error', program: null, canRepair: true,
+        configuration: { executable: false, configPath: false },
+        error: { code: 'GROK_PROGRAM_CHANGED', message: '程序内容在验证期间发生变化。' } } });
+      window.harness.refresh();
+    });
+    await page.locator('#hubMeta').filter({ hasText: '准备失败' }).waitFor();
+    await page.locator('#nodeHub').click();
+    check('changed unpinned program offers explicit private preparation',
+      (await page.locator('[data-a=redetect]').textContent()).trim(), '重新准备');
+    await page.locator('[data-a=redetect]').click();
+    check('changed program dispatches repair instead of repeating detection',
+      await read(() => window.harness.state.calls.filter(call => call.method === 'repairProgram').length), 1);
+    check('program-change recovery preserves shared configuration',
+      await read(() => JSON.stringify(window.harness.state.content)), configurationBeforeRepair);
+    await close();
+    for (const code of ['GROK_PROGRAM_CHANGED', 'GROK_CACHE_DAMAGED']) {
+      await state('returning');
+      await page.evaluate(code => {
+        window.harness.configure({ program: { phase: 'error', program: null, canRepair: false,
+          configuration: { executable: true, configPath: false },
+          error: { code, message: '指定程序未通过验证。' } } });
+        window.harness.refresh();
+      }, code);
+      await page.locator('#hubMeta').filter({ hasText: '准备失败' }).waitFor();
+      await page.locator('#nodeHub').click();
+      const detection = page.locator('[data-a=redetect]');
+      check(`configured program preserves detection-only action (${code})`,
+        (await detection.textContent()).trim(), '重新检测');
+      await detection.click();
+      check(`configured program never dispatches private repair (${code})`,
+        await read(() => window.harness.state.calls.filter(call => call.method === 'repairProgram').length), 0);
+      check(`configured program dispatches detection (${code})`,
+        await read(() => window.harness.state.calls.filter(call => call.method === 'prepareProgram').length), 1);
+      await close();
+    }
     const compatibilityReport = (overrides = {}) => ({
       schemaVersion: 1, hostVersion: '0.2.2-rc.3', pluginVersion: '0.4.0', channel: 'rc',
       minimumAdmitted: true, verification: 'unverified', phase: 'ready', revision: 'missing',

@@ -657,3 +657,25 @@ test('clearing during GitHub tool execution suppresses new and late records', as
   assert.equal(history.snapshot(randomUUID()).records.length, 0);
   context.dispose(); history.dispose();
 });
+
+
+test('caller-owned custom abort reasons remain cancelled without hiding independent failures or timeouts', async () => {
+  for (const mode of ['custom-error', 'primitive', 'independent-failure', 'timeout']) {
+    const history = createSearchLog(), context = createToolRouteContext({ searchLog: history });
+    const controller = new AbortController(), session = randomUUID();
+    const reason = mode === 'primitive' ? 'cancelled by caller' : mode === 'timeout'
+      ? Object.assign(new Error('expired'), { code: 'GROK_TIMEOUT' }) : new Error('cancelled by caller');
+    const failure = mode === 'independent-failure' ? new Error('independent provider failure') : reason;
+    try {
+      await assert.rejects(context.run({ ...exec(session, mode), signal: controller.signal }, () => {
+        const attribution = context.capture();
+        history.begin('offline cancellation', attribution);
+        controller.abort(reason);
+        throw failure;
+      }), error => error === failure);
+      const expected = ['independent-failure', 'timeout'].includes(mode) ? 'failed' : 'cancelled';
+      assert.equal(context.read(session, mode).state, expected, mode);
+      assert.equal(history.snapshot(randomUUID()).records[0].kind, expected, mode);
+    } finally { context.dispose(); history.dispose(); }
+  }
+});

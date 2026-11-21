@@ -496,8 +496,9 @@ export function createSharedConfigStore({
         try {
           const stat = fstatSync(fd);
           if (!stat.isFile() || stat.size > MAX_BYTES || lstatSync(historical).isSymbolicLink()) fail('CONFIG_HISTORY_INVALID', '配置历史文件不安全。');
-          const text = readFileSync(fd, 'utf8');
-          if (hash(text) !== revision) fail('CONFIG_HISTORY_INVALID', '配置历史校验失败。');
+          const bytes = readFileSync(fd);
+          const text = bytes.toString('utf8');
+          if (hash(bytes) !== revision || !Buffer.from(text).equals(bytes)) fail('CONFIG_HISTORY_INVALID', '配置历史校验失败。');
           return text;
         } finally { closeSync(fd); }
       }, { keepHistory: [revision], verify, paired });

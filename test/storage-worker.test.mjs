@@ -67,6 +67,27 @@ test('worker leases deduplicate tasks, preserve the remaining owner and cancel o
   assert.equal((await c).status, 'cancelled');
 });
 
+test('a rejected asynchronous maintenance observer cannot fail the completed worker operation', async () => {
+  const f = fixture(1);
+  let child, observed = false;
+  const service = createStorageMaintenanceWorker({ ...f,
+    onResult: async () => { observed = true; throw new Error('optional observer failed'); },
+    workerFactory: () => {
+      child = new EventEmitter();
+      child.postMessage = () => {};
+      child.terminate = async () => { queueMicrotask(() => child.emit('exit', 0)); return 0; };
+      return child;
+    },
+  });
+  try {
+    const pending = service.schedule();
+    child.emit('message', { status: 'unchanged' });
+    assert.equal((await pending).status, 'unchanged');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(observed, true);
+  } finally { service.dispose(); }
+});
+
 test('cancellation waits for a safe boundary and releases the maintenance lock', async () => {
   const f = fixture(151);
   const service = createStorageMaintenanceWorker(f);

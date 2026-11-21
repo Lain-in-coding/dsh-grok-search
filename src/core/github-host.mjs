@@ -71,6 +71,7 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
     try {
       const result = await reader.read({ ...input, scope, signal: exec.signal, ...options });
       assertCapability(exec, exec.name === 'web_fetch');
+      exec.signal?.throwIfAborted();
       searchLog?.finishRead(token, result);
       route?.finish({ served: 'github', outcome: 'ok', resultProviders: ['github'], resultProvidersComplete: true });
       return result;
@@ -152,8 +153,8 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
         }
         const result = await next();
         if ((githubUrl || exec.name === 'github_read') && hostRejection(result)) invalidateScope(exec);
+        if (githubUrl || exec.name === 'github_read') exec.signal?.throwIfAborted();
         if (githubUrl) {
-          exec.signal?.throwIfAborted();
           if (!current.readerCompleted && !result?.isError) throw fetchUnavailable();
         }
         return result;
@@ -190,10 +191,11 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
     return new Proxy(service, { get(target, property, receiver) {
       if (property !== 'fetch') return Reflect.get(target, property, receiver);
       return async (request, signal) => {
+        const exec = current.exec;
+        const requestSignal = exec.signal && signal && exec.signal !== signal
+          ? AbortSignal.any([exec.signal, signal]) : exec.signal ?? signal;
         try {
-          const exec = current.exec;
-          exec.signal?.throwIfAborted();
-          signal?.throwIfAborted();
+          requestSignal?.throwIfAborted();
           if (disposed || !enabled()) throw new GrokSearchError('GITHUB_DISABLED', 'GitHub 读取已停用，请重新发起请求。');
           assertCapability(current.exec, true);
           if (!current.active || storage.getStore() !== current) throw new GrokSearchError('GITHUB_SCOPE_REQUIRED', 'GitHub 调用上下文已失效。');
@@ -224,16 +226,17 @@ export function createGithubIntegration({ ctx, getState, searchLog, callRoutes, 
           const rawCap = unwrap(config?.fetchMaxOutputChars);
           const cap = typeof rawCap === 'number' ? rawCap : 16000;
           // Reserve room for the original tool's header and trust notice.
-          const result = await perform({ url: request.url }, { ...exec, signal }, {
+          const result = await perform({ url: request.url }, { ...exec, signal: requestSignal }, {
             limitChars: Math.min(16000, cap - 1200), timeoutMs: Math.min(30_000, resolved.timeoutMs ?? 30_000),
           });
+          requestSignal?.throwIfAborted();
           current.readerCompleted = true;
           return { url: result.url, statusCode: 200, body: { kind: 'text', content: formatGithubRead(result) },
             // This segment is complete. Our text explains remaining segments;
             // the official truncation footer would incorrectly recommend a new URL.
             truncated: false };
         } catch (failure) {
-          throw hostFailure(failure, signal, WebError);
+          throw hostFailure(failure, requestSignal, WebError);
         }
       };
     } });

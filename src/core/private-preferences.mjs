@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, lstatSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, fstatSync, lstatSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { GrokSearchError } from './errors.mjs';
 import { acquireOwnedLock, DEFAULT_STALE_LOCK_MS } from './owned-lock.mjs';
@@ -74,10 +74,10 @@ export function createPrivatePreferences({ path, fault }) {
         fail('PREFERENCES_REVISION_REQUIRED', '保存偏好前必须读取当前修订。');
       }
       validate(value);
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       const lockPath = path + '.dsh-grok-search.lock';
-      let lock, stage, published = false;
+      let lock, stage, stageIdentity, published = false;
       try {
+        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
         try { lock = acquireOwnedLock(lockPath, { reclaimStaleAfterMs: DEFAULT_STALE_LOCK_MS }); }
         catch (error) {
           if (error.code === 'EEXIST') fail('PREFERENCES_BUSY', '插件偏好正在保存或上次保存被中断，请稍后检查。');
@@ -97,9 +97,18 @@ export function createPrivatePreferences({ path, fault }) {
         }
         stage = `${path}.${randomUUID()}.tmp`;
         const fd = openSync(stage, 'wx', 0o600);
-        try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+        try {
+          stageIdentity = fstatSync(fd);
+          writeFileSync(fd, text); fsyncSync(fd);
+        } finally { closeSync(fd); }
         fault?.('before-publish');
         if (read().revision !== expectedRevision) fail('PREFERENCES_CONFLICT', '插件偏好已被其他窗口修改，请重新读取。');
+        const staged = lstatSync(stage);
+        if (!staged.isFile() || staged.isSymbolicLink() || staged.size > 65536
+          || staged.dev !== stageIdentity.dev || staged.ino !== stageIdentity.ino
+          || !readFileSync(stage).equals(Buffer.from(text))) {
+          fail('PREFERENCES_PATH_UNSAFE', '偏好暂存文件已改变，保存未发布。');
+        }
         renameSync(stage, path);
         published = true;
         fault?.('after-publish');
@@ -111,7 +120,13 @@ export function createPrivatePreferences({ path, fault }) {
         if (error instanceof GrokSearchError) throw error;
         fail('PREFERENCES_WRITE_FAILED', '无法保存插件偏好；原文件未由本次操作替换。');
       } finally {
-        if (stage && !published) { try { unlinkSync(stage); } catch {} }
+        if (stageIdentity && !published) {
+          try {
+            const current = lstatSync(stage);
+            if (current.isFile() && !current.isSymbolicLink()
+              && current.dev === stageIdentity.dev && current.ino === stageIdentity.ino) unlinkSync(stage);
+          } catch {}
+        }
         if (lock) lock.release();
       }
     },

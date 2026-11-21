@@ -389,6 +389,124 @@ test('grok-search-rs internal fallback is recorded as grok-sources with a stable
   assert.equal(free.routed.routeSnapshot().grokCode, 'grok_provider_error');
 });
 
+test('native fallback preserves the original HTTP failure in route/log and testGrok without extra searches', async t => {
+  for (const [httpStatus, reason, message] of [
+    [502, 'upstream_error', /上游接口调用失败/],
+    [404, 'model_not_found', /模型或路由不存在/],
+    [422, 'tool_unsupported', /不支持搜索工具/],
+  ]) await t.test(`${httpStatus} ${reason}`, async () => {
+    const primaryFailure = { schemaVersion: 1, provider: 'grok', protocol: 'responses', stage: 'response',
+      httpStatus, reason, evidence: 'primary-request' };
+    const { routed, calls } = harness({ grok: async () => ({ content: 'fallback answer',
+      sources: [{ url: 'https://result.test/a', provider: 'tavily_fallback' }],
+      diagnostic: { fallbackUsed: true, fallbackReason: 'grok_provider_error', primaryFailure },
+    }) });
+    try {
+      const result = await routed.search({ query: QUERY });
+      assert.equal(result.sources[0].url, 'https://result.test/a');
+      assert.doesNotMatch(JSON.stringify(result), /primaryFailure|primary-request/);
+      const route = routed.routeSnapshot();
+      assert.equal(route.served, 'tavily');
+      assert.equal(route.grokCode, `HTTP_${httpStatus}`);
+      assert.deepEqual(route.primaryFailure, primaryFailure);
+      assert.deepEqual(route.resultProviders, ['tavily']);
+      const row = routed.searchLog.snapshot(randomUUID()).records[0];
+      assert.equal(row.reason, `HTTP_${httpStatus}`);
+      assert.equal(row.calls[0].code, `HTTP_${httpStatus}`);
+      assert.deepEqual(row.calls.map(call => [call.provider, call.result]), [['grok', 'failed'], ['tavily', 'ok']]);
+      assert.equal(row.calls[1].evidence, 'source-label');
+      await assert.rejects(routed.testGrok({ query: QUERY }), error => {
+        assert.equal(error.code, `HTTP_${httpStatus}`);
+        assert.match(error.message, message);
+        assert.doesNotMatch(error.message, /路径|协议/);
+        assert.deepEqual(error.details, primaryFailure);
+        return true;
+      });
+      assert.deepEqual(routed.routeSnapshot(), route);
+      assert.equal(routed.searchLog.snapshot(randomUUID()).records.length, 1);
+      assert.equal(calls.grok, 2);
+      assert.equal(calls.sources.length, 0);
+    } finally { await routed.dispose(); }
+  });
+});
+
+test('native fallback with absent or untrusted primaryFailure retains the legacy diagnosis', async t => {
+  const valid = { schemaVersion: 1, provider: 'grok', protocol: 'responses', stage: 'response',
+    httpStatus: 404, reason: 'model_not_found', evidence: 'primary-request' };
+  for (const primaryFailure of [undefined, null, { ...valid, schemaVersion: 2 }, { ...valid, reason: 'future_reason' },
+    { ...valid, evidence: 'primary-doctor' }, { ...valid, body: 'never-retain-this-secret' },
+    { ...valid, upstreamCode: 'never-retain-this-secret' }]) await t.test(JSON.stringify(primaryFailure) ?? 'absent', async () => {
+    const { routed, calls } = harness({ grok: async () => ({ sources: [{ url: 'https://result.test/a' }],
+      diagnostic: { fallbackUsed: true, fallbackReason: 'grok_auth_error', primaryFailure },
+    }) });
+    try {
+      await routed.search({ query: QUERY });
+      assert.equal(routed.routeSnapshot().grokCode, 'grok_auth_error');
+      assert.equal(routed.routeSnapshot().primaryFailure, undefined);
+      await assert.rejects(routed.testGrok({ query: QUERY }), error => {
+        assert.equal(error.code, 'grok_auth_error');
+        assert.equal(error.details, undefined);
+        assert.doesNotMatch(JSON.stringify([error, error.stack]), /never-retain-this-secret/);
+        return true;
+      });
+      assert.doesNotMatch(JSON.stringify([routed.routeSnapshot(), routed.searchLog.snapshot(randomUUID())]), /never-retain-this-secret/);
+      assert.equal(calls.sources.length, 0);
+    } finally { await routed.dispose(); }
+  });
+});
+
+test('a thrown primary failure keeps safe details whether plugin fallback succeeds, fails, or is unavailable', async t => {
+  for (const outcome of ['ok', 'failed', 'zero', 'unavailable']) await t.test(outcome, async () => {
+    const details = { schemaVersion: 1, provider: 'grok', protocol: 'responses', stage: 'response',
+      httpStatus: 502, reason: 'upstream_error', evidence: 'primary-request' };
+    const primary = new GrokSearchError('HTTP_502', 'Grok upstream failed (HTTP 502).', details);
+    const { routed, calls } = harness({ grok: async () => { throw primary; }, sources: {
+      available: outcome !== 'unavailable', search: async () => {
+        if (outcome === 'ok') return sourceResult('exa');
+        if (outcome === 'zero') throw new GrokSearchError('FALLBACK_SOURCES_ZERO', 'No source budget.');
+        throw new GrokSearchError('SOURCE_ALL_FAILED', 'Sources failed.', { failures: [{ provider: 'exa', code: 'HTTP_503' }] });
+      },
+    } });
+    try {
+      if (outcome === 'ok') await routed.search({ query: QUERY });
+      else await assert.rejects(routed.search({ query: QUERY }), error => {
+        if (outcome === 'failed') {
+          assert.equal(error.code, 'SOURCE_ALL_FAILED');
+          assert.deepEqual(error.details.failures[0].primaryFailure, details);
+        } else assert.equal(error, primary);
+        return true;
+      });
+      assert.deepEqual(routed.routeSnapshot().primaryFailure, details);
+      assert.equal(routed.routeSnapshot().grokCode, 'HTTP_502');
+      assert.equal(routed.searchLog.snapshot(randomUUID()).records[0].calls[0].code, 'HTTP_502');
+      const route = routed.routeSnapshot();
+      const sourceCalls = calls.sources.length;
+      await assert.rejects(routed.testGrok({ query: QUERY }), error => error === primary);
+      assert.equal(calls.sources.length, sourceCalls);
+      assert.deepEqual(routed.routeSnapshot(), route);
+    } finally { await routed.dispose(); }
+  });
+});
+
+test('cancelling testGrok keeps the cancellation ahead of a native fallback diagnosis', async () => {
+  const controller = new AbortController();
+  const reason = new GrokSearchError('SETTINGS_DIAGNOSIS_CANCELLED', 'Cancelled.');
+  const { routed, calls } = harness({ grok: async () => {
+    controller.abort(reason);
+    return { sources: [{ url: 'https://result.test/a', provider: 'tavily_fallback' }], diagnostic: {
+      fallbackUsed: true, fallbackReason: 'grok_provider_error', primaryFailure: {
+        schemaVersion: 1, provider: 'grok', protocol: 'responses', stage: 'response', httpStatus: 404,
+        reason: 'model_not_found', evidence: 'primary-request',
+      },
+    } };
+  } });
+  try {
+    await assert.rejects(routed.testGrok({ query: QUERY }, controller.signal), error => error === reason);
+    assert.equal(calls.sources.length, 0);
+    assert.equal(routed.routeSnapshot(), null);
+  } finally { await routed.dispose(); }
+});
+
 test('内部回退采用结果携带的实际供应商，不读取配置顺序或额外搜索', async () => {
   for (const provider of ['tavily', 'exa', 'tinyfish', 'firecrawl']) {
     const { routed, calls } = harness({ grok: async () => ({
@@ -746,4 +864,21 @@ test('caller cancellation cannot hide an unreaped process or release its faulted
     await new Promise(resolve => setImmediate(resolve));
     await routed.dispose();
   }
+});
+
+
+test('unknown token-shaped fallback reasons stay out of route, log and primary diagnosis', async () => {
+  const { routed } = harness({ grok: async () => ({ sources: [{ url: 'https://example.invalid/result', provider: 'tavily_fallback' }],
+    diagnostic: { fallbackUsed: true, fallbackReason: 'TOKEN_SHAPED_PRIVATE_VALUE' } }) });
+  try {
+    await routed.search({ query: QUERY });
+    const route = routed.routeSnapshot();
+    assert.equal(route.fallbackUsed, true);
+    assert.equal(route.served, 'tavily');
+    assert.equal(route.grokCode, 'grok_provider_error');
+    const log = routed.searchLog.snapshot(randomUUID());
+    assert.equal(log.records[0].calls[0].result, 'failed');
+    assert.doesNotMatch(JSON.stringify([route, log]), /TOKEN_SHAPED_PRIVATE_VALUE/);
+    await assert.rejects(routed.testGrok({ query: QUERY }), { code: 'grok_provider_error' });
+  } finally { await routed.dispose(); }
 });

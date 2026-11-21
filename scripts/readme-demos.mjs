@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { connectRenderer, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { project } from './lib/internal-candidate-utils.mjs';
+import { stopPreviewService } from './lib/browser-gates.mjs';
 
 const usage = 'Usage: node scripts/readme-demos.mjs --chrome <path> [--ffmpeg <path>] [--formats apng,gif,webp,mp4] [--dpr 1.25] [--fps 24] [--speed 0.3] [--only id,...] [--keep-frames true|false]';
 const options = new Map();
@@ -115,36 +116,69 @@ function pageHelpers(css) {
   return true;
 }
 
-const preview = spawn(process.execPath, [join(project, 'scripts/ui-route-preview.mjs')], { cwd: project, stdio: ['ignore', 'pipe', 'inherit'], windowsHide: true });
-const info = await new Promise((done, fail) => {
-  let text = '';
-  const timer = setTimeout(() => fail(new Error('Preview server did not start.')), 15000);
-  preview.stdout.on('data', chunk => {
-    text += chunk;
-    if (!text.includes('\n')) return;
-    clearTimeout(timer);
-    try { done(JSON.parse(text.split('\n')[0])); } catch (error) { fail(error); }
+const services = [];
+function ownProcess(child) {
+  const service = { child, exited: false, error: null };
+  child.once('exit', () => {
+    if (!service.stopping) service.error ??= new Error('Recording process exited before cleanup.');
   });
-  preview.once('exit', code => { clearTimeout(timer); fail(new Error('Preview server exited: ' + code)); });
-});
-const scratch = mkdtempSync(join(tmpdir(), 'dsh-readme-demos-'));
-const profile = join(scratch, 'profile');
-// 缩放比直接交给浏览器窗口：仿真 deviceScaleFactor 会在并发截图时把鼠标坐标按错误比例换算。
-const browser = spawn(chrome, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, `--force-device-scale-factor=${dpr}`, '--no-first-run',
-  '--no-default-browser-check', '--disable-extensions', '--disable-background-networking', '--disable-sync', '--hide-scrollbars',
-  '--mute-audio', '--force-color-profile=srgb', '--window-size=1280,1000', 'about:blank'], { stdio: 'ignore', windowsHide: true });
-const browserExit = new Promise(done => browser.once('exit', done));
+  service.closed = new Promise(done => child.once('close', () => {
+    if (!service.stopping) service.error ??= new Error('Recording process exited before cleanup.');
+    service.exited = true; done();
+  }));
+  child.on('error', error => { service.error ??= error; });
+  services.push(service);
+  return service;
+}
 
-let renderer, succeeded = false;
-const report = { runId: info.runId, scope: 'README animated demos: generated production client + offline synthetic host shim; synthetic keys, no reveal/copy; demo cursor injected in host page only; page time slowed during capture and restored at encode; not Desktop, real host or paid-provider evidence',
-  pluginVersion: JSON.parse(readFileSync(join(project, 'package.json'), 'utf8')).version,
-  command: `node scripts/readme-demos.mjs --chrome <browser> --formats ${formats.join(',')} --dpr ${dpr} --speed ${speed} --keep-frames ${keepFrames}`,
-  dpr, speed, width: WIDTH, scenarios: [] };
+async function previewInfo(child) {
+  let timer, onData, onError, onExit;
+  try {
+    return await new Promise((done, fail) => {
+      let text = '';
+      onError = fail;
+      onExit = code => fail(new Error('Preview server exited: ' + code));
+      onData = chunk => {
+        text += chunk;
+        if (!text.includes('\n')) return;
+        try { done(JSON.parse(text.split('\n')[0])); } catch (error) { fail(error); }
+      };
+      timer = setTimeout(() => fail(new Error('Preview server did not start.')), 15000);
+      child.stdout.on('data', onData);
+      child.once('error', onError);
+      child.once('exit', onExit);
+    });
+  } finally {
+    clearTimeout(timer);
+    child.stdout.off('data', onData);
+    child.off('error', onError);
+    child.off('exit', onExit);
+  }
+}
+
+let renderer, scratch, info, report, fatal, succeeded = false;
 try {
+  const preview = ownProcess(spawn(process.execPath, [join(project, 'scripts/ui-route-preview.mjs')], {
+    cwd: project, stdio: ['ignore', 'pipe', 'inherit'], windowsHide: true
+  }));
+  info = await previewInfo(preview.child);
+  scratch = mkdtempSync(join(tmpdir(), 'dsh-readme-demos-'));
+  const profile = join(scratch, 'profile');
+  // 缩放比直接交给浏览器窗口：仿真 deviceScaleFactor 会在并发截图时把鼠标坐标按错误比例换算。
+  const browser = ownProcess(spawn(chrome, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, `--force-device-scale-factor=${dpr}`, '--no-first-run',
+    '--no-default-browser-check', '--disable-extensions', '--disable-background-networking', '--disable-sync', '--hide-scrollbars',
+    '--mute-audio', '--force-color-profile=srgb', '--window-size=1280,1000', 'about:blank'], { stdio: 'ignore', windowsHide: true }));
+  await new Promise((done, fail) => { browser.child.once('spawn', done); browser.child.once('error', fail); });
+  report = { runId: info.runId, scope: 'README animated demos: generated production client + offline synthetic host shim; synthetic keys, no reveal/copy; demo cursor injected in host page only; page time slowed during capture and restored at encode; not Desktop, real host or paid-provider evidence',
+    pluginVersion: JSON.parse(readFileSync(join(project, 'package.json'), 'utf8')).version,
+    command: `node scripts/readme-demos.mjs --chrome <browser> --formats ${formats.join(',')} --dpr ${dpr} --speed ${speed} --keep-frames ${keepFrames}`,
+    dpr, speed, width: WIDTH, scenarios: [] };
   const portFile = join(profile, 'DevToolsActivePort');
   const deadline = Date.now() + 20000;
   let port = 0;
   while (!port) {
+    if (browser.exited) throw new Error('Chrome exited before exposing DevTools.');
+    if (browser.error) throw browser.error;
     if (existsSync(portFile)) port = Number(readFileSync(portFile, 'utf8').split('\n')[0]) || 0;
     if (!port) { if (Date.now() > deadline) throw new Error('Chrome did not expose DevTools.'); await sleep(100); }
   }
@@ -388,20 +422,33 @@ try {
   }
   report.pageErrors = renderer.exceptions.map(item => item.description ?? item.text);
   report.passed = report.scenarios.every(item => item.sensitiveCalls === 0 && item.expected) && report.pageErrors.length === 0;
-  writeFileSync(join(info.directory, 'recording-report.json'), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
+  // The preview seals source hashes while alive; success waits for owned-process cleanup.
   const response = await fetch(info.origin + '/evidence', { method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: info.origin }, body: JSON.stringify(report) });
+    headers: { 'Content-Type': 'application/json', Origin: info.origin },
+    body: JSON.stringify({ ...report, passed: false, cleanupPending: true }) });
   if (!response.ok) throw new Error('Evidence write failed: ' + await response.text());
-  succeeded = report.passed;
-  console.log(JSON.stringify({ runId: info.runId, directory: info.directory, passed: report.passed, pageErrors: report.pageErrors.length }));
+} catch (error) {
+  fatal = error;
 } finally {
-  renderer?.close();
-  browser.kill();
-  await Promise.race([browserExit, sleep(5000)]);
-  preview.kill();
-  const root = resolve(tmpdir()), target = resolve(scratch);
-  if (succeeded && keepFrames !== 'true' && target.startsWith(root + sep) && basename(target).startsWith('dsh-readme-demos-')) {
-    rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-  } else console.error('临时帧保留在：' + target);
+  const cleanupErrors = [];
+  try { renderer?.close(); } catch (error) { cleanupErrors.push(error); }
+  const cleanup = await Promise.allSettled(services.map(service => stopPreviewService(service)));
+  for (const result of cleanup) if (result.status === 'rejected') cleanupErrors.push(result.reason);
+  for (const service of services) if (service.error) fatal ??= service.error;
+  for (const error of cleanupErrors) { fatal ??= error; console.error('Recording cleanup failed:', error); }
+  if (scratch) {
+    const root = resolve(tmpdir()), target = resolve(scratch);
+    if (!fatal && report?.passed && keepFrames !== 'true' && target.startsWith(root + sep) && basename(target).startsWith('dsh-readme-demos-')) {
+      try { rmSync(target, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+      catch (error) { fatal ??= error; console.error('Recording cleanup failed:', error); }
+    } else console.error('临时帧保留在：' + target);
+  }
 }
+if (fatal) throw fatal;
+const summaryPath = join(info.directory, 'summary.json');
+const summary = JSON.parse(readFileSync(summaryPath, 'utf8'));
+writeFileSync(join(info.directory, 'recording-report.json'), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
+writeFileSync(summaryPath, JSON.stringify({ ...summary, ...report, cleanupPending: false }, null, 2) + '\n');
+succeeded = report.passed;
+console.log(JSON.stringify({ runId: info.runId, directory: info.directory, passed: report.passed, pageErrors: report.pageErrors.length }));
 if (!succeeded) process.exitCode = 1;

@@ -511,6 +511,33 @@ test('explicit release recovery preserves the release intent and completes it on
   assert.equal(repeat.completionCommitted, true);
   assert.deepEqual(unused.state, { observeCalls: 0, verifyCalls: 0 });
 });
+
+test('recovery never restores a record superseded while its legal observation was pending', async t => {
+  for (const branch of ['startup', 'release']) await t.test(branch, async sub => {
+    const required = requiredIntent({ acquisition: { ...requiredIntent().acquisition,
+      authorSearchProvider: observation().authorSearchProvider } });
+    const intent = branch === 'startup' ? required : {
+      ...required, policy: 'released', priorIntent: required,
+      release: { explicit: true, committedAt: OBSERVED_AT, kind: 'intent-release-commit',
+        operationId: randomUUID(), hostId: OLD_HOST },
+    };
+    const { store, before } = fixture(sub, { intent });
+    let superseded, restores = 0;
+    const run = branch === 'startup' ? completeDeferredStartup : completeReleaseRecovery;
+    await expectCode(() => run({ store,
+      async observe() {
+        if (!superseded) superseded = store.compareAndSwap({ expectedRevision: before.revision,
+          intent: requiredIntent({ reason: 'new-control-owner' }) });
+        return observation();
+      },
+      restoreRoute: () => { restores++; return { routeChanged: true }; },
+      verifyRoute: input => routeReceipt(input, { routeChanged: true }),
+    }), 'CONTROL_CAS_CONFLICT');
+    assert.equal(restores, 0);
+    assert.deepEqual(store.read(), superseded);
+  });
+});
+
 test('a confirmed pause is retained when a required record receives startup correction', async t => {
   const pause = { confirmed: true, confirmedAt: OBSERVED_AT, reason: 'explicit user pause', evidence: { supplied: true } };
   const { directory, store, before } = fixture(t, { intent: requiredIntent({ pause }) });

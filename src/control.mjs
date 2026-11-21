@@ -103,7 +103,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     || recorded.authorSearchProviderPresent !== current.authorSearchProviderPresent
     || recorded.authorFetchProvider !== current.authorFetchProvider
     || recorded.authorInjectSha256 !== current.authorInjectSha256;
-  const sameLease = (lease, current) => lease?.hostId === current.hostId && lease?.uid === current.uid
+  const sameLease = (lease, current) => lease?.hostId === current.hostId && lease?.pid === current.pid && lease?.uid === current.uid
     && lease?.entryId === current.entryId && lease?.moduleName === current.moduleName
     && lease?.provider === current.provider;
   const requiredIntent = (selection, acquisition, lease, prior = null) => ({
@@ -160,11 +160,27 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       }
       const currentLease = createLease(ctx);
       const currentAcquisition = createAcquisition(ctx);
+      const assertAcquisitionCurrent = () => {
+        acquisitionSignal.throwIfAborted();
+        if (disposed || stopRequested || !canAcquire() || !isCurrent()) {
+          throw new ControlRecordError('CONTROL_ACQUISITION_CANCELLED',
+            'The current owner can no longer acquire the search route.', { retriable: true });
+        }
+        const latest = createAcquisition(ctx);
+        if (latest.selectionSha256 !== currentAcquisition.selectionSha256
+          || !latest.selectedBundles.includes(PRODUCT_SEARCH_BUNDLE)
+          || latest.ownerUid !== currentAcquisition.ownerUid
+          || !sameLease(createLease(ctx), currentLease)
+          || acquisitionChanged(currentAcquisition, latest)) {
+          throw new ControlRecordError('CONTROL_ACQUISITION_INPUT_CHANGED',
+            'Search acquisition inputs changed before publication; retry with current inputs.', { retriable: true });
+        }
+      };
       const reactivating = existing?.intent.policy === 'released' || existing?.intent.pause?.confirmed === true;
       if (reactivating) {
         existing = await writeControlIntent(store, { expectedRevision: existing.revision,
           intent: requiredIntent(selection, currentAcquisition, currentLease, existing.intent),
-          signal: acquisitionSignal });
+          signal: acquisitionSignal, assertCurrent: assertAcquisitionCurrent });
         if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
         setRecord(existing);
         state.releaseOutcome = null;
@@ -185,19 +201,28 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
         if (!sameLease(existing.intent.lease, currentLease) || acquisitionChanged(recorded, currentAcquisition)) {
           const intent = requiredIntent(selection, currentAcquisition, currentLease, existing.intent);
           existing = await writeControlIntent(store, { expectedRevision: existing.revision, intent,
-            signal: acquisitionSignal });
+            signal: acquisitionSignal, assertCurrent: assertAcquisitionCurrent });
           if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
           setRecord(existing);
         }
       } else {
         const intent = requiredIntent(selection, currentAcquisition, currentLease);
-        existing = await writeControlIntent(store, { expectedRevision: 0, intent, signal: acquisitionSignal });
+        existing = await writeControlIntent(store, { expectedRevision: 0, intent, signal: acquisitionSignal,
+          assertCurrent: assertAcquisitionCurrent });
         if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
         setRecord(existing);
       }
       const core = ctx.get('grokSearchCore');
       if (!core) throw new ControlRecordError('CONTROL_RELEASE_CORE_REQUIRED',
         'The query core must be loaded before the product owner can take over search.');
+      assertAcquisitionCurrent();
+      const latest = store.read();
+      if (latest?.revision !== existing.revision || latest.operationId !== existing.operationId
+        || latest.intent.policy !== 'required' || latest.intent.release !== null
+        || latest.intent.pause?.confirmed === true) {
+        throw new ControlRecordError('CONTROL_CAS_CONFLICT',
+          'The committed control intent changed before route acquisition.', { retriable: true });
+      }
       const pending = takeOverAuthorRoute(ctx, existing.intent.acquisition, existing.intent.lease);
       takeovers.add(pending);
       let takeover;

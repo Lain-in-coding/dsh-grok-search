@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -11,6 +11,18 @@ import { mkdtempTracked } from './helpers/temp-fixture.mjs';
 const branch = 'feat/performance-closeout-030-20261112';
 const ref = `refs/heads/${branch}`;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+
+test('private CI direct entry executes through a directory alias rather than silently succeeding', () => {
+  const f = fixture();
+  const alias = join(f.root, 'tooling-alias');
+  symlinkSync(join(f.root, 'tooling'), alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const result = spawnSync(process.execPath, [join(alias, 'prepare-private-ci.mjs'), 'feat/unapproved'], {
+    cwd: f.repo, encoding: 'utf8', timeout: 30_000, windowsHide: true,
+  });
+  assert.notEqual(result.status, 0, result.stderr);
+  assert.match(result.stderr, /feat\/performance-closeout-030-20261112/);
+  assert.equal(f.current(), '');
+});
 
 function fixture() {
   const root = mkdtempTracked(join(tmpdir(), 'dsh-private-ci-tooling-'));

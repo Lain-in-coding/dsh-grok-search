@@ -11,6 +11,12 @@ import { connectRenderer } from '../scripts/lib/renderer-cdp.mjs';
 
 const fixtureHelper = new URL('./helpers/temp-fixture.mjs', import.meta.url).href;
 
+test('native installation keeps its unique scratch name short and retains special-path mode', () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  assert.match(source, /const root = join\(tmpdir\(\), 'dsh-deferred-desktop-' \+ randomUUID\(\)\.replaceAll\('-', ''\)\.slice\(0, 6\)/);
+  assert.ok(source.includes(`openConfig ? " 中文 空格 ' & $"`));
+});
+
 test('program probe keeps historical modes and requires an exact package and hash for final-package checks', () => {
   const source = readFileSync(new URL('../scripts/program-install-probe.mjs', import.meta.url), 'utf8');
   const start = source.indexOf('export function parseProgramProbeArguments(');

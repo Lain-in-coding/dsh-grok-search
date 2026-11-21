@@ -43,7 +43,8 @@ for (const row of packageReceipt.sourceHashes) {
 const upgradePackage = upgradeFrom ? readUpgradePackage(upgradeFrom) : null;
 if (upgradePackage) assert.notEqual(upgradePackage.manifest.version, packageReceipt.version, 'Upgrade needs distinct verified package versions.');
 const run = freshRun('rc5-user-path');
-const root = join(tmpdir(), 'dsh-deferred-desktop-user-path-' + run.runId + (openConfig ? " 中文 空格 ' & $" : ''));
+// The owned scratch already has a unique parent; keep native executable paths short.
+const root = join(tmpdir(), 'dsh-deferred-desktop-' + randomUUID().replaceAll('-', '').slice(0, 6) + (openConfig ? " 中文 空格 ' & $" : ''));
 prepareDesktopFixture(runtime.executable, root, { pluginManagerEntries: true, liveHmr: true, ...runtimeOptions });
 const control = JSON.parse(readFileSync(join(root, 'local-control.json'), 'utf8'));
 const extraction = join(root, 'extracted-product');

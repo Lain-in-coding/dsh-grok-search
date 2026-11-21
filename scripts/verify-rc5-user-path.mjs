@@ -83,7 +83,10 @@ const quotaServer = createHttpServer((request, response) => {
   response.end(JSON.stringify({ account: { plan_usage: 2, plan_limit: 10 } }));
 });
 await new Promise(done => quotaServer.listen(0, '127.0.0.1', done));
-const child = spawn(control.electron, [control.archive, '--user-data-dir=' + control.userData,
+// Native first installation must exercise the signed packaged entry, not default_app.
+const packaged = liveInstall && process.platform === 'win32';
+const launchExecutable = packaged ? runtime.executable : control.electron;
+const child = spawn(launchExecutable, [...(packaged ? [] : [control.archive]), '--user-data-dir=' + control.userData,
   '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + port, '--lang=zh-CN'], {
   cwd: root, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
   env: prepareDesktopAcceptanceEnvironment(root, {
@@ -233,6 +236,8 @@ try {
     root, port, version: JSON.parse(readFileSync(join(product, 'package.json'), 'utf8')).version,
     ...(registryResolution ? { registryResolution, repositoryReadmeDiffers } : {}),
     packageSha256: packageReceipt.sha256, fixtureBundle: false, snapshot, ui, compatibility,
+    startupMode: packaged ? 'official-signed-packaged-windows-desktop' : 'existing-isolated-desktop-entry',
+    packagedStartupVerified: packaged,
     ...(upgradePackage ? { upgradeFrom: { version: upgradePackage.manifest.version, sha256: upgradePackage.receipt.sha256 } } : {}),
     log: await rpc('readSearchLog', { sessionId }),
     route: await rpc('toolCallRoute', { sessionId, callId: 'unknown' }),

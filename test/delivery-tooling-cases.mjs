@@ -15,6 +15,9 @@ test('native installation keeps its unique scratch name short and retains specia
   const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
   assert.match(source, /const root = join\(tmpdir\(\), 'dsh-deferred-desktop-' \+ randomUUID\(\)\.replaceAll\('-', ''\)\.slice\(0, 6\)/);
   assert.ok(source.includes(`openConfig ? " 中文 空格 ' & $"`));
+  assert.match(source, /const packaged = liveInstall && process\.platform === 'win32';/);
+  assert.match(source, /const launchExecutable = packaged \? runtime\.executable : control\.electron;/);
+  assert.match(source, /spawn\(launchExecutable, \[\.\.\.\(packaged \? \[\] : \[control\.archive\]\)/);
 });
 
 test('program probe keeps historical modes and requires an exact package and hash for final-package checks', () => {

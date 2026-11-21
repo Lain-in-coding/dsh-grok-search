@@ -43,9 +43,6 @@ jobs:
       actions: read
       id-token: write
     env:
-      NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-trusted-publish.npmrc
-      NPM_CHANNEL_OUTPUT: ${{ runner.temp }}/npm-trusted-publish
-      NPM_CHANNEL_RUNNER: ${{ runner.environment }}
       NPM_CHANNEL_MODE: ${{ inputs.mode }}
       NPM_CHANNEL_VERSION: ${{ inputs.version }}
       NPM_CHANNEL_SHA256: ${{ inputs.package_sha256 }}
@@ -68,6 +65,9 @@ jobs:
       - name: Check trusted authentication or publish the unchanged release archive
         env:
           GH_TOKEN: ${{ github.token }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-trusted-publish.npmrc
+          NPM_CHANNEL_OUTPUT: ${{ runner.temp }}/npm-trusted-publish
+          NPM_CHANNEL_RUNNER: ${{ runner.environment }}
         run: node scripts/npm-trusted-publish.mjs
       - name: Preserve only the sanitized channel receipt
         if: always()

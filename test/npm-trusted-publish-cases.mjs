@@ -127,4 +127,9 @@ test('channel workflow is dispatch-only, pinned, tokenless and uploads only its 
   for (const match of text.matchAll(/uses: (\S+)/g)) assert.match(match[1], /@[a-f0-9]{40}$/);
   assert.match(text, /retention-days: 30/);
   assert.match(text, /path: \$\{\{ runner.temp \}\}\/npm-trusted-publish\/result\.json/);
+  const jobEnv = text.slice(text.indexOf('    env:\n'), text.indexOf('    steps:\n'));
+  assert.doesNotMatch(jobEnv, /runner\./, 'Runner context is only available after job dispatch.');
+  const closure = readFileSync(new URL('../scripts/macos-full-acceptance.mjs', import.meta.url), 'utf8');
+  for (const path of ['scripts/npm-trusted-publish.mjs', 'test/npm-trusted-publish-cases.mjs',
+    '.github/workflows/npm-publish.yml']) assert.ok(closure.includes(`'${path}'`));
 });

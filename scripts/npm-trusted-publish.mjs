@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import { digest, packageFiles } from './lib/compatibility-program-checks.mjs';
 
 export const repository = 'Lain-in-coding/dsh-grok-search';
@@ -128,24 +129,30 @@ async function githubJson(path, env) {
   return response.json();
 }
 
-async function download(url, limit) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+async function download(url, limit, { signal } = {}) {
+  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000);
+  const response = await fetch(url, { signal: requestSignal });
   insist(response.ok, 'NPM_CHANNEL_DOWNLOAD_FAILED');
   const parts = [];
   let size = 0;
   for await (const part of response.body) {
+    requestSignal.throwIfAborted();
     size += part.length;
     insist(size <= limit, 'NPM_CHANNEL_DOWNLOAD_LIMIT');
     parts.push(part);
   }
+  requestSignal.throwIfAborted();
   return Buffer.concat(parts);
 }
 
-async function registryJson(path, missing = false) {
-  const response = await fetch(`${registry}/${path}`, { cache: 'no-store', signal: AbortSignal.timeout(30_000) });
+async function registryJson(path, missing = false, { signal } = {}) {
+  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000);
+  const response = await fetch(`${registry}/${path}`, { cache: 'no-store', signal: requestSignal });
   if (missing && response.status === 404) return null;
   insist(response.ok, 'NPM_CHANNEL_REGISTRY_REQUEST_FAILED');
-  return response.json();
+  const value = await response.json();
+  requestSignal.throwIfAborted();
+  return value;
 }
 
 async function publishOnce(path, env) {
@@ -159,12 +166,68 @@ async function publishOnce(path, env) {
   });
 }
 
+export async function publishAndVerify({ result, existing, path, env, expected, previousTags }, {
+  publish = publishOnce, readRegistry = registryJson, fetchArchive = download,
+  now = () => performance.now(), sleep = (ms, signal) => delay(ms, undefined, { signal }),
+} = {}) {
+  result.uploadAccepted = false;
+  result.registryDownloadVerified = false;
+  if (!existing) {
+    const latest = previousTags.latest?.match(/^(\d+)\.(\d+)\.(\d+)$/);
+    insist(latest && latest.slice(1).map(Number).some((part, index, values) => {
+      const target = expected.version.split('.').map(Number);
+      return values.slice(0, index).every((value, prior) => value === target[prior]) && part < target[index];
+    }), 'NPM_CHANNEL_LATEST_DOWNGRADE_REJECTED');
+    // Upload acceptance and public registry visibility are separate facts.
+    Object.assign(result, { published: null, uploadAccepted: null });
+    const outcome = result.publishAttempt = await publish(path, env);
+    if (outcome.startFailed) Object.assign(result, { published: false, uploadAccepted: false });
+    else result.uploadAccepted = outcome.code === 0 && !outcome.signal && !outcome.timedOut ? true : null;
+  } else Object.assign(result, { alreadyPublished: true, published: null });
+  const deadline = now() + 180_000, signal = AbortSignal.timeout(180_000);
+  const withinDeadline = () => {
+    signal.throwIfAborted();
+    insist(now() < deadline, 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT');
+  };
+  let verificationError;
+  // Only read-side verification retries; never repeat an upload with an uncertain outcome.
+  while (now() < deadline && !signal.aborted) {
+    let observedTags;
+    try {
+      const metadata = await readRegistry(`${packageName}/${expected.version}`, false, { signal });
+      withinDeadline();
+      insist(typeof metadata.dist?.tarball === 'string'
+        && new URL(metadata.dist.tarball).origin === registry, 'NPM_CHANNEL_REGISTRY_URL_INVALID');
+      const bytes = await fetchArchive(metadata.dist.tarball, 16 * 1024 ** 2, { signal });
+      withinDeadline();
+      observedTags = (await readRegistry(packageName, false, { signal }))['dist-tags'] ?? {};
+      withinDeadline();
+      verifyRegistryPackage(metadata, bytes, expected, observedTags, previousTags);
+      Object.assign(result, { distTags: observedTags, published: true, registryDownloadVerified: true });
+      return;
+    } catch (error) {
+      verificationError = error;
+      if (['NPM_CHANNEL_REGISTRY_URL_INVALID', 'NPM_CHANNEL_DOWNLOAD_LIMIT',
+        'NPM_CHANNEL_REGISTRY_PACKAGE_MISMATCH'].includes(error.code)
+        || error.code === 'NPM_CHANNEL_REGISTRY_TAG_MISMATCH' && observedTags?.next !== previousTags.next) throw error;
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0 || signal.aborted) break;
+    try { await sleep(Math.min(5000, remaining), signal); }
+    catch (error) { if (!signal.aborted) throw error; break; }
+  }
+  result.registryVerificationTimedOut = true;
+  result.lastRegistryErrorCode = safeCode(verificationError);
+  fail('NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT');
+}
+
 export async function runChannel(env = process.env) {
   const request = validateRequest(env);
   insist(typeof env.NPM_CHANNEL_OUTPUT === 'string' && isAbsolute(env.NPM_CHANNEL_OUTPUT),
     'NPM_CHANNEL_OUTPUT_INVALID');
   mkdirSync(env.NPM_CHANNEL_OUTPUT, { recursive: true, mode: 0o700 });
   const result = { schemaVersion: 1, mode: request.mode, repository, passed: false, published: false,
+    uploadAccepted: false, registryDownloadVerified: false,
     packageBytesChanged: false, credentialsPersisted: false, code: null };
   try {
     if (request.mode === 'check') Object.assign(result, await checkTrustedIdentity(env), { passed: true });
@@ -198,32 +261,7 @@ export async function runChannel(env = process.env) {
       const existing = await registryJson(`${packageName}/${request.version}`, true);
       const path = join(env.NPM_CHANNEL_OUTPUT, expected.filename);
       writeFileSync(path, bytes, { flag: 'wx', mode: 0o600 });
-      if (!existing) {
-        const latest = previousTags.latest?.match(/^(\d+)\.(\d+)\.(\d+)$/);
-        insist(latest && latest.slice(1).map(Number).some((part, index, values) => {
-          const target = request.version.split('.').map(Number);
-          return values.slice(0, index).every((value, prior) => value === target[prior]) && part < target[index];
-        }), 'NPM_CHANNEL_LATEST_DOWNGRADE_REJECTED');
-        result.publishAttempt = await publishOnce(path, env);
-      } else result.alreadyPublished = true;
-      // A failed or interrupted upload is checked, never blindly published a second time.
-      let verified = false, verificationError;
-      for (let attempt = 0; attempt < 6 && !verified; attempt++) {
-        try {
-          const metadata = await registryJson(`${packageName}/${request.version}`);
-          insist(typeof metadata.dist?.tarball === 'string'
-            && new URL(metadata.dist.tarball).origin === registry, 'NPM_CHANNEL_REGISTRY_URL_INVALID');
-          const publishedBytes = await download(metadata.dist.tarball, 16 * 1024 ** 2);
-          const tags = (await registryJson(packageName))['dist-tags'] ?? {};
-          verifyRegistryPackage(metadata, publishedBytes, expected, tags, previousTags);
-          result.distTags = tags;
-          verified = true;
-        } catch (error) {
-          verificationError = error;
-          if (attempt < 5) await new Promise(done => setTimeout(done, 5000));
-        }
-      }
-      if (!verified) throw verificationError;
+      await publishAndVerify({ result, existing, path, env, expected, previousTags });
       insist(readFileSync(path).equals(bytes), 'NPM_CHANNEL_LOCAL_PACKAGE_CHANGED');
       Object.assign(result, { passed: true, published: true, registryDownloadVerified: true });
     }

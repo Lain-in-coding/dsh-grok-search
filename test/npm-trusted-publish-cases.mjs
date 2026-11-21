@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { digest, tarGzip } from '../scripts/lib/compatibility-program-checks.mjs';
 import { checkTrustedIdentity, repository, validateOfflineRun, validateRelease, validateRequest,
-  verifyFrozenPackage, verifyRegistryPackage } from '../scripts/npm-trusted-publish.mjs';
+  publishAndVerify, verifyFrozenPackage, verifyRegistryPackage } from '../scripts/npm-trusted-publish.mjs';
 
 const env = { GITHUB_REPOSITORY: repository, GITHUB_REF: 'refs/heads/main', GITHUB_EVENT_NAME: 'workflow_dispatch',
   GITHUB_WORKFLOW_REF: `${repository}/.github/workflows/npm-publish.yml@refs/heads/main`,
@@ -103,6 +103,127 @@ test('registry verification rejects altered archives and changes to next', () =>
   assert.throws(() => verifyRegistryPackage(metadata, Buffer.from('wrong'), product, after, before));
   assert.throws(() => verifyRegistryPackage(metadata, bytes, product, { ...after, next: '0.4.2' }, before));
   assert.throws(() => verifyRegistryPackage(metadata, bytes, product, before, before));
+});
+
+function publicationScenario({ visibleAfter = 0, tagsAfter = 0, badHash = false, next = '0.1.1',
+  outcome = { code: 0, signal: null, timedOut: false }, existing = false, lateArchive = false } = {}) {
+  const { files, bytes, expected, sums } = fixture();
+  const product = verifyFrozenPackage(bytes, sums, expected, path => files.get(path));
+  const result = { passed: false, published: false, code: null };
+  const state = { elapsed: 0, uploads: 0, requests: 0, waits: [] };
+  const metadata = { name: product.name, version: product.version,
+    dist: { integrity: product.integrity, tarball: 'https://registry.npmjs.org/dsh-grok-search/-/synthetic.tgz' } };
+  const options = { result, existing, path: 'synthetic-frozen.tgz', env: {}, expected: product,
+    previousTags: { latest: '0.4.1', next: '0.1.1' } };
+  const dependencies = {
+    now: () => state.elapsed,
+    sleep: async (ms, signal) => {
+      assert.ok(signal instanceof AbortSignal);
+      assert.ok(ms > 0 && ms <= 5000);
+      state.waits.push(ms);
+      state.elapsed += ms;
+    },
+    publish: async path => {
+      assert.equal(path, options.path);
+      assert.equal(existing, false, 'An existing version must not trigger another publish.');
+      state.uploads++;
+      return outcome;
+    },
+    readRegistry: async (path, missing, { signal }) => {
+      assert.ok(signal instanceof AbortSignal);
+      assert.equal(missing, false);
+      state.requests++;
+      if (state.elapsed < visibleAfter) throw Object.assign(new Error('Synthetic registry processing'),
+        { code: 'NPM_CHANNEL_REGISTRY_REQUEST_FAILED' });
+      if (path === 'dsh-grok-search/0.4.2') return metadata;
+      assert.equal(path, 'dsh-grok-search');
+      return { 'dist-tags': { latest: state.elapsed < tagsAfter ? '0.4.1' : '0.4.2', next } };
+    },
+    fetchArchive: async (url, limit, { signal }) => {
+      assert.equal(url, metadata.dist.tarball);
+      assert.equal(limit, 16 * 1024 ** 2);
+      assert.ok(signal instanceof AbortSignal);
+      if (lateArchive) state.elapsed = 180_001;
+      return badHash ? Buffer.from('synthetic-wrong-archive') : bytes;
+    },
+  };
+  return { result, state, execute: () => publishAndVerify(options, dependencies) };
+}
+
+test('accepted upload waits for a 120-second registry delay without uploading a second time', async () => {
+  const scenario = publicationScenario({ visibleAfter: 120_000 });
+  await scenario.execute();
+  assert.equal(scenario.state.elapsed, 120_000);
+  assert.equal(scenario.state.waits.length, 24);
+  assert.equal(scenario.state.uploads, 1);
+  assert.equal(scenario.result.uploadAccepted, true);
+  assert.equal(scenario.result.published, true);
+  assert.equal(scenario.result.registryDownloadVerified, true);
+});
+
+test('registry deadline preserves accepted upload and unknown visibility rather than claiming not published', async () => {
+  const scenario = publicationScenario({ visibleAfter: Infinity });
+  await assert.rejects(scenario.execute(), { code: 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT' });
+  assert.equal(scenario.state.elapsed, 180_000);
+  assert.equal(scenario.state.waits.length, 36);
+  assert.equal(scenario.state.uploads, 1);
+  assert.equal(scenario.result.uploadAccepted, true);
+  assert.equal(scenario.result.published, null);
+  assert.equal(scenario.result.registryDownloadVerified, false);
+  assert.equal(scenario.result.registryVerificationTimedOut, true);
+  assert.equal(scenario.result.lastRegistryErrorCode, 'NPM_CHANNEL_REGISTRY_REQUEST_FAILED');
+  assert.equal(scenario.result.passed, false);
+});
+
+test('interrupted upload stays unknown and is never repeated while registry reads expire', async () => {
+  const scenario = publicationScenario({ visibleAfter: Infinity,
+    outcome: { code: null, signal: 'SIGKILL', timedOut: true } });
+  await assert.rejects(scenario.execute(), { code: 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT' });
+  assert.equal(scenario.state.uploads, 1);
+  assert.equal(scenario.result.uploadAccepted, null);
+  assert.equal(scenario.result.published, null);
+  assert.equal(scenario.result.registryDownloadVerified, false);
+});
+
+test('registry visibility waiting cannot pass wrong archive bytes or a changed next tag', async () => {
+  for (const [options, code] of [[{ badHash: true }, 'NPM_CHANNEL_REGISTRY_PACKAGE_MISMATCH'],
+    [{ next: '0.4.2' }, 'NPM_CHANNEL_REGISTRY_TAG_MISMATCH']]) {
+    const scenario = publicationScenario(options);
+    await assert.rejects(scenario.execute(), { code });
+    assert.equal(scenario.state.uploads, 1);
+    assert.equal(scenario.state.waits.length, 0);
+    assert.equal(scenario.result.uploadAccepted, true);
+    assert.equal(scenario.result.registryDownloadVerified, false);
+    assert.equal(scenario.result.passed, false);
+  }
+});
+
+test('a lagging latest tag is still checked strictly until it becomes visible', async () => {
+  const scenario = publicationScenario({ tagsAfter: 120_000 });
+  await scenario.execute();
+  assert.equal(scenario.state.elapsed, 120_000);
+  assert.equal(scenario.state.uploads, 1);
+  assert.deepEqual(scenario.result.distTags, { latest: '0.4.2', next: '0.1.1' });
+});
+
+test('late valid archive bytes cannot escape the total verification deadline', async () => {
+  const scenario = publicationScenario({ lateArchive: true });
+  await assert.rejects(scenario.execute(), { code: 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT' });
+  assert.equal(scenario.state.uploads, 1);
+  assert.equal(scenario.state.requests, 1, 'No next registry request after the deadline.');
+  assert.equal(scenario.result.uploadAccepted, true);
+  assert.equal(scenario.result.published, null);
+  assert.equal(scenario.result.registryDownloadVerified, false);
+});
+
+test('existing published versions are verified without another upload', async () => {
+  const scenario = publicationScenario({ existing: true });
+  await scenario.execute();
+  assert.equal(scenario.state.uploads, 0);
+  assert.equal(scenario.result.uploadAccepted, false);
+  assert.equal(scenario.result.alreadyPublished, true);
+  assert.equal(scenario.result.published, true);
+  assert.equal(scenario.result.registryDownloadVerified, true);
 });
 
 test('OIDC check uses only the package-scoped exchange, masks ephemeral tokens and never publishes', async () => {

@@ -5,12 +5,23 @@ import { createServer as createHttpServer } from 'node:http';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { parseRuntimeReceiptArguments, readDesktopGateRuntimes, prepareDesktopFixture } from './deferred-release-desktop-prepare.mjs';
 import { connectRenderer, requestDesktopShutdown, waitForRenderer } from './lib/renderer-cdp.mjs';
 import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson } from './lib/internal-candidate-utils.mjs';
 import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
 import { readUpgradePackage } from './verify-search-log-upgrade.mjs';
+import { inspectPackage } from './lib/compatibility-smoke.mjs';
+
+export function assertBareRegistryIdentity(resolved, installed, metadata, expectedName) {
+  assert.ok(['applied', 'restart-required'].includes(resolved?.application));
+  assert.equal(resolved.error ?? null, null);
+  assert.match(resolved.version, /^\d+\.\d+\.\d+$/);
+  assert.equal(installed.name, expectedName);
+  assert.equal(metadata.name, expectedName);
+  assert.equal(installed.version, resolved.version);
+  assert.equal(metadata.version, resolved.version);
+}
 
 // Unlike the historical desktop suite, this starts without the fixture bundle,
 // replacement providers, pre-created preferences, control records or shared keys.
@@ -179,7 +190,27 @@ try {
         assert.equal(existsSync(join(product, 'package.json')), false,
           'rejected old version cannot remain installed');
       } else {
-        assert.equal(value?.version, manifest.version, 'an accepted bare-name install must be the current candidate');
+        // The host's publication-age policy may legitimately select an older compatible release.
+        assert.match(value?.version ?? '', /^\d+\.\d+\.\d+$/);
+        const response = await fetch(`${registry}${manifest.name}/${value.version}`, { signal: AbortSignal.timeout(30_000) });
+        assert.equal(response.status, 200, 'the resolved bare-name version is actually published');
+        const metadata = await response.json();
+        const installed = JSON.parse(readFileSync(join(product, 'package.json'), 'utf8'));
+        assertBareRegistryIdentity(value, installed, metadata, manifest.name);
+        assert.equal(new URL(metadata.dist.tarball).origin, 'https://registry.npmjs.org');
+        const download = await fetch(metadata.dist.tarball, { signal: AbortSignal.timeout(60_000) });
+        assert.equal(download.status, 200);
+        const bytes = Buffer.from(await download.arrayBuffer());
+        assert.equal('sha512-' + createHash('sha512').update(bytes).digest('base64'), metadata.dist.integrity);
+        const packed = inspectPackage(bytes);
+        assert.equal(packed.manifest.version, value.version);
+        for (const [file, content] of packed.files) {
+          assert.ok(readFileSync(join(product, file)).equals(content), 'resolved registry package matches installed bytes: ' + file);
+        }
+        registryResolution.bareResolvedIdentity = { name: manifest.name, version: value.version,
+          sha256: createHash('sha256').update(bytes).digest('hex'), integrity: metadata.dist.integrity,
+          installedFilesVerified: packed.files.size, differsFromLatest: value.version !== manifest.version };
+        writeJson(join(run.directory, 'bare-registry-identity.json'), registryResolution.bareResolvedIdentity);
         const removed = await rpc('removeBundle', { name: manifest.name }, true);
         assert.equal(removed.body?.result?.ok, true, 'remove only this test-created package before exact-version verification');
         assert.notEqual(removed.body.result.value.application, 'failed');

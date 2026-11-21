@@ -11,6 +11,27 @@ import { connectRenderer } from '../scripts/lib/renderer-cdp.mjs';
 
 const fixtureHelper = new URL('./helpers/temp-fixture.mjs', import.meta.url).href;
 
+test('registry installation verifies the actual host-resolved release while allowing publication-age selection', () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('export function assertBareRegistryIdentity(');
+  const end = source.indexOf('\n// Unlike the historical', start);
+  assert.ok(start >= 0 && end > start);
+  const verify = runInNewContext(source.slice(start, end).replace('export ', '')
+    + '\nassertBareRegistryIdentity;', { assert });
+  const name = 'dsh-grok-search';
+  for (const version of ['0.4.1', '0.4.2']) {
+    verify({ application: 'applied', version }, { name, version }, { name, version }, name);
+  }
+  assert.throws(() => verify({ application: 'applied', version: '0.4.1' },
+    { name, version: '0.4.2' }, { name, version: '0.4.1' }, name));
+  assert.throws(() => verify({ application: 'applied', version: '0.4.1' },
+    { name, version: '0.4.1' }, { name: 'other', version: '0.4.1' }, name));
+  assert.throws(() => verify({ application: 'failed', version: '0.4.1' },
+    { name, version: '0.4.1' }, { name, version: '0.4.1' }, name));
+  assert.match(source, /packed\.files\) \{[\s\S]*?readFileSync\(join\(product, file\)\)\.equals\(content\)/);
+  assert.match(source, /spec: registryInstall \? `\$\{manifest\.name\}@\$\{manifest\.version\}` : tarball/);
+});
+
 test('native installation keeps its unique scratch name short and retains special-path mode', () => {
   const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
   assert.match(source, /const root = join\(tmpdir\(\), 'dsh-deferred-desktop-' \+ randomUUID\(\)\.replaceAll\('-', ''\)\.slice\(0, 6\)/);

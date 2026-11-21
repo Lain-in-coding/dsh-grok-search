@@ -1,0 +1,79 @@
+name: Trusted npm Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Check npm authentication only, or publish an explicitly approved frozen release.
+        type: choice
+        options: [check, publish]
+        default: check
+      version:
+        description: Exact approved release version; required only for publish.
+        type: string
+        default: ""
+      package_sha256:
+        description: SHA-256 of the approved, tested release tarball; required only for publish.
+        type: string
+        default: ""
+      source_commit:
+        description: Reviewed release tag commit; required only for publish.
+        type: string
+        default: ""
+      offline_run_id:
+        description: Successful Offline Gates run for that exact commit; required only for publish.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: npm-publish-dsh-grok-search
+  cancel-in-progress: false
+
+jobs:
+  trusted-publish:
+    if: github.repository == 'Lain-in-coding/dsh-grok-search' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-trusted-publish.npmrc
+      NPM_CHANNEL_OUTPUT: ${{ runner.temp }}/npm-trusted-publish
+      NPM_CHANNEL_RUNNER: ${{ runner.environment }}
+      NPM_CHANNEL_MODE: ${{ inputs.mode }}
+      NPM_CHANNEL_VERSION: ${{ inputs.version }}
+      NPM_CHANNEL_SHA256: ${{ inputs.package_sha256 }}
+      NPM_CHANNEL_COMMIT: ${{ inputs.source_commit }}
+      NPM_CHANNEL_OFFLINE_RUN: ${{ inputs.offline_run_id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Use the pinned npm CLI with native trusted publishing
+        run: npm install --global npm@11.19.0 --ignore-scripts --registry=https://registry.npmjs.org/
+      - name: Verify publishing boundaries without network requests
+        run: node --test test/npm-trusted-publish-cases.mjs
+      - name: Check trusted authentication or publish the unchanged release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/npm-trusted-publish.mjs
+      - name: Preserve only the sanitized channel receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-trusted-publish-${{ github.run_id }}
+          path: ${{ runner.temp }}/npm-trusted-publish/result.json
+          retention-days: 30
+          if-no-files-found: warn

@@ -1,8 +1,9 @@
 import test from 'node:test';
 import './delivery-tooling-cases.mjs';
 import './private-ci-tooling-cases.mjs';
+import './npm-trusted-publish-cases.mjs';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -83,7 +84,7 @@ test('market tools isolate native Documents before preparing their child environ
     runInNewContext(text.slice(begin, end + 1), { writeFileSync, join, control, folder, desktopWorkspacePatch });
     const patch = JSON.parse(readFileSync(join(control.profile, 'cordis.patch.yml'), 'utf8'));
     assert.equal(patch.find(row => row.id === 'workspace-controller')?.config.documentsDirectory,
-      join(folder, 'user', 'Documents'));
+      join(realpathSync(folder), 'user', 'Documents'));
     const { env, paths } = prepareDesktopAcceptanceEnvironment(folder);
     assert.equal(env.HOME, paths.home);
     assert.equal(env.DSH_HOME, paths.dshHome);

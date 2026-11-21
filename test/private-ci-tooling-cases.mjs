@@ -12,6 +12,16 @@ const branch = 'feat/performance-closeout-030-20261112';
 const ref = `refs/heads/${branch}`;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
+test('private CI utilities can be imported from standard input without executing the CLI', () => {
+  const url = new URL('../scripts/prepare-private-ci.mjs', import.meta.url).href;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-'], {
+    input: `await import(${JSON.stringify(url)}); console.log('IMPORTED');`,
+    encoding: 'utf8', timeout: 30_000, windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'IMPORTED');
+});
+
 test('private CI direct entry executes through a directory alias rather than silently succeeding', () => {
   const f = fixture();
   const alias = join(f.root, 'tooling-alias');

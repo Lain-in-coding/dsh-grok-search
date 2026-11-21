@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { digest, tarGzip } from '../scripts/lib/compatibility-program-checks.mjs';
 import { checkTrustedIdentity, repository, validateOfflineRun, validateRelease, validateRequest,
@@ -13,6 +14,16 @@ const run = { repository: { full_name: repository }, path: '.github/workflows/of
   head_sha: request.commit, head_branch: 'main', event: 'push', status: 'completed', conclusion: 'success' };
 const jobs = ['Offline gates on windows-2025', 'Offline gates on ubuntu-24.04',
   'Offline gates on macos-15', 'Chromium UI smoke'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
+
+test('trusted publishing utilities import from standard input without starting authentication or publishing', () => {
+  const url = new URL('../scripts/npm-trusted-publish.mjs', import.meta.url).href;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-'], {
+    input: `await import(${JSON.stringify(url)}); console.log('IMPORTED');`,
+    encoding: 'utf8', timeout: 30_000, windowsHide: true,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'IMPORTED');
+});
 
 test('trusted publishing is explicit, main-only and rejects static credentials and incomplete identities', () => {
   assert.equal(validateRequest(env).mode, 'check');

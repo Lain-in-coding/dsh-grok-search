@@ -1120,6 +1120,52 @@ test('a ready root rejects an externally changed search route before dispatching
   } finally { await f.ctx.dispose(); }
 });
 
+test('a protected product route cannot hide a current author selection conflict', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-author-conflict-'));
+  writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+  const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+    trustedRoot: directory, governance: true, autoMaintain: false });
+  const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }), overrides: {
+    control: { name: 'control', apply: applyControl },
+    routeVerifier: { name: 'verifier', apply: applyRouteVerifier },
+    core: { name: 'core', apply(child) {
+      child.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+    } },
+  } });
+  f.ctx.profileContext.dir = directory;
+  f.entry.update = async ({ config }) => {
+    f.entry.options.config = structuredClone(config);
+    f.webFiber.config = structuredClone(config);
+    f.webFiber.rawConfig = f.webFiber.config;
+    f.webFiber.effectiveConfig = f.webFiber.resolveConfig(config);
+    f.web.config = f.webFiber.effectiveConfig;
+    f.web.searchProviderId = selectedId(f.webFiber.effectiveConfig.searchProvider);
+    f.web.fetchProviderId = selectedId(f.webFiber.effectiveConfig.fetchProvider);
+  };
+  try {
+    f.start();
+    await f.settle();
+    assert.equal(f.coordinator().report().coreReady, true);
+    const owner = f.service('grokSearchControl'), before = store.read();
+    await f.entry.update({ config: { searchProvider: 'new-author', fetchProvider: 'fetch' } });
+    assert.equal((await owner.retry()).error.code, 'CONTROL_SEARCH_SELECTION_CONFLICT');
+    assert.equal(f.web.searchProviderId, 'grok-search', 'the root config hook still protects the effective route');
+    let dispatched = false;
+    assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { dispatched = true; }),
+      { code: 'CONTROL_SEARCH_SELECTION_CONFLICT' });
+    assert.equal(dispatched, false);
+    assert.equal(f.coordinator().report().coreReady, false);
+    assert.equal(f.entry.options.config.searchProvider, 'new-author');
+    assert.deepEqual(store.read(), before, 'a conflict does not rewrite or release ownership');
+    await f.coordinator().start();
+    await f.settle();
+    assert.equal(f.coordinator().report().coreReady, true, 'a new explicit owner may adopt the current author');
+    assert.equal(store.read().intent.acquisition.authorSearchProvider, 'new-author');
+    assert.equal(store.read().intent.release, null);
+    assert.equal(f.entry.options.config.searchProvider, 'new-author');
+  } finally { await f.ctx.dispose(); }
+});
+
 test('an admitted search rechecks its route and epoch when a paused tool resumes', async t => {
   for (const change of ['external-route', 'replacement-epoch']) await t.test(change, async () => {
     const f = bootstrapFixture(), entered = deferred(), resume = deferred();
@@ -2127,6 +2173,57 @@ test('reprovided services cannot start another program before the detached gener
     assert.equal(f.calls.filter(call => call === 'program').length, 2);
     assert.equal(f.coordinator().report().coreReady, true);
   } finally { release.resolve(); await detached; await f.ctx.dispose(); }
+});
+
+test('a detached generation resumes only after its failed resource proves exit', async t => {
+  for (const change of ['none', 'pause', 'dispose']) await t.test(change, async () => {
+    const exited = deferred();
+    let cores = 0, disposals = 0;
+    const f = bootstrapFixture({ overrides: {
+      core: { name: 'core', apply(child) {
+        const first = ++cores === 1;
+        child.provide('grokSearchCore', { dispose() {
+          disposals++;
+          if (!first) return Promise.resolve();
+          const error = Object.assign(new Error('The detached resource has not exited.'), { code: 'GROK_PROCESS_REAP_FAILED' });
+          Object.defineProperty(error, 'whenExited', { value: exited.promise });
+          return Promise.reject(error);
+        } });
+      } },
+    } });
+    try {
+      f.start();
+      await f.settle();
+      const bootstrap = f.ctx.get('grokSearchBootstrap'), compatibility = f.coordinator();
+      const required = f.store.read();
+      await assert.rejects(f.deactivateHost(['web']), { code: 'GROK_PROCESS_REAP_FAILED' });
+      f.activateHost();
+      await f.settle();
+      assert.equal(cores, 1, 'reprovided web cannot overlap a resource awaiting exit');
+      assert.equal(f.coordinator().report().coreReady, false);
+      assert.deepEqual(f.store.read(), required, 'dependency loss does not release control intent');
+      if (change === 'pause') await assert.rejects(f.coordinator().start(), { code: 'GROK_PROCESS_REAP_FAILED' });
+      if (change === 'dispose') await assert.rejects(f.ctx.dispose(), { code: 'GROK_PROCESS_REAP_FAILED' });
+      exited.resolve();
+      await turn();
+      await bootstrap.settled();
+      if (change === 'none') {
+        assert.equal(compatibility.report().coreReady, true, 'confirmed exit must retire the rejected detach promise');
+        assert.equal(cores, 2);
+        assert.equal(disposals, 1, 'the exited predecessor is not disposed again');
+      } else {
+        assert.equal(compatibility.report().coreReady, false);
+        assert.equal(cores, 1, 'late exit cannot activate a paused or destroyed root');
+        if (change === 'pause') {
+          await compatibility.start();
+          await bootstrap.settled();
+          assert.equal(compatibility.report().coreReady, true);
+          assert.equal(cores, 2, 'a later explicit start may replace the exited predecessor');
+          assert.equal(disposals, 1);
+        }
+      }
+    } finally { exited.resolve(); await turn(); await f.ctx.dispose(); }
+  });
 });
 
 test('optional timeout restoration failure does not block retiring and replacing a search generation', async () => {

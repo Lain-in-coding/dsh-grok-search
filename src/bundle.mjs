@@ -91,12 +91,16 @@ export function apply(ctx, configuration, { load = loadModule,
     if (!coordinator) throw unavailable('COMPATIBILITY_CHECKING');
     try { coordinator.assertSearchAllowed(operation); }
     catch (error) { throw unavailable(error?.code ?? 'COMPATIBILITY_BLOCKED'); }
+    const ownerCode = generation?.owner?.publicSnapshot?.()?.error?.code;
+    if (ownerCode === 'CONTROL_SEARCH_SELECTION_CONFLICT') {
+      coordinator.block(ownerCode);
+      throw unavailable(ownerCode);
+    }
     let routed = false;
     try { routed = effectiveSearchProvider(webEntry(activeContext ?? ctx)) === PRODUCT_PROVIDER_ID; } catch {}
     if (!routed) {
       if (generation?.owner?.refreshing?.()) throw unavailable('COMPATIBILITY_CHECKING');
-      const ownerCode = generation?.owner?.publicSnapshot?.()?.error?.code;
-      const code = ownerCode === 'CONTROL_SEARCH_SELECTION_CONFLICT' ? ownerCode : 'COMPATIBILITY_ROUTE_UNCONFIRMED';
+      const code = 'COMPATIBILITY_ROUTE_UNCONFIRMED';
       coordinator.block(code);
       throw unavailable(code);
     }
@@ -1033,6 +1037,14 @@ export function apply(ctx, configuration, { load = loadModule,
         }, error => {
           if (!destroyed && retiring === task) coordinator.block(error?.code);
           backgroundError(error);
+          // A rejected detach is not terminal once its owned resources prove exit.
+          if (typeof error?.whenExited?.then === 'function') {
+            Promise.resolve(error.whenExited).then(() => {
+              if (destroyed || retiring !== task) return;
+              retiring = null;
+              if (!userStopped && !disabling) { coordinator.beginEpoch(); schedule(); }
+            }, backgroundError);
+          }
         });
         return task;
       });

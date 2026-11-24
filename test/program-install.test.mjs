@@ -8,11 +8,14 @@ import { PassThrough } from 'node:stream';
 import { gzipSync } from 'node:zlib';
 import fs, { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPrivateProgramInstaller, resolveGrokProgram, unpackPlatformArchive, verifyArchiveIntegrity } from '../src/core/program-install.mjs';
 import { createProgramController } from '../src/program.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
+import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
+import { inspectGrokProgram } from '../src/core/program-discovery.mjs';
+import { probeMcpHandshake, runMcpSearch } from '../src/core/mcp-search.mjs';
 const NAME = '@epsiekygrr_zedxx/grok-search-rs-win32-x64';
 const VERSION = '0.1.26';
 const PLATFORM = { packageName: NAME, version: VERSION, platform: 'win32' };
@@ -39,8 +42,8 @@ const validRows = () => [
 const integrity = data => 'sha512-' + createHash('sha512').update(data).digest('base64');
 function fixture({ latest = VERSION, archive = tar(validRows()), mutateMetadata, failOfficial = false,
   redirect = null, failOfficialArchive = false, handshakeFailure = false, failAll = false, handshake,
-  inspect: inspectImpl } = {}) {
-  const directory = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-test-'));
+  inspect: inspectImpl, directory: suppliedDirectory } = {}) {
+  const directory = suppliedDirectory ?? mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-test-'));
   const urls = [], versions = [];
   const fetchImpl = async url => {
     urls.push(url);
@@ -257,12 +260,15 @@ for (const [label, code, exited] of [
   test(`failed inspection retains its candidate without explicit confirmed exit (${label})`, async () => {
     const failure = new GrokSearchError(code, 'inspection exit is unconfirmed');
     if (exited !== undefined) Object.defineProperty(failure, 'diagnostic', { value: Object.freeze({ exited }) });
-    const { installer, directory, versions } = fixture({ inspect: async () => { throw failure; } });
+    const { installer, directory, versions, urls } = fixture({ inspect: async () => { throw failure; } });
     await assert.rejects(installer.install(), error => error === failure);
     assert.equal(readFileSync(versions[0], 'utf8'), 'offline-native-binary-fixture');
-    assert.equal(readdirSync(directory).length, 1);
+    assert.equal(readdirSync(directory).length, 2);
     assert.equal(existsSync(join(directory, 'active.json')), false);
-    assert.equal(existsSync(join(directory, '.install.lock')), false);
+    assert.equal(existsSync(join(directory, '.install.lock')), true, 'no exit proof means the validator still owns the cache');
+    const requests = urls.length;
+    await assert.rejects(installer.install(), { code: 'GROK_INSTALL_BUSY' });
+    assert.equal(urls.length, requests);
   });
 }
 for (const [label, handshake] of [
@@ -271,13 +277,307 @@ for (const [label, handshake] of [
   }],
   ['exit result', async () => ({ version: VERSION, toolsDeclared: true, exited: false })],
 ]) {
-  test(`an uncertain validation process retains its candidate files (${label})`, async () => {
-    const { installer, directory } = fixture({ handshake });
+  test(`an unproven handshake retains its lock and candidate (${label})`, async () => {
+    const { installer, directory, urls } = fixture({ handshake });
     await assert.rejects(installer.install(), { code: 'GROK_PROCESS_REAP_FAILED' });
     assert.equal(existsSync(join(directory, 'active.json')), false);
     assert.equal(readdirSync(directory).filter(name => name.startsWith(VERSION + '-')).length, 1);
+    assert.equal(existsSync(join(directory, '.install.lock')), true, 'an exited:false result is not exit proof');
+    const requests = urls.length;
+    await assert.rejects(installer.install(), { code: 'GROK_INSTALL_BUSY' });
+    assert.equal(urls.length, requests);
   });
 }
+for (const point of ['inspect', 'handshake']) {
+  test(`real ${point} preflight failure cleans its candidate and permits another attempt`, async () => {
+    const f = fixture({
+      inspect: point === 'inspect' ? inspectGrokProgram : undefined,
+      handshake: point === 'handshake' ? options => runMcpSearch({ ...options,
+        request: { query: 'offline-handshake-not-sent' }, handshakeOnly: true, remainingMs: () => 5_000,
+        sdkFactory: async () => ({}),
+      }) : undefined,
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(f.installer.install(), error =>
+        error.code === (point === 'inspect' ? 'GROK_PROGRAM_NOT_NATIVE' : 'GROK_SDK_UNSUPPORTED')
+        && error.diagnostic?.exited === true);
+      assert.deepEqual(readdirSync(f.directory), [], 'a known pre-spawn failure owns no process or cache lock');
+    }
+    assert.equal(f.versions.length, 2);
+  });
+}
+
+for (const point of ['inspect', 'handshake']) {
+  test(`real ${point} spawn failure owns no child and cannot retain the installation lock`, async () => {
+    const f = fixture({
+      archive: tar([{ name: 'package/package.json', body: JSON.stringify(manifest) },
+        { name: 'package/bin/grok-search-rs.exe', body: Buffer.from('4d5a0000', 'hex') }]),
+      inspect: point === 'inspect' ? inspectGrokProgram : undefined,
+      handshake: point === 'handshake' ? probeMcpHandshake : undefined,
+    });
+    const spawn = childProcess.spawn, children = [];
+    const cause = Object.assign(new Error('synthetic validator spawn denial'), { code: 'EACCES' });
+    childProcess.spawn = () => {
+      const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(),
+        stderr: new PassThrough(), kill: () => assert.fail('No child exists to terminate.') });
+      children.push(child);
+      queueMicrotask(() => { child.emit('error', cause); child.emit('close', -1, null); });
+      return child;
+    };
+    syncBuiltinESMExports();
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await assert.rejects(f.installer.install(), error => point === 'inspect'
+          ? error.code === 'GROK_CACHE_ACCESS_DENIED' && error.cause === cause
+          : error.code === 'GROK_PROCESS_ERROR' && error.diagnostic?.exited === true
+            && error.diagnostic.childPid === null);
+        assert.deepEqual(readdirSync(f.directory), [], 'confirmed spawn failure permits retry without a stale guard');
+      }
+      assert.equal(children.length, 2);
+    } finally {
+      childProcess.spawn = spawn;
+      syncBuiltinESMExports();
+      for (const child of children) { child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); }
+    }
+  });
+}
+
+test('cancellation after inspection stops before the real handshake preflight and cleans the candidate', async () => {
+  const controller = new AbortController(), reason = new GrokSearchError('GROK_SEARCH_STOPPING', 'cancel before handshake');
+  let handshakes = 0;
+  const f = fixture({ inspect: async path => {
+    controller.abort(reason);
+    return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
+  }, handshake: options => { handshakes++; return probeMcpHandshake(options); } });
+  await assert.rejects(f.installer.install({ signal: controller.signal }), error => error === reason);
+  assert.equal(handshakes, 0);
+  assert.deepEqual(readdirSync(f.directory), [], 'the completed inspection owns no live validation process');
+});
+
+for (const point of ['inspect', 'handshake']) {
+  test(`an unreaped ${point} keeps its installation lock until actual exit`, async () => {
+    let resolveExit, failValidation = true;
+    const whenExited = new Promise(resolve => { resolveExit = resolve; });
+    const code = point === 'inspect' ? 'GROK_PROGRAM_REAP_FAILED' : 'GROK_PROCESS_REAP_FAILED';
+    const failure = new GrokSearchError(code, 'validation process is still running');
+    Object.defineProperty(failure, 'whenExited', { value: whenExited });
+    Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+    const f = fixture({
+      inspect: point === 'inspect' ? async path => {
+        if (failValidation) throw failure;
+        return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
+      } : undefined,
+      handshake: async () => {
+        if (point === 'handshake' && failValidation) throw failure;
+        return { version: VERSION, toolsDeclared: true, exited: true };
+      },
+    });
+    const lock = join(f.directory, '.install.lock');
+    try {
+      await assert.rejects(f.installer.install(), error => error === failure);
+      assert.equal(existsSync(lock), true, 'a rejected validation is not permission for another installer');
+      const urls = f.urls.length;
+      await assert.rejects(f.installer.install(), { code: 'GROK_INSTALL_BUSY' });
+      assert.equal(f.urls.length, urls, 'the next attempt cannot download before the previous validation exits');
+      assert.equal(existsSync(join(f.directory, 'active.json')), false);
+      assert.equal(existsSync(f.versions[0]), true, 'the live validator keeps its candidate bytes');
+      resolveExit();
+      await whenExited;
+      assert.equal(existsSync(lock), false);
+      assert.equal(existsSync(f.versions[0]), false, 'confirmed late exit cleans only this incomplete candidate');
+      assert.equal(existsSync(dirname(f.versions[0])), false);
+      failValidation = false;
+      assert.equal((await f.installer.install()).version, VERSION);
+    } finally { resolveExit(); await whenExited; }
+  });
+}
+
+test('a late validator exit cannot remove a replacement installation lock', async () => {
+  let resolveExit, replacement;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator still owns its process');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => { throw failure; } });
+  const path = join(f.directory, '.install.lock');
+  try {
+    await assert.rejects(f.installer.install(), error => error === failure);
+    assert.equal(existsSync(path), true);
+    unlinkSync(path);
+    replacement = acquireOwnedLock(path);
+    const before = readFileSync(path);
+    resolveExit();
+    await whenExited;
+    assert.deepEqual(readFileSync(path), before);
+    const urls = f.urls.length;
+    await assert.rejects(f.installer.install(), { code: 'GROK_INSTALL_BUSY' });
+    assert.equal(f.urls.length, urls);
+  } finally { resolveExit(); await whenExited; replacement?.release(); }
+});
+
+for (const replacement of ['file', 'content', 'directory', 'cache']) {
+  test(`late validator cleanup preserves a replaced candidate ${replacement}`, async () => {
+    let resolveExit, successor;
+    const whenExited = new Promise(resolve => { resolveExit = resolve; });
+    const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+    Object.defineProperty(failure, 'whenExited', { value: whenExited });
+    Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+    let alias, previousCache, nextCache;
+    if (replacement === 'cache') {
+      const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-alias-'));
+      const previous = join(root, 'previous'), next = join(root, 'next');
+      mkdirSync(previous); mkdirSync(next);
+      alias = join(root, 'selected');
+      symlinkSync(previous, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      previousCache = join(previous, 'cache'); nextCache = join(next, 'cache');
+      mkdirSync(nextCache);
+    }
+    const f = fixture({ handshake: async () => { throw failure; },
+      directory: alias ? join(alias, 'cache') : undefined });
+    try {
+      await assert.rejects(f.installer.install(), error => error === failure);
+      const path = f.versions[0], folder = dirname(path), original = readFileSync(path);
+      if (replacement === 'file') {
+        fs.renameSync(path, path + '.retained');
+        writeFileSync(path, original);
+      } else if (replacement === 'content') {
+        writeFileSync(path, 'replacement-content-at-the-same-inode');
+      } else if (replacement === 'directory') {
+        const retained = folder + '-retained';
+        fs.renameSync(folder, retained);
+        mkdirSync(folder);
+        fs.renameSync(join(retained, basename(path)), path);
+      } else {
+        fs.renameSync(join(previousCache, basename(folder)), join(nextCache, basename(folder)));
+        unlinkSync(alias);
+        symlinkSync(dirname(nextCache), alias, process.platform === 'win32' ? 'junction' : 'dir');
+        successor = acquireOwnedLock(join(f.directory, '.install.lock'));
+      }
+      const before = readFileSync(path);
+      const lock = join(f.directory, '.install.lock'), lockBytes = successor ? readFileSync(lock) : null;
+      resolveExit();
+      await whenExited;
+      assert.deepEqual(readFileSync(path), before);
+      assert.equal(existsSync(folder), true);
+      if (successor) {
+        assert.deepEqual(readFileSync(lock), lockBytes);
+        assert.equal(existsSync(join(previousCache, '.install.lock')), true, 'a retargeted path cannot unlink the original lock');
+      } else assert.equal(existsSync(lock), false);
+    } finally { resolveExit(); await whenExited; successor?.release(); }
+  });
+}
+
+test('late validator cleanup removes only its candidate while preserving the old active and unknown files', async () => {
+  let resolveExit, failValidation = false;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => {
+    if (failValidation) throw failure;
+    return { version: VERSION, toolsDeclared: true, exited: true };
+  } });
+  const installed = await f.installer.install(), active = readFileSync(join(f.directory, 'active.json'));
+  const original = readFileSync(installed.path);
+  failValidation = true;
+  try {
+    await assert.rejects(f.installer.install(), error => error === failure);
+    const candidate = f.versions.at(-1), unknown = join(dirname(candidate), 'unknown.txt');
+    writeFileSync(unknown, 'not-created-by-this-installer');
+    resolveExit();
+    await whenExited;
+    assert.equal(existsSync(candidate), false);
+    assert.equal(readFileSync(unknown, 'utf8'), 'not-created-by-this-installer');
+    assert.deepEqual(readFileSync(join(f.directory, 'active.json')), active);
+    assert.deepEqual(readFileSync(installed.path), original);
+    assert.equal(existsSync(join(f.directory, '.install.lock')), false);
+  } finally { resolveExit(); await whenExited; }
+});
+
+test('late validator cleanup accepts an unchanged ancestor directory alias', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'dsh-installer-alias-cleanup-'));
+  const physical = join(root, 'physical'), alias = join(root, 'selected');
+  mkdirSync(physical);
+  symlinkSync(physical, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  let resolveExit;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ directory: join(alias, 'cache'), handshake: async () => { throw failure; } });
+  try {
+    await assert.rejects(f.installer.install(), error => error === failure);
+    const path = f.versions[0];
+    assert.equal(existsSync(path), true);
+    resolveExit();
+    await whenExited;
+    assert.equal(existsSync(path), false);
+    assert.deepEqual(readdirSync(join(physical, 'cache')), []);
+    assert.equal(fs.lstatSync(alias).isSymbolicLink(), true);
+  } finally { resolveExit(); await whenExited; }
+});
+
+test('late validator cleanup preserves a candidate selected by the current active record', async () => {
+  let resolveExit;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => { throw failure; } });
+  try {
+    await assert.rejects(f.installer.install(), error => error === failure);
+    const path = f.versions[0], before = readFileSync(path);
+    const active = JSON.stringify({ executable: `${basename(dirname(path))}/${basename(path)}` });
+    writeFileSync(join(f.directory, 'active.json'), active);
+    resolveExit();
+    await whenExited;
+    assert.deepEqual(readFileSync(path), before);
+    assert.equal(readFileSync(join(f.directory, 'active.json'), 'utf8'), active);
+    assert.equal(existsSync(join(f.directory, '.install.lock')), false);
+  } finally { resolveExit(); await whenExited; }
+});
+
+test('late lock release absorbs an unlink failure without rejecting deferred cleanup', async () => {
+  let resolveExit, releaseAttempts = 0;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => { throw failure; } });
+  await assert.rejects(f.installer.install(), error => error === failure);
+  const path = join(f.directory, '.install.lock'), unlink = fs.unlinkSync, before = readFileSync(path);
+  fs.unlinkSync = target => {
+    if (target === path) { releaseAttempts++; throw Object.assign(new Error('synthetic lock unlink failure'), { code: 'EACCES' }); }
+    return unlink(target);
+  };
+  syncBuiltinESMExports();
+  try {
+    resolveExit();
+    await whenExited;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(releaseAttempts, 1);
+    assert.deepEqual(readFileSync(path), before);
+    assert.equal(existsSync(f.versions[0]), false);
+  } finally { fs.unlinkSync = unlink; syncBuiltinESMExports(); resolveExit(); await whenExited; }
+});
+
+test('a rejected validator exit proof never releases the installation lock', async () => {
+  let rejectExit;
+  const whenExited = new Promise((_, reject) => { rejectExit = reject; });
+  whenExited.catch(() => {});
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator exit is unproven');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => { throw failure; } });
+  await assert.rejects(f.installer.install(), error => error === failure);
+  const path = join(f.directory, '.install.lock'), before = readFileSync(path), urls = f.urls.length;
+  rejectExit(new Error('exit observer failed'));
+  await whenExited.catch(() => {});
+  assert.deepEqual(readFileSync(path), before);
+  await assert.rejects(f.installer.install(), { code: 'GROK_INSTALL_BUSY' });
+  assert.equal(f.urls.length, urls);
+});
+
 test('binary mutation during the official backend handshake cannot replace an existing active record', async () => {
   let mutate = false;
   const { installer, directory } = fixture({ handshake: async ({ executable }) => {

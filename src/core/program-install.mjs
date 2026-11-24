@@ -1,6 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
-import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
+import { chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
   renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { GrokSearchError } from './errors.mjs';
@@ -112,9 +112,12 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     catch (error) { if (error.code === 'ENOENT') return; throw error; }
     if (!stat.isDirectory() || stat.isSymbolicLink()) fail('GROK_CACHE_PATH_INVALID', '程序缓存必须是插件自管的实际目录。');
   };
-  const removeIncompleteVersion = ({ id, folder, files }) => {
+  const sameIdentity = (current, expected) => current.dev === expected.dev && current.ino === expected.ino;
+  const removeIncompleteVersion = ({ id, folder, files, cacheIdentity, identity }) => {
     checkCacheRoot();
-    if (!lstatSync(folder).isDirectory() || lstatSync(folder).isSymbolicLink()) return;
+    const cache = lstatSync(directory), candidate = lstatSync(folder);
+    if (!sameIdentity(cache, cacheIdentity) || !candidate.isDirectory() || candidate.isSymbolicLink()
+      || !sameIdentity(candidate, identity)) return;
     const root = realpathSync(directory), target = realpathSync(folder);
     if (relative(root, target) !== id) return;
     try {
@@ -127,10 +130,13 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     // Remove only the files we created, after the validation process is known
     // to have exited. Unknown files, active versions and linked paths survive.
     for (const file of files) {
-      if (relative(target, resolve(file)).includes(sep) || !lstatSync(file).isFile()
-        || lstatSync(file).isSymbolicLink()) return;
-      unlinkSync(file);
+      const current = lstatSync(file.path);
+      if (!current.isFile() || current.isSymbolicLink()
+        || !sameIdentity(current, file.identity) || current.size !== file.byteLength
+        || relative(target, realpathSync(file.path)).includes(sep)
+        || sha256(readFileSync(file.path)) !== file.sha256) return;
     }
+    for (const file of files) unlinkSync(file.path);
     rmdirSync(target);
   };
   const fetchBytes = async (url, limit, signal) => {
@@ -219,7 +225,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     pending = (async () => {
       const lock = join(directory, '.install.lock');
       let ownedLock;
-      let incomplete = null, staged = null, published = false, validationExited = true;
+      let incomplete = null, staged = null, published = false, validationExited = true, validationExit = null;
       try {
         combined.throwIfAborted();
         checkCacheRoot();
@@ -261,12 +267,16 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         const id = `${version}-${platform}-${arch}-${randomUUID()}`;
         const folder = join(directory, id);
         mkdirSync(folder, { mode: 0o700 });
-        incomplete = { id, folder, files: [] };
+        incomplete = { id, folder, files: [], cacheIdentity: lstatSync(directory), identity: lstatSync(folder) };
         const path = join(folder, unpacked.filename);
         const binary = openSync(path, 'wx', 0o700);
-        incomplete.files.push(path);
-        try { writeFileSync(binary, unpacked.executable); fsyncSync(binary); } finally { closeSync(binary); }
+        try {
+          incomplete.files.push({ path, identity: fstatSync(binary), byteLength: unpacked.executable.length,
+            sha256: sha256(unpacked.executable) });
+          writeFileSync(binary, unpacked.executable); fsyncSync(binary);
+        } finally { closeSync(binary); }
         if (platform !== 'win32') chmodSync(path, 0o700);
+        combined.throwIfAborted();
         validationExited = false;
         const checked = await inspect(path, { signal: combined, platform });
         validationExited = true;
@@ -281,6 +291,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         Object.assign(envOverrides, { HOME: folder, USERPROFILE: folder, GROK_SEARCH_AUTH_MODE: 'api_key',
           GROK_SEARCH_API_KEY: 'dsh-handshake-only-sentinel-not-a-real-key',
           GROK_SEARCH_URL: 'http://127.0.0.1:9', GROK_SEARCH_MODEL: 'offline-handshake' });
+        combined.throwIfAborted();
         validationExited = false;
         const protocol = await handshake({ executable: path, signal: combined,
           configPath: join(folder, 'handshake-config-not-created.toml'), envOverrides });
@@ -296,8 +307,13 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
           sha256: sha256(unpacked.executable), integrity: data.dist.integrity, registry: resolved.origin, downloadRegistry,
           mcpHandshakeValidated: true, handshakeUsesSyntheticConfig: true, credentialsValidated: false };
         const receiptPath = join(folder, 'receipt.json');
-        writeFileSync(receiptPath, JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-        incomplete.files.push(receiptPath);
+        const receiptBytes = Buffer.from(JSON.stringify(record, null, 2) + '\n');
+        const receiptFd = openSync(receiptPath, 'wx', 0o600);
+        try {
+          incomplete.files.push({ path: receiptPath, identity: fstatSync(receiptFd), byteLength: receiptBytes.length,
+            sha256: sha256(receiptBytes) });
+          writeFileSync(receiptFd, receiptBytes);
+        } finally { closeSync(receiptFd); }
         staged = join(directory, `active-${randomUUID()}.json`);
         const stagedFd = openSync(staged, 'wx', 0o600);
         try { writeFileSync(stagedFd, JSON.stringify(record) + '\n'); fsyncSync(stagedFd); } finally { closeSync(stagedFd); }
@@ -308,6 +324,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         return { ...checked, source: 'private-cache', found: true };
       } catch (error) {
         if (error.diagnostic?.exited === true) validationExited = true;
+        if (!validationExited && typeof error.whenExited?.then === 'function') validationExit = error.whenExited;
         const permissionCause = ['EACCES', 'EPERM'].includes(error.code) ? error
           : ['EACCES', 'EPERM'].includes(error.cause?.code) ? error.cause : null;
         if (permissionCause) {
@@ -318,11 +335,17 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
         throw error;
       } finally {
         if (!published && staged) { try { unlinkSync(staged); } catch { /* An uncertain stage is never activated. */ } }
-        if (!published && incomplete && validationExited) {
-          try { removeIncompleteVersion(incomplete); }
-          catch { /* Preserve uncertain leftovers; never change the original installation error. */ }
+        const cleanup = () => {
+          if (!published && incomplete) {
+            try { removeIncompleteVersion(incomplete); }
+            catch { /* Preserve uncertain leftovers; never change the original installation error. */ }
+          }
+        };
+        if (validationExited) { cleanup(); ownedLock?.release(); }
+        else if (validationExit) {
+          // Unknown or rejected exit proof retains both the candidate and its guard.
+          void Promise.resolve(validationExit).then(() => { cleanup(); ownedLock?.release(); }).catch(() => {});
         }
-        if (ownedLock) ownedLock.release();
       }
     })().finally(() => { clearTimeout(timer); pending = null; });
     return pending;

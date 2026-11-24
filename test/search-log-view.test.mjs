@@ -142,6 +142,61 @@ test('ordinary log transport failures retain the last readable history', async (
   } finally { h.view.dispose(); }
 });
 
+test('a missing log service is unreadable rather than an empty successful history', async () => {
+  for (const initiallyReadable of [false, true]) {
+    let unavailable = !initiallyReadable;
+    const h = harness(async () => {
+      if (unavailable) throw Object.assign(new Error('log service retired'), { code: 'SEARCH_LOG_UNAVAILABLE' });
+      return records;
+    });
+    try {
+      await h.view.read();
+      unavailable = true;
+      await h.view.read();
+      assert.match(h.$('#logNote').textContent, /SEARCH_LOG_UNAVAILABLE.*这不代表没有搜索记录/);
+      assert.equal(h.query(), initiallyReadable ? 'private-query' : '');
+      assert.equal(h.$('#logCount').textContent, initiallyReadable ? '1' : '—');
+      if (!initiallyReadable) {
+        assert.match(h.$('#logList').children.at(-1).innerHTML, /搜索记录暂不可读/);
+        assert.doesNotMatch(h.$('#logList').children.at(-1).innerHTML, /还没有搜索记录/);
+      }
+      assert.equal(h.toasts.length, 0);
+      assert.equal(h.denied(), 0);
+      unavailable = false;
+      await h.view.read();
+      assert.equal(h.query(), 'private-query');
+      assert.doesNotMatch(h.$('#logNote').textContent, /暂不可读/);
+    } finally { h.view.dispose(); }
+  }
+});
+
+test('a missing log service cannot announce a completed clear or an empty history', async () => {
+  let unavailable = true;
+  const h = harness(async () => records, {
+    clearSearchLog: async () => {
+      if (unavailable) throw Object.assign(new Error('log service retired'), { code: 'SEARCH_LOG_UNAVAILABLE' });
+    },
+  });
+  try {
+    await h.view.read();
+    await h.view.clear();
+    assert.deepEqual(h.toasts, ['清空未确认，请稍后重试']);
+    assert.doesNotMatch(h.$('#logAnnouncer').textContent, /已清空/);
+    assert.match(h.$('#logNote').textContent, /SEARCH_LOG_UNAVAILABLE/);
+    assert.equal(h.$('#logCount').textContent, '—');
+    assert.match(h.$('#logList').children.at(-1).innerHTML, /搜索记录暂不可读/);
+    assert.doesNotMatch(h.$('#logList').children.at(-1).innerHTML, /还没有搜索记录/);
+    await h.view.read();
+    assert.equal(h.query(), 'private-query');
+    unavailable = false;
+    await h.view.clear();
+    assert.equal(h.$('#logCount').textContent, '0');
+    assert.equal(h.toasts.at(-1), '已清空当前插件的搜索记录');
+    assert.match(h.$('#logAnnouncer').textContent, /^已清空/);
+    assert.doesNotMatch(h.$('#logNote').textContent, /暂不可读/);
+  } finally { h.view.dispose(); }
+});
+
 test('snapshot denial invalidates an in-flight log response across later reauthorization', async () => {
   let resolveReply;
   const h = harness(() => new Promise(resolve => { resolveReply = resolve; }));
@@ -154,6 +209,48 @@ test('snapshot denial invalidates an in-flight log response across later reautho
     assert.equal(h.query(), '');
     assert.equal(h.clears(), 0);
   } finally { h.view.dispose(); }
+});
+
+test('a pending log session cannot dispatch a clear after private access is revoked', async () => {
+  for (const reauthorized of [false, true]) {
+    let resolveSession;
+    const h = harness(async () => records, {
+      openSearchLog: () => new Promise(resolve => { resolveSession = resolve; }),
+    });
+    try {
+      const clearing = h.view.clear();
+      h.view.restrict('SETTINGS_AUTH_REQUIRED');
+      h.S.capabilities = { secretsAllowed: reauthorized };
+      resolveSession({ sessionId: 'issued-before-revocation' });
+      await clearing;
+      assert.equal(h.clears(), 0, 'An old clear must not start a new RPC in another access lifetime.');
+      assert.equal(h.toasts.length, 0);
+    } finally { h.view.dispose(); }
+  }
+});
+
+test('late clear results cannot acknowledge success or revoke a newer authorized log view', async () => {
+  for (const code of [null, 'SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED']) {
+    let finish;
+    const h = harness(async () => records, {
+      clearSearchLog: () => new Promise((resolve, reject) => {
+        finish = () => code ? reject(Object.assign(new Error('obsolete denial'), { code })) : resolve({});
+      }),
+    });
+    try {
+      const clearing = h.view.clear();
+      assert.equal(h.clears(), 1);
+      h.view.restrict('SETTINGS_AUTH_REQUIRED');
+      h.S.capabilities = { secretsAllowed: true };
+      finish();
+      await clearing;
+      assert.equal(h.denied(), 0, 'A reply from the revoked lifetime cannot deny the new one.');
+      assert.equal(h.S.capabilities.secretsAllowed, true);
+      assert.equal(h.toasts.length, 0);
+      await h.view.read();
+      assert.equal(h.query(), 'private-query', 'Clearing must still release its busy state.');
+    } finally { h.view.dispose(); }
+  }
 });
 
 test('replay catches failures while reading initial lock state before any UI mutation', async () => {

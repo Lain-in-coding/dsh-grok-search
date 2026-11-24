@@ -583,6 +583,24 @@ test('clearing private search history preserves independent chat routes and trac
   } finally { log.dispose(); routes.dispose(); }
 });
 
+test('a missing or retired search log cannot report empty history or acknowledge a clear', async () => {
+  const log = createSearchLog(), services = new Map([['grokSearchLog', log]]);
+  const gateway = diagnosticGateway({ services });
+  try {
+    const { sessionId } = await gateway.openSearchLog();
+    const token = log.begin('synthetic-preserved-history');
+    log.finish(token, { outcome: 'ok', served: 'tavily' });
+    assert.equal((await gateway.readSearchLog({ sessionId })).records.length, 1);
+    services.delete('grokSearchLog');
+    for (const method of ['readSearchLog', 'clearSearchLog']) {
+      await assert.rejects(gateway[method]({ sessionId }), { code: 'SEARCH_LOG_UNAVAILABLE' });
+    }
+    assert.equal(log.snapshot(sessionId).records.length, 1, 'Unavailable is not a successful clear.');
+    services.set('grokSearchLog', log);
+    assert.equal((await gateway.readSearchLog({ sessionId })).records.length, 1);
+  } finally { log.dispose(); }
+});
+
 test('chat route RPC requires owner and exact session/call identity without exposing search text', async () => {
   const routes = createToolRouteContext(), sessionId = randomUUID();
   await routes.run({ name: 'web_search', callId: 'native-call', agent: { session: { id: sessionId } } }, async () => {

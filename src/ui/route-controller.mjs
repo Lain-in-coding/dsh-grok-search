@@ -236,11 +236,13 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
     || S.configIdentity && S.configIdentity !== snapshot.config?.quotaRevision);
   const preferencesChanged = S.prefs && preferences
     && (S.prefs.value.grokEnabled !== preferences.value.grokEnabled || S.prefs.value.githubReadEnabled !== preferences.value.githubReadEnabled);
-  if (externalRevision || preferencesChanged) cancelTest();
+  if (capabilitiesChanged && snapshot.capabilities?.secretsAllowed === false && S.testing) cancelTest({ preserve: true });
+  else if (externalRevision || preferencesChanged) cancelTest();
   S.control = snapshot.control || snapshot;
   S.program = snapshot.program;
   S.pluginInfo = snapshot.plugin || {};
   S.capabilities = snapshot.capabilities;
+  if (capabilitiesChanged && S.capabilities?.secretsAllowed === false) accessGeneration++;
   if (capabilitiesChanged || configChanged) secretEpoch++;
   // Capability revocation is synchronous UI state, not the next log poll.
   // read() invalidates an outstanding private reply before awaiting anything.
@@ -308,6 +310,7 @@ function denyPrivateAccess(error) {
   secretEpoch++;
   snapshotSignature = null;
   S.capabilities = { ...S.capabilities, secretsAllowed: false, reason: code };
+  if (S.testing) cancelTest({ preserve: true });
   logView?.restrict(code);
   quotaView?.render();
   if (D?.kind === 'card') {
@@ -3039,16 +3042,17 @@ async function retryHubControl(button) {
   }
 }
 async function redetect(b) {
-  if (!D || dialogBusy() || b.disabled) return;
+  if (!D || dialogBusy() || b.disabled || disposed) return;
   const html = b.innerHTML;
   const repair = b.dataset.repair === 'true';
   b.disabled = true;
   b.innerHTML = `<span class="spin"></span>${repair ? '准备中…' : '检测中…'}`;
-  const mine = D;
+  const mine = D, accessAtStart = accessGeneration;
+  const current = () => !disposed && D === mine && accessAtStart === accessGeneration;
   S.busy = true;
   try {
     const program = await (repair ? remote.repairProgram() : remote.prepareProgram());
-    if (disposed || D !== mine) return;
+    if (!current()) return;
     stateGeneration++;
     snapshotSignature = null;
     S.program = program;
@@ -3056,13 +3060,14 @@ async function redetect(b) {
     toast(`${programPhase()} · ${programSource()}${program.program?.version ? ' v' + program.program.version : ''}`, { tone: 'info' });
     renderHub();
   } catch (error) {
+    if (!current()) return;
     await refresh({ force: true, readLog: false });
-    if (!disposed && D === mine) operationError(error, true);
+    if (current()) operationError(error, true);
   }
   finally {
     S.busy = false;
-    if (b.isConnected) { b.disabled = false; b.innerHTML = html; }
-    if (!disposed) syncAll(true);
+    if (!disposed && D === mine && b.isConnected) { b.disabled = false; b.innerHTML = html; }
+    if (current()) syncAll(true);
   }
 }
 async function commitHub(draft = D.draft) {
@@ -3303,7 +3308,6 @@ async function runTest() {
       if (!alive()) return;
       S.diagnosticOperation = null;
       if (denyPrivateAccess(result)) {
-        cancelTest({ preserve: true });
         syncAll(true);
         toast(errText(result.code), { tone: 'warn' });
         return;

@@ -303,6 +303,21 @@ test('no-op save is idempotent and creates no redundant history', () => {
   assert.deepEqual(store.history(), []);
 });
 
+test('same-value saves preserve noncanonical TOML bytes without creating history', () => {
+  const text = "\uFEFFgrok_model\t=  'existing' \t# keep this spelling\r\n"
+    + "source_providers = [\r\n  'tavily', # first\r\n  'exa',\r\n]\r\n"
+    + 'cache_size = 256\r\n[future]\r\nopaque = "unchanged"\r\n';
+  const { store, path } = setup(text);
+  const revision = store.snapshot().revision;
+  const result = store.save({ expectedRevision: revision,
+    updates: { grok_model: 'existing', source_providers: ['tavily', 'exa'] } });
+  assert.deepEqual(readFileSync(path), Buffer.from(text));
+  assert.equal(result.revision, revision);
+  assert.deepEqual(store.history(), []);
+  assert.equal(patchSharedToml(text, { grok_model: 'existing',
+    source_providers: ['tavily', 'exa'], cache_size: 384 }), text.replace('cache_size = 256', 'cache_size = 384'));
+});
+
 test('no-op save refuses a revision replaced after the locked identity check', () => {
   const { store, path } = setup('grok_model = "existing"\n');
   assert.throws(() => store.save({ expectedRevision: store.snapshot().revision, updates: {}, paired: true,

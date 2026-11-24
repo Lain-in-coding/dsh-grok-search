@@ -779,6 +779,80 @@ test('an earlier settings poll cannot replace a successful program preparation',
   assert.equal(context.S.program, ready);
 });
 
+test('late program preparation cannot publish or refresh after its access lifetime changes', async () => {
+  for (const outcome of ['success', 'failure']) {
+    let finish;
+    const before = { phase: 'error', program: null }, newer = { phase: 'discovering', program: null };
+    const button = element(), renders = [], reads = [], notices = [];
+    const context = vm.createContext({
+      disposed: false, accessGeneration: 0, stateGeneration: 0, snapshotSignature: null,
+      D: { kind: 'hub' }, S: { program: before }, dialogBusy: () => false,
+      refresh: async () => { reads.push('refresh'); }, operationError: error => notices.push(error),
+      syncAll: () => renders.push('sync'), renderHead: () => renders.push('head'), renderHub: () => renders.push('hub'),
+      toast: message => notices.push(message), programPhase: () => 'ready', programSource: () => 'private-cache',
+      remote: { prepareProgram: () => new Promise((resolve, reject) => {
+        finish = () => outcome === 'success' ? resolve({ phase: 'ready', program: {} })
+          : reject(Object.assign(new Error('obsolete preparation failure'), { code: 'GROK_PROGRAM_UNAVAILABLE' }));
+      }) },
+    });
+    vm.runInContext(section('async function redetect(', 'async function commitHub('), context);
+    const pending = context.redetect(button);
+    context.accessGeneration++;
+    context.S.program = newer;
+    finish();
+    await pending;
+    assert.equal(context.S.program, newer);
+    assert.deepEqual(reads, []);
+    assert.deepEqual(renders, []);
+    assert.deepEqual(notices, []);
+    assert.equal(context.S.busy, false);
+  }
+});
+
+for (const outcome of ['success', 'failure']) {
+  test('real snapshot revocation and reauthorization reject late program preparation ' + outcome, async () => {
+    const h = controlLifecycleStateHarness(), renders = [], reads = [], notices = [];
+    const button = element(), newer = { phase: 'discovering', program: null };
+    let finish;
+    Object.assign(h.context, {
+      D: { kind: 'hub', draft: { timeout: 75 }, base: { timeout: 60 } },
+      dialogBusy: () => false, active: () => null,
+      syncAll: () => renders.push('sync'), renderHead: () => renders.push('head'), renderHub: () => renders.push('hub'),
+      operationError: error => notices.push(error), toast: message => notices.push(message),
+    });
+    h.context.remote.snapshot = async () => { reads.push('snapshot'); return structuredClone(h.state.snapshot); };
+    h.context.remote.preferences = async () => { reads.push('preferences'); return structuredClone(h.state.preferences); };
+    h.context.remote.prepareProgram = () => new Promise((resolve, reject) => {
+      finish = () => outcome === 'success' ? resolve({ phase: 'ready', program: {} })
+        : reject(Object.assign(new Error('obsolete preparation failure'), { code: 'GROK_PROGRAM_UNAVAILABLE' }));
+    });
+    vm.runInContext(section('async function redetect(', 'async function commitHub('), h.context);
+    const accessAtStart = h.context.accessGeneration;
+    const pending = h.context.redetect(button);
+    h.state.snapshot.program = newer;
+    h.state.snapshot.capabilities = { secretsAllowed: false };
+    await h.context.refresh({ force: true, readLog: false });
+    assert.equal(h.context.S.capabilities.secretsAllowed, false);
+    assert.equal(h.context.accessGeneration, accessAtStart + 1);
+    h.state.snapshot.capabilities = { secretsAllowed: true };
+    await h.context.refresh({ force: true, readLog: false });
+    assert.equal(h.context.S.capabilities.secretsAllowed, true);
+    assert.equal(h.context.accessGeneration, accessAtStart + 1, 'Reauthorization cannot revive the revoked access lifetime.');
+    assert.equal(h.context.D.draft.timeout, 75);
+    const currentProgram = h.context.S.program;
+    assert.equal(currentProgram.phase, 'discovering');
+    renders.length = reads.length = notices.length = 0;
+    finish();
+    await pending;
+    assert.equal(h.context.S.program, currentProgram);
+    assert.deepEqual(reads, []);
+    assert.deepEqual(renders, []);
+    assert.deepEqual(notices, []);
+    assert.equal(h.context.S.busy, false);
+    assert.equal(button.disabled, false);
+  });
+}
+
 test('a stale settings poll still revokes private access without restoring old config', async () => {
   for (const rejectRead of [false, true]) {
     let finish;
@@ -981,6 +1055,54 @@ test('an invalidated hub reload releases the actual disabled controls', async ()
   assert.equal(mine.saving, false);
   assert.equal(control.disabled, false, 'Closing or retrying must remain possible.');
 });
+
+for (const revocation of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED', 'snapshot']) {
+  test('an independent ' + revocation + ' revocation invalidates a pending provider diagnostic', async () => {
+    const h = harness(), requests = [], cancellations = [], nodes = new Map();
+    let finish;
+    Object.assign(h.context.S, { order: ['tavily'], checked: {}, bad: {}, providerBad: {}, identity: {}, hub: {},
+      prov: { grok: { enabled: true }, tavily: { enabled: true } } });
+    Object.assign(h.context, {
+      gen: 0, accessGeneration: 0, snapshotSignature: null, performance: { now: () => 0 },
+      logView: { cancel() {}, restrict() {}, read() {} },
+      HUB_FIELDS: {}, sourceChain: { view: () => ({ order: ['tavily'] }) },
+      providersFrom: () => h.context.S.prov, providerIdentity: () => 'unchanged',
+      ingestRoute() {}, buildRows() {}, syncOpenCardBaseline() {},
+      $: selector => { if (!nodes.has(selector)) nodes.set(selector, element()); return nodes.get(selector); },
+      routeStatus: () => 'ready', grokOn: () => true, isOn: () => false, enabledSupp: () => ['tavily'],
+      META: { grok: { name: 'Grok' }, tavily: { name: 'Tavily' } }, SUPP: ['tavily'],
+      reduced: () => true, uuid: () => 'diagnostic-operation', normalizeCode: value => value, errText: value => value,
+      rowOf: () => element(), T: { trace: 1000 }, untestedCode: () => false,
+      renderHead() {}, renderSummary() {}, renderBanner() {}, syncRows() {}, pumpWires() {},
+      tickTestProgress() {}, clearToasts() {}, clearLit() {}, toast() {}, hideStripTip() {},
+      rememberCheck() { assert.fail('A diagnostic from the revoked access lifetime must not validate credentials.'); },
+    });
+    h.context.remote.diagnoseProvider = request => {
+      requests.push(request);
+      return new Promise(resolve => { finish = resolve; });
+    };
+    h.context.remote.cancelDiagnosis = async request => { cancellations.push(request); return {}; };
+    vm.runInContext([
+      section('function acceptSnapshot(', 'let readTask ='),
+      section('function denyPrivateAccess(', 'async function refresh('),
+      section('function cancelTest(', 'function cancelOwnedDiagnosis('),
+      section('async function runTest(', '/* ---------- Mount-local theme'),
+    ].join('\n'), h.context);
+    const pending = h.context.runTest();
+    if (revocation !== 'snapshot') h.context.denyPrivateAccess({ code: revocation });
+    else h.context.acceptSnapshot({ config: h.context.S.config,
+      control: { phase: 'required', policy: 'required', available: true },
+      capabilities: { secretsAllowed: false }, plugin: {} }, { value: {} });
+    h.context.S.capabilities = { secretsAllowed: true };
+    finish({ provider: 'grok', status: 'ok', code: 'OK', keys: [] });
+    await pending;
+    assert.equal(requests.length, 1);
+    assert.equal(cancellations.length, 1);
+    assert.equal(h.context.S.testing, false);
+    assert.equal(h.context.S.diagnosticOperation, null);
+    assert.equal(Object.keys(h.context.S.checked).length, 0);
+  });
+}
 
 for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED']) {
   test('provider diagnostics stop on ' + code + ' without marking credentials as failed', async () => {

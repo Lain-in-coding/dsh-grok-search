@@ -562,12 +562,16 @@ class GrokSearchSettingsGateway extends Service {
 
   async readSearchLog(request = {}) {
     this._privateView();
-    return this.searchLog?.snapshot(request.sessionId) ?? { records: [] };
+    const searchLog = this.searchLog;
+    if (!searchLog) throw new GrokSearchError('SEARCH_LOG_UNAVAILABLE', '搜索记录服务未加载，请重新打开插件页。');
+    return searchLog.snapshot(request.sessionId);
   }
 
   async clearSearchLog(request = {}) {
     this._privateView();
-    return this.searchLog?.clear(request.sessionId) ?? { records: [] };
+    const searchLog = this.searchLog;
+    if (!searchLog) throw new GrokSearchError('SEARCH_LOG_UNAVAILABLE', '搜索记录服务未加载，请重新打开插件页。');
+    return searchLog.clear(request.sessionId);
   }
 
   async closeSearchLog(request = {}) {

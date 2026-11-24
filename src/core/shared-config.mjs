@@ -148,6 +148,7 @@ export function patchSharedToml(text, updates) {
     const key = match?.[2] ?? match?.[3] ?? match?.[4];
     if (!key || !Object.hasOwn(updates, key)) continue;
     found.add(key);
+    if (updates[key] !== null && isDeepStrictEqual(before[key], updates[key])) continue;
     // Retain an end-of-assignment comment when replacing its value. Embedded
     // comments in arrays stay unchanged unless that array itself is edited.
     const lineEnding = /\r?\n$/.exec(row.text)?.[0] ?? '';

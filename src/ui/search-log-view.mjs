@@ -1132,25 +1132,37 @@ async function read() {
   return readTask;
 }
 async function clearRemoteLog() {
-  if (clearing || disposed) return;
+  if (clearing || disposed || !S.capabilities?.secretsAllowed) return;
   clearing = true;
-  generation++;
+  const mine = ++generation;
+  const current = () => !disposed && mine === generation && S.capabilities?.secretsAllowed;
   try {
-    clearLocalLog();
+    clearLocalLog({ announce: false });
     const id = sessionId || await logSession();
-    if (disposed) return;
+    if (!current()) return;
     await remote.clearSearchLog({ sessionId: id });
-    if (!disposed) toast('已清空当前插件的搜索记录', { tone: 'info' });
+    if (current()) {
+      logReadError = null;
+      $('#logNote').textContent = '仅内存 · 最近 20 条 · 停用或退出 DSH 后清空';
+      renderLog();
+      $('#logAnnouncer').textContent = '已清空本次会话的搜索记录。';
+      toast('已清空当前插件的搜索记录', { tone: 'info' });
+    }
   } catch (error) {
+    if (!current()) return;
     logBaselined = false;
-    if (!disposed && (error?.code === 'SETTINGS_AUTH_REQUIRED' || error?.code === 'SETTINGS_SECURE_CONNECTION_REQUIRED')) {
+    if (error?.code === 'SETTINGS_AUTH_REQUIRED' || error?.code === 'SETTINGS_SECURE_CONNECTION_REQUIRED') {
       restrict(error.code);
       onPrivateAccessDenied?.(error);
     }
     if (error?.code === 'SEARCH_LOG_VIEW_EXPIRED' && typeof remote.openSearchLog === 'function') sessionId = null;
-    if (!disposed) toast('清空未确认，请稍后重试', { tone: 'info' });
+    logReadError = /^[\w./-]{1,80}$/.test(error?.code || '') ? error.code : 'SETTINGS_UNAVAILABLE';
+    $('#logNote').textContent = logReadNotice(logReadError);
+    $('#logAnnouncer').textContent = '清空未确认，请稍后重试。';
+    renderLog();
+    toast('清空未确认，请稍后重试', { tone: 'info' });
   }
-  finally { generation++; clearing = false; }
+  finally { if (mine === generation) generation++; clearing = false; }
 }
 renderLog({ snap: true });
 const poll = async () => {

@@ -558,11 +558,13 @@
       const configChanged = S.config && (S.config.path !== snapshot.config?.path || S.config.revision !== snapshot.config?.revision || S.config.quotaRevision !== snapshot.config?.quotaRevision);
       const externalRevision = !trustedConfigUpdate && (S.configRevision && S.configRevision !== snapshot.config?.revision || S.configIdentity && S.configIdentity !== snapshot.config?.quotaRevision);
       const preferencesChanged = S.prefs && preferences && (S.prefs.value.grokEnabled !== preferences.value.grokEnabled || S.prefs.value.githubReadEnabled !== preferences.value.githubReadEnabled);
-      if (externalRevision || preferencesChanged) cancelTest();
+      if (capabilitiesChanged && snapshot.capabilities?.secretsAllowed === false && S.testing) cancelTest({ preserve: true });
+      else if (externalRevision || preferencesChanged) cancelTest();
       S.control = snapshot.control || snapshot;
       S.program = snapshot.program;
       S.pluginInfo = snapshot.plugin || {};
       S.capabilities = snapshot.capabilities;
+      if (capabilitiesChanged && S.capabilities?.secretsAllowed === false) accessGeneration++;
       if (capabilitiesChanged || configChanged) secretEpoch++;
       if (S.capabilities && !S.capabilities.secretsAllowed) void logView?.read();
       S.rpcError = null;
@@ -626,6 +628,7 @@
       secretEpoch++;
       snapshotSignature = null;
       S.capabilities = { ...S.capabilities, secretsAllowed: false, reason: code };
+      if (S.testing) cancelTest({ preserve: true });
       logView?.restrict(code);
       quotaView?.render();
       if (D?.kind === "card") {
@@ -3595,16 +3598,17 @@ ${dots.map((d) => d.tip).join("\n")}
       }
     }
     async function redetect(b) {
-      if (!D || dialogBusy() || b.disabled) return;
+      if (!D || dialogBusy() || b.disabled || disposed) return;
       const html = b.innerHTML;
       const repair = b.dataset.repair === "true";
       b.disabled = true;
       b.innerHTML = `<span class="spin"></span>${repair ? "准备中…" : "检测中…"}`;
-      const mine = D;
+      const mine = D, accessAtStart = accessGeneration;
+      const current = () => !disposed && D === mine && accessAtStart === accessGeneration;
       S.busy = true;
       try {
         const program = await (repair ? remote.repairProgram() : remote.prepareProgram());
-        if (disposed || D !== mine) return;
+        if (!current()) return;
         stateGeneration++;
         snapshotSignature = null;
         S.program = program;
@@ -3612,15 +3616,16 @@ ${dots.map((d) => d.tip).join("\n")}
         toast(`${programPhase()} · ${programSource()}${program.program?.version ? " v" + program.program.version : ""}`, { tone: "info" });
         renderHub();
       } catch (error) {
+        if (!current()) return;
         await refresh({ force: true, readLog: false });
-        if (!disposed && D === mine) operationError(error, true);
+        if (current()) operationError(error, true);
       } finally {
         S.busy = false;
-        if (b.isConnected) {
+        if (!disposed && D === mine && b.isConnected) {
           b.disabled = false;
           b.innerHTML = html;
         }
-        if (!disposed) syncAll(true);
+        if (current()) syncAll(true);
       }
     }
     async function commitHub(draft = D.draft) {
@@ -3909,7 +3914,6 @@ ${dots.map((d) => d.tip).join("\n")}
           if (!alive()) return;
           S.diagnosticOperation = null;
           if (denyPrivateAccess(result)) {
-            cancelTest({ preserve: true });
             syncAll(true);
             toast(errText(result.code), { tone: "warn" });
             return;
@@ -5516,25 +5520,37 @@ ${dots.map((d) => d.tip).join("\n")}
       return readTask;
     }
     async function clearRemoteLog() {
-      if (clearing || disposed) return;
+      if (clearing || disposed || !S.capabilities?.secretsAllowed) return;
       clearing = true;
-      generation++;
+      const mine = ++generation;
+      const current = () => !disposed && mine === generation && S.capabilities?.secretsAllowed;
       try {
-        clearLocalLog();
+        clearLocalLog({ announce: false });
         const id = sessionId || await logSession();
-        if (disposed) return;
+        if (!current()) return;
         await remote.clearSearchLog({ sessionId: id });
-        if (!disposed) toast("已清空当前插件的搜索记录", { tone: "info" });
+        if (current()) {
+          logReadError = null;
+          $("#logNote").textContent = "仅内存 · 最近 20 条 · 停用或退出 DSH 后清空";
+          renderLog();
+          $("#logAnnouncer").textContent = "已清空本次会话的搜索记录。";
+          toast("已清空当前插件的搜索记录", { tone: "info" });
+        }
       } catch (error) {
+        if (!current()) return;
         logBaselined = false;
-        if (!disposed && (error?.code === "SETTINGS_AUTH_REQUIRED" || error?.code === "SETTINGS_SECURE_CONNECTION_REQUIRED")) {
+        if (error?.code === "SETTINGS_AUTH_REQUIRED" || error?.code === "SETTINGS_SECURE_CONNECTION_REQUIRED") {
           restrict(error.code);
           onPrivateAccessDenied?.(error);
         }
         if (error?.code === "SEARCH_LOG_VIEW_EXPIRED" && typeof remote.openSearchLog === "function") sessionId = null;
-        if (!disposed) toast("清空未确认，请稍后重试", { tone: "info" });
+        logReadError = /^[\w./-]{1,80}$/.test(error?.code || "") ? error.code : "SETTINGS_UNAVAILABLE";
+        $("#logNote").textContent = logReadNotice(logReadError);
+        $("#logAnnouncer").textContent = "清空未确认，请稍后重试。";
+        renderLog();
+        toast("清空未确认，请稍后重试", { tone: "info" });
       } finally {
-        generation++;
+        if (mine === generation) generation++;
         clearing = false;
       }
     }

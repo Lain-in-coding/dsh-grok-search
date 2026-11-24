@@ -133,7 +133,8 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     if (stopRequested) return Promise.resolve(snapshot());
     if (task) return task;
     state.phase = 'checking';
-    task = (async () => {
+    // Publish the shared task before a synchronous host callback can re-enter refresh.
+    task = Promise.resolve().then(async () => {
       if (disposed) {
         state.phase = 'disposed';
         return snapshot();
@@ -198,8 +199,11 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
           || latest.ownerUid !== currentAcquisition.ownerUid
           || !sameLease(latestLease, currentLease)
           || acquisitionChanged(currentAcquisition, latest)) {
-          throw new ControlRecordError('CONTROL_ACQUISITION_INPUT_CHANGED',
-            'Search acquisition inputs changed before publication; retry with current inputs.', { retriable: true });
+          const authorConflict = acquired && (latest.authorSearchProvider !== currentAcquisition.authorSearchProvider
+            || latest.authorSearchProviderPresent !== currentAcquisition.authorSearchProviderPresent);
+          throw new ControlRecordError(authorConflict ? 'CONTROL_SEARCH_SELECTION_CONFLICT' : 'CONTROL_ACQUISITION_INPUT_CHANGED',
+            authorConflict ? 'The current author search selection differs from the recorded ownership intent.'
+              : 'Search acquisition inputs changed before publication; retry with current inputs.', { retriable: !authorConflict });
         }
         // Supersession grants a new acquisition; the old incomplete release stays historical evidence.
         if (supersededRelease && (canSupersedeNativeRelease({ record: supersededRelease,
@@ -250,13 +254,16 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       if (!core) throw new ControlRecordError('CONTROL_RELEASE_CORE_REQUIRED',
         'The query core must be loaded before the product owner can take over search.');
       assertAcquisitionCurrent();
-      const latest = store.read();
-      if (latest?.revision !== existing.revision || latest.operationId !== existing.operationId
-        || latest.intent.policy !== 'required' || latest.intent.release !== null
-        || latest.intent.pause?.confirmed === true) {
-        throw new ControlRecordError('CONTROL_CAS_CONFLICT',
-          'The committed control intent changed before route acquisition.', { retriable: true });
-      }
+      const assertRecordCurrent = () => {
+        const latest = store.read();
+        if (latest?.revision !== existing.revision || latest.operationId !== existing.operationId
+          || latest.intent.policy !== 'required' || latest.intent.release !== null
+          || latest.intent.pause?.confirmed === true) {
+          throw new ControlRecordError('CONTROL_CAS_CONFLICT',
+            'The committed control intent changed during route acquisition.', { retriable: true });
+        }
+      };
+      assertRecordCurrent();
       const pending = takeOverAuthorRoute(ctx, existing.intent.acquisition, existing.intent.lease);
       takeovers.add(pending);
       let takeover;
@@ -265,11 +272,14 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       // The release restores the author after this late host update settles.
       if (disposed || stopRequested || !canAcquire() || !isCurrent()) return snapshot();
       acquired = true;
+      // A late host callback is not proof that the author or committed intent stayed current.
+      assertAcquisitionCurrent();
+      assertRecordCurrent();
       state.phase = 'required';
       state.error = null;
       state.routeChanged = takeover.routeChanged;
       return snapshot();
-    })().catch(error => {
+    }).catch(error => {
       // A superseded takeover failure must not overwrite the explicit stop state.
       if (disposed || stopRequested) return snapshot();
       state.phase = 'incomplete';

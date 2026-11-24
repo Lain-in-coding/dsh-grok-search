@@ -1899,6 +1899,55 @@ test('a pending historical release runs recovery without automatically acquiring
   } finally { await f.ctx.dispose(); }
 });
 
+test('bootstrap never becomes ready from a takeover superseded by author selection or committed intent', async t => {
+  for (const change of ['author', 'release', 'pause']) await t.test(change, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-takeover-intent-'));
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+    const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+      trustedRoot: directory, governance: true, autoMaintain: false });
+    const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }),
+      overrides: { control: { name: 'control', async apply(child, configuration) {
+        await applyControl(child, configuration);
+        // This synthetic host does not await inject callbacks; join the real pending acquisition.
+        await child.get('grokSearchControl').retry().catch(() => {});
+      } } } });
+    f.ctx.profileContext.dir = directory;
+    const applied = deferred(), finish = deferred();
+    f.entry.update = async ({ config }) => {
+      f.entry.options.config = structuredClone(config);
+      f.webFiber.config = structuredClone(config);
+      f.webFiber.rawConfig = f.webFiber.config;
+      f.webFiber.effectiveConfig = f.webFiber.resolveConfig(config);
+      f.web.config = f.webFiber.effectiveConfig;
+      f.web.searchProviderId = selectedId(f.webFiber.effectiveConfig.searchProvider);
+      f.web.fetchProviderId = selectedId(f.webFiber.effectiveConfig.fetchProvider);
+      applied.resolve();
+      await finish.promise;
+    };
+    try {
+      f.start();
+      await applied.promise;
+      const acquired = store.read();
+      let expected = acquired;
+      if (change === 'author') f.entry.options.config = { ...f.entry.options.config, searchProvider: 'new-author' };
+      else expected = store.compareAndSwap({ expectedRevision: acquired.revision, intent: change === 'pause'
+          ? { ...acquired.intent, pause: { confirmed: true, reason: 'concurrent-pause' } }
+          : { ...acquired.intent, policy: 'released', reason: 'concurrent-explicit-release',
+            priorIntent: acquired.intent, release: { explicit: true, committedAt: new Date().toISOString(),
+              kind: 'intent-release-commit', operationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', counterBaseline: 0 } } });
+      finish.resolve();
+      await f.settle();
+      assert.equal(f.ctx.get('grokSearchControl')?.snapshot().phase, 'incomplete');
+      assert.equal(f.coordinator().report().coreReady, false);
+      let dispatched = false;
+      assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { dispatched = true; }));
+      assert.equal(dispatched, false, 'a late host callback cannot authorize search over the newer user intent');
+      assert.deepEqual(store.read(), expected);
+      assert.equal(f.web.fetchProviderId, 'fetch');
+    } finally { finish.resolve(); await f.ctx.dispose(); }
+  });
+});
+
 test('an absent host service and missing version never impose an experimental consent gate', async () => {
   const f = bootstrapFixture({ ready: false, hostVersion: null });
   try {

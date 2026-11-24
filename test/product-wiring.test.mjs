@@ -762,6 +762,89 @@ test('acquisition does not take over a release committed before its write return
   } finally { ctx.dispose(); }
 });
 
+test('a completed takeover rechecks author selection and committed intent before reporting required', async t => {
+  for (const change of ['author', 'release', 'pause']) await t.test(change, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), entry = ctx.loader.entries()[0];
+    const store = createProductStore(ctx, { deferMaintenance: true });
+    const authorBefore = structuredClone(entry.options.config);
+    const applied = deferred(), finish = deferred(), update = entry.update;
+    entry.update = async options => {
+      await update(options);
+      applied.resolve();
+      await finish.promise;
+    };
+    const starting = applyControl(ctx, { store, keepAliveOnFailure: true });
+    try {
+      await applied.promise;
+      const acquired = store.read();
+      let expected = acquired;
+      if (change === 'author') {
+        entry.options.config = { ...entry.options.config, searchProvider: 'new-author' };
+      } else {
+        expected = store.compareAndSwap({ expectedRevision: acquired.revision, intent: change === 'pause'
+          ? { ...acquired.intent, pause: { confirmed: true, reason: 'concurrent-pause' } }
+          : { ...acquired.intent, policy: 'released', reason: 'concurrent-explicit-release',
+            priorIntent: acquired.intent, release: { explicit: true, committedAt: new Date().toISOString(),
+              kind: 'intent-release-commit', operationId: randomUUID(), counterBaseline: 0 } } });
+      }
+      const authorConfig = change === 'author' ? structuredClone(entry.options.config) : authorBefore;
+      finish.resolve();
+      await starting;
+      const owner = ctx.get('grokSearchControl');
+      assert.equal(owner.publicSnapshot().phase, 'incomplete');
+      assert.equal(owner.snapshot().error.code, change === 'author'
+        ? 'CONTROL_SEARCH_SELECTION_CONFLICT' : 'CONTROL_CAS_CONFLICT');
+      assert.deepEqual(store.read(), expected, 'the late takeover cannot replace newer intent or author evidence');
+      assert.deepEqual(entry.options.config, authorConfig, 'failure must not guess an author route restoration');
+      assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+      const retried = await owner.retry();
+      assert.equal(retried.phase, change === 'author' ? 'conflict' : change === 'pause' ? 'stopped' : 'released');
+      assert.deepEqual(store.read(), expected, 'retrying the same live owner cannot adopt the superseding author or pause');
+    } finally { finish.resolve(); await starting.catch(() => {}); ctx.dispose(); }
+  });
+});
+
+test('a successful awaited host callback can stage product config without conflicting with its recorded author', async t => {
+  for (const mutation of ['replacement', 'in-place']) await t.test(mutation, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), entry = ctx.loader.entries()[0];
+    const store = createProductStore(ctx, { deferMaintenance: true });
+    const author = structuredClone(entry.options.config), update = entry.update;
+    entry.update = async options => {
+      await update(options);
+      if (mutation === 'in-place') entry.options.config = options.config;
+      await nextImmediate();
+    };
+    try {
+      await applyControl(ctx, { store });
+      const owner = ctx.get('grokSearchControl'), acquired = store.read();
+      assert.equal(owner.publicSnapshot().phase, 'required');
+      assert.equal(owner.snapshot().error, null);
+      assert.equal(acquired.intent.acquisition.authorSearchProvider, author.searchProvider);
+      assert.equal(acquired.intent.acquisition.authorFetchProvider, author.fetchProvider);
+      assert.deepEqual(entry.options.config, author);
+      assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+      assert.equal((await owner.retry()).phase, 'required');
+      assert.deepEqual(store.read(), acquired);
+    } finally { ctx.dispose(); }
+  });
+});
+
+test('a synchronous takeover callback cannot publish another acquisition from the staged product route', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+  const before = createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  try {
+    await applyControl(ctx, { store, keepAliveOnFailure: true });
+    const owner = ctx.get('grokSearchControl');
+    assert.equal(owner.snapshot().phase, 'required');
+    assert.equal(owner.snapshot().error, null);
+    assert.deepEqual(store.read(), before, 'the synchronous volatile callback must join the in-flight acquisition');
+    assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+    assert.equal(ctx.loader.entries()[0].options.config.searchProvider, before.intent.acquisition.authorSearchProvider);
+    assert.equal((await owner.retry()).phase, 'required');
+    assert.deepEqual(store.read(), before);
+  } finally { ctx.dispose(); }
+});
+
 test('product control stop prelude failure is recorded and retryable', async () => {
   const ctx = makeContext();
   await applyControl(ctx);

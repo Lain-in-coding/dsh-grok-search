@@ -41,6 +41,18 @@ export function verifyUserPathIdentities({ tarball, packageReceipt, product, sou
     hostHashes: hostHashes.map(({ role, sha256 }) => ({ role, sha256 })) };
 }
 
+export function assertUserPathInstallation(installation, version, { allowRestart = false } = {}) {
+  assert.equal(installation?.http, 200, 'native installation RPC succeeds');
+  assert.equal(installation.body?.result?.ok, true, 'native installer returns a successful result');
+  const value = installation.body.result.value;
+  assert.equal(value?.error ?? null, null, 'native installer reports no error');
+  assert.equal(value?.version, version, 'native installer selects the candidate version');
+  assert.ok(value.application === 'applied'
+    || allowRestart === true && value.application === 'restart-required',
+  'native installation must be applied, or require a verified cold upgrade');
+  return value.application;
+}
+
 export function assertBareRegistryIdentity(resolved, installed, metadata, expectedName) {
   assert.ok(['applied', 'restart-required'].includes(resolved?.application));
   assert.equal(resolved.error ?? null, null);
@@ -178,8 +190,8 @@ const quotaServer = createHttpServer((request, response) => {
   response.end(JSON.stringify({ account: { plan_usage: 2, plan_limit: 10 } }));
 });
 await new Promise(done => quotaServer.listen(0, '127.0.0.1', done));
-// Native first installation must exercise the signed packaged entry, not default_app.
-const packaged = (liveInstall || replayHistory) && process.platform === 'win32';
+// Native installation, upgrade and cold replay use the signed packaged entry.
+const packaged = (liveInstall || replayHistory || upgradeFrom) && process.platform === 'win32';
 const launchExecutable = packaged ? runtime.executable : control.electron;
 function launchDesktop() {
   const child = spawn(launchExecutable, [...(packaged ? [] : [control.archive]), '--user-data-dir=' + control.userData,
@@ -315,10 +327,25 @@ try {
       ? { http: installation.http, stage: installation.body.result.value.stage,
         application: installation.body.result.value.application, version: installation.body.result.value.version,
         error: installation.body.result.value.error } : installation }));
-    assert.equal(installation.body?.result?.ok, true, 'native installation RPC succeeds');
-    assert.equal(installation.body.result.value.error ?? null, null, 'native installer reports no error');
-    assert.equal(installation.body.result.value.application, 'applied', 'new code is applied without restart');
-    assert.equal(installation.body.result.value.version, packageReceipt.version, 'native installer selects the candidate version');
+    const application = assertUserPathInstallation(installation, packageReceipt.version,
+      { allowRestart: Boolean(upgradePackage) });
+    if (application === 'restart-required') {
+      // Files are installed, not yet running. Verify them before restarting the
+      // same owned profile; the normal readiness checks below prove activation.
+      const installedIdentity = verifyIdentities();
+      renderer.close();
+      renderer = null;
+      await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 });
+      const exit = await closed;
+      writeJson(join(run.directory, 'upgrade-first-exit.json'), exit);
+      assert.equal(exit.code, 0, 'normally exit the old host before activating the upgrade');
+      assert.equal(exit.signal, null, 'do not treat forced shutdown as a successful upgrade');
+      ({ child, closed } = launchDesktop());
+      renderer = await connectRenderer(port, { timeoutMs: 90_000, requestTimeoutMs: 200_000 });
+      await waitForRenderer(renderer, client => client.evaluate('document.readyState === "complete" && !!document.querySelector(\'button[aria-label="插件"]\')'));
+      writeJson(join(run.directory, 'upgrade-restart.json'), { requested: true,
+        completed: true, installationApplication: application, installedIdentity });
+    }
   }
   if (baselineReplay) {
     await waitForRenderer(renderer, async () => (await rpc('snapshot')).body?.result?.ok);

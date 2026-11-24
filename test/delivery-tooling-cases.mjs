@@ -34,19 +34,22 @@ test('registry installation verifies the actual host-resolved release while allo
   assert.match(source, /spec: registryInstall \? `\$\{manifest\.name\}@\$\{manifest\.version\}` : tarball/);
 });
 
-test('native installation and cold replay select the signed Windows entry and retain special-path mode', () => {
+test('native installation, upgrade and cold replay select the signed Windows entry and retain special-path mode', () => {
   const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
   assert.match(source, /const root = join\(tmpdir\(\), 'dsh-deferred-desktop-' \+ randomUUID\(\)\.replaceAll\('-', ''\)\.slice\(0, 6\)/);
   assert.ok(source.includes(`openConfig ? " 中文 空格 ' & $"`));
   const start = source.indexOf('const packaged ='), end = source.indexOf('\nfunction launchDesktop()', start);
   assert.ok(start >= 0 && end > start);
   for (const platform of ['win32', 'darwin', 'linux']) {
-    for (const [liveInstall, replayHistory] of [[true, null], [false, 'synthetic-control-history'], [false, null]]) {
+    for (const [liveInstall, replayHistory, upgradeFrom] of [
+      [true, null, null], [false, 'synthetic-control-history', null],
+      [false, null, 'previous.tgz'], [false, null, null],
+    ]) {
       const result = runInNewContext(source.slice(start, end) + '\n({ packaged, launchExecutable });', {
-        process: { platform }, liveInstall, replayHistory,
+        process: { platform }, liveInstall, replayHistory, upgradeFrom,
         runtime: { executable: 'official-signed-host' }, control: { electron: 'isolated-development-entry' },
       });
-      const signed = platform === 'win32' && (liveInstall || replayHistory !== null);
+      const signed = platform === 'win32' && (liveInstall || replayHistory !== null || upgradeFrom !== null);
       assert.equal(Boolean(result.packaged), signed);
       assert.equal(result.launchExecutable, signed ? 'official-signed-host' : 'isolated-development-entry');
     }
@@ -60,10 +63,64 @@ function userPathGuards() {
   const end = source.indexOf('export function assertBareRegistryIdentity(', start);
   assert.ok(start >= 0 && end > start);
   return runInNewContext(source.slice(start, end).replaceAll('export function ', 'function ')
-    + '\n({ assertReplayReady, verifyUserPathIdentities });', {
+    + '\n({ assertReplayReady, verifyUserPathIdentities, assertUserPathInstallation });', {
     assert, join, sha256: path => createHash('sha256').update(readFileSync(path)).digest('hex'),
   });
 }
+
+test('upgrade installation accepts restart-required only for an explicitly verified cold upgrade', () => {
+  const { assertUserPathInstallation } = userPathGuards();
+  const response = (application, version = '0.4.3') => ({
+    http: 200, body: { result: { ok: true, value: { application, version, error: null } } },
+  });
+  assert.equal(assertUserPathInstallation(response('applied'), '0.4.3'), 'applied');
+  assert.throws(() => assertUserPathInstallation(response('restart-required'), '0.4.3'));
+  assert.equal(assertUserPathInstallation(response('restart-required'), '0.4.3', { allowRestart: true }), 'restart-required');
+  for (const value of [false, 'true', 1]) {
+    assert.throws(() => assertUserPathInstallation(response('restart-required'), '0.4.3', { allowRestart: value }));
+  }
+  for (const invalid of [null, response('failed'), response('unknown'), response('applied', '0.4.2'),
+    { http: 500, body: response('applied').body },
+    { http: 200, body: { result: { ok: false } } },
+    { http: 200, body: { result: { ok: true, value: { ...response('applied').body.result.value, error: { code: 'failure' } } } } }]) {
+    assert.throws(() => assertUserPathInstallation(invalid, '0.4.3', { allowRestart: true }));
+  }
+});
+
+test('restart-required upgrade verifies installed files, exits normally and cold-boots before readiness checks', async () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf("    if (application === 'restart-required') {");
+  const end = source.indexOf('\n  }\n  if (baselineReplay)', start);
+  assert.ok(start >= 0 && end > start);
+  const calls = [], evidence = [];
+  const run = vmExit => runInNewContext(`(async () => {
+    let renderer = { close() { calls.push('close-renderer'); } };
+    let child, closed = Promise.resolve(vmExit);
+    ${source.slice(start, end)}
+    return renderer;
+  })()`, {
+    assert, calls, vmExit, application: 'restart-required', port: 1234,
+    run: { directory: 'synthetic-upgrade-evidence' }, join,
+    verifyIdentities: () => { calls.push('verify-files'); return { installedFilesVerified: 59 }; },
+    requestDesktopShutdown: async () => { calls.push('shutdown'); },
+    launchDesktop: () => { calls.push('cold-boot'); return { child: {}, closed: Promise.resolve({ code: 0, signal: null }) }; },
+    connectRenderer: async () => { calls.push('connect-new'); return { evaluate() {} }; },
+    waitForRenderer: async () => { calls.push('new-ui-ready'); },
+    writeJson: (path, value) => evidence.push({ path, value }),
+  });
+  await run({ code: 0, signal: null });
+  assert.deepEqual(calls, ['verify-files', 'close-renderer', 'shutdown', 'cold-boot', 'connect-new', 'new-ui-ready']);
+  assert.equal(evidence.at(-1).value.completed, true);
+  assert.equal(evidence.at(-1).value.installedIdentity.installedFilesVerified, 59);
+  for (const exit of [{ code: 1, signal: null }, { code: 0, signal: 'SIGKILL' }]) {
+    calls.length = evidence.length = 0;
+    await assert.rejects(run(exit));
+    assert.deepEqual(calls, ['verify-files', 'close-renderer', 'shutdown']);
+    assert.equal(evidence.some(item => item.value.completed), false);
+  }
+  assert.ok(source.indexOf('const snapshot = await waitForRenderer', end) > end,
+    'normal runtime readiness is still required after the cold upgrade');
+});
 
 test('cold replay rejects an upgrade combination before opening any package or profile', () => {
   const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');

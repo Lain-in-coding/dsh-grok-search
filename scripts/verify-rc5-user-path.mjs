@@ -274,6 +274,7 @@ try {
       };
       const before = profileState();
       const inspection = await rpc('inspect', { spec: manifest.name, options: { registry } }, true);
+      writeJson(join(run.directory, 'registry-inspection.json'), inspection);
       assert.equal(inspection.body?.result?.ok, true, 'native registry inspection succeeds');
       assert.equal(inspection.body.result.value.version, manifest.version, 'registry preview identifies the candidate');
       const bare = await rpc('installBundle', {

@@ -5,12 +5,13 @@ import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Config, resolveRuntimeConfig } from '../src/core/product-config.mjs';
-import { createSearchConfigHook, checkRuntimeContracts, effectiveFetchProvider, selectedId } from '../src/core/product-control.mjs';
+import { createSearchConfigHook, checkRuntimeContracts, effectiveFetchProvider, selectedId, holdProductRelease } from '../src/core/product-control.mjs';
 import { ControlRecordError, createControlIntentStore } from '../src/core/control-intent-store.mjs';
 import { apply as applyBundle, Config as BundleConfig } from '../src/bundle.mjs';
 import { apply as applyCore, Config as CoreConfig } from '../src/index.mjs';
 import { apply as applyControl } from '../src/control.mjs';
 import { apply as applyRouteVerifier } from '../src/route-verifier.mjs';
+import { apply as applyRecovery } from '../src/recovery.mjs';
 import { createCompatibilityGateway, COMPATIBILITY_DESCRIPTORS } from '../src/compatibility-service.mjs';
 import { createGithubIntegration } from '../src/core/github-host.mjs';
 import { createProgramController } from '../src/program.mjs';
@@ -237,6 +238,7 @@ function bootstrapFixture({ hostVersion = '0.2.1-rc.2', ready = true, overrides 
   initialRecord = null, readError = null, githubEnabled = false, preferencesFactory = null,
   stateFactory = null, storeFactory = null, retryDelay = async () => {}, trackedServices = [] } = {}) {
   const h = bootstrapHost({ ready, trackedServices }), calls = [], stateListeners = new Set();
+  h.ctx.profileContext.dir = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-profile-'));
   let record = initialRecord, confirmation = false, notified = false, confirmationError = null;
   const createPreferences = preferencesFactory ?? (() => ({
     snapshot: () => ({ value: { githubReadEnabled: githubEnabled } }),
@@ -317,7 +319,10 @@ function bootstrapFixture({ hostVersion = '0.2.1-rc.2', ready = true, overrides 
   const start = (configuration = defaults) => applyBundle(h.ctx, configuration, {
     load, checkContracts: (...args) => { contractCheckCalls++; return checks(...args); },
     createState: stateFactory ?? makeState,
-    createStore: storeFactory ?? (() => store), createPreferences, retryDelay,
+    createStore: (...args) => {
+      const selected = storeFactory ? storeFactory(...args) : store;
+      return { ...selected, directory: selected.directory ?? join(h.ctx.profileContext.dir, 'control-intent.records') };
+    }, createPreferences, retryDelay,
   });
   return { ...h, calls, start, store,
     loseConfirmation(errorCode = null) {
@@ -1168,6 +1173,7 @@ test('the root search guard preserves current calls, recovery access and complet
     assert.throws(() => held.search(), { code: 'COMPATIBILITY_STOPPED' });
     await f.service('grokSearchControl').stop();
     assert.equal(f.store.read().intent.policy, 'released');
+    await f.settle();
     assert.equal(f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => {
       return f.ctx.waterfall('internal/get', caller, 'web', null, () => original).search();
     }), 'current-result', 'completed explicit release returns search authority to the author');
@@ -1633,7 +1639,7 @@ test('transient bootstrap failures retry twice, then report a neutral block; man
 });
 
 test('pending settings and lifecycle retries do not delay a failed core recovering on recheck', async t => {
-  for (const optional of ['settings', 'lifecycle']) await t.test(optional, async () => {
+  for (const retry of ['compatibility', 'root']) for (const optional of ['settings', 'lifecycle']) await t.test(`${retry}: ${optional}`, async () => {
     const release = deferred();
     let repaired = false, coreLoads = 0, optionalAttempts = 0, optionalReady = false, recheckDone = false, recheck;
     const settings = { name: 'settings', apply(child) {
@@ -1673,7 +1679,7 @@ test('pending settings and lifecycle retries do not delay a failed core recoveri
       assert.equal(optionalAttempts, 1);
       const blockedEpoch = f.coordinator().captureEpoch();
       repaired = true;
-      recheck = f.coordinator().recheck();
+      recheck = retry === 'root' ? f.ctx.get('grokSearchBootstrap').retryControlRelease() : f.coordinator().recheck();
       recheck.then(() => { recheckDone = true; }, () => {});
       await turn();
       assert.equal(optionalAttempts, 2, 'the optional retry must have entered its unresolved work');
@@ -2049,7 +2055,7 @@ test('a fresh capability epoch waits for retirement and an explicit release wins
         assert.equal(f.coordinator().report().coreReady, false, 'a recheck is not an explicit user start');
         assert.equal(f.service('grokSearchControl'), owner);
       } else {
-        assert.equal(f.coordinator().report().coreReady, true);
+        assert.equal(f.coordinator().report().coreReady, true, JSON.stringify({ report: f.coordinator().report(), calls: f.calls }));
         assert.notEqual(f.service('grokSearchControl'), owner);
         assert.equal(f.calls.filter(call => call === 'program').length, 2);
         assert.equal(f.store.read().intent.policy, 'required');
@@ -2556,5 +2562,377 @@ test('retriable control storage lock contention during initialize recovers withi
     assert.equal(f.coordinator().report().phase, 'ready');
   } finally {
     await f.ctx.dispose();
+  }
+});
+
+for (const reason of ['native-bundle-disable', 'native-component-disable', 'settings-ui-explicit-stop']) {
+  for (const changedAuthor of [false, true]) test(`a generated incomplete ${reason} survives teardown with changedAuthor=${changedAuthor}`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-pending-release-'));
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+    const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+      trustedRoot: directory, governance: true, autoMaintain: false });
+    let failRestore = true;
+    const mount = () => {
+      const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }), overrides: {
+        control: { name: 'control', apply: applyControl },
+        recovery: { name: 'recovery', apply: applyRecovery },
+        routeVerifier: { name: 'verifier', apply: applyRouteVerifier },
+        core: { name: 'core', apply(child) {
+          child.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+        } },
+      } });
+      f.ctx.profileContext.dir = directory;
+      f.entry.update = async ({ config }) => {
+        if (failRestore && config.searchProvider !== 'grok-search') {
+          throw new ControlRecordError('CONTROL_ROUTE_UPDATE_FAILED');
+        }
+        f.entry.options.config = structuredClone(config);
+        f.webFiber.config = structuredClone(config);
+        f.webFiber.rawConfig = f.webFiber.config;
+        f.webFiber.effectiveConfig = f.webFiber.resolveConfig(config);
+        f.web.config = f.webFiber.effectiveConfig;
+        f.web.searchProviderId = selectedId(f.webFiber.effectiveConfig.searchProvider);
+        f.web.fetchProviderId = selectedId(f.webFiber.effectiveConfig.fetchProvider);
+      };
+      return f;
+    };
+    const first = mount();
+    let second;
+    try {
+      first.start();
+      await first.settle();
+      const release = await first.service('grokSearchControl').stop(reason);
+      assert.equal(release.completionCommitted, false, 'a real release transaction leaves the pending record');
+      assert.equal(store.read().intent.policy, 'released');
+      const originalOperation = store.read().intent.release.operationId;
+      await first.ctx.dispose();
+      failRestore = false;
+      second = mount();
+      if (changedAuthor) await second.entry.update({ config: { searchProvider: 'new-author', fetchProvider: 'new-fetch' } });
+      second.start();
+      await second.settle();
+      const record = store.read();
+      if (reason === 'settings-ui-explicit-stop') {
+        assert.equal(record.intent.policy, 'released', 'an explicit stop is not undone by mounting the same bundle');
+        assert.equal(record.intent.release.operationId, originalOperation);
+        assert.equal(record.intent.releaseCompletion?.routeVerified, changedAuthor ? undefined : true);
+        assert.equal(second.coordinator().report().coreReady, false);
+        assert.equal(second.ctx.get('grokSearchBootstrap').controlSnapshot().phase, changedAuthor ? 'incomplete' : 'released');
+      } else {
+        assert.equal(second.coordinator().report().coreReady, true, 'native re-enable resumes after verified recovery');
+        assert.equal(second.service('grokSearchControl').publicSnapshot().phase, 'required');
+        assert.equal(record.intent.policy, 'required');
+        assert.equal(record.intent.priorIntent.release.operationId, originalOperation);
+        assert.equal(record.intent.priorIntent.releaseCompletion?.routeVerified, changedAuthor ? undefined : true);
+        if (changedAuthor) {
+          assert.equal(record.intent.acquisition.authorSearchProvider, 'new-author');
+          assert.equal(record.intent.acquisition.authorFetchProvider, 'new-fetch');
+          await second.service('grokSearchControl').stop('settings-ui-explicit-stop');
+          assert.equal(second.web.searchProviderId, 'new-author');
+          assert.equal(second.web.fetchProviderId, 'new-fetch');
+        }
+      }
+    } finally {
+      failRestore = false;
+      await first.ctx.dispose();
+      await second?.ctx.dispose();
+    }
+  });
+}
+
+test('a generated failed native release can be retried from the root before a control service exists', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-root-recovery-'));
+  writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+  const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+    trustedRoot: directory, governance: true, autoMaintain: false });
+  const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }), overrides: {
+    control: { name: 'control', apply: applyControl },
+    recovery: { name: 'recovery', apply: applyRecovery },
+    routeVerifier: { name: 'verifier', apply: applyRouteVerifier },
+    core: { name: 'core', apply(child) {
+      child.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+    } },
+  } });
+  f.ctx.profileContext.dir = directory;
+  let rejectRestore = true;
+  f.entry.update = async ({ config }) => {
+    if (rejectRestore && config.searchProvider !== 'grok-search') throw new ControlRecordError('CONTROL_ROUTE_UPDATE_FAILED');
+    f.entry.options.config = structuredClone(config);
+    f.webFiber.config = structuredClone(config);
+    f.webFiber.rawConfig = f.webFiber.config;
+    f.webFiber.effectiveConfig = f.webFiber.resolveConfig(config);
+    f.web.config = f.webFiber.effectiveConfig;
+    f.web.searchProviderId = selectedId(f.webFiber.effectiveConfig.searchProvider);
+    f.web.fetchProviderId = selectedId(f.webFiber.effectiveConfig.fetchProvider);
+  };
+  let replacement;
+  try {
+    f.start();
+    await f.settle();
+    const outcome = await f.service('grokSearchControl').stop('native-bundle-disable');
+    assert.equal(outcome.completionCommitted, false);
+    await f.ctx.dispose();
+    replacement = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }), overrides: {
+      core: { name: 'core', apply(child) {
+        child.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+      } },
+      control: { name: 'control', apply: applyControl },
+      recovery: { name: 'recovery', apply: applyRecovery },
+      routeVerifier: { name: 'verifier', apply: applyRouteVerifier },
+    } });
+    replacement.ctx.profileContext.dir = directory;
+    replacement.entry.update = f.entry.update;
+    replacement.web.searchProviderId = 'external-provider';
+    replacement.webFiber.effectiveConfig.searchProvider = { get: () => 'external-provider' };
+    replacement.start();
+    await replacement.settle();
+    const root = replacement.ctx.get('grokSearchBootstrap');
+    assert.equal(root.controlSnapshot().phase, 'incomplete');
+    assert.equal(replacement.ctx.get('grokSearchControl'), undefined);
+    const revision = store.read().revision;
+    replacement.web.searchProviderId = 'author';
+    replacement.webFiber.effectiveConfig.searchProvider = { get: () => 'author' };
+    rejectRestore = false;
+    replacement.entry.update = async ({ config }) => {
+      replacement.entry.options.config = structuredClone(config);
+      replacement.webFiber.config = structuredClone(config);
+      replacement.webFiber.rawConfig = replacement.webFiber.config;
+      replacement.webFiber.effectiveConfig = replacement.webFiber.resolveConfig(config);
+      replacement.web.config = replacement.webFiber.effectiveConfig;
+      replacement.web.searchProviderId = selectedId(replacement.webFiber.effectiveConfig.searchProvider);
+      replacement.web.fetchProviderId = selectedId(replacement.webFiber.effectiveConfig.fetchProvider);
+    };
+    await Promise.all([root.retryControlRelease(), root.retryControlRelease()]);
+    await replacement.settle();
+    assert.equal(root.controlSnapshot().phase, 'required');
+    assert.equal(replacement.coordinator().report().coreReady, true);
+    assert.equal(store.read().revision, revision + 2, 'one recovery completion and one new acquisition, no duplicate writes');
+  } finally { await f.ctx.dispose(); await replacement?.ctx.dispose(); }
+});
+
+for (const service of ['grokSearchCore', 'grokSearchProgram', 'grokSearchControl']) {
+  test(`losing ${service} cannot leave a stale ready runtime and root retry recovers`, async () => {
+    const f = bootstrapFixture();
+    try {
+      f.start();
+      await f.settle();
+      const root = f.ctx.get('grokSearchBootstrap');
+      assert.equal(f.coordinator().report().coreReady, true);
+      f.services.delete(service);
+      assert.equal(f.coordinator().report().coreReady, false);
+      const state = root.controlSnapshot();
+      assert.notEqual(state.phase, 'required');
+      let officialCalls = 0;
+      assert.throws(() => f.ctx.waterfall('tools/execute', { name: 'web_search' }, () => { officialCalls++; }));
+      await root.retryControlRelease();
+      await f.settle();
+      assert.equal(f.coordinator().report().coreReady, true);
+      assert.equal(officialCalls, 0);
+    } finally { await f.ctx.dispose(); }
+  });
+}
+
+test('ordinary startup and confirmed external pauses use honest root snapshots without implicit activation', async () => {
+  const waiting = deferred();
+  const f = bootstrapFixture({ overrides: { core: () => waiting.promise } });
+  try {
+    f.start();
+    await turn();
+    const current = f.ctx.get('grokSearchBootstrap').controlSnapshot();
+    assert.equal(current.phase, 'starting');
+    assert.equal(current.error, null);
+  } finally {
+    const bootstrap = f.ctx.get('grokSearchBootstrap');
+    waiting.resolve({ name: 'core', apply(child) { child.provide('grokSearchCore', { dispose: async () => {} }); } });
+    await f.ctx.dispose();
+    await bootstrap.settled();
+  }
+  for (const policy of ['required', 'released']) {
+    const stopped = bootstrapFixture({ initialRecord: { intent: {
+      policy, reason: 'external-user-pause', pause: { confirmed: true }, release: null,
+      ...(policy === 'released' ? { recovery: { routeVerified: true } } : {}),
+    } } });
+    try {
+      stopped.start();
+      await stopped.settle();
+      const root = stopped.ctx.get('grokSearchBootstrap');
+      await root.retryControlRelease();
+      assert.equal(stopped.calls.includes('core'), false);
+      assert.equal(stopped.coordinator().report().coreReady, false);
+      assert.equal(root.controlSnapshot().phase, policy === 'released' ? 'released' : 'stopped');
+    } finally { await stopped.ctx.dispose(); }
+  }
+});
+
+test('a control owner claiming required cannot hide a failed root route validation', async () => {
+  const f = bootstrapFixture({ overrides: { control: { name: 'control', apply(child) {
+    child.provide('grokSearchControl', { publicSnapshot: () => ({
+      available: true, phase: 'required', policy: 'required', revision: 0, releaseOperationId: null,
+      completionCommitted: false, routeVerified: false, routeChanged: false, canStop: true, error: null,
+    }) });
+  } } } });
+  try {
+    f.start();
+    await f.settle();
+    assert.equal(f.coordinator().report().code, 'COMPATIBILITY_ROUTE_UNCONFIRMED');
+    const snapshot = f.ctx.get('grokSearchBootstrap').controlSnapshot();
+    assert.equal(snapshot.phase, 'incomplete');
+    assert.equal(snapshot.error.code, 'COMPATIBILITY_ROUTE_UNCONFIRMED');
+    assert.equal(snapshot.canStop, false);
+  } finally { await f.ctx.dispose(); }
+});
+
+test('a runtime restart waits for every failed resource exit and retires stale cleanup promises', async () => {
+  for (const firstExit of ['core', 'program']) {
+    const exits = { core: deferred(), program: deferred() };
+    const mounts = { core: 0, program: 0 }, disposals = { core: 0, program: 0 };
+    const resource = key => ({ name: key, apply(child) {
+      const first = ++mounts[key] === 1;
+      child.provide('grokSearch' + key[0].toUpperCase() + key.slice(1), {
+        dispose() {
+          disposals[key]++;
+          if (!first) return Promise.resolve();
+          const error = Object.assign(new Error('The owned resource has not exited.'), { code: 'GROK_PROCESS_REAP_FAILED' });
+          Object.defineProperty(error, 'whenExited', { value: exits[key].promise });
+          return Promise.reject(error);
+        },
+      });
+    } });
+    const f = bootstrapFixture({ overrides: { core: resource('core'), program: resource('program') } });
+    try {
+      f.start();
+      await f.settle();
+      f.coordinator().block('COMPATIBILITY_CORE_UNAVAILABLE');
+      await f.settle();
+      let proof;
+      await assert.rejects(f.coordinator().start(), error => {
+        proof = error.whenExited;
+        return error.code === 'GROK_PROCESS_REAP_FAILED' && typeof proof?.then === 'function';
+      });
+      let allExited = false;
+      proof.then(() => { allExited = true; });
+      exits[firstExit].resolve();
+      await turn();
+      assert.equal(allExited, false);
+      await assert.rejects(f.coordinator().start(), { code: 'GROK_PROCESS_REAP_FAILED' });
+      assert.deepEqual(mounts, { core: 1, program: 1 });
+      exits[firstExit === 'core' ? 'program' : 'core'].resolve();
+      await proof;
+      await turn();
+      await f.coordinator().start();
+      await f.settle();
+      assert.equal(f.coordinator().report().coreReady, true);
+      assert.deepEqual(mounts, { core: 2, program: 2 });
+      assert.deepEqual(disposals, { core: 1, program: 1 }, 'already exited resources are not disposed again');
+    } finally {
+      exits.core.resolve(); exits.program.resolve();
+      await turn();
+      await f.ctx.dispose();
+    }
+  }
+});
+
+test('a new enabled root waits for profile cleanup even without a release record', async () => {
+  for (const cancelled of [false, true]) {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-cleanup-before-record-'));
+    const store = { directory: join(directory, 'control-intent.records'), read: () => null, startMaintenance() {} };
+    const closing = deferred();
+    holdProductRelease(store, {}, closing.promise, { whenDrained: closing.promise });
+    const f = bootstrapFixture({ storeFactory: () => store });
+    f.ctx.profileContext.dir = directory;
+    let bootstrap;
+    try {
+      f.start();
+      bootstrap = f.ctx.get('grokSearchBootstrap');
+      await f.settle();
+      assert.equal(f.calls.includes('program'), false);
+      assert.equal(f.calls.includes('core'), false);
+      assert.equal(f.coordinator().report().coreReady, false);
+      if (cancelled) await f.ctx.dispose();
+      closing.resolve();
+      await bootstrap.settled();
+      if (cancelled) assert.equal(f.calls.includes('core'), false);
+      else {
+        assert.equal(f.coordinator().report().coreReady, true);
+        assert.equal(f.calls.filter(call => call === 'core').length, 1);
+      }
+    } finally { closing.resolve(); await f.ctx.dispose(); }
+  }
+});
+
+test('settlement of an old release automatically resumes only the still-active native reinstallation', async () => {
+  for (const change of ['none', 'pause', 'dispose']) {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-bootstrap-release-notify-'));
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['dsh-grok-search'] } } }));
+    const store = createControlIntentStore({ directory: join(directory, 'control-intent.records'),
+      trustedRoot: directory, governance: true, autoMaintain: false });
+    let componentDisabled = false;
+    const overrides = {
+      appBoot: { getDshRuntimeVersion: () => '0.2.2-rc.5',
+        readProfilePatches: () => [], composeEntries: () => [{ id: 'grok-search', disabled: componentDisabled }] },
+      control: { name: 'control', apply: applyControl },
+      recovery: { name: 'recovery', apply: applyRecovery },
+      routeVerifier: { name: 'verifier', apply: applyRouteVerifier },
+      core: { name: 'core', apply(child) {
+        child.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+      } },
+    };
+    const mount = () => {
+      const f = bootstrapFixture({ storeFactory: () => ({ ...store, startMaintenance() {} }), overrides });
+      f.ctx.profileContext.dir = directory;
+      f.entry.update = async ({ config }) => {
+        f.entry.options.config = structuredClone(config);
+        f.webFiber.config = structuredClone(config);
+        f.webFiber.rawConfig = f.webFiber.config;
+        f.webFiber.effectiveConfig = f.webFiber.resolveConfig(config);
+        f.web.config = f.webFiber.effectiveConfig;
+        f.web.searchProviderId = selectedId(f.webFiber.effectiveConfig.searchProvider);
+        f.web.fetchProviderId = selectedId(f.webFiber.effectiveConfig.fetchProvider);
+      };
+      return f;
+    };
+    const first = mount(), held = deferred();
+    let replacement;
+    try {
+      first.start();
+      await first.settle();
+      first.entry.update = async () => { throw new ControlRecordError('CONTROL_ROUTE_UPDATE_FAILED'); };
+      const release = await first.service('grokSearchControl').stop('native-bundle-disable');
+      assert.equal(release.completionCommitted, false);
+      const pending = store.read(), operationId = pending.intent.release.operationId;
+      await first.ctx.dispose();
+      holdProductRelease(store, operationId, held.promise);
+      replacement = mount();
+      replacement.start();
+      await replacement.settle();
+      assert.equal(replacement.ctx.get('grokSearchRecovery').snapshot().phase, 'owner-present');
+      assert.equal(replacement.ctx.get('grokSearchControl'), undefined);
+      if (change === 'pause') {
+        componentDisabled = true;
+        replacement.ctx.fiber.entry.options.disabled = true;
+      }
+      if (change === 'dispose') await replacement.ctx.dispose();
+      held.resolve();
+      await held.promise;
+      for (let pass = 0; pass < 10; pass++) {
+        await turn();
+        if (change !== 'dispose') await replacement.settle();
+        if (replacement.ctx.get('grokSearchControl')) break;
+      }
+      if (change === 'none') {
+        assert.equal(replacement.coordinator().report().coreReady, true);
+        assert.equal(replacement.ctx.get('grokSearchControl').publicSnapshot().phase, 'required');
+        assert.equal(store.read().intent.priorIntent.releaseCompletion.releaseOperationId, operationId);
+      } else {
+        assert.equal(replacement.ctx.get('grokSearchControl'), undefined, change);
+        assert.equal(store.read().intent.policy, 'released', change);
+        if (change === 'dispose') assert.deepEqual(store.read(), pending);
+        else assert.equal(replacement.coordinator().report().coreReady, false);
+      }
+    } finally {
+      held.resolve();
+      await first.ctx.dispose();
+      await replacement?.ctx.dispose();
+    }
   }
 });

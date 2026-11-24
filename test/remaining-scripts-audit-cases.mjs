@@ -381,7 +381,7 @@ test('RC5 upgrade rejects an unverified old package before any fixture preparati
   const body = section(source('verify-rc5-user-path.mjs'), 'const packageReceipt =', 'const run =');
   const verify = upgradeFrom => runInNewContext(body, {
     assert, join, dirname, readUpgradePackage, upgradeFrom, tarball: 'synthetic-candidate.tgz',
-    project: 'fixture-project', registryInstall: false, sha256: () => 'b'.repeat(64),
+    project: 'fixture-project', registryInstall: false, baselineReplay: false, sha256: () => 'b'.repeat(64),
     readFileSync: () => JSON.stringify({ sha256: 'b'.repeat(64), version: '0.4.0', sourceHashes: [] }),
   });
   assert.doesNotThrow(() => verify(null), 'Fresh-install preflight must not read an old package.');

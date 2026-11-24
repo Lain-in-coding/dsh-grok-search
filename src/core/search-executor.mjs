@@ -53,6 +53,7 @@ export function createSearchExecutor({ snapshot, runQuery = runMcpSearch, budget
       lastDiagnostic = error?.diagnostic ?? null;
       if (error?.code === 'GROK_PROCESS_REAP_FAILED') {
         holdSlot = true;
+        record.whenExited = error.whenExited;
         faulted.set(record.id, record);
         rejectQueued(reapError());
         if (error.whenExited && typeof error.whenExited.then === 'function') {
@@ -111,7 +112,15 @@ export function createSearchExecutor({ snapshot, runQuery = runMcpSearch, budget
       rejectQueued(reason);
       for (const record of active.values()) record.controller.abort(reason);
       disposeTask = Promise.allSettled([...active.values()].map(record => record.task)).then(() => {
-        if (faulted.size) throw reapError();
+        if (faulted.size) {
+          const error = reapError(), exits = [...faulted.values()].map(record => record.whenExited);
+          if (exits.every(exit => typeof exit?.then === 'function')) {
+            const whenExited = Promise.all(exits);
+            whenExited.catch(() => {});
+            Object.defineProperty(error, 'whenExited', { value: whenExited });
+          }
+          throw error;
+        }
       });
       return disposeTask;
     },

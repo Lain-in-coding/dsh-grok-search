@@ -236,6 +236,7 @@ test('recheck allows the backend deadline and a timeout is followed by a report 
   await settle();
   assert.ok([...h.schedules.values()].some(timer => timer.ms === 20000));
   h.tick(20000);
+  assert.match(h.get('[data-compatibility-text]').textContent, /重新检查未确认/);
   current = report();
   h.tick(5000);
   await settle();
@@ -244,6 +245,69 @@ test('recheck allows the backend deadline and a timeout is followed by a report 
   await settle();
   assert.equal(h.root.dataset.compatibilityPhase, 'normal', 'late recheck cannot restore stale failure');
   h.view.dispose();
+});
+
+test('manual recheck failures give safe actionable feedback without replacing backend compatibility', async () => {
+  for (const [code, expected] of [
+    ['SETTINGS_SECURE_CONNECTION_REQUIRED', /本机直连或 HTTPS/],
+    ['SETTINGS_AUTH_REQUIRED', /身份验证/],
+    ['COMPATIBILITY_UNAVAILABLE', /重新打开插件详情页/],
+    ['private-secret-value', /稍后重试/],
+  ]) {
+    let fail = true;
+    const h = harness({ compatibilityReport: async () => blocked(), recheckCompatibility: async () => {
+      if (fail) throw Object.assign(new Error('private-path-and-token'), { code, details: { token: 'private-token' } });
+      return report();
+    } });
+    await settle();
+    const title = h.get('[data-compatibility-title]').textContent;
+    await h.view.recheck();
+    assert.equal(h.root.dataset.compatibilityPhase, 'blocked');
+    assert.equal(h.get('[data-compatibility-title]').textContent, title);
+    const text = h.get('[data-compatibility-text]').textContent;
+    assert.match(text, /重新检查未完成/);
+    assert.match(text, expected);
+    assert.doesNotMatch(text, /private-path|private-token|private-secret-value/);
+    assert.equal(h.get('[data-compatibility-recheck]').disabled, false);
+    await h.view.refresh();
+    assert.equal(h.get('[data-compatibility-text]').textContent, text, 'An unchanged poll must not immediately erase the operation feedback.');
+    fail = false;
+    await h.view.recheck();
+    assert.equal(h.get('.compatibility-banner').hidden, true);
+    assert.doesNotMatch(h.get('[data-compatibility-text]').textContent, /重新检查未完成/);
+    h.view.dispose();
+  }
+});
+
+test('a missing recheck method is explained without inventing a backend block', async () => {
+  const remote = { compatibilityReport: async () => report() };
+  const h = harness(remote);
+  await settle();
+  await h.view.recheck();
+  assert.equal(h.root.dataset.compatibilityPhase, 'normal');
+  assert.equal(h.get('.compatibility-banner').hidden, false);
+  assert.match(h.get('[data-compatibility-text]').textContent, /重新检查未完成.*重新打开插件详情页/);
+  assert.equal(h.get('[data-compatibility-recheck]').hidden, true);
+  h.view.dispose();
+});
+
+test('late recheck errors cannot add feedback after disposal, rebinding or a newer successful report', async () => {
+  for (const change of ['dispose', 'bind', 'timeout']) {
+    let reject;
+    const h = harness({ compatibilityReport: async () => blocked(),
+      recheckCompatibility: () => new Promise((resolve, fail) => { reject = fail; }) });
+    await settle();
+    const pending = h.view.recheck();
+    await settle();
+    if (change === 'dispose') h.view.dispose();
+    else if (change === 'bind') { h.view.bind({ compatibilityReport: async () => report() }); await settle(); }
+    else { h.tick(20000); await h.view.refresh(); }
+    const before = h.get('[data-compatibility-text]').textContent;
+    reject(Object.assign(new Error('late private details'), { code: 'SETTINGS_AUTH_REQUIRED' }));
+    await pending;
+    assert.equal(h.get('[data-compatibility-text]').textContent, before, change);
+    h.view.dispose();
+  }
 });
 
 test('automatic polling does not accumulate unresolved transport calls', async () => {

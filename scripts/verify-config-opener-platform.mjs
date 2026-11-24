@@ -13,7 +13,10 @@ assert.ok(process.argv[2]?.endsWith('.tgz'), 'Pass the frozen .tgz');
 const receipt = JSON.parse(readFileSync(join(dirname(tarball), 'package-receipt.json'), 'utf8'));
 const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
 assert.equal(hash(tarball), receipt.sha256);
-const directory = join(project, 'artifacts/config-opener-platform', new Date().toISOString().replaceAll(':', '-') + '-' + process.pid);
+const artifactRoot = process.env.DSH_VALIDATION_ARTIFACT_ROOT ?? join(project, 'artifacts');
+assert.ok(artifactRoot && !artifactRoot.includes('\0') && resolve(artifactRoot) === join(artifactRoot, '.'),
+  'DSH_VALIDATION_ARTIFACT_ROOT must be an absolute path.');
+const directory = join(artifactRoot, 'config-opener-platform', new Date().toISOString().replaceAll(':', '-') + '-' + process.pid);
 mkdirSync(directory, { recursive: true });
 const result = { platform: platform(), osRelease: release(), packageSha256: receipt.sha256, passed: false,
   syntheticConfigOnly: true, published: false };

@@ -1,7 +1,7 @@
 import { isAbsolute } from 'node:path';
 import { statSync } from 'node:fs';
 import { createSearchExecutor } from './core/search-executor.mjs';
-import { GrokSearchError } from './core/errors.mjs';
+import { GrokSearchError, cleanupFailure } from './core/errors.mjs';
 import { createManagedMcpSearch } from './core/mcp-search.mjs';
 import { SEARCH_EXECUTION } from './core/search-config.mjs';
 
@@ -44,7 +44,8 @@ export function createGrokProvider({ configuration, sdkFactory, runQuery, execut
     snapshot: () => ({ ...executor.snapshot(), executableReady: executableReady(), session: session?.snapshot() ?? null }),
     async dispose() {
       const outcomes = await Promise.allSettled([executor.dispose(), session?.dispose()]);
-      for (const result of outcomes) if (result.status === 'rejected') throw result.reason;
+      const failure = cleanupFailure(outcomes);
+      if (failure) throw failure;
     },
   };
 }

@@ -1415,6 +1415,39 @@ test('the same settings instance sees runtime services appearing and disappearin
   assert.equal(searches, 1);
 }));
 
+test('the root runtime snapshot overrides a surviving control service after another required service exits', async () => withIsolatedHome(async () => {
+  const { gateway, services } = viewGateway({ core: null, withProgram: false });
+  const initial = (await gateway.snapshot()).control;
+  const stale = { ...initial, available: true, phase: 'required', policy: 'required', canStop: true, error: null };
+  const current = { ...stale, phase: 'incomplete', canStop: false,
+    error: { code: 'COMPATIBILITY_CORE_UNAVAILABLE', message: 'A required search service exited.' } };
+  services.set('grokSearchControl', { publicSnapshot: () => stale });
+  services.set('grokSearchBootstrap', { controlSnapshot: () => current });
+  const snapshot = await gateway.snapshot();
+  assert.deepEqual(snapshot.control, current);
+  assert.deepEqual(snapshotCodec().parse(snapshot), snapshot);
+}));
+
+test('settings retry reaches the root while control is absent and keeps the legacy result codec', async () => withIsolatedHome(async () => {
+  const { gateway, services } = viewGateway({ core: null, withProgram: false });
+  const initial = (await gateway.snapshot()).control;
+  let current = { ...initial, available: true, phase: 'incomplete',
+    error: { code: 'CONTROL_RELEASE_PENDING', message: 'A previous release is incomplete.' } };
+  let retries = 0;
+  services.set('grokSearchBootstrap', {
+    controlSnapshot: () => current,
+    async retryControlRelease() {
+      retries++;
+      current = { ...current, phase: 'required', policy: 'required', error: null, canStop: true };
+    },
+  });
+  assert.equal((await gateway.snapshot()).control.error.code, 'CONTROL_RELEASE_PENDING');
+  const result = await gateway.retryControlRelease();
+  assert.equal(retries, 1);
+  assert.deepEqual(result.control, current);
+  assert.deepEqual(SETTINGS_DESCRIPTORS.find(row => row.method === 'retryControlRelease').result.create().parse(result), result);
+}));
+
 test('snapshot carries the last route and plugin facts through the strict codec', async () => withIsolatedHome(async home => {
   const route = { at: 1, origin: 'search', outcome: 'ok', served: 'tavily', grokCode: 'grok_auth_error',
     fallbackUsed: true, failures: [{ provider: 'exa', code: 'HTTP_401' }],

@@ -4,16 +4,18 @@ import { completeDeferredStartup, completeReleaseRecovery } from './core/startup
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE,
   PRODUCT_HOST_ID, createProductStore, createRecoveryObservation, readSelection, restoreAuthorRoute, routeReceipt,
+  productRuntimeCleanupInFlight, onProductRuntimeCleanupIdle,
 } from './core/product-control.mjs';
 
 export const name = 'dsh-grok-search-recovery';
 export const inject = ['loader', 'profileContext'];
 
-export function apply(ctx, { store: suppliedStore = null } = {}) {
+export function apply(ctx, { store: suppliedStore = null, onSettled = null } = {}) {
   const store = suppliedStore ?? createProductStore(ctx);
   const loadId = randomUUID();
   let disposed = false;
   let task = null;
+  let releaseUnsubscribe = null, waitingOperationId = null, rerun = false, queued = null;
   const lifetime = new AbortController();
   const state = {
     phase: 'idle',
@@ -30,15 +32,36 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
     state.recordEnvelope = envelope;
     return envelope;
   };
-  const readCurrent = ({ observation, routeChanged, counterBaseline }) => ({
-    observation: createRecoveryObservation(ctx, loadId),
-    receipt: routeReceipt(ctx, {
-      authorSearchProvider: observation.authorSearchProvider,
-      authorFetchProvider: observation.authorFetchProvider,
-      expectedInjectSha256: observation.authorInjectSha256,
-      routeChanged, counterBaseline,
-    }),
-  });
+  const assertCleanupIdle = () => {
+    if (productRuntimeCleanupInFlight(store)) throw new ControlRecordError('CONTROL_RUNTIME_CLEANUP_PENDING',
+      'The previous runtime has not completed cleanup.', { retriable: true });
+  };
+  const readCurrent = ({ observation, routeChanged, counterBaseline }) => {
+    assertCleanupIdle();
+    return {
+      observation: createRecoveryObservation(ctx, loadId),
+      receipt: routeReceipt(ctx, {
+        authorSearchProvider: observation.authorSearchProvider,
+        authorFetchProvider: observation.authorFetchProvider,
+        expectedInjectSha256: observation.authorInjectSha256,
+        routeChanged, counterBaseline,
+      }),
+    };
+  };
+  const forgetRelease = () => {
+    releaseUnsubscribe?.();
+    releaseUnsubscribe = null;
+    waitingOperationId = null;
+  };
+  const scheduleRecovery = () => {
+    if (disposed) return;
+    if (task) { rerun = true; return; }
+    if (queued) return;
+    queued = setImmediate(() => {
+      queued = null;
+      if (!disposed) void run('release-idle').catch(error => ctx.logger?.error?.(error));
+    });
+  };
   const run = reason => {
     if (task) return task;
     state.phase = 'checking';
@@ -48,8 +71,11 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
         return snapshot();
       }
       const before = setRecord(store.read());
+      const operationId = before?.intent.release?.operationId;
+      if (waitingOperationId !== operationId) forgetRelease();
       if (!before) {
         state.phase = 'no-record';
+        state.error = null;
         return snapshot();
       }
       const incompleteRelease = before.intent.policy === 'released'
@@ -58,6 +84,7 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
       if (before.intent.policy === 'released' && !incompleteRelease
         && before.intent.release?.explicit !== true) {
         state.phase = 'already-released';
+        state.error = null;
         return snapshot();
       }
       const verifier = ctx.get('grokSearchRouteVerifier');
@@ -70,21 +97,24 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
         state.outcome = { kind: 'incomplete', recordCommitted: false, routeChanged: false };
         return snapshot();
       }
-      // Release ownership follows the process identity, not the momentary service
-      // registration: restoring the web route restarts the control fiber, so the owner
-      // service can be briefly absent while its release task is still in flight. A
-      // release intent committed by this process is always left to that task; only a
-      // release left behind by a previous process is finished here (D-28).
-      if (incompleteRelease && before.intent.release?.hostId === PRODUCT_HOST_ID) {
+      // A service can disappear during teardown while its release is still running.
+      // Process identity alone cannot distinguish that from a finished, failed owner.
+      if (incompleteRelease && productRuntimeCleanupInFlight(store)) {
+        if (!releaseUnsubscribe) {
+          waitingOperationId = operationId;
+          releaseUnsubscribe = onProductRuntimeCleanupIdle(store, scheduleRecovery);
+        }
         state.phase = 'owner-present';
+        state.error = null;
         state.outcome = { kind: 'owner-present', recordCommitted: false, routeChanged: false };
         return snapshot();
       }
+      forgetRelease();
       if (incompleteRelease) {
         const outcome = await completeReleaseRecovery({
           store,
           observe: async () => createRecoveryObservation(ctx, loadId),
-          restoreRoute: ({ priorIntent }) => restoreAuthorRoute(ctx, priorIntent),
+          restoreRoute: ({ priorIntent }) => { assertCleanupIdle(); return restoreAuthorRoute(ctx, priorIntent); },
           verifyRoute,
           readCurrent,
           operationId: randomUUID(),
@@ -104,10 +134,12 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
       // control entry and the recovery entry never corrects or releases it (D-28 Q1).
       if (readSelection(ctx).bundles.includes(PRODUCT_SEARCH_BUNDLE)) {
         state.phase = 'still-selected';
+        state.error = null;
         return snapshot();
       }
       if (before.intent.lease?.hostId === PRODUCT_HOST_ID && ctx.get('grokSearchControl')) {
         state.phase = 'same-host';
+        state.error = null;
         state.outcome = { kind: 'same-host', recordCommitted: false, routeChanged: false };
         return snapshot();
       }
@@ -132,9 +164,19 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
       state.error = { code: error.code ?? null, message: error.message };
       state.outcome = error.recoveryOutcome ?? { kind: 'incomplete', recordCommitted: false,
         routeVerified: false, routeChanged: false };
+      if (error.code === 'CONTROL_RUNTIME_CLEANUP_PENDING' && !releaseUnsubscribe) {
+        releaseUnsubscribe = onProductRuntimeCleanupIdle(store, scheduleRecovery);
+      }
       if (error.code === 'CONTROL_ROUTE_COUNTER_REQUIRED') return snapshot();
       throw error;
-    }).finally(() => { task = null; });
+    }).finally(() => {
+      task = null;
+      if (!disposed) {
+        try { Promise.resolve(onSettled?.(snapshot())).catch(error => ctx.logger?.error?.(error)); }
+        catch (error) { ctx.logger?.error?.(error); }
+        if (rerun) { rerun = false; scheduleRecovery(); }
+      }
+    });
     return task;
   };
   const background = reason => { if (!disposed) void run(reason).catch(error => ctx.logger?.error?.(error)); };
@@ -154,6 +196,9 @@ export function apply(ctx, { store: suppliedStore = null } = {}) {
   ctx.inject(['web', 'grokSearchControl'], () => background('legal-web-activation'));
   ctx.effect(() => () => {
     disposed = true;
+    forgetRelease();
+    clearImmediate(queued);
+    queued = null;
     lifetime.abort(new ControlRecordError('CONTROL_RECOVERY_CANCELLED', 'The recovery owner was disposed.'));
     state.phase = 'disposed';
   });

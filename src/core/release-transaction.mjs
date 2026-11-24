@@ -69,6 +69,7 @@ export function createReleaseBarrier({ drainTimeoutMs = 2_000 } = {}) {
   let epoch = 0;
   const operations = new Map();
   const invalidated = new Set();
+  const settledWaiters = new Set();
   const snapshot = () => ({ state, epoch, activeOperationIds: [...operations.keys()],
     invalidatedOperationIds: [...invalidated] });
   const begin = ({ operationId } = {}) => {
@@ -80,7 +81,12 @@ export function createReleaseBarrier({ drainTimeoutMs = 2_000 } = {}) {
   };
   const settle = ({ operationId } = {}) => {
     if (!UUID.test(operationId)) fail('CONTROL_RELEASE_OPERATION_INVALID', 'A UUID operation ID is required.');
-    return operations.delete(operationId);
+    const deleted = operations.delete(operationId);
+    if (!operations.size) {
+      for (const resolve of settledWaiters) resolve(snapshot());
+      settledWaiters.clear();
+    }
+    return deleted;
   };
   const assertActive = operationId => {
     if (!UUID.test(operationId) || !operations.has(operationId)) {
@@ -114,7 +120,8 @@ export function createReleaseBarrier({ drainTimeoutMs = 2_000 } = {}) {
     }
     return snapshot();
   };
-  return Object.freeze({ begin, settle, assertActive, invalidate, drain, snapshot });
+  const whenSettled = () => operations.size ? new Promise(resolve => settledWaiters.add(resolve)) : Promise.resolve(snapshot());
+  return Object.freeze({ begin, settle, assertActive, invalidate, drain, whenSettled, snapshot });
 }
 
 async function finishExplicitRelease({ store, record, owner, controller, reason, now, releaseOperationId }) {

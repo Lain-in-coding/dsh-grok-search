@@ -1,19 +1,165 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { GrokSearchError } from '../src/core/errors.mjs';
+import vm from 'node:vm';
+import { GrokSearchError, cleanupFailure } from '../src/core/errors.mjs';
 import { decodeGrokResult, mapSearchResult } from '../src/core/result-map.mjs';
 import { createSearchExecutor } from '../src/core/search-executor.mjs';
+import { createGrokProvider } from '../src/provider.mjs';
 import { apply as applySearch } from '../src/index.mjs';
 import { mkdtempTracked } from './helpers/temp-fixture.mjs';
 
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const answer = { content: '已完成', sources: [], truncated: false };
 const tick = () => new Promise(resolve => setImmediate(resolve));
+
+const rejectedCleanup = reason => ({ status: 'rejected', reason });
+const exitFailure = (code, proof) => {
+  const error = new GrokSearchError(code, 'Synthetic cleanup failure.');
+  if (proof) Object.defineProperty(error, 'whenExited', { value: proof });
+  return error;
+};
+
+// Evaluate the actual exported boundaries with synthetic resource owners.
+// This avoids adding test-only injection APIs or starting any child process.
+function cleanupBoundary(entry, failures) {
+  const calls = [];
+  const resource = index => ({ dispose: async () => { calls.push(index); throw failures[index]; } });
+  const globals = { GrokSearchError, cleanupFailure, Error };
+  if (entry === 'provider') {
+    const create = vm.runInNewContext(`(${createGrokProvider.toString()})`, {
+      ...globals, PROVIDER_ID: 'grok-search',
+      createSearchExecutor: () => resource(0), createManagedMcpSearch: () => resource(1),
+    });
+    return { calls, dispose: create({ configuration: {} }).dispose };
+  }
+  const services = new Map();
+  const apply = vm.runInNewContext(`(${applySearch.toString()})`, {
+    ...globals, createGrokProvider: () => ({ ...resource(1), provider: {}, snapshot: () => ({ executableReady: true }) }),
+    createRoutedSearch: () => resource(0), createSourceRouter: () => ({}), createReleaseBarrier: () => ({}),
+  });
+  apply({ get: key => services.get(key), provide: (key, value) => services.set(key, value),
+    effect() {}, web: { registerSearchProvider() {} } }, {}, { WebError: Error });
+  return { calls, dispose: services.get('grokSearchCore').dispose };
+}
+
+test('cleanup aggregation preserves single failure identity and hides aggregate-only diagnostics', async () => {
+  assert.equal(cleanupFailure([]), null);
+  assert.equal(cleanupFailure([{ status: 'fulfilled', value: undefined }]), null);
+  const proof = Promise.resolve();
+  const first = exitFailure('GROK_PROCESS_REAP_FAILED', proof);
+  first.details = { retriable: true, privateFixture: 'not-public' };
+  Object.defineProperty(first, 'diagnostic', { value: { exited: false } });
+  first.retriable = true;
+  Object.freeze(first);
+  assert.equal(cleanupFailure([{ status: 'fulfilled' }, rejectedCleanup(first)]), first);
+  const second = new Error('private-secondary-failure');
+  const combined = cleanupFailure([rejectedCleanup(first), rejectedCleanup(second)]);
+  assert.ok(combined instanceof GrokSearchError);
+  assert.equal(combined.code, first.code);
+  assert.equal(combined.message, first.message);
+  assert.equal(combined.name, first.name);
+  assert.equal(combined.details, first.details);
+  assert.equal(combined.diagnostic, first.diagnostic);
+  assert.equal(combined.retriable, true);
+  assert.deepEqual(combined.errors, [first, second]);
+  assert.equal(combined.cause, first);
+  assert.equal(Object.hasOwn(combined, 'whenExited'), false);
+  assert.equal(first.whenExited, proof, 'aggregation must not mutate the original error');
+  assert.doesNotMatch(JSON.stringify(combined), /details|diagnostic|private|errors|cause|whenExited/);
+  const ordinary = Object.assign(new TypeError('first ordinary failure'), { code: 'SYNTHETIC_CLEANUP' });
+  const wrapped = cleanupFailure([rejectedCleanup(ordinary), rejectedCleanup(second)]);
+  assert.equal(wrapped instanceof GrokSearchError, false);
+  assert.equal(wrapped.name, ordinary.name);
+  assert.equal(wrapped.message, ordinary.message);
+  assert.equal(wrapped.code, ordinary.code);
+  for (const reason of [undefined, null, 'private-non-error']) {
+    const unknown = cleanupFailure([rejectedCleanup(reason)]);
+    assert.ok(unknown instanceof Error);
+    assert.equal(Object.hasOwn(unknown, 'whenExited'), false);
+    assert.doesNotMatch(JSON.stringify(unknown), /private-non-error/);
+  }
+});
+
+for (const entry of ['provider', 'index']) {
+  for (const firstExit of [0, 1]) test(`${entry} disposal waits for both independent proofs (${firstExit} exits first)`, async () => {
+    const exits = [deferred(), deferred()];
+    const failures = exits.map((exit, index) => exitFailure(index ? 'GROK_PROGRAM_REAP_FAILED' : 'GROK_PROCESS_REAP_FAILED', exit.promise));
+    const boundary = cleanupBoundary(entry, failures);
+    let failure, complete = false;
+    try {
+      await assert.rejects(boundary.dispose(), error => { failure = error; return error.code === failures[0].code; });
+      assert.deepEqual(boundary.calls, [0, 1]);
+      assert.equal(typeof failure.whenExited?.then, 'function');
+      const observed = failure.whenExited.then(() => { complete = true; });
+      exits[firstExit].resolve();
+      await tick();
+      assert.equal(complete, false, 'one process exit must not release the other resource');
+      exits[1 - firstExit].resolve();
+      await observed;
+      assert.equal(complete, true);
+      assert.equal(Object.getOwnPropertyDescriptor(failure, 'whenExited').enumerable, false);
+      assert.notEqual(failure, failures[0], 'do not replace a resource proof in the original error');
+    } finally { for (const exit of exits) exit.resolve(); }
+  });
+
+  test(`${entry} disposal does not publish a partial proof when another failure has no proof`, async () => {
+    for (const missing of [0, 1]) {
+      const exit = deferred();
+      const failures = [0, 1].map(index => exitFailure(index ? 'GROK_PROGRAM_REAP_FAILED' : 'GROK_PROCESS_REAP_FAILED',
+        index === missing ? null : exit.promise));
+      const boundary = cleanupBoundary(entry, failures);
+      let failure;
+      await assert.rejects(boundary.dispose(), error => { failure = error; return error.code === failures[0].code; });
+      exit.resolve();
+      await tick();
+      assert.equal(Object.hasOwn(failure, 'whenExited'), false);
+      assert.equal(failure.errors.length, failures.length);
+      for (const [index, original] of failures.entries()) assert.equal(failure.errors[index], original);
+      assert.deepEqual(boundary.calls, [0, 1]);
+    }
+  });
+
+  test(`${entry} disposal never succeeds when an independent exit proof rejects`, async () => {
+    for (const rejected of [0, 1]) {
+      const exits = [deferred(), deferred()], denied = new Error('Synthetic exit observation failed.');
+      for (const exit of exits) exit.promise.catch(() => {});
+      const boundary = cleanupBoundary(entry, exits.map(exit => exitFailure('GROK_PROCESS_REAP_FAILED', exit.promise)));
+      let failure;
+      await assert.rejects(boundary.dispose(), error => { failure = error; return true; });
+      const outcome = failure.whenExited.then(() => ({ complete: true }), error => ({ complete: false, error }));
+      exits[1 - rejected].resolve();
+      exits[rejected].reject(denied);
+      assert.deepEqual(await outcome, { complete: false, error: denied });
+    }
+  });
+}
+
+test('nested cleanup aggregation retains all proofs and observes a rejected aggregate immediately', async () => {
+  const exits = [deferred(), deferred(), deferred()];
+  const failures = exits.map(exit => exitFailure('GROK_PROCESS_REAP_FAILED', exit.promise));
+  const inner = cleanupFailure(failures.slice(0, 2).map(rejectedCleanup));
+  const outer = cleanupFailure([rejectedCleanup(inner), rejectedCleanup(failures[2])]);
+  let completed = false;
+  const observed = outer.whenExited.then(() => { completed = true; });
+  exits[0].resolve(); exits[2].resolve();
+  await tick();
+  assert.equal(completed, false);
+  exits[1].resolve();
+  await observed;
+  assert.equal(completed, true);
+  const rejected = deferred(), denial = new Error('Synthetic observer rejection.');
+  const blocked = cleanupFailure([rejectedCleanup(exitFailure('GROK_PROCESS_REAP_FAILED', rejected.promise)),
+    rejectedCleanup(exitFailure('GROK_PROCESS_REAP_FAILED', Promise.resolve()))]);
+  rejected.reject(denial);
+  await tick();
+  await assert.rejects(blocked.whenExited, error => error === denial);
+});
 
 function registeredSearch(t, { ready = false, grokEnabled = true, sources = true, fallback = 5 } = {}) {
   const directory = mkdtempTracked(join(tmpdir(), 'dsh-search-slice-'));
@@ -284,6 +430,58 @@ test('回收失败保留故障槽位，直到实际退出才允许后续查询',
   exit.resolve(); await tick();
   assert.deepEqual(await executor.search({ query: '实际退出后' }), answer);
   await executor.dispose();
+});
+
+test('executor disposal preserves the actual exit proof after its bounded cleanup fails', async () => {
+  const exit = deferred();
+  const executor = createSearchExecutor({ snapshot: () => ({}), runQuery: async () => {
+    const error = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'The test process has not exited.');
+    Object.defineProperty(error, 'whenExited', { value: exit.promise });
+    throw error;
+  } });
+  await assert.rejects(executor.search({ query: 'synthetic pending exit' }), { code: 'GROK_PROCESS_REAP_FAILED' });
+  let exited = false, cleanupError;
+  await assert.rejects(executor.dispose(), error => {
+    cleanupError = error;
+    return error.code === 'GROK_PROCESS_REAP_FAILED' && typeof error.whenExited?.then === 'function';
+  });
+  const proof = cleanupError.whenExited.then(() => { exited = true; });
+  await tick();
+  assert.equal(exited, false);
+  assert.equal(executor.snapshot().faulted, 1);
+  exit.resolve();
+  await proof;
+  assert.equal(executor.snapshot().faulted, 0);
+  assert.equal(executor.snapshot().running, 0);
+});
+
+test('executor observes a rejected aggregate exit proof without clearing its unresolved resource', () => {
+  const script = `
+    import assert from 'node:assert/strict';
+    import { createSearchExecutor } from ${JSON.stringify(new URL('../src/core/search-executor.mjs', import.meta.url).href)};
+    import { GrokSearchError } from ${JSON.stringify(new URL('../src/core/errors.mjs', import.meta.url).href)};
+    let rejectExit;
+    const whenExited = new Promise((_, reject) => { rejectExit = reject; });
+    const executor = createSearchExecutor({ snapshot: () => ({}), runQuery: async () => {
+      const error = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'Synthetic pending exit.');
+      Object.defineProperty(error, 'whenExited', { value: whenExited });
+      throw error;
+    } });
+    await assert.rejects(executor.search({ query: 'synthetic pending exit' }), { code: 'GROK_PROCESS_REAP_FAILED' });
+    const failure = await executor.dispose().catch(error => error);
+    const denied = new Error('Synthetic exit observer rejected.');
+    rejectExit(denied);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(failure.whenExited, error => error === denied);
+    assert.equal(executor.snapshot().faulted, 1);
+    assert.equal(executor.snapshot().accepting, false);
+  `;
+  const result = spawnSync(process.execPath, ['--unhandled-rejections=strict', '--input-type=module', '-e', script], {
+    windowsHide: true, timeout: 10_000, encoding: 'utf8',
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('上游错误直接传播，不调用任何替代搜索', async () => {

@@ -198,7 +198,7 @@ class GrokSearchSettingsGateway extends Service {
           : { code: 'CONFIG_READ_FAILED', message: '配置读取失败。' },
       };
     }
-    const control = this.control?.publicSnapshot?.() ?? {
+    const control = this.ctx.get?.('grokSearchBootstrap')?.controlSnapshot?.() ?? this.control?.publicSnapshot?.() ?? {
       available: false, phase: 'unavailable', policy: null, revision: 0,
       canStop: false, completionCommitted: false, routeVerified: false,
       routeChanged: false, releaseOperationId: null,
@@ -637,16 +637,20 @@ class GrokSearchSettingsGateway extends Service {
     this._owner();
     // Older hot-loaded owners may lack the new method. Reading their snapshot
     // is safe; calling the general stop() would create an unintended stop.
-    try { await this.control?.retryRelease?.(); }
+    try {
+      const runtime = this.ctx.get?.('grokSearchBootstrap');
+      if (typeof runtime?.retryControlRelease === 'function') await runtime.retryControlRelease();
+      else await this.control?.retryRelease?.();
+    }
     catch (error) {
       // The control owner stores the original failure code in its public
       // snapshot. Do not forward its raw exception (paths/host details), and
       // do not replace it with an unhelpful generic gateway failure.
       this._owner();
-      const current = this.control?.publicSnapshot?.();
+      const current = this.ctx.get?.('grokSearchBootstrap')?.controlSnapshot?.() ?? this.control?.publicSnapshot?.();
       const code = current?.error?.code;
-      throw new GrokSearchError(typeof code === 'string' && /^CONTROL_[A-Z0-9_]{1,80}$/.test(code)
-        ? code : 'CONTROL_RETRY_FAILED', '停用尚未完成，请按错误码检查宿主状态后重试；不会重新开启接管。');
+      throw new GrokSearchError(typeof code === 'string' && /^(?:CONTROL|COMPATIBILITY)_[A-Z0-9_]{1,80}$/.test(code)
+        ? code : 'CONTROL_RETRY_FAILED', '搜索运行状态尚未恢复，请按错误码检查后重试；不会覆盖已确认的停用或暂停。');
     }
     this._owner();
     return this.snapshot();

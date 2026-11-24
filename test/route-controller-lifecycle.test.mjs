@@ -402,7 +402,7 @@ test('destination drafts cannot cross a known config path or effective identity 
       fields: { grok_api_url: { value: 'https://api.example', source: 'file' } } };
     const config = { ...structuredClone(baseline), ...changed }, requests = [];
     const context = vm.createContext({
-      S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+      S: { config }, disposed: false, accessGeneration: 0, clone: structuredClone, updateConfig() {},
       remote: { save: async request => {
         requests.push(request);
         return { config: { ...config, revision: 'saved' } };
@@ -420,7 +420,7 @@ test('an effective identity change requires explicit review even for an unrelate
     fields: { grok_model: { value: 'before', source: 'file' } } };
   const config = { ...structuredClone(baseline), quotaRevision: 'effective-b' }, requests = [];
   const context = vm.createContext({
-    S: { config }, disposed: false, clone: structuredClone, updateConfig() {},
+    S: { config }, disposed: false, accessGeneration: 0, clone: structuredClone, updateConfig() {},
     remote: { save: async request => { requests.push(request); return { config: { ...config, revision: 'saved' } }; },
       saveWithIdentity: async request => { requests.push(request); return { config: { ...config, revision: 'saved' } }; } },
   });
@@ -1058,4 +1058,604 @@ test('primary model-route help survives a diagnostic but is cleared by a newer c
   assert.equal(context.primaryHelp('grok', '404'), '');
   context.rememberPrimaryFailure({ evidence: 'primary-request', provider: 'grok', protocol: 'responses', reason: 'secret remote body' });
   assert.equal(context.primaryHelp('grok', '404'), '');
+});
+
+function controlRecoveryHarness() {
+  const calls = [], notices = [], accepted = [], nodes = new Map();
+  const state = {
+    snapshot: {
+      control: { available: true, phase: 'incomplete', policy: 'released', revision: 1, canStop: false,
+        completionCommitted: false, routeVerified: false, routeChanged: false, releaseOperationId: 'pending-release',
+        error: { code: 'CONTROL_RELEASE_PENDING', message: 'Recovery pending.' } },
+      program: { phase: 'ready' }, config: { path: '/config.toml', revision: 'before', error: null },
+      capabilities: { secretsAllowed: true },
+    },
+    preferences: { revision: 'preferences', value: {} },
+  };
+  const context = vm.createContext({
+    disposed: false, controlRetrying: false, accessGeneration: 0, stateGeneration: 0, secretEpoch: 0,
+    readTask: null, snapshotSignature: null, drag: null, logView: null, quotaView: null, D: null,
+    S: { loading: false, busy: false, testing: false, plugin: true, rpcError: null,
+      ...structuredClone(state.snapshot), prov: { grok: { enabled: true } }, lastRoute: null },
+    $: selector => {
+      if (!nodes.has(selector)) nodes.set(selector, element());
+      return nodes.get(selector);
+    },
+    esc: String, svg: () => '', reduced: () => true, pumpWires() {}, setTimeout: () => 0,
+    servingSupp: () => null, unknownFallback: () => false, grokOn: () => true, isBad: () => false,
+    enabledSupp: () => [], isSet: () => true,
+    acceptSnapshot(snapshot, preferences) {
+      accepted.push(snapshot);
+      Object.assign(context.S, snapshot, { prefs: preferences, loading: false, rpcError: null });
+      context.S.plugin = !(snapshot.control.policy === 'released' && snapshot.control.routeVerified
+        && snapshot.control.completionCommitted);
+      context.syncAll(true);
+    },
+    syncAll() { calls.push('render'); context.renderBanner(); },
+    toast(text, options) { notices.push({ text, options }); },
+    remote: {
+      async retryControlRelease() { calls.push('retryControlRelease'); return structuredClone(state.snapshot); },
+      async snapshot() { calls.push('snapshot'); return structuredClone(state.snapshot); },
+      async preferences() { calls.push('preferences'); return structuredClone(state.preferences); },
+      stop() { assert.fail('Recovery must not initiate a new stop.'); },
+      start() { assert.fail('Recovery must not implicitly start a legacy owner.'); },
+    },
+  });
+  vm.runInContext([
+    section('function denyPrivateAccess(', 'async function refresh('),
+    section('async function refresh(', 'function schedulePoll('),
+    section('function operationError(', '// An external write'),
+    section('function routeStatus()', 'const STATUS_TEXT'),
+    section('let bannerHtml =', 'function renderFoot('),
+  ].join('\n'), context);
+  return { context, state, calls, notices, accepted, banner: () => context.$('#bannerSlot') };
+}
+
+test('control recovery refreshes the current root state and deduplicates the retry action', async () => {
+  const h = controlRecoveryHarness(), oldReply = structuredClone(h.state.snapshot);
+  let complete;
+  h.context.remote.retryControlRelease = () => {
+    h.calls.push('retryControlRelease');
+    return new Promise(resolve => { complete = resolve; });
+  };
+  const retrying = h.context.retryControl();
+  assert.equal(h.context.S.busy, true);
+  assert.match(h.banner().innerHTML, /disabled aria-busy="true"/);
+  await h.context.retryControl();
+  assert.equal(h.calls.filter(call => call === 'retryControlRelease').length, 1);
+  h.state.snapshot.control = { ...oldReply.control, phase: 'required', policy: 'required', error: null };
+  complete(oldReply);
+  await retrying;
+  assert.equal(h.accepted.length, 1);
+  assert.equal(h.context.S.control.phase, 'required', 'Read the current root rather than the retry receipt.');
+  assert.equal(h.context.S.control.error, null);
+  assert.deepEqual(h.calls.filter(call => call !== 'render'), ['retryControlRelease', 'snapshot', 'preferences']);
+  assert.equal(h.context.S.busy, false);
+  assert.equal(h.context.controlRetrying, false);
+});
+
+test('failed control recovery retains the actual root error code after its state refresh', async () => {
+  const h = controlRecoveryHarness(), code = 'CONTROL_ROUTE_COUNTER_REQUIRED';
+  h.state.snapshot.control.error = { code, message: 'The host counter is unavailable.' };
+  h.context.remote.retryControlRelease = async () => {
+    h.calls.push('retryControlRelease');
+    throw Object.assign(new Error('The host counter is unavailable.'), { code });
+  };
+  await h.context.retryControl();
+  assert.equal(h.context.S.control.error.code, code);
+  assert.equal(h.context.routeStatus(), 'ctlerr');
+  assert.match(h.banner().innerHTML, new RegExp(code));
+  assert.match(h.banner().innerHTML, /搜索恢复或重新检查当前状态/);
+  assert.doesNotMatch(h.banner().innerHTML, /否则仅检查状态|重试继续未完成的停用/);
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0].text, new RegExp(code));
+  assert.equal(h.context.S.busy, false);
+  assert.equal(h.context.controlRetrying, false);
+});
+
+test('control recovery drains an earlier settings read before refreshing the recovered state', async () => {
+  const h = controlRecoveryHarness(), before = structuredClone(h.state.snapshot);
+  let complete, reads = 0;
+  h.context.remote.snapshot = () => {
+    h.calls.push('snapshot');
+    return ++reads === 1 ? new Promise(resolve => { complete = resolve; }) : Promise.resolve(structuredClone(h.state.snapshot));
+  };
+  const reading = h.context.refresh({ force: true });
+  const retrying = h.context.retryControl();
+  assert.equal(h.calls.includes('retryControlRelease'), false);
+  h.state.snapshot.control = { ...before.control, phase: 'required', policy: 'required', error: null };
+  complete(before);
+  await reading;
+  await retrying;
+  assert.equal(h.accepted.length, 2);
+  assert.equal(h.context.S.control.phase, 'required');
+  assert.deepEqual(h.calls.filter(call => call !== 'render'), [
+    'snapshot', 'preferences', 'retryControlRelease', 'snapshot', 'preferences',
+  ]);
+});
+
+test('an invalidated controller cannot dispatch recovery after an earlier read settles', async () => {
+  for (const change of ['dispose', 'access']) {
+    const h = controlRecoveryHarness();
+    let complete;
+    h.context.readTask = new Promise(resolve => { complete = resolve; });
+    const retrying = h.context.retryControl(), renders = h.calls.filter(call => call === 'render').length;
+    if (change === 'dispose') h.context.disposed = true; else h.context.accessGeneration++;
+    complete();
+    await retrying;
+    assert.equal(h.calls.includes('retryControlRelease'), false, change);
+    assert.equal(h.calls.filter(call => call === 'render').length, renders, change);
+    assert.equal(h.notices.length, 0, change);
+    assert.equal(h.context.S.busy, false, change);
+    assert.equal(h.context.controlRetrying, false, change);
+  }
+});
+
+test('late recovery success or failure cannot refresh or render a disposed or access-changed controller', async () => {
+  for (const change of ['dispose', 'access']) for (const rejected of [false, true]) {
+    const h = controlRecoveryHarness();
+    let complete;
+    h.context.remote.retryControlRelease = () => {
+      h.calls.push('retryControlRelease');
+      return new Promise((resolve, reject) => { complete = rejected ? reject : resolve; });
+    };
+    const retrying = h.context.retryControl(), renders = h.calls.filter(call => call === 'render').length;
+    if (change === 'dispose') h.context.disposed = true; else h.context.accessGeneration++;
+    complete(rejected ? Object.assign(new Error('Late owner failure.'), { code: 'CONTROL_OWNER_ABSENT' }) : h.state.snapshot);
+    await retrying;
+    assert.equal(h.calls.includes('snapshot'), false, change);
+    assert.equal(h.calls.filter(call => call === 'render').length, renders, change);
+    assert.equal(h.accepted.length, 0, change);
+    assert.equal(h.notices.length, 0, change);
+    assert.equal(h.context.S.busy, false, change);
+    assert.equal(h.context.controlRetrying, false, change);
+  }
+});
+
+test('a late recovery state read cannot publish a legacy hint or render after its access lifetime changes', async () => {
+  for (const change of ['dispose', 'access']) for (const rejected of [false, true]) {
+    const h = controlRecoveryHarness();
+    let complete;
+    h.context.remote.retryControlRelease = async () => {
+      throw Object.assign(new Error('Legacy owner is unavailable.'), { code: 'CONTROL_OWNER_ABSENT' });
+    };
+    h.context.remote.snapshot = () => new Promise((resolve, reject) => { complete = rejected ? reject : resolve; });
+    const retrying = h.context.retryControl();
+    for (let index = 0; index < 8; index++) await Promise.resolve();
+    assert.equal(typeof complete, 'function');
+    const renders = h.calls.filter(call => call === 'render').length, notices = h.notices.length;
+    if (change === 'dispose') h.context.disposed = true; else h.context.accessGeneration++;
+    complete(rejected ? Object.assign(new Error('Late read failure.'), { code: 'SETTINGS_UNAVAILABLE' }) : h.state.snapshot);
+    await retrying;
+    assert.equal(h.calls.filter(call => call === 'render').length, renders, change);
+    assert.equal(h.accepted.length, 0, change);
+    assert.equal(h.notices.length, notices, change);
+    assert.equal(h.context.S.busy, false, change);
+    assert.equal(h.context.controlRetrying, false, change);
+  }
+});
+
+test('a recovery authorization failure revokes access before any follow-up state read', async () => {
+  const h = controlRecoveryHarness();
+  h.context.remote.retryControlRelease = async () => {
+    throw Object.assign(new Error('Owner authorization was revoked.'), { code: 'SETTINGS_AUTH_REQUIRED' });
+  };
+  await h.context.retryControl();
+  assert.equal(h.context.accessGeneration, 1);
+  assert.equal(h.context.S.capabilities.secretsAllowed, false);
+  assert.equal(h.calls.includes('snapshot'), false);
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0].text, /SETTINGS_AUTH_REQUIRED/);
+  assert.equal(h.context.S.busy, false);
+  assert.equal(h.context.controlRetrying, false);
+});
+
+test('unsupported legacy recovery and missing owners offer native guidance without stop or start', async () => {
+  for (const failure of ['missing-method', 'gateway/method_not_found', 'SETTINGS_UNAVAILABLE',
+    'CONTROL_SETTINGS_UNAVAILABLE', 'CONTROL_OWNER_ABSENT', 'observed-missing-owner']) {
+    const h = controlRecoveryHarness();
+    h.state.snapshot.control = { ...h.state.snapshot.control, available: false, phase: 'unavailable',
+      error: { code: 'CONTROL_SETTINGS_UNAVAILABLE', message: 'The control owner is unavailable.' } };
+    if (failure === 'missing-method') delete h.context.remote.retryControlRelease;
+    else if (failure !== 'observed-missing-owner') h.context.remote.retryControlRelease = async () => {
+      throw Object.assign(new Error('Legacy recovery is unavailable.'), { code: failure });
+    };
+    await h.context.retryControl();
+    assert.equal(h.context.S.control.error.code, 'CONTROL_SETTINGS_UNAVAILABLE', failure);
+    assert.match(h.banner().innerHTML, /CONTROL_SETTINGS_UNAVAILABLE.*原生开关/, failure);
+    assert.ok(h.notices.some(notice => /原生开关.*宿主日志/.test(notice.text)), failure);
+    const hint = h.notices.at(-1);
+    assert.match(hint.text, /本页不会更改原生开关/, failure);
+    assert.doesNotMatch(hint.text, /重启|reboot|restart/i, failure);
+    assert.equal(h.context.S.busy, false, failure);
+    assert.equal(h.context.controlRetrying, false, failure);
+  }
+});
+
+test('starting is neutral while genuine control errors and confirmed releases keep their own states', async () => {
+  for (const row of [
+    { control: { phase: 'starting', available: true, error: null }, status: 'connecting', tone: 'info' },
+    { control: { phase: 'starting', available: false, error: null }, status: 'connecting', tone: 'info' },
+    { control: { phase: 'starting', error: { code: 'CONTROL_RELEASE_PENDING' } }, status: 'ctlerr', tone: 'err' },
+    { control: { phase: 'starting', error: { code: 'COMPATIBILITY_INITIALIZATION_PENDING' } }, status: 'ctlerr', tone: 'err' },
+    { control: { phase: 'required', available: false, error: null }, status: 'ctlerr', tone: 'err' },
+    { control: { phase: 'released', available: false, error: null, routeVerified: true, completionCommitted: true },
+      status: 'off', tone: 'info' },
+  ]) {
+    const h = controlRecoveryHarness();
+    h.state.snapshot.control = { ...h.state.snapshot.control, ...row.control };
+    await h.context.refresh({ force: true });
+    assert.equal(h.context.routeStatus(), row.status);
+    assert.match(h.banner().innerHTML, new RegExp(`data-tone="${row.tone}"`));
+    if (row.status === 'connecting') {
+      assert.match(h.banner().innerHTML, /正在启动搜索组件.*当前尚未确认搜索路由/);
+      assert.doesNotMatch(h.banner().innerHTML, /data-act="retry-control"|接管状态异常/);
+    } else if (row.status === 'ctlerr') {
+      assert.match(h.banner().innerHTML, /data-act="retry-control"/);
+      if (row.control.error) assert.match(h.banner().innerHTML, new RegExp(row.control.error.code));
+    } else assert.match(h.banner().innerHTML, /已恢复原搜索设置/);
+  }
+});
+
+function controlLifecycleStateHarness() {
+  const h = controlRecoveryHarness(), card = element();
+  card.classList.toggle = () => {};
+  Object.assign(h.context, {
+    card, META: { grok: { name: 'Grok' }, github: { name: 'GitHub' } }, HUB_FIELDS: {},
+    sourceChain: { view: () => ({ order: [] }) },
+    providersFrom: () => ({ grok: { enabled: true }, github: { enabled: false } }),
+    providerIdentity: () => 'synthetic-config',
+    isOn: id => id === 'grok', servingSupps: () => [],
+    programPhase: () => '等待程序', programSource: () => '自动检测',
+    cancelTest() { assert.fail('A lifecycle-only snapshot must not mutate preferences or restart tests.'); },
+    ingestRoute() {}, buildRows() {}, syncOpenCardBaseline() {},
+  });
+  Object.assign(h.context.S, {
+    order: [], identity: {}, checked: {}, bad: {}, providerBad: {}, hub: {},
+    configRevision: h.context.S.config.revision, configPath: h.context.S.config.path,
+  });
+  // Use production snapshot ingestion, not the retry harness's sentinel state.
+  vm.runInContext([
+    section('function acceptSnapshot(', 'let readTask ='),
+    section('const STATUS_TEXT =', 'function rowState('),
+    section('function rowState(', 'const RANK ='),
+    section('function wireDefs(', 'function portEl('),
+    section('function renderHead(', 'function programPhase('),
+    section('async function runTest(', '/* ---------- Mount-local theme'),
+  ].join('\n'), h.context);
+  h.context.syncAll = () => {
+    h.calls.push('render');
+    h.context.renderHead();
+    h.context.renderBanner();
+  };
+  return h;
+}
+
+test('starting after historical release completion stays neutral until the current runtime is ready', async () => {
+  for (const available of [true, false]) {
+    const h = controlLifecycleStateHarness();
+    h.state.snapshot.control = { ...h.state.snapshot.control, available, phase: 'starting', policy: 'released',
+      completionCommitted: true, routeVerified: true, error: null };
+    await h.context.refresh({ force: true });
+    assert.equal(h.context.S.plugin, true);
+    assert.equal(h.context.routeStatus(), 'connecting');
+    assert.equal(h.context.card.dataset.plugin, 'on');
+    assert.equal(h.context.$('#statusText').textContent, '正在启动…');
+    assert.equal(h.context.$('#nodeOfficial').getAttribute('aria-hidden'), 'true');
+    assert.match(h.banner().innerHTML, /data-tone="info".*正在启动搜索组件/);
+    assert.doesNotMatch(h.banner().innerHTML, /已恢复原搜索设置|重新启用|data-act="retry-control"|接管状态异常/);
+    assert.equal(h.context.$('#testBtn').disabled, true);
+    assert.equal(h.context.wireDefs().find(wire => wire.id === 'dsh-off').ws, 'hidden');
+    h.state.snapshot.control = { ...h.state.snapshot.control, available: true, phase: 'required', policy: 'required' };
+    await h.context.refresh({ force: true });
+    assert.equal(h.context.routeStatus(), 'live');
+    assert.equal(h.context.$('#testBtn').disabled, false);
+    assert.equal(h.calls.includes('retryControlRelease'), false);
+    assert.equal(h.notices.length, 0);
+  }
+});
+
+test('a stopped required runtime shows an honest pause without active routes, tests or resume actions', async () => {
+  for (const available of [true, false]) for (const completionCommitted of [true, false]) {
+    const h = controlLifecycleStateHarness();
+    h.state.snapshot.control = { ...h.state.snapshot.control, available, phase: 'stopped', policy: 'required',
+      completionCommitted, routeVerified: completionCommitted, error: null };
+    await h.context.refresh({ force: true });
+    assert.equal(h.context.S.plugin, true);
+    assert.equal(h.context.routeStatus(), 'paused');
+    assert.equal(h.context.$('#statusText').textContent, '搜索已暂停');
+    assert.equal(h.context.$('#nodeOfficial').getAttribute('aria-hidden'), 'true');
+    assert.match(h.banner().innerHTML, /data-tone="info".*搜索已暂停/);
+    assert.match(h.banner().innerHTML, /本页不会自动恢复接管/);
+    assert.match(h.banner().innerHTML, /原生开关与宿主日志/);
+    assert.doesNotMatch(h.banner().innerHTML, /正在确认|等待宿主|完成后自动更新|无需重启|data-act=/);
+    assert.equal(h.context.$('#testBtn').disabled, true);
+    assert.match(h.context.$('#testBtn').title, /搜索已暂停/);
+    assert.equal(h.context.rowState('grok'), 'on');
+    const wires = h.context.wireDefs();
+    assert.equal(wires.find(wire => wire.id === 'dsh-hub').ws, 'rest');
+    assert.equal(wires.find(wire => wire.id === 'dsh-off').ws, 'hidden');
+    assert.equal(wires.some(wire => wire.ws === 'live'), false);
+    await h.context.runTest();
+    assert.equal(h.context.S.testing, false);
+    assert.equal(h.calls.includes('retryControlRelease'), false);
+    assert.equal(h.notices.length, 0);
+  }
+});
+
+test('a confirmed released runtime retains the original restored-search display', async () => {
+  for (const available of [true, false]) {
+    const h = controlLifecycleStateHarness();
+    h.state.snapshot.control = { ...h.state.snapshot.control, available, phase: 'released', policy: 'released',
+      completionCommitted: true, routeVerified: true, error: null };
+    await h.context.refresh({ force: true });
+    assert.equal(h.context.S.plugin, false);
+    assert.equal(h.context.routeStatus(), 'off');
+    assert.equal(h.context.$('#statusText').textContent, '已恢复原搜索');
+    assert.equal(h.context.$('#nodeOfficial').getAttribute('aria-hidden'), 'false');
+    assert.match(h.banner().innerHTML, /data-tone="info".*已恢复原搜索设置，无需重启/);
+    assert.match(h.banner().innerHTML, /原生开关重新启用/);
+    assert.doesNotMatch(h.banner().innerHTML, /正在启动|搜索已暂停|data-act=/);
+    assert.equal(h.context.wireDefs().find(wire => wire.id === 'dsh-off').ws, 'live');
+    assert.equal(h.context.$('#testBtn').disabled, true);
+  }
+});
+
+test('actual control failures remain visible ahead of starting, paused and historical release states', async () => {
+  for (const phase of ['starting', 'stopped', 'released']) {
+    const h = controlLifecycleStateHarness(), code = 'CONTROL_ROUTE_COUNTER_REQUIRED';
+    h.state.snapshot.control = { ...h.state.snapshot.control, phase,
+      policy: phase === 'stopped' ? 'required' : 'released', completionCommitted: true, routeVerified: true,
+      error: { code, message: 'Current recovery evidence is unavailable.' } };
+    await h.context.refresh({ force: true });
+    assert.equal(h.context.routeStatus(), 'ctlerr');
+    assert.match(h.banner().innerHTML, /data-tone="err"/);
+    assert.match(h.banner().innerHTML, new RegExp(code));
+    assert.match(h.banner().innerHTML, /data-act="retry-control"/);
+    assert.doesNotMatch(h.banner().innerHTML, /正在启动搜索组件|本页不会自动恢复接管|已恢复原搜索设置/);
+    assert.equal(h.context.$('#testBtn').disabled, true);
+  }
+});
+
+function partialWriteHarness(code) {
+  const h = controlRecoveryHarness(), revoked = [], rendered = [];
+  const draft = { key: 'synthetic-edited-key', enabled: false };
+  h.context.D = { kind: 'card', id: 'grok', base: { key: 'synthetic-before', enabled: true },
+    draft, fields: {}, show: { key: true }, saving: true };
+  Object.assign(h.context, {
+    clone: structuredClone, normCard, dlg: element(), shake() {}, fid: key => key, hidden: () => false,
+    CARD_FIELDS: { grok: { key: 'grok_api_key' } }, HUB_FIELDS: {},
+    logView: { restrict(value) { revoked.push(value); } },
+    saveConfig: async () => ({ after: 'saved' }), restoreReceipt: async () => ({ config: {} }),
+    updateConfig() {}, configFields: () => ({}),
+    savePreference: async () => { throw Object.assign(new Error('Synthetic private failure details'), { code }); },
+    renderCard() { rendered.push(h.context.keyIn('key', h.context.D.draft.key, '')); },
+  });
+  vm.runInContext([
+    section('function fieldReadOnly(', 'function chip('),
+    section('function configUndo(', 'async function restoreReceipt('),
+    section('async function commitCard(', 'async function clearArm('),
+  ].join('\n'), h.context);
+  return { ...h, revoked, rendered, draft };
+}
+
+test('partial config saves retain security error classification and revoke revealed credentials immediately', async () => {
+  for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED', 'PREFERENCES_BUSY']) {
+    const h = partialWriteHarness(code), restricted = code.startsWith('SETTINGS_');
+    await h.context.commitCard(h.draft);
+    assert.equal(h.context.D.operationError.code, restricted ? code : 'SETTINGS_PARTIAL_SAVE');
+    assert.match(h.context.D.operationError.message, /共享配置已保存/);
+    assert.equal(h.context.S.capabilities.secretsAllowed, !restricted);
+    assert.equal(h.revoked.length, restricted ? 1 : 0);
+    assert.equal(h.context.D.base.key, h.draft.key, 'Retain the committed configuration as the retry baseline.');
+    assert.equal(h.context.D.base.enabled, true, 'Do not invent a successful private switch write.');
+    if (restricted) {
+      assert.equal(h.context.accessGeneration, 1);
+      assert.equal(Object.keys(h.context.D.show).length, 0);
+      assert.doesNotMatch(h.rendered.at(-1), /synthetic-edited-key|type="text"/);
+      assert.match(h.rendered.at(-1), /data-a="copy"[^>]*disabled/);
+    }
+  }
+});
+
+test('partial undo retains security error classification without hiding the completed config restore', async () => {
+  for (const code of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED', 'PREFERENCES_BUSY']) {
+    const h = partialWriteHarness(code), restricted = code.startsWith('SETTINGS_');
+    await h.context.cardUndo({ undo: true }, 'grok', true, true)();
+    assert.match(h.notices.at(-1).text, new RegExp(restricted ? code : 'SETTINGS_PARTIAL_RESTORE'));
+    assert.match(h.notices.at(-1).text, /共享配置已恢复/);
+    assert.equal(h.context.S.capabilities.secretsAllowed, !restricted);
+    assert.equal(h.revoked.length, restricted ? 1 : 0);
+    assert.equal(h.context.S.busy, false);
+    if (restricted) assert.doesNotMatch(h.rendered.at(-1), /synthetic-edited-key|type="text"/);
+  }
+});
+
+test('config conflict rereads cannot restart a write after access is revoked or reauthorized', async () => {
+  for (const reauthorized of [false, true]) {
+    const h = controlRecoveryHarness(), requests = [];
+    const config = { path: '/config.toml', revision: 'before', quotaRevision: 'same-effective',
+      fields: { grok_model: { value: 'before' } } };
+    h.context.S.config = config;
+    Object.assign(h.context, { clone: structuredClone,
+      updateConfig() { assert.fail('An obsolete save must not publish configuration.'); } });
+    let complete, entered;
+    const reading = new Promise(resolve => { entered = resolve; });
+    h.context.remote.snapshot = () => new Promise(resolve => { complete = resolve; entered(); });
+    h.context.remote.saveWithIdentity = async request => {
+      requests.push(request);
+      if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'CONFIG_CONFLICT' });
+      return { config: { ...config, revision: 'unexpected-save' } };
+    };
+    vm.runInContext(section('async function saveConfig(', 'async function savePreference('), h.context);
+    const saving = h.context.saveConfig({ grok_model: 'after' }).then(() => null, error => error);
+    await reading;
+    h.context.denyPrivateAccess({ code: 'SETTINGS_AUTH_REQUIRED' });
+    if (reauthorized) h.context.S.capabilities.secretsAllowed = true;
+    complete({ config, capabilities: { secretsAllowed: true } });
+    const error = await saving;
+    assert.equal(requests.length, 1);
+    assert.equal(error?.code, 'CONFIG_CONFLICT');
+    assert.equal(h.context.S.config, config);
+  }
+});
+
+test('preference conflict rereads cannot replace state or retry after access is revoked or reauthorized', async () => {
+  for (const reauthorized of [false, true]) {
+    const h = controlRecoveryHarness(), requests = [];
+    const before = { revision: 'before', value: { grokEnabled: true, githubReadEnabled: false } };
+    h.context.S.prefs = before;
+    let complete, entered;
+    const reading = new Promise(resolve => { entered = resolve; });
+    h.context.remote.preferences = () => new Promise(resolve => { complete = resolve; entered(); });
+    h.context.remote.savePreferences = async request => {
+      requests.push(request);
+      if (requests.length === 1) throw Object.assign(new Error('conflict'), { code: 'PREFERENCES_CONFLICT' });
+      return { revision: 'unexpected-save', value: request.value };
+    };
+    vm.runInContext(section('async function savePreference(', 'function configUndo('), h.context);
+    const saving = h.context.savePreference('grok', false).then(() => null, error => error);
+    await reading;
+    h.context.denyPrivateAccess({ code: 'SETTINGS_AUTH_REQUIRED' });
+    if (reauthorized) h.context.S.capabilities.secretsAllowed = true;
+    complete({ revision: 'new', value: before.value });
+    const error = await saving;
+    assert.equal(requests.length, 1);
+    assert.equal(error?.code, 'PREFERENCES_CONFLICT');
+    assert.equal(h.context.S.prefs, before);
+    assert.equal(h.context.S.prov.grok.enabled, true);
+  }
+});
+
+function absentProgramHarness() {
+  const h = controlRecoveryHarness();
+  let click;
+  h.context.S.program = null;
+  h.state.snapshot.program = null;
+  h.context.D = { kind: 'hub', draft: { timeout: 75 }, base: { timeout: 60 }, advOpen: false };
+  Object.assign(h.context, {
+    dlg: { addEventListener(type, callback) { if (type === 'click') click = callback; } },
+    dialogBusy: () => false, configLocation: () => ({ name: 'config.toml', full: '/config.toml', label: '/config.toml' }),
+    programPhase: () => '等待程序', programSource: () => '自动检测',
+    field: () => '', stepper: () => '', txt: () => '', note: text => text,
+    renderHub() { h.calls.push('hub-render'); h.context.$('#hubBody').innerHTML = h.context.hubBody(h.context.D.draft); },
+  });
+  h.context.remote.prepareProgram = h.context.remote.repairProgram = () => assert.fail('Missing program recovery must use the root.');
+  vm.runInContext([
+    section('function hubBody(', 'function renderHub('),
+    section('function toggleAdv(', 'async function redetect('),
+    section('async function redetect(', 'async function commitHub('),
+    section("dlg.addEventListener('click',", 'async function testGithubDraft('),
+  ].join('\n'), h.context);
+  return { ...h, click: button => click({ target: { closest: () => button } }),
+    html: () => h.context.hubBody(h.context.D.draft) };
+}
+
+test('missing program presentation is honest and offers root retry only for a current recoverable control', () => {
+  for (const phase of ['incomplete', 'starting', 'stopped', 'released', 'unavailable']) {
+    const h = absentProgramHarness();
+    h.context.S.control = { available: phase !== 'unavailable', phase, policy: phase === 'released' ? 'released' : 'required', error: null };
+    const html = h.html();
+    assert.match(html, /程序管理组件当前未加载/);
+    assert.doesNotMatch(html, /正在自动检测|data-a="redetect"/);
+    if (phase === 'incomplete') assert.match(html, /data-a="retry-control"[^>]*>.*重试恢复/);
+    else assert.doesNotMatch(html, /data-a="retry-control"/);
+  }
+  const h = absentProgramHarness();
+  delete h.context.remote.retryControlRelease;
+  assert.doesNotMatch(h.html(), /data-a="retry-control"/);
+  assert.match(h.html(), /原生开关与宿主日志/);
+  h.context.S.program = { phase: 'error', canRepair: true, error: { code: 'GROK_CACHE_DAMAGED', message: 'Synthetic damaged cache' } };
+  assert.match(h.html(), /data-a="redetect" data-repair="true"[^>]*>.*重新准备/);
+});
+
+test('the program recovery action uses one root retry and refreshes the same hub without losing its draft', async () => {
+  const h = absentProgramHarness(), mine = h.context.D, draft = mine.draft;
+  let complete;
+  h.context.remote.retryControlRelease = () => {
+    h.calls.push('retryControlRelease');
+    return new Promise(resolve => { complete = resolve; });
+  };
+  const button = element(); button.dataset.a = 'retry-control';
+  const pending = h.click(button);
+  assert.equal(h.calls.filter(call => call === 'retryControlRelease').length, 1);
+  assert.equal(button.disabled, true);
+  await h.click(button);
+  h.state.snapshot.program = { phase: 'ready', program: { version: 'synthetic-ready' } };
+  complete({});
+  await pending;
+  assert.equal(h.calls.filter(call => call === 'retryControlRelease').length, 1);
+  assert.equal(h.context.D, mine);
+  assert.equal(h.context.D.draft, draft);
+  assert.equal(h.context.D.draft.timeout, 75);
+  assert.match(h.context.$('#hubBody').innerHTML, /synthetic-ready/);
+  assert.equal(h.context.S.busy, false);
+});
+
+test('late program recovery cannot rerender a disposed, replaced or access-changed hub', async () => {
+  for (const change of ['dispose', 'dialog', 'access']) {
+    const h = absentProgramHarness();
+    let complete;
+    h.context.remote.retryControlRelease = () => new Promise(resolve => { complete = resolve; });
+    const button = element(); button.dataset.a = 'retry-control';
+    const pending = h.click(button);
+    assert.equal(typeof complete, 'function');
+    if (change === 'dispose') h.context.disposed = true;
+    else if (change === 'dialog') h.context.D = { kind: 'hub', draft: {} };
+    else h.context.accessGeneration++;
+    complete({});
+    await pending;
+    assert.equal(h.calls.includes('hub-render'), false, change);
+  }
+});
+
+test('the hub recovery action rechecks current service and pause state before dispatch', async () => {
+  for (const change of ['ready', 'paused', 'unavailable', 'missing-method']) {
+    const h = absentProgramHarness(), button = element();
+    button.dataset.a = 'retry-control';
+    if (change === 'ready') h.context.S.program = { phase: 'ready' };
+    else if (change === 'paused') h.context.S.control = { available: true, phase: 'stopped', policy: 'required' };
+    else if (change === 'unavailable') h.context.S.control.available = false;
+    else delete h.context.remote.retryControlRelease;
+    await h.click(button);
+    assert.equal(h.calls.includes('retryControlRelease'), false, change);
+  }
+});
+
+test('a current hub recovery rejection preserves its code and releases the visible busy state', async () => {
+  for (const code of ['SETTINGS_AUTH_REQUIRED', 'CONTROL_ROUTE_COUNTER_REQUIRED']) {
+    const h = absentProgramHarness(), button = element();
+    button.dataset.a = 'retry-control';
+    h.context.shake = () => {};
+    h.context.remote.retryControlRelease = async () => { throw Object.assign(new Error('Synthetic recovery failure'), { code }); };
+    await h.click(button);
+    assert.equal(h.context.D.operationError?.code, code);
+    assert.equal(h.context.S.busy, false);
+    assert.equal(h.context.controlRetrying, false);
+    assert.doesNotMatch(h.context.$('#hubBody').innerHTML, /处理中|data-a="retry-control" disabled/);
+    if (code === 'SETTINGS_AUTH_REQUIRED') assert.equal(h.context.S.capabilities.secretsAllowed, false);
+  }
+});
+
+test('an open hub follows program service recovery without replacing an unsaved configuration draft', async () => {
+  const h = controlLifecycleStateHarness(), draft = { timeout: 75 }, renders = [];
+  h.context.S.program = null;
+  h.context.D = { kind: 'hub', draft, base: { timeout: 60 }, saving: false };
+  Object.assign(h.context, {
+    dlg: {}, active: () => null, dialogBusy: () => h.context.D.saving,
+    renderHub() { renders.push(h.context.S.program); },
+  });
+  h.state.snapshot.control = { ...h.state.snapshot.control, phase: 'starting', error: null };
+  h.state.snapshot.program = { phase: 'ready', program: { version: 'synthetic-ready' } };
+  await h.context.refresh({ force: true });
+  assert.equal(renders.length, 1);
+  assert.equal(renders[0].program.version, 'synthetic-ready');
+  assert.equal(h.context.D.draft, draft);
+  assert.equal(h.context.D.base.timeout, 60);
+  await h.context.refresh({ force: true });
+  assert.equal(renders.length, 1, 'Identical status polling must not keep replacing dialog DOM.');
+  h.context.D.saving = true;
+  h.state.snapshot.program = null;
+  await h.context.refresh({ force: true });
+  assert.equal(renders.length, 1, 'A current dialog operation still owns its DOM.');
 });

@@ -8,7 +8,7 @@ export const inject = ['profileContext'];
 
 export function createProgramController({ configuration, directory, env = () => process.env,
   resolveProgram = resolveGrokProgram, installer = createPrivateProgramInstaller({ directory }) }) {
-  let task = null, abort = null, disposed = false, failure = null, resolved = null;
+  let task = null, abort = null, disposed = false, failure = null, resolved = null, pendingExit = null;
   // Whether the loader config pins a program or a config file. Only booleans:
   // the settings view never needs the configured values themselves.
   const state = { phase: 'idle', program: null, configPath: null, error: null, canRepair: false,
@@ -17,7 +17,7 @@ export function createProgramController({ configuration, directory, env = () => 
   const prepare = (repair = false) => {
     if (disposed) return Promise.reject(new GrokSearchError('GROK_SEARCH_STOPPING', '程序管理器已停止。'));
     if (task) return task;
-    if (failure?.code === 'GROK_PROGRAM_REAP_FAILED' || failure?.code === 'GROK_PROCESS_REAP_FAILED') return Promise.reject(failure);
+    if (pendingExit) return Promise.reject(pendingExit);
     if (repair && !state.canRepair) return Promise.reject(new GrokSearchError('GROK_CACHE_REPAIR_UNAVAILABLE', '当前没有可重新准备的损坏私有缓存，请先重新检测。'));
     state.phase = 'discovering';
     state.error = null;
@@ -40,6 +40,15 @@ export function createProgramController({ configuration, directory, env = () => 
       return snapshot();
     })().catch(error => {
       failure = error instanceof GrokSearchError ? error : new GrokSearchError('GROK_PROGRAM_PREPARE_FAILED', 'Grok 程序准备失败，请重试。');
+      if (['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(failure.code)) {
+        const unreaped = failure;
+        pendingExit = unreaped;
+        if (typeof unreaped.whenExited?.then === 'function') {
+          Promise.resolve(unreaped.whenExited).then(() => {
+            if (pendingExit === unreaped) pendingExit = null;
+          }, () => {});
+        }
+      }
       if (!disposed) {
         state.phase = 'error';
         state.error = { code: failure.code, message: failure.message };
@@ -67,9 +76,10 @@ export function createProgramController({ configuration, directory, env = () => 
       disposed = true;
       state.phase = 'disposed';
       abort?.abort(new GrokSearchError('GROK_SEARCH_STOPPING', '程序管理器已停止。'));
-      if (task) await task.catch(error => {
-        if (['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED'].includes(error.code)) throw error;
-      });
+      if (task) await Promise.allSettled([task]);
+      // Preparation may already have settled. Only its actual exit proof can
+      // clear a cleanup failure; an ordinary preparation error owns no process.
+      if (pendingExit) throw pendingExit;
     },
   };
 }

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { runInNewContext } from 'node:vm';
+import { fileURLToPath } from 'node:url';
 import { mkdtempTracked } from './helpers/temp-fixture.mjs';
 import { connectRenderer } from '../scripts/lib/renderer-cdp.mjs';
 
@@ -32,13 +34,166 @@ test('registry installation verifies the actual host-resolved release while allo
   assert.match(source, /spec: registryInstall \? `\$\{manifest\.name\}@\$\{manifest\.version\}` : tarball/);
 });
 
-test('native installation keeps its unique scratch name short and retains special-path mode', () => {
+test('native installation and cold replay select the signed Windows entry and retain special-path mode', () => {
   const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
   assert.match(source, /const root = join\(tmpdir\(\), 'dsh-deferred-desktop-' \+ randomUUID\(\)\.replaceAll\('-', ''\)\.slice\(0, 6\)/);
   assert.ok(source.includes(`openConfig ? " 中文 空格 ' & $"`));
-  assert.match(source, /const packaged = liveInstall && process\.platform === 'win32';/);
-  assert.match(source, /const launchExecutable = packaged \? runtime\.executable : control\.electron;/);
+  const start = source.indexOf('const packaged ='), end = source.indexOf('\nfunction launchDesktop()', start);
+  assert.ok(start >= 0 && end > start);
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    for (const [liveInstall, replayHistory] of [[true, null], [false, 'synthetic-control-history'], [false, null]]) {
+      const result = runInNewContext(source.slice(start, end) + '\n({ packaged, launchExecutable });', {
+        process: { platform }, liveInstall, replayHistory,
+        runtime: { executable: 'official-signed-host' }, control: { electron: 'isolated-development-entry' },
+      });
+      const signed = platform === 'win32' && (liveInstall || replayHistory !== null);
+      assert.equal(Boolean(result.packaged), signed);
+      assert.equal(result.launchExecutable, signed ? 'official-signed-host' : 'isolated-development-entry');
+    }
+  }
   assert.match(source, /spawn\(launchExecutable, \[\.\.\.\(packaged \? \[\] : \[control\.archive\]\)/);
+});
+
+function userPathGuards() {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('export function assertReplayReady(');
+  const end = source.indexOf('export function assertBareRegistryIdentity(', start);
+  assert.ok(start >= 0 && end > start);
+  return runInNewContext(source.slice(start, end).replaceAll('export function ', 'function ')
+    + '\n({ assertReplayReady, verifyUserPathIdentities });', {
+    assert, join, sha256: path => createHash('sha256').update(readFileSync(path)).digest('hex'),
+  });
+}
+
+test('cold replay rejects an upgrade combination before opening any package or profile', () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('const liveInstall ='), end = source.indexOf('const [runtime] =', start);
+  assert.ok(start >= 0 && end > start);
+  const parse = args => runInNewContext(source.slice(start, end) + '\n({ replayHistory, baselineReplay, upgradeFrom });', {
+    assert, resolve, inputArguments: [...args, 'candidate.tgz', 'official-desktop.exe'],
+  });
+  const replay = ['--replay-control-history', 'control-intent.records'];
+  assert.equal(parse(replay).replayHistory, resolve('control-intent.records'));
+  assert.equal(parse([...replay, '--baseline-replay']).baselineReplay, true);
+  assert.equal(parse(['--upgrade-from', 'previous.tgz']).upgradeFrom, resolve('previous.tgz'));
+  for (const extra of [[], ['--baseline-replay']]) {
+    assert.throws(() => parse([...replay, ...extra, '--upgrade-from', 'previous.tgz']), /cannot be combined/);
+  }
+  assert.throws(() => parse([...replay, '--live-install']), /cold boot/);
+  assert.throws(() => parse(['--baseline-replay']), /historical baseline/);
+});
+
+test('replay success requires live control and a healthy rendered UI, not just a required ledger', () => {
+  const { assertReplayReady } = userPathGuards();
+  const control = { available: true, phase: 'required', policy: 'required', error: null };
+  const ui = { text: 'ready', note: 'empty log', controlUnavailable: false, componentError: false };
+  assertReplayReady(control, ui);
+  for (const invalid of [null, { ...control, available: false }, { ...control, phase: 'released' },
+    { ...control, policy: 'released' }, { ...control, error: { code: 'CONTROL_SETTINGS_UNAVAILABLE' } }]) {
+    assert.throws(() => assertReplayReady(invalid, ui));
+  }
+  for (const invalid of [null, { ...ui, text: '' }, { ...ui, note: null },
+    { ...ui, controlUnavailable: true }, { ...ui, componentError: true }]) {
+    assert.throws(() => assertReplayReady(control, invalid));
+  }
+});
+
+test('user-path identity checks reject changed package, installed files, sources and official host bytes', () => {
+  const { verifyUserPathIdentities } = userPathGuards();
+  const root = mkdtempTracked(join(tmpdir(), 'dsh-user-path-identity-'));
+  const product = join(root, 'installed'), sourceRoot = join(root, 'source');
+  mkdirSync(product); mkdirSync(sourceRoot);
+  const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+  const originals = new Map(), put = (path, content) => { originals.set(path, content); writeFileSync(path, content); return path; };
+  const tarball = put(join(root, 'frozen.tgz'), 'synthetic-archive');
+  const sourceHashes = ['runtime.mjs', 'README.md'].map(file => {
+    const content = 'synthetic-' + file;
+    put(join(product, file), content); put(join(sourceRoot, file), content);
+    return { file, sha256: hash(content) };
+  });
+  const hostHashes = ['executable', 'archive', 'fuseBinary', 'runtime-receipt'].map(role => {
+    const content = 'synthetic-' + role, path = put(join(root, role), content);
+    return { role, path, sha256: hash(content) };
+  });
+  const options = { tarball, product, sourceRoot, hostHashes,
+    packageReceipt: { sha256: hash('synthetic-archive'), sourceHashes } };
+  assert.equal(verifyUserPathIdentities(options).sourceFilesVerified, 2);
+  for (const [path, content] of originals) {
+    writeFileSync(path, content + '-changed');
+    assert.throws(() => verifyUserPathIdentities(options), /unchanged|changed/);
+    writeFileSync(path, content);
+  }
+  writeFileSync(join(sourceRoot, 'README.md'), 'post-publication-guidance');
+  assert.equal(verifyUserPathIdentities({ ...options, registryInstall: true }).sourceFilesVerified, 1);
+  writeFileSync(join(sourceRoot, 'runtime.mjs'), 'current-candidate-source');
+  assert.throws(() => verifyUserPathIdentities({ ...options, registryInstall: true }), /source file changed/);
+  assert.equal(verifyUserPathIdentities({ ...options, baselineReplay: true }).sourceFilesVerified, 0);
+  writeFileSync(join(product, 'runtime.mjs'), 'changed-baseline');
+  assert.throws(() => verifyUserPathIdentities({ ...options, baselineReplay: true }), /installed file changed/);
+});
+
+test('baseline replay still captures the diagnosed failure and never becomes a success result', async () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('  if (baselineReplay) {', source.indexOf('let { child, closed }'));
+  const end = source.indexOf('  const snapshot = await waitForRenderer', start);
+  assert.ok(start >= 0 && end > start);
+  const writes = [], events = [];
+  const execute = runInNewContext('(async () => {\n' + source.slice(start, end)
+    + '\n})()', {
+    assert, Buffer, join, baselineReplay: true, baselineReproduced: false, run: { directory: 'synthetic-evidence' },
+    renderer: { evaluate: async () => true, send: async () => ({ data: Buffer.from('synthetic-image').toString('base64') }) },
+    waitForRenderer: async (_renderer, _predicate, options) => options?.timeoutMs === 15_000
+      ? { control: { available: false, error: { code: 'CONTROL_SETTINGS_UNAVAILABLE' } },
+        ui: { controlUnavailable: true } } : true,
+    verifyIdentities: () => { events.push('identity'); return { packageSha256: 'synthetic-hash' }; },
+    packageReceipt: { version: 'synthetic-old-version', sha256: 'synthetic-hash', sourceHashes: [{}] },
+    replayEvidence: { revision: 58 },
+    writeFileSync: (path, bytes) => { writes.push({ path, image: Buffer.isBuffer(bytes) }); },
+    writeJson: (path, value) => { writes.push({ path, value }); },
+  });
+  await assert.rejects(execute, /KNOWN_BASELINE_FAILURE_REPRODUCED: CONTROL_SETTINGS_UNAVAILABLE/);
+  assert.deepEqual(events, ['identity']);
+  assert.ok(writes.some(row => row.path.endsWith('baseline-replay.png') && row.image));
+  const receipt = writes.find(row => row.path.endsWith('baseline-reproduction.json')).value;
+  assert.equal(receipt.reproduced, true); assert.equal(receipt.repaired, false);
+  assert.equal(writes.some(row => row.path.endsWith('summary.json')), false);
+});
+
+test('final identity checks run after host shutdown and cannot turn a failed baseline or changed input green', async () => {
+  const source = readFileSync(new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('} finally {\n  renderer?.close();');
+  assert.ok(start >= 0);
+  for (const baseline of [false, true]) for (const changed of [false, true]) {
+    const events = [], writes = [], baselineError = new Error('KNOWN_BASELINE_FAILURE_REPRODUCED');
+    const identityError = new Error('synthetic final identity mismatch');
+    const failure = baseline ? baselineError : undefined;
+    const context = { assert, join, setTimeout, clearTimeout, run: { directory: 'synthetic-evidence' },
+      failure, baselineReproduced: baseline, finalIdentity: null, result: {},
+      renderer: { close() { events.push('renderer-close'); } }, port: 1,
+      closed: Promise.resolve({ code: 0, signal: null }),
+      requestDesktopShutdown: async () => { events.push('shutdown'); },
+      quotaServer: { closeAllConnections() {}, close(done) { events.push('quota-close'); done(); } },
+      verifyIdentities: () => { events.push('identity'); if (changed) throw identityError; return { verified: true }; },
+      writeJson: (path, value) => { writes.push({ path, value: { ...value } }); },
+    };
+    const execute = runInNewContext('(async () => { try { if (failure) throw failure; '
+      + source.slice(start) + '\nreturn result; })()', context);
+    if (changed || baseline) await assert.rejects(execute, error => error === (changed ? identityError : baselineError));
+    else assert.equal((await execute).passed, true);
+    assert.ok(events.indexOf('shutdown') < events.indexOf('identity'));
+    assert.equal(writes.find(row => row.path.endsWith('final-identity.json')).value.passed, !changed);
+    assert.equal(writes.some(row => row.path.endsWith('summary.json')), !changed && !baseline);
+  }
+});
+
+test('modified native user-path and delivery tooling modules pass syntax checking without launching a host', () => {
+  for (const path of [new URL('../scripts/verify-rc5-user-path.mjs', import.meta.url), new URL(import.meta.url)]) {
+    const result = spawnSync(process.execPath, ['--check', fileURLToPath(path)], {
+      encoding: 'utf8', timeout: 15_000, windowsHide: true,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+  }
 });
 
 test('program probe keeps historical modes and requires an exact package and hash for final-package checks', () => {

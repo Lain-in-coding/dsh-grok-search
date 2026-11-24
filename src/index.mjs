@@ -1,6 +1,6 @@
 import { createGrokProvider } from './provider.mjs';
 import { createReleaseBarrier } from './core/release-transaction.mjs';
-import { GrokSearchError } from './core/errors.mjs';
+import { GrokSearchError, cleanupFailure } from './core/errors.mjs';
 import { createSharedConfigStore } from './core/shared-config.mjs';
 import { createSourceRouter } from './core/source-adapters.mjs';
 import { createRoutedSearch } from './core/routed-search.mjs';
@@ -50,7 +50,8 @@ export function apply(ctx, config, { WebError = ctx.get('grokSearchHostAdapter')
   const dispose = async () => {
     for (const cancel of diagnosticCancellers) cancel();
     const results = await Promise.allSettled([routed.dispose(), core.dispose()]);
-    for (const result of results) if (result.status === 'rejected') throw result.reason;
+    const failure = cleanupFailure(results);
+    if (failure) throw failure;
   };
   const releaseBarrier = createReleaseBarrier();
   const callRoutes = ctx.get('grokSearchCallRoutes');

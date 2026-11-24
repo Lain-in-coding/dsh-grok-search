@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { ControlRecordError, writeControlIntent } from './core/control-intent-store.mjs';
 import { commitExplicitRelease } from './core/release-transaction.mjs';
+import { cleanupFailure } from './core/errors.mjs';
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID,
   createAcquisition, createLease, createProductReleaseController, createProductStore,
   originalSearchCounter, readSelection, suspendCore, takeOverAuthorRoute,
+  holdProductRelease, productReleaseInFlight, productRuntimeCleanupInFlight,
 } from './core/product-control.mjs';
 
 export const name = 'dsh-grok-search-control';
@@ -40,7 +42,7 @@ export function projectPublicSnapshot(current, disposed = false) {
 
 export async function apply(ctx, { counterSnapshot = null, store: suppliedStore = null,
   canAcquire = () => true, isCurrent = () => true, onStop = () => {}, onStart = null, signal = null,
-  keepAliveOnFailure = false } = {}) {
+  keepAliveOnFailure = false, canSupersedeNativeRelease = () => false } = {}) {
   const store = suppliedStore ?? createProductStore(ctx);
   let disposed = false;
   const acquisitionAbort = new AbortController();
@@ -78,7 +80,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       try {
         const current = store.read();
         const completion = current?.intent?.releaseCompletion;
-        if (completion && current.intent.policy === 'released') {
+        if (completion && current.intent.policy === 'released' && !productRuntimeCleanupInFlight(store)) {
           state.releaseOutcome = { kind: 'released', recordCommitted: false, completionCommitted: true,
             routeChanged: completion.routeChanged === true, routeVerified: completion.routeVerified === true,
             operationId: current.intent.release?.operationId ?? null };
@@ -120,6 +122,12 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     release: null,
     ...(prior?.migration ? { migration: structuredClone(prior.migration) } : {}),
   });
+  const assertRuntimeCleanupIdle = () => {
+    if (productRuntimeCleanupInFlight(store)) {
+      throw new ControlRecordError('CONTROL_RUNTIME_CLEANUP_PENDING',
+        'A previous runtime has not proved resource cleanup; retry after it becomes idle.', { retriable: true });
+    }
+  };
   const refresh = () => {
     if (releaseTask) return releaseTask;
     if (stopRequested) return Promise.resolve(snapshot());
@@ -137,16 +145,31 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       }
       let existing = store.read();
       setRecord(existing);
+      let currentLease, currentAcquisition, supersededRelease = null;
       if (existing?.intent.policy === 'released' && (acquired || !existing.intent.releaseCompletion
         && !existing.intent.recovery)) {
-        const completion = existing.intent.releaseCompletion;
-        state.phase = 'released';
-        state.releaseOutcome = completion ? { kind: 'released', recordCommitted: false,
-          completionCommitted: true, routeChanged: completion.routeChanged === true,
-          routeVerified: completion.routeVerified === true,
-          operationId: existing.intent.release?.operationId ?? null } : null;
-        state.error = null;
-        return snapshot();
+        const intent = existing.intent;
+        if (!acquired && !intent.releaseCompletion && !intent.recovery
+          && ['native-bundle-disable', 'native-component-disable'].includes(intent.reason)
+          && intent.release?.explicit === true && intent.release.kind === 'intent-release-commit'
+          && (intent.pause?.confirmed !== true || intent.pause.reason === intent.reason)
+          && !productRuntimeCleanupInFlight(store)) {
+          currentLease = createLease(ctx);
+          currentAcquisition = createAcquisition(ctx);
+          if (canSupersedeNativeRelease({ record: existing, acquisition: currentAcquisition, lease: currentLease }) === true) {
+            supersededRelease = existing;
+          }
+        }
+        if (!supersededRelease) {
+          const completion = intent.releaseCompletion;
+          state.phase = 'released';
+          state.releaseOutcome = completion ? { kind: 'released', recordCommitted: false,
+            completionCommitted: true, routeChanged: completion.routeChanged === true,
+            routeVerified: completion.routeVerified === true,
+            operationId: intent.release?.operationId ?? null } : null;
+          state.error = null;
+          return snapshot();
+        }
       }
       if (existing && acquired && (existing.intent.pause?.confirmed === true || existing.intent.release !== null)) {
         state.phase = 'stopped';
@@ -158,23 +181,34 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
         state.error = { code: 'COMPATIBILITY_CORE_BLOCKED', message: 'Runtime admission is required before taking over search.' };
         return snapshot();
       }
-      const currentLease = createLease(ctx);
-      const currentAcquisition = createAcquisition(ctx);
+      assertRuntimeCleanupIdle();
+      currentLease ??= createLease(ctx);
+      currentAcquisition ??= createAcquisition(ctx);
       const assertAcquisitionCurrent = () => {
         acquisitionSignal.throwIfAborted();
         if (disposed || stopRequested || !canAcquire() || !isCurrent()) {
           throw new ControlRecordError('CONTROL_ACQUISITION_CANCELLED',
             'The current owner can no longer acquire the search route.', { retriable: true });
         }
+        assertRuntimeCleanupIdle();
         const latest = createAcquisition(ctx);
+        const latestLease = createLease(ctx);
         if (latest.selectionSha256 !== currentAcquisition.selectionSha256
           || !latest.selectedBundles.includes(PRODUCT_SEARCH_BUNDLE)
           || latest.ownerUid !== currentAcquisition.ownerUid
-          || !sameLease(createLease(ctx), currentLease)
+          || !sameLease(latestLease, currentLease)
           || acquisitionChanged(currentAcquisition, latest)) {
           throw new ControlRecordError('CONTROL_ACQUISITION_INPUT_CHANGED',
             'Search acquisition inputs changed before publication; retry with current inputs.', { retriable: true });
         }
+        // Supersession grants a new acquisition; the old incomplete release stays historical evidence.
+        if (supersededRelease && (canSupersedeNativeRelease({ record: supersededRelease,
+          acquisition: latest, lease: latestLease }) !== true
+          || productReleaseInFlight(store, supersededRelease.intent.release.operationId))) {
+          throw new ControlRecordError('CONTROL_ACQUISITION_CANCELLED',
+            'Native release supersession is no longer authorized or its owner is still draining.', { retriable: true });
+        }
+        assertRuntimeCleanupIdle();
       };
       const reactivating = existing?.intent.policy === 'released' || existing?.intent.pause?.confirmed === true;
       if (reactivating) {
@@ -249,11 +283,6 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     if (disposed) return Promise.reject(new ControlRecordError('CONTROL_OWNER_ABSENT', 'The product owner is absent.'));
     if (releaseTask) return releaseTask;
     stopRequested = true;
-    let runtimeStop;
-    try { runtimeStop = Promise.resolve(onStop()); }
-    catch (error) { runtimeStop = Promise.reject(error); }
-    runtimeStop.catch(() => {});
-    acquisitionAbort.abort(new ControlRecordError('CONTROL_ACQUISITION_CANCELLED', 'Explicit stop cancelled pending acquisition.'));
     const stopFailure = error => {
       state.phase = 'incomplete';
       state.error = { code: error?.code ?? null, message: error?.message ?? String(error) };
@@ -262,16 +291,44 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       return error;
     };
     let before, priorIntent, owner, controller, counterBaseline;
+    let runtimeStop, coreDisposal, coreBarrier, resolveRelease, rejectRelease;
+    const transaction = new Promise((resolve, reject) => { resolveRelease = resolve; rejectRelease = reject; });
+    const proveCleanup = async () => {
+      const results = await Promise.allSettled([
+        runtimeStop, coreDisposal, Promise.allSettled([...takeovers]),
+        coreBarrier ? coreBarrier.whenSettled?.() ?? coreBarrier.drain() : Promise.resolve(),
+        controller?.whenDrained(),
+      ]);
+      const failure = cleanupFailure(results);
+      if (failure) throw failure;
+    };
+    const whenDrained = transaction.then(proveCleanup, proveCleanup);
+    const currentRelease = transaction.catch(error => { stopFailure(error); throw error; })
+      .finally(() => { if (releaseTask === currentRelease) releaseTask = null; });
+    releaseTask = currentRelease;
+    // Register before onStop can trigger teardown, even without a durable release record.
+    holdProductRelease(store, {}, currentRelease, { whenDrained });
+    const finishRelease = pending => { Promise.resolve(pending).then(resolveRelease, rejectRelease); return currentRelease; };
+    try { runtimeStop = Promise.resolve(onStop()); }
+    catch (error) { runtimeStop = Promise.reject(error); }
+    runtimeStop.catch(() => {});
+    acquisitionAbort.abort(new ControlRecordError('CONTROL_ACQUISITION_CANCELLED', 'Explicit stop cancelled pending acquisition.'));
     try {
-      const core = ctx.get('grokSearchCore');
-      // Pause this plugin's own queries before any prelude check can fail; the
-      // record and route are released by the transaction below.
-      if (core?.releaseBarrier && typeof core.dispose === 'function') {
-        suspendCore(core, typeof reason === 'string' && reason ? reason : 'explicit-user-release');
-      }
+      let core;
+      try {
+        core = ctx.get('grokSearchCore');
+        coreBarrier = core?.releaseBarrier;
+        // Pause queries even if the record, counter or lease prelude fails.
+        if (coreBarrier && typeof core.dispose === 'function') {
+          coreDisposal = suspendCore(core, typeof reason === 'string' && reason ? reason : 'explicit-user-release');
+        }
+      } catch (error) { coreDisposal = Promise.reject(error); coreDisposal.catch(() => {}); throw error; }
       before = store.read();
       if (!before) throw new ControlRecordError('CONTROL_RELEASE_RECORD_MISSING',
         'No control record exists to release.');
+      releaseOperationId ??= before.intent.release?.operationId ?? randomUUID();
+      state.releaseOperationId = releaseOperationId;
+      holdProductRelease(store, releaseOperationId, currentRelease, { whenDrained });
       if (before.intent.policy === 'released' && before.intent.releaseCompletion) {
         completedReleaseCleanup = true;
         controller = createProductReleaseController({ ctx, priorIntent: before.intent.priorIntent, core,
@@ -280,7 +337,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
           onState: phase => { state.phase = phase; } });
         controller.invalidate({ reason: reason || 'explicit-user-release' });
         state.error = null;
-        releaseTask = (async () => {
+        return finishRelease((async () => {
           await controller.drain();
           completedReleaseCleanup = false;
           state.phase = 'released';
@@ -289,11 +346,8 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
             routeVerified: before.intent.releaseCompletion.routeVerified === true };
           setRecord(before);
           return structuredClone(state.releaseOutcome);
-        })().catch(error => { stopFailure(error); throw error; }).finally(() => { releaseTask = null; });
-        return releaseTask;
+        })());
       }
-      releaseOperationId ??= before.intent.release?.operationId ?? randomUUID();
-      state.releaseOperationId = releaseOperationId;
       priorIntent = before.intent.policy === 'required' ? before.intent : before.intent.priorIntent;
       counterBaseline = (counterSnapshot ? counterSnapshot() : originalSearchCounter(ctx)).calls;
       owner = createLease(ctx);
@@ -302,12 +356,12 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
         pendingTakeovers: async () => { await Promise.allSettled([...takeovers]); await runtimeStop; },
         onState: phase => { state.phase = phase; } });
     } catch (error) {
-      stopFailure(error);
-      return Promise.reject(error);
+      rejectRelease(error);
+      return currentRelease;
     }
     state.phase = 'stopping';
     state.error = null;
-    releaseTask = (async () => {
+    return finishRelease((async () => {
       const outcome = await commitExplicitRelease({ store, owner, controller,
         reason: reason ?? 'explicit-user-release', operationId: releaseOperationId, counterBaseline });
       state.releaseOutcome = outcome;
@@ -315,11 +369,7 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
       state.error = outcome.error ?? null;
       setRecord(store.read());
       return outcome;
-    })().catch(error => {
-      stopFailure(error);
-      throw error;
-    }).finally(() => { releaseTask = null; });
-    return releaseTask;
+    })());
   };
   const publicSnapshot = () => {
     // Keep display observations separate from state used by control operations.
@@ -329,7 +379,8 @@ export async function apply(ctx, { counterSnapshot = null, store: suppliedStore 
     try {
       const current = store.readView();
       const completion = current?.intent?.releaseCompletion;
-      if (!completedReleaseCleanup && completion && current.intent.policy === 'released' && current.revision >= state.revision) {
+      if (!completedReleaseCleanup && completion && current.intent.policy === 'released' && current.revision >= state.revision
+        && !productRuntimeCleanupInFlight(store)) {
         presentation = { ...state, phase: disposed ? state.phase : 'released',
           record: current.intent, revision: current.revision,
           releaseOperationId: current.intent.release?.operationId ?? null,

@@ -55,7 +55,7 @@ test('正式编号、lockfile、支持矩阵与 MCP 客户端身份一致且不�
   const lock = JSON.parse(read('package-lock.json'));
   assert.equal(validatePackChannel(manifest, matrix, { release: true }), 'release');
   assert.throws(() => validatePackChannel(manifest, matrix, { alpha: true }));
-  assert.equal(manifest.version, '0.4.2');
+  assert.equal(manifest.version, '0.4.3');
   assert.deepEqual(manifest.publishConfig, { tag: 'latest', access: 'public' });
   assert.equal(lock.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
@@ -92,12 +92,12 @@ test('开发通道拒绝latest、错误版本和混合通道，保留正式通�
   assert.equal(validatePackChannel(release, { ...matrix, packageVersion: release.version }, { release: true }), 'release');
 });
 
-test('0.4.2发布文档固定目标版本并保留历史实录与验证范围', () => {
+test('0.4.3发布文档固定目标版本并保留历史实录与验证范围', () => {
   const readme = read('README.md');
   const changelog = read('CHANGELOG.md');
-  assert.match(readme, /Version-0\.4\.2-/);
+  assert.match(readme, /Version-0\.4\.3-/);
   assert.match(readme, /实际发布状态以/);
-  assert.match(readme, /releases\/tag\/v0\.4\.2/);
+  assert.match(readme, /releases\/tag\/v0\.4\.3/);
   assert.match(readme, /历史操作实录：Windows Desktop 0\.2\.2-rc\.2 · 插件 0\.3\.0/);
   assert.match(readme, /原人工验收与宿主矩阵保留各自包的验证范围/);
   assert.doesNotMatch(readme, /运行文件与该人工验收包逐字节一致/);
@@ -108,20 +108,21 @@ test('0.4.2发布文档固定目标版本并保留历史实录与验证范围', 
   assert.match(changelog, /^## 0\.4\.0$/m);
   assert.match(changelog, /^## 0\.4\.1 - 2026-11-19$/m);
   assert.match(changelog, /^## 0\.4\.2 - 2026-11-21$/m);
+  assert.match(changelog, /^## 0\.4\.3 - 2026-11-24$/m);
   assert.doesNotMatch(changelog, /## 0\.3\.0-alpha/);
   assert.equal(matrix.packageVersion, manifest.version);
-  assert.match(matrix.channel, /0\.4\.2/);
+  assert.match(matrix.channel, /0\.4\.3/);
 });
 
-test('发布安装示例固定0.4.2但不预先声称registry已经发布', () => {
+test('发布安装示例固定0.4.3但不预先声称registry已经发布', () => {
   const readme = read('README.md');
   const install = readme.split('### 方式一：在 DSH 中按名称安装')[1]?.split('\n### ')[0];
   const expected = `${manifest.name}@${manifest.version}`;
   assert.equal(install?.match(/```text\s+([^\r\n]+)\s+```/)?.[1]?.trim(), expected);
   assert.equal(readme.match(/^dsh plugin --profile web add (\S+)$/m)?.[1], expected);
   assert.match(readme, /确认目标版本可下载后/);
-  assert.match(readme, /dsh-grok-search-0\.4\.2\.tgz/);
-  assert.doesNotMatch(readme, /安装已发布 \*\*0\.4\.2\*\*/);
+  assert.match(readme, /dsh-grok-search-0\.4\.3\.tgz/);
+  assert.doesNotMatch(readme, /安装已发布 \*\*0\.4\.3\*\*/);
   assert.equal(manifest.bin['dsh-grok-search-compatibility'], './src/core/compatibility-cli.mjs');
 });
 

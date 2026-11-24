@@ -12,6 +12,34 @@ import { cleanEnvironment, commandResult, freshRun, project, sha256, writeJson }
 import { desktopWorkspacePatch, prepareDesktopAcceptanceEnvironment } from './lib/desktop-acceptance-environment.mjs';
 import { readUpgradePackage } from './verify-search-log-upgrade.mjs';
 import { inspectPackage } from './lib/compatibility-smoke.mjs';
+import { createControlIntentStore } from '../src/core/control-intent-store.mjs';
+
+export function assertReplayReady(control, ui) {
+  assert.equal(control?.available, true, 'cold replay must restore the live control service');
+  assert.equal(control.phase, 'required', 'cold replay must acquire search');
+  assert.equal(control.policy, 'required');
+  assert.equal(control.error, null, 'cold replay must not retain a control error');
+  assert.ok(ui?.text && ui.note, 'cold replay must render the control and log status');
+  assert.equal(ui.controlUnavailable, false, 'cold replay UI must clear CONTROL_SETTINGS_UNAVAILABLE');
+  assert.equal(ui.componentError, false, 'cold replay UI must not report a component error');
+}
+
+export function verifyUserPathIdentities({ tarball, packageReceipt, product, sourceRoot, hostHashes,
+  baselineReplay = false, registryInstall = false }) {
+  assert.equal(sha256(tarball), packageReceipt.sha256, 'the frozen tarball must remain unchanged');
+  let sourceFilesVerified = 0;
+  for (const row of packageReceipt.sourceHashes) {
+    assert.equal(sha256(join(product, row.file)), row.sha256, `installed file changed: ${row.file}`);
+    if (baselineReplay || registryInstall && row.file === 'README.md') continue;
+    assert.equal(sha256(join(sourceRoot, row.file)), row.sha256, `source file changed: ${row.file}`);
+    sourceFilesVerified++;
+  }
+  for (const row of hostHashes) assert.equal(sha256(row.path), row.sha256, `official host changed: ${row.role}`);
+  return { packageSha256: packageReceipt.sha256, installedFilesVerified: packageReceipt.sourceHashes.length,
+    sourceFilesVerified, baselineSourceComparisonSkipped: baselineReplay,
+    registryReadmeComparisonSkipped: registryInstall,
+    hostHashes: hostHashes.map(({ role, sha256 }) => ({ role, sha256 })) };
+}
 
 export function assertBareRegistryIdentity(resolved, installed, metadata, expectedName) {
   assert.ok(['applied', 'restart-required'].includes(resolved?.application));
@@ -28,15 +56,24 @@ export function assertBareRegistryIdentity(resolved, installed, metadata, expect
 const { args: inputArguments, runtimeOptions } = parseRuntimeReceiptArguments(process.argv.slice(2));
 const liveInstall = inputArguments.includes('--live-install');
 const registryInstall = inputArguments.includes('--registry-install');
+const reinstall = inputArguments.includes('--reinstall');
+const baselineReplay = inputArguments.includes('--baseline-replay');
 const openConfig = inputArguments.includes('--open-config');
 const hiddenFolder = inputArguments.includes('--hidden-folder');
 assert.ok(!hiddenFolder || openConfig, '--hidden-folder requires --open-config');
 assert.ok(!registryInstall || liveInstall, '--registry-install requires --live-install');
-const input = inputArguments.filter(value => !['--live-install', '--registry-install', '--open-config', '--hidden-folder'].includes(value));
+assert.ok(!reinstall || liveInstall, '--reinstall requires --live-install');
+const input = inputArguments.filter(value => !['--live-install', '--registry-install', '--reinstall', '--baseline-replay', '--open-config', '--hidden-folder'].includes(value));
+const historyIndex = input.indexOf('--replay-control-history');
+if (historyIndex >= 0) assert.ok(input[historyIndex + 1] && !input[historyIndex + 1].startsWith('--'), 'Replay requires a control-history directory');
+const replayHistory = historyIndex < 0 ? null : resolve(input.splice(historyIndex, 2)[1]);
+assert.ok(!replayHistory || !liveInstall, 'Replay is a cold boot of the verified installed archive');
+assert.ok(!baselineReplay || replayHistory, 'A historical baseline is valid only for isolated history reproduction');
 const upgradeIndex = input.indexOf('--upgrade-from');
 if (upgradeIndex >= 0) assert.ok(input[upgradeIndex + 1] && !input[upgradeIndex + 1].startsWith('--'), '--upgrade-from requires an old tarball');
 const upgradeFrom = upgradeIndex < 0 ? null : resolve(input.splice(upgradeIndex, 2)[1]);
-assert.equal(input.length, 2, 'Usage: [--live-install [--registry-install] | --upgrade-from <old tgz>] [--open-config] [--runtime-receipt <json> --runtime-receipt-sha256 <hash>] <tgz> <official Desktop executable>');
+assert.ok(!replayHistory || !upgradeFrom, '--replay-control-history cannot be combined with --upgrade-from');
+assert.equal(input.length, 2, 'Usage: [--live-install [--registry-install] [--reinstall] | --upgrade-from <old tgz> | --replay-control-history <directory> [--baseline-replay]] [--open-config] [--runtime-receipt <json> --runtime-receipt-sha256 <hash>] <tgz> <official Desktop executable>');
 const [tarball, executable] = input.map(value => resolve(value));
 assert.ok(tarball && executable, 'Usage: <tgz> <official Desktop executable>');
 assert.equal(liveInstall && Boolean(upgradeFrom), false, 'Choose fresh installation or upgrade, not both');
@@ -48,12 +85,22 @@ const repositoryReadmeDiffers = packageReceipt.sourceHashes.some(row =>
 for (const row of packageReceipt.sourceHashes) {
   // Post-publication installation guidance may change without replacing the
   // published package. Still reject any runtime-file drift in registry mode.
-  if (registryInstall && row.file === 'README.md') continue;
+  if (baselineReplay || registryInstall && row.file === 'README.md') continue;
   assert.equal(sha256(join(project, row.file)), row.sha256);
+}
+if (baselineReplay) {
+  const verified = readUpgradePackage(tarball);
+  assert.equal(verified.receipt.sha256, packageReceipt.sha256);
+  assert.notEqual(verified.manifest.version, JSON.parse(readFileSync(join(project, 'package.json'))).version,
+    'The baseline must be a distinct older package, not the current candidate');
 }
 const upgradePackage = upgradeFrom ? readUpgradePackage(upgradeFrom) : null;
 if (upgradePackage) assert.notEqual(upgradePackage.manifest.version, packageReceipt.version, 'Upgrade needs distinct verified package versions.');
 const run = freshRun('rc5-user-path');
+const hostHashes = Object.entries({ executable: runtime.executable, archive: runtime.archivePath, fuseBinary: runtime.fuseBinary })
+  .map(([role, path]) => ({ role, path, sha256: runtime.candidateReceipt?.files[role]?.sha256 ?? sha256(path) }));
+if (runtimeOptions.runtimeReceiptPath) hostHashes.push({ role: 'runtime-receipt', path: runtimeOptions.runtimeReceiptPath,
+  sha256: runtimeOptions.runtimeReceiptSha256 });
 // The owned scratch already has a unique parent; keep native executable paths short.
 const root = join(tmpdir(), 'dsh-deferred-desktop-' + randomUUID().replaceAll('-', '').slice(0, 6) + (openConfig ? " 中文 空格 ' & $" : ''));
 prepareDesktopFixture(runtime.executable, root, { pluginManagerEntries: true, liveHmr: true, ...runtimeOptions });
@@ -63,6 +110,8 @@ mkdirSync(extraction);
 const unpack = await commandResult('tar.exe', ['-xf', upgradeFrom || tarball, '-C', extraction], { timeoutMs: 30_000 });
 assert.equal(unpack.exitCode, 0);
 const product = join(control.profile, 'node_modules/dsh-grok-search');
+const verifyIdentities = () => verifyUserPathIdentities({ tarball, packageReceipt, product, sourceRoot: project,
+  hostHashes, baselineReplay, registryInstall });
 const manifest = JSON.parse(readFileSync(join(extraction, 'package/package.json'), 'utf8'));
 if (upgradePackage) for (const row of upgradePackage.receipt.sourceHashes) {
   assert.equal(sha256(join(extraction, 'package', row.file)), row.sha256, 'The old installation must match its verified receipt.');
@@ -83,6 +132,41 @@ writeFileSync(join(control.profile, 'package.json'), JSON.stringify({
     ...(!liveInstall ? ['dsh-grok-search'] : [])] } },
 }));
 writeFileSync(join(control.profile, 'cordis.patch.yml'), JSON.stringify([desktopWorkspacePatch(root)], null, 2) + '\n');
+let replayEvidence = null;
+if (replayHistory) {
+  assert.equal(basename(replayHistory), 'control-intent.records');
+  const target = join(control.profile, 'control-intent.records'), identities = [];
+  let totalBytes = 0;
+  const copyHistory = (source, destination, prefix = '') => {
+    const stat = lstatSync(source);
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), 'control history must contain ordinary directories');
+    mkdirSync(destination);
+    for (const entry of readdirSync(source, { withFileTypes: true })) {
+      assert.equal(entry.isSymbolicLink(), false, 'control history replay never follows links');
+      const from = join(source, entry.name), to = join(destination, entry.name), file = prefix + entry.name;
+      if (entry.isDirectory()) { copyHistory(from, to, file + '/'); continue; }
+      // Unpublished stages and locks are not committed history and never copied.
+      if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name.startsWith('stage-')) continue;
+      const bytes = readFileSync(from);
+      totalBytes += bytes.length;
+      assert.ok(bytes.length <= 1024 * 1024 && totalBytes <= 32 * 1024 * 1024 && identities.length < 2000);
+      JSON.parse(bytes);
+      writeFileSync(to, bytes, { flag: 'wx' });
+      identities.push({ file, sha256: sha256(from) });
+      assert.equal(sha256(to), identities.at(-1).sha256);
+    }
+  };
+  copyHistory(replayHistory, target);
+  for (const row of identities) assert.equal(sha256(join(replayHistory, row.file)), row.sha256, 'history changed during capture');
+  const before = createControlIntentStore({ directory: target, trustedRoot: control.profile,
+    governance: true, autoMaintain: false }).read();
+  assert.equal(before?.intent.policy, 'released');
+  assert.equal(before.intent.releaseCompletion, undefined, 'cold replay starts with an incomplete release');
+  replayEvidence = { files: identities.length, bytes: totalBytes, identitySha256: createHash('sha256')
+    .update(JSON.stringify(identities)).digest('hex'), revision: before.revision,
+    releaseOperationId: before.intent.release.operationId, completionBeforeBoot: false };
+  writeJson(join(run.directory, 'control-history-replay.json'), replayEvidence);
+}
 const reservation = createServer();
 await new Promise(done => reservation.listen(0, '127.0.0.1', done));
 const port = reservation.address().port;
@@ -95,24 +179,30 @@ const quotaServer = createHttpServer((request, response) => {
 });
 await new Promise(done => quotaServer.listen(0, '127.0.0.1', done));
 // Native first installation must exercise the signed packaged entry, not default_app.
-const packaged = liveInstall && process.platform === 'win32';
+const packaged = (liveInstall || replayHistory) && process.platform === 'win32';
 const launchExecutable = packaged ? runtime.executable : control.electron;
-const child = spawn(launchExecutable, [...(packaged ? [] : [control.archive]), '--user-data-dir=' + control.userData,
-  '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + port, '--lang=zh-CN'], {
-  cwd: root, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
-  env: prepareDesktopAcceptanceEnvironment(root, {
-    DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
-    DSH_DESKTOP_PRIMARY_RUNTIME_DIR: control.primaryRuntime, DSH_DESKTOP_PNPM_ENTRY: control.pnpmEntry,
-    DSH_DESKTOP_OPEN_DEVTOOLS: '0', DSH_PRODUCT_ANALYTICS_OTLP_URL: 'http://127.0.0.1:9',
-    ...(openConfig ? { GROK_SEARCH_CONFIG: join(root, 'user/.config/grok-search-rs', `config-open-${run.runId}.toml`) } : {}),
-  }).env,
-});
-child.stdout.resume(); child.stderr.resume();
-const closed = new Promise(done => child.once('close', (code, signal) => done({ code, signal })));
+function launchDesktop() {
+  const child = spawn(launchExecutable, [...(packaged ? [] : [control.archive]), '--user-data-dir=' + control.userData,
+    '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + port, '--lang=zh-CN'], {
+    cwd: root, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'],
+    env: prepareDesktopAcceptanceEnvironment(root, {
+      DSH_HOME: control.dshHome, DSH_DESKTOP_DSH_DIR: control.runtime,
+      DSH_DESKTOP_PRIMARY_RUNTIME_DIR: control.primaryRuntime, DSH_DESKTOP_PNPM_ENTRY: control.pnpmEntry,
+      DSH_DESKTOP_OPEN_DEVTOOLS: '0', DSH_PRODUCT_ANALYTICS_OTLP_URL: 'http://127.0.0.1:9',
+      ...(openConfig ? { GROK_SEARCH_CONFIG: join(root, 'user/.config/grok-search-rs', `config-open-${run.runId}.toml`) } : {}),
+    }).env,
+  });
+  child.stdout.resume(); child.stderr.resume();
+  const closed = new Promise(done => child.once('close', (code, signal) => done({ code, signal })));
+  return { child, closed };
+}
+let { child, closed } = launchDesktop();
 let renderer;
 let registryResolution;
 let result;
 let failure;
+let baselineReproduced = false;
+let finalIdentity = null;
 try {
   renderer = await connectRenderer(port, { timeoutMs: 90_000, requestTimeoutMs: 200_000 });
   await waitForRenderer(renderer, client => client.evaluate('document.readyState === "complete" && !!document.querySelector(\'button[aria-label="插件"]\')'));
@@ -230,6 +320,32 @@ try {
     assert.equal(installation.body.result.value.application, 'applied', 'new code is applied without restart');
     assert.equal(installation.body.result.value.version, packageReceipt.version, 'native installer selects the candidate version');
   }
+  if (baselineReplay) {
+    await waitForRenderer(renderer, async () => (await rpc('snapshot')).body?.result?.ok);
+    await renderer.evaluate('document.querySelector(\'button[aria-label="插件"]\').click()');
+    await waitForRenderer(renderer, client => client.evaluate('!!document.querySelector(\'button[aria-label="查看 dsh-grok-search"]\')'));
+    await renderer.evaluate('document.querySelector(\'button[aria-label="查看 dsh-grok-search"]\').click()');
+    const baseline = await waitForRenderer(renderer, async () => {
+      const response = await rpc('snapshot'), current = response.body?.result?.value;
+      const ui = await renderer.evaluate(`(() => {
+        const root=document.querySelector('[data-dsg-route]')?.shadowRoot;
+        return { status:root?.querySelector('#statusText')?.textContent??null,
+          controlUnavailable:root?.textContent?.includes('CONTROL_SETTINGS_UNAVAILABLE')===true };
+      })()`);
+      return current?.control?.error?.code === 'CONTROL_SETTINGS_UNAVAILABLE' && ui.controlUnavailable
+        ? { control: current.control, program: current.program?.phase ?? null, ui } : null;
+    }, { timeoutMs: 15_000 });
+    const identity = verifyIdentities();
+    const capture = await renderer.send('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(join(run.directory, 'baseline-replay.png'), Buffer.from(capture.data, 'base64'), { flag: 'wx' });
+    writeJson(join(run.directory, 'baseline-reproduction.json'), {
+      baselineVersion: packageReceipt.version, packageSha256: packageReceipt.sha256,
+      installedFilesVerified: packageReceipt.sourceHashes.length, identity, input: replayEvidence, baseline,
+      reproduced: true, repaired: false,
+    });
+    baselineReproduced = true;
+    throw new Error('KNOWN_BASELINE_FAILURE_REPRODUCED: CONTROL_SETTINGS_UNAVAILABLE');
+  }
   const snapshot = await waitForRenderer(renderer, async () => {
     const response = await rpc('snapshot');
     return response.body?.result?.ok && ['ready', 'error'].includes(response.body.result.value.program?.phase) ? response : null;
@@ -291,6 +407,76 @@ try {
     assert.equal(result.draftQuota.body.result?.ok, true, 'SRC-compatible draft quota RPC');
     assert.equal((await rpc('snapshot')).body.result.value.config.revision, snapshot.body.result.value.config.revision);
     assert.deepEqual(quotaRequests, ['/usage']);
+  }
+  if (reinstall) {
+    const ledger = createControlIntentStore({
+      directory: join(control.profile, 'control-intent.records'), trustedRoot: control.profile,
+      governance: true, autoMaintain: false,
+    });
+    const lifecycle = { packageSha256: packageReceipt.sha256, stages: [] };
+    const observe = async stage => {
+      let latest = null;
+      try {
+        latest = await waitForRenderer(renderer, async () => {
+          const response = await rpc('snapshot');
+          if (!response.body?.result?.ok) return null;
+          latest = response.body.result.value;
+          return latest.control?.available && latest.control.phase === 'required' ? latest : null;
+        }, { timeoutMs: 15_000 });
+      } catch (error) {
+        if (!latest) throw error;
+      }
+      const record = ledger.read();
+      const observation = {
+        stage, control: latest.control, program: latest.program?.phase ?? null,
+        intent: record?.intent ?? null, revision: record?.revision ?? 0,
+        profilePatchSha256: sha256(join(control.profile, 'cordis.patch.yml')),
+        selectedBundles: JSON.parse(readFileSync(join(control.profile, 'package.json'), 'utf8')).dsh.profile.bundles,
+      };
+      observation.identity = verifyIdentities();
+      observation.installedFilesVerified = packageReceipt.sourceHashes.length;
+      lifecycle.stages.push(observation);
+      writeJson(join(run.directory, `reinstall-${stage}.json`), observation);
+      console.log(JSON.stringify({ reinstallStage: stage, control: observation.control, program: observation.program,
+        policy: observation.intent?.policy, reason: observation.intent?.reason,
+        releaseReason: observation.intent?.release?.reason, completion: Boolean(observation.intent?.releaseCompletion),
+        recovery: observation.intent?.recovery?.action, revision: observation.revision }));
+      return observation;
+    };
+    await observe('before-remove');
+    const removed = await rpc('removeBundle', { name: manifest.name }, true);
+    writeJson(join(run.directory, 'reinstall-removal.json'), removed);
+    assert.equal(removed.body?.result?.ok, true, 'remove the enabled test-created bundle');
+    assert.notEqual(removed.body.result.value.application, 'failed');
+    writeJson(join(run.directory, 'reinstall-removed-record.json'), ledger.read());
+    const installed = await rpc('installBundle', {
+      spec: tarball, options: { enabled: false, requestId: randomUUID(), registry: 'https://registry.npmjs.org/' },
+    }, true);
+    writeJson(join(run.directory, 'reinstall-installation.json'), installed);
+    assert.equal(installed.body?.result?.ok, true, 'reinstall the exact same tarball without clearing the profile');
+    assert.equal(installed.body.result.value.error ?? null, null);
+    const enabled = await rpc('setBundleEnabled', { name: manifest.name, enabled: true }, true);
+    writeJson(join(run.directory, 'reinstall-enabling.json'), enabled);
+    assert.equal(enabled.body?.result?.ok, true, 'enable through the native manager, as the UI does');
+    const warm = await observe('warm');
+    await rpc('retryControlRelease');
+    await observe('after-retry');
+    renderer.close();
+    renderer = null;
+    await requestDesktopShutdown(port, closed, { timeoutMs: 20_000 });
+    const exit = await closed;
+    writeJson(join(run.directory, 'reinstall-first-exit.json'), exit);
+    assert.equal(exit.code, 0, 'normally exit the owned host before cold restart');
+    ({ child, closed } = launchDesktop());
+    renderer = await connectRenderer(port, { timeoutMs: 90_000, requestTimeoutMs: 200_000 });
+    await waitForRenderer(renderer, client => client.evaluate('document.readyState === "complete" && !!document.querySelector(\'button[aria-label="插件"]\')'));
+    const cold = await observe('cold');
+    result.reinstall = lifecycle;
+    writeJson(join(run.directory, 'reinstall-lifecycle.json'), lifecycle);
+    for (const observation of [warm, cold]) {
+      assert.equal(observation.control.available, true, `${observation.stage}: reinstall must restore the control service`);
+      assert.equal(observation.control.phase, 'required', `${observation.stage}: the enabled reinstallation must acquire search`);
+    }
   }
   if (openConfig) {
     // This creates only a brand-new, non-secret test file in this owned profile.
@@ -451,6 +637,29 @@ ConvertTo-Json -InputObject @{ first=$first; last=$last; crashEvents=$crashes; i
     result.realFolderVisibilityValidated = true;
     result.configOpenUsesSyntheticFile = true;
   }
+  if (replayEvidence) {
+    const replayState = await waitForRenderer(renderer, async client => {
+      const response = await rpc('snapshot');
+      if (!response.body?.result?.ok) return null;
+      const ui = await client.evaluate(`(() => {
+        const root=document.querySelector('[data-dsg-route]')?.shadowRoot;
+        return { text:root?.querySelector('#statusText')?.textContent??null,
+          note:root?.querySelector('#logNote')?.textContent??null,
+          controlUnavailable:root?.textContent?.includes('CONTROL_SETTINGS_UNAVAILABLE')===true,
+          componentError:/共\\s*1\\s*个[·\\s]*1\\s*异常/.test(document.body.innerText) };
+      })()`);
+      const control = response.body.result.value.control;
+      assertReplayReady(control, ui);
+      return { control, ui };
+    }, { timeoutMs: 30_000 });
+    const after = createControlIntentStore({ directory: join(control.profile, 'control-intent.records'),
+      trustedRoot: control.profile, governance: true, autoMaintain: false }).read();
+    assert.equal(after.intent.policy, 'required', 'cold replay must acquire a fresh enabled owner');
+    assert.ok(after.revision > replayEvidence.revision);
+    assert.equal(after.intent.priorIntent?.release?.operationId, replayEvidence.releaseOperationId);
+    result.controlHistoryReplay = { ...replayEvidence, revisionAfterBoot: after.revision,
+      priorReleaseCompleted: Boolean(after.intent.priorIntent.releaseCompletion), ...replayState };
+  }
 } catch (error) {
   failure = error;
   throw error;
@@ -498,7 +707,17 @@ ConvertTo-Json -InputObject @{ first=$first; last=$last; crashEvents=$crashes; i
   } finally {
     quotaServer.closeAllConnections();
     await new Promise(done => quotaServer.close(done));
+    if (failure === undefined || baselineReproduced) {
+      try {
+        finalIdentity = verifyIdentities();
+        writeJson(join(run.directory, 'final-identity.json'), { passed: true, ...finalIdentity });
+      } catch (error) {
+        writeJson(join(run.directory, 'final-identity.json'), { passed: false, error: error.message });
+        throw error;
+      }
+    }
   }
 }
+result.finalIdentity = finalIdentity;
 result.passed = true;
 writeJson(join(run.directory, 'summary.json'), result);

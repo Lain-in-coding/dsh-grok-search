@@ -71,12 +71,78 @@ test('disposed controller cannot be revived by a late preparation result', async
 });
 test('unreaped verification process prevents retry from launching a replacement', async () => {
   let calls = 0;
-  const manager = setup(async () => { calls++; throw new GrokSearchError('GROK_PROGRAM_REAP_FAILED', 'not reaped'); });
-  await assert.rejects(manager.prepare());
-  await assert.rejects(manager.prepare());
+  const failure = new GrokSearchError('GROK_PROGRAM_REAP_FAILED', 'not reaped');
+  const manager = setup(async () => { calls++; throw failure; });
+  await assert.rejects(manager.prepare(), error => error === failure);
+  await assert.rejects(manager.prepare(), error => error === failure);
   assert.equal(calls, 1);
-  await manager.dispose();
+  await assert.rejects(manager.dispose(), error => error === failure);
+  await assert.rejects(manager.dispose(), error => error === failure);
 });
+
+for (const code of ['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED']) {
+  test(`stored ${code} blocks disposal until the actual exit proof settles`, async () => {
+    const exit = deferred(), failure = new GrokSearchError(code, 'synthetic pending exit');
+    Object.defineProperty(failure, 'whenExited', { value: exit.promise });
+    let calls = 0;
+    const manager = setup(async () => { calls++; throw failure; });
+    await assert.rejects(manager.prepare(), error => error === failure);
+    await assert.rejects(manager.prepare(), error => error === failure);
+    await assert.rejects(manager.dispose(), error => error === failure && error.whenExited === exit.promise);
+    assert.equal(calls, 1, 'cleanup failure must not permit overlapping preparation');
+    exit.resolve();
+    await exit.promise;
+    await manager.dispose();
+    assert.equal(manager.snapshot().phase, 'disposed');
+    await assert.rejects(manager.prepare(), { code: 'GROK_SEARCH_STOPPING' });
+  });
+
+  test(`late ${code} during disposal retains exit proof and permits cleanup after exit`, async () => {
+    const gate = deferred(), exit = deferred(), failure = new GrokSearchError(code, 'synthetic pending exit');
+    Object.defineProperty(failure, 'whenExited', { value: exit.promise });
+    const manager = setup(async () => { await gate.promise; throw failure; });
+    const preparation = assert.rejects(manager.prepare(), error => error === failure);
+    const disposal = assert.rejects(manager.dispose(), error => error === failure);
+    gate.resolve();
+    await Promise.all([preparation, disposal]);
+    await assert.rejects(manager.dispose(), error => error === failure);
+    exit.resolve();
+    await exit.promise;
+    await manager.dispose();
+    assert.equal(manager.snapshot().phase, 'disposed');
+  });
+
+  test(`proven ${code} permits an explicit recheck without overlapping processes`, async () => {
+    const exit = deferred(), failure = new GrokSearchError(code, 'synthetic pending exit');
+    Object.defineProperty(failure, 'whenExited', { value: exit.promise });
+    let calls = 0;
+    const manager = setup(async () => { if (++calls === 1) throw failure; return program; });
+    await assert.rejects(manager.prepare(), error => error === failure);
+    await assert.rejects(manager.prepare(), error => error === failure);
+    assert.equal(calls, 1);
+    exit.resolve();
+    await exit.promise;
+    assert.equal(manager.snapshot().phase, 'error', 'an exit is not program readiness');
+    assert.throws(manager.execution, error => error === failure);
+    await manager.prepare();
+    assert.equal(calls, 2);
+    assert.equal(manager.snapshot().phase, 'ready');
+    await manager.dispose();
+  });
+
+  test(`rejected ${code} exit proof stays explicitly blocked`, async () => {
+    const failure = new GrokSearchError(code, 'synthetic unproven exit');
+    const proof = Promise.reject(new Error('synthetic exit observation failed'));
+    proof.catch(() => {});
+    Object.defineProperty(failure, 'whenExited', { value: proof });
+    let calls = 0;
+    const manager = setup(async () => { calls++; throw failure; });
+    await assert.rejects(manager.prepare(), error => error === failure);
+    await assert.rejects(manager.prepare(), error => error === failure);
+    await assert.rejects(manager.dispose(), error => error === failure);
+    assert.equal(calls, 1);
+  });
+}
 
 test('cache recovery is explicit, deduplicated and remains retryable after a failed download', async () => {
   const attempts = [];
@@ -148,7 +214,10 @@ for (const code of ['GROK_CACHE_PATH_INVALID', 'GROK_CACHE_ACCESS_DENIED', 'GROK
         code: code.endsWith('REAP_FAILED') ? code : 'GROK_CACHE_REPAIR_UNAVAILABLE',
       });
       assert.equal(calls, 2);
-    } finally { await manager.dispose(); }
+    } finally {
+      if (code.endsWith('REAP_FAILED')) await assert.rejects(manager.dispose(), error => error === failure);
+      else await manager.dispose();
+    }
   });
 }
 

@@ -103,6 +103,9 @@ async function inspectProgram(executable, { signal, timeoutMs = 5_000,
   const version = await new Promise((resolveVersion, reject) => {
     let output = '', failed, timer, killTimer, settled = false;
     const child = spawn(actual, ['--version'], { env: environment, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    let resolveExit;
+    const whenExited = new Promise(resolve => { resolveExit = resolve; });
+    const markExited = () => { processState.exited = true; resolveExit(); };
     processState.exited = false;
     const finish = (error, value) => {
       if (settled) return;
@@ -114,7 +117,11 @@ async function inspectProgram(executable, { signal, timeoutMs = 5_000,
     const stop = reason => {
       failed ??= reason;
       if (settled || killTimer) return;
-      killTimer = setTimeout(() => finish(new GrokSearchError('GROK_PROGRAM_REAP_FAILED', '程序验证已停止，但验证进程未确认退出。')), 2_000);
+      killTimer = setTimeout(() => {
+        const error = new GrokSearchError('GROK_PROGRAM_REAP_FAILED', '程序验证已停止，但验证进程未确认退出。');
+        Object.defineProperty(error, 'whenExited', { value: whenExited });
+        finish(error);
+      }, 2_000);
       try { child.kill('SIGKILL'); } catch {}
     };
     const abort = () => stop(signal.reason);
@@ -124,7 +131,7 @@ async function inspectProgram(executable, { signal, timeoutMs = 5_000,
       const error = new GrokSearchError('GROK_PROGRAM_START_FAILED', '无法启动 Grok 版本检查。');
       Object.defineProperty(error, 'cause', { value: cause, writable: true, configurable: true });
       // A failed kill also emits error; only a missing pid proves spawn failed.
-      if (child.pid === undefined) { processState.exited = true; finish(error); } else stop(error);
+      if (child.pid === undefined) { markExited(); finish(error); } else stop(error);
     });
     child.stdout.on('data', bytes => {
       if (output.length + bytes.length > 8192) { stop(new GrokSearchError('GROK_PROGRAM_OUTPUT_INVALID', '程序版本输出异常。')); return; }
@@ -132,7 +139,7 @@ async function inspectProgram(executable, { signal, timeoutMs = 5_000,
     });
     child.stderr.resume(); // Never retain upstream error text or credentials.
     child.once('close', code => {
-      processState.exited = true;
+      markExited();
       if (failed) return finish(failed);
       const match = /^grok-search-rs (\d+\.\d+\.\d+(?:-[\w.-]+)?)\s*$/.exec(output);
       if (code !== 0 || !match) return finish(new GrokSearchError('GROK_PROGRAM_IDENTITY_INVALID', '所选程序不是可识别的 grok-search-rs。'));

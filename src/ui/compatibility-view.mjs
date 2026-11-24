@@ -37,6 +37,15 @@ const COMPATIBILITY_CSS = `
 `;
 
 const safeCode = code => typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(code) ? code : '';
+const recheckNotice = error => {
+  const code = /^(?:SETTINGS|COMPATIBILITY)_[A-Z0-9_]{1,60}$/.test(error?.code || '')
+    ? error.code : 'COMPATIBILITY_RECHECK_FAILED';
+  const help = code === 'SETTINGS_AUTH_REQUIRED' ? '请重新连接并完成宿主身份验证后再试。'
+    : code === 'SETTINGS_SECURE_CONNECTION_REQUIRED' ? '请通过已认证的本机直连或 HTTPS 连接重新检查。'
+      : ['SETTINGS_UNAVAILABLE', 'COMPATIBILITY_UNAVAILABLE'].includes(code) ? '请重新打开插件详情页后再试。'
+        : '请检查连接，稍后重试。';
+  return `重新检查未完成 · ${code} · ${help}`;
+};
 
 function describe(report) {
   const code = safeCode(report?.code);
@@ -83,7 +92,7 @@ function describe(report) {
   return null;
 }
 
-/** Shows only backend-confirmed compatibility states; transport errors stay invisible. */
+/** Backend reports own compatibility; manual operation failures have separate feedback. */
 export function createCompatibilityView({ root, remote = null, parseReport, memory = null, timers = globalThis,
   reportTimeoutMs = 4000, recheckTimeoutMs = 20000, refreshIntervalMs = 5000 }) {
   function bindCachedReport() {
@@ -94,7 +103,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, memo
     return null;
   }
   let disposed = false, generation = 0, pending = null, report = bindCachedReport(), detailsOpen = false;
-  let refreshTimer = null;
+  let refreshTimer = null, recheckError = null;
   const flights = new Set();
   const document = root.ownerDocument;
   root.innerHTML = `<style>${COMPATIBILITY_CSS}</style><section class="compatibility-banner" data-tone="warn" role="status" aria-live="polite" aria-atomic="true" hidden>
@@ -115,17 +124,17 @@ export function createCompatibilityView({ root, remote = null, parseReport, memo
   function render() {
     if (disposed) return;
     const state = describe(report);
-    banner.hidden = !state;
+    banner.hidden = !state && !recheckError;
     root.dataset.compatibilityPhase = state?.kind || 'normal';
     root.setAttribute('aria-busy', String(Boolean(pending)));
-    if (!state) return;
-    banner.dataset.tone = state.tone;
-    title.textContent = state.title;
-    text.textContent = state.text;
-    detail.textContent = state.detail;
-    detail.hidden = !detailsOpen;
-    detailsButton.hidden = false;
-    detailsButton.setAttribute('aria-expanded', String(detailsOpen));
+    text.textContent = [state?.text, recheckError].filter(Boolean).join(' ');
+    if (!state && !recheckError) return;
+    banner.dataset.tone = state?.tone || 'warn';
+    title.textContent = state?.title || '重新检查未完成';
+    detail.textContent = state?.detail || '';
+    detail.hidden = !state || !detailsOpen;
+    detailsButton.hidden = !state;
+    detailsButton.setAttribute('aria-expanded', String(Boolean(state && detailsOpen)));
     detailsButton.textContent = detailsOpen ? '收起详情' : '查看原因';
     recheckButton.hidden = typeof remote?.recheckCompatibility !== 'function';
     recheckButton.disabled = pending?.method === 'recheckCompatibility';
@@ -157,25 +166,36 @@ export function createCompatibilityView({ root, remote = null, parseReport, memo
     refreshTimer = null;
     flights.add(mine);
     pending = mine;
+    if (method === 'recheckCompatibility') recheckError = null;
     render();
     mine.timer = timers.setTimeout(() => {
       if (disposed || pending !== mine) return;
       pending = null;
+      if (method === 'recheckCompatibility') recheckError = '重新检查未确认；后台可能仍在处理，页面会继续读取状态。';
       render();
       scheduleRefresh();
     }, timeoutMs);
     mine.task = Promise.resolve().then(() => {
       if (disposed || pending !== mine || mine.generation !== generation) return null;
-      if (typeof mine.remote[method] !== 'function') return null;
+      if (typeof mine.remote[method] !== 'function') {
+        if (method === 'recheckCompatibility') throw Object.assign(new Error(), { code: 'COMPATIBILITY_UNAVAILABLE' });
+        return null;
+      }
       return mine.remote[method]();
     }).then(value => {
       if (!value || disposed || pending !== mine || mine.generation !== generation) return;
       const parsed = parseReport(value);
-      if (JSON.stringify(describe(parsed)) !== JSON.stringify(describe(report))) detailsOpen = false;
+      if (JSON.stringify(describe(parsed)) !== JSON.stringify(describe(report))) {
+        detailsOpen = false;
+        recheckError = null;
+      }
+      if (method === 'recheckCompatibility') recheckError = null;
       report = parsed;
       if (memory?.remote === mine.remote) memory.report = parsed;
-    }).catch(() => {
-      // RPC failure is not evidence that the host or plugin is incompatible.
+    }).catch(error => {
+      if (disposed || pending !== mine || mine.generation !== generation) return;
+      // Keep the accepted backend state; never expose raw transport details.
+      if (method === 'recheckCompatibility') recheckError = recheckNotice(error);
     }).finally(() => {
       timers.clearTimeout(mine.timer);
       flights.delete(mine);
@@ -218,6 +238,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, memo
       remote = next;
       report = bindCachedReport();
       detailsOpen = false;
+      recheckError = null;
       render();
       void refresh();
     },
@@ -233,6 +254,7 @@ export function createCompatibilityView({ root, remote = null, parseReport, memo
       pending = null;
       flights.clear();
       report = null;
+      recheckError = null;
       root.replaceChildren();
     },
   });

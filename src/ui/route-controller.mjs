@@ -226,6 +226,8 @@ function providerIdentity(id, fields, p) {
 }
 function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true, trustedConfigUpdate = false } = {}) {
   const fields = snapshot.config?.fields || {}, oldOrder = S.order.join();
+  const runtimeChanged = JSON.stringify([S.program, S.control?.phase, S.control?.available, S.control?.error])
+    !== JSON.stringify([snapshot.program, snapshot.control?.phase, snapshot.control?.available, snapshot.control?.error]);
   const capabilitiesChanged = Boolean(S.capabilities?.secretsAllowed) !== Boolean(snapshot.capabilities?.secretsAllowed);
   const configChanged = S.config && (S.config.path !== snapshot.config?.path
     || S.config.revision !== snapshot.config?.revision || S.config.quotaRevision !== snapshot.config?.quotaRevision);
@@ -247,7 +249,7 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
   S.config = snapshot.config;
   S.prefs = preferences || S.prefs;
   S.cfgExists = snapshot.config?.exists === true;
-  const restored = S.control.policy === 'released' && S.control.routeVerified === true
+  const restored = S.control.phase !== 'starting' && S.control.policy === 'released' && S.control.routeVerified === true
     && S.control.completionCommitted === true;
   S.plugin = !restored;
   const next = providersFrom(fields, S.prefs?.value);
@@ -279,6 +281,18 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
     renderCard();
     const body = $('.dlg-body', dlg);
     if (body) body.scrollTop = top;
+  } else if (runtimeChanged && D?.kind === 'hub' && !S.busy && !dialogBusy()) {
+    const top = $('.dlg-body', dlg)?.scrollTop || 0;
+    const focused = active(), key = focused?.dataset?.k;
+    const selection = focused?.selectionStart;
+    renderHub();
+    const body = $('.dlg-body', dlg);
+    if (body) body.scrollTop = top;
+    const input = key && Object.hasOwn(D.draft, key) ? $(`input[data-k="${key}"]`, dlg) : null;
+    if (input) {
+      input.focus({ preventScroll: true });
+      if (typeof selection === 'number') input.setSelectionRange(selection, selection);
+    }
   }
   if (first) S.readBanner = S.cfgExists && Object.keys(META).some(id => isSet(id));
   if (oldOrder !== S.order.join()) buildRows(false);
@@ -383,28 +397,42 @@ function operationError(error, dialog = false) {
 }
 async function retryControl() {
   if (disposed || controlRetrying || S.busy) return;
+  const generation = accessGeneration;
+  const dialog = D?.kind === 'hub' ? D : null;
+  const current = () => !disposed && generation === accessGeneration;
+  const unavailable = code => ['CONTROL_SETTINGS_UNAVAILABLE', 'CONTROL_OWNER_ABSENT'].includes(code);
+  const recoveryHint = code => toast(`${code} · 请重新打开插件详情页，核对原生开关与宿主日志；恢复接口不可用时，请由原生开关发起重新启用。本页不会更改原生开关。`, { tone: 'warn', ms: 7000 });
   controlRetrying = true;
   S.busy = true;
   renderBanner();
-  const generation = accessGeneration;
   try {
     // Finish an earlier read before the mutating retry so its late snapshot
     // cannot overwrite a successful release result.
     if (readTask) await readTask;
-    if (disposed || generation !== accessGeneration) return;
+    if (!current()) return;
+    if (typeof remote.retryControlRelease !== 'function') {
+      throw Object.assign(new Error('此宿主未提供搜索恢复接口。'), { code: 'SETTINGS_UNAVAILABLE' });
+    }
     await remote.retryControlRelease();
-    if (!disposed && generation === accessGeneration) await refresh({ force: true });
-  } catch (error) {
-    if (disposed || generation !== accessGeneration) return;
-    operationError(error);
+    if (!current()) return;
     await refresh({ force: true });
-    if (!disposed && /^gateway[/.]|^SETTINGS_UNAVAILABLE$/.test(error?.code || '')) {
-      toast('此宿主暂不能执行恢复操作，请通过插件页原生开关重试。', { tone: 'warn' });
+    if (current() && !S.rpcError && unavailable(S.control?.error?.code)) recoveryHint(S.control.error.code);
+  } catch (error) {
+    if (!current()) return;
+    if (['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED'].includes(error?.code)) {
+      controlRetrying = false;
+      S.busy = false;
+    }
+    operationError(error, dialog !== null && D === dialog);
+    if (!current()) return;
+    await refresh({ force: true });
+    if (current() && (/^gateway[/.]|^SETTINGS_UNAVAILABLE$/.test(error?.code || '') || unavailable(error?.code))) {
+      recoveryHint(error.code);
     }
   } finally {
     controlRetrying = false;
     S.busy = false;
-    if (!disposed) syncAll(true);
+    if (current()) syncAll(true);
   }
 }
 // An external write leaves an open card's baseline behind. When that blocks its
@@ -455,7 +483,7 @@ async function reloadDialogDraft() {
 // field with a stale whole-file snapshot; an undo deliberately never rebases.
 async function saveConfig(build, baseline = null) {
   if (!S.config || S.config.error) throw Object.assign(new Error('请先修正配置文件。'), { code: 'CONFIG_PARSE_FAILED' });
-  const starting = clone(S.config);
+  const starting = clone(S.config), accessAtStart = accessGeneration;
   const saveUnavailable = '当前设置服务无法完成保存，请重新打开设置；仍不可用时重启 DSH 后重试。';
   // An effective identity includes credentials that redacted fields cannot
   // compare. Only an unchanged identity may rebase an unrelated file edit.
@@ -477,7 +505,7 @@ async function saveConfig(build, baseline = null) {
           { code: 'SETTINGS_SAVE_UNAVAILABLE' });
       }
       const path = S.config.path, identity = S.config.quotaRevision;
-      const epoch = secretEpoch, accessAtStart = accessGeneration;
+      const epoch = secretEpoch;
       const result = await remote.saveWithIdentity({
         expectedRevision: revision, configIdentity: identity, updates,
       });
@@ -496,9 +524,10 @@ async function saveConfig(build, baseline = null) {
       if (/METHOD_NOT_FOUND|method[./_]not[./_]found|^SETTINGS_UNAVAILABLE$/i.test(error?.code || '')) {
         throw Object.assign(new Error(saveUnavailable), { code: error.code });
       }
-      if (attempt || error?.code !== 'CONFIG_CONFLICT' || disposed) throw error;
+      if (attempt || error?.code !== 'CONFIG_CONFLICT' || disposed || accessAtStart !== accessGeneration) throw error;
       await refresh({ force: true });
       if (disposed) return null;
+      if (accessAtStart !== accessGeneration) throw error;
       if (S.rpcError || !S.config || S.config.error) throw error;
       // Redacted snapshots cannot establish whether another writer replaced a
       // credential with a different same-length/same-count value. Never rebase
@@ -512,11 +541,11 @@ async function savePreference(id, on) {
   const key = id === 'grok' ? 'grokEnabled' : 'githubReadEnabled';
   const readEnabled = (prefs, targetId) => targetId === 'github'
     ? prefs?.value?.githubReadEnabled === true : prefs?.value?.grokEnabled !== false;
-  const starting = S.prefs;
+  const starting = S.prefs, accessAtStart = accessGeneration;
   for (let attempt = 0; attempt < 2; attempt++) {
     if (disposed) return;
     try {
-      const revision = S.prefs.revision, accessAtStart = accessGeneration;
+      const revision = S.prefs.revision;
       const result = await remote.savePreferences({ expectedRevision: revision,
         value: { ...S.prefs.value, [key]: on } });
       if (!disposed) {
@@ -532,9 +561,10 @@ async function savePreference(id, on) {
       }
       return result;
     } catch (error) {
-      if (attempt || error?.code !== 'PREFERENCES_CONFLICT' || disposed) throw error;
+      if (attempt || error?.code !== 'PREFERENCES_CONFLICT' || disposed || accessAtStart !== accessGeneration) throw error;
       const current = await remote.preferences();
       if (disposed) return;
+      if (accessAtStart !== accessGeneration) throw error;
       stateGeneration++;
       snapshotSignature = null;
       S.prefs = current;
@@ -574,7 +604,8 @@ function cardUndo(receipt, id, previousEnabled, preferenceChanged) {
       if (!disposed) { syncAll(false); toast('已撤销配置和 DSH 开关修改'); }
     } catch (error) {
       operationError(restored ? Object.assign(new Error('共享配置已恢复，但 DSH 开关未恢复。请核对开关。'),
-        { code: 'SETTINGS_PARTIAL_RESTORE' }) : error);
+        { code: ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED'].includes(error?.code)
+          ? error.code : 'SETTINGS_PARTIAL_RESTORE' }) : error);
     } finally { S.busy = false; if (!disposed) syncAll(true); }
   };
 }
@@ -735,7 +766,10 @@ function routeStatus() {
   if (S.rpcError) return 'down';
   if (S.config?.error) return 'cfgerr';
   if (S.control?.error || ['incomplete', 'conflict', 'unavailable', 'stopping'].includes(S.control?.phase)) return 'ctlerr';
+  if (S.control?.phase === 'starting') return 'connecting';
+  if (S.control?.phase === 'stopped' && S.control?.policy === 'required') return 'paused';
   if (!S.plugin) return 'off';
+  if (S.control?.available === false) return 'ctlerr';
   if (!['required'].includes(S.control?.phase)) return 'connecting';
   if (S.lastRoute?.outcome === 'failed') return 'err';
   const sv = servingSupp();
@@ -756,12 +790,12 @@ function routeStatus() {
   return anySet ? 'none' : 'wait';
 }
 const STATUS_TEXT = { load: '读取配置…', down: '设置服务不可用', cfgerr: '配置文件无法读取', ctlerr: '接管异常',
-  connecting: '正在接管…', prep: '正在准备 Grok', off: '已恢复原搜索', wait: '等待配置', none: '未启用来源',
+  connecting: '正在接管…', paused: '搜索已暂停', prep: '正在准备 Grok', off: '已恢复原搜索', wait: '等待配置', none: '未启用来源',
   err: '搜索失败', live: '正在接管', fallback: '已静默回退', backup: '补充来源接管' };
 
 function rowState(id) {
   const st = routeStatus();
-  if (['load', 'down', 'cfgerr', 'ctlerr', 'connecting'].includes(st)) return isSet(id) ? 'on' : 'unset';
+  if (['load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'paused'].includes(st)) return isSet(id) ? 'on' : 'unset';
   if (id === 'grok') {
     if (!isSet('grok')) return st === 'wait' ? 'wait' : 'unset';
     if (!grokOn()) return 'off';
@@ -789,14 +823,14 @@ function wireDefs() {
   const covering = st === 'fallback' || st === 'backup';
   const defs = [];
   const top = { off: 'rest', load: 'hidden', down: 'rest', cfgerr: 'broken', ctlerr: 'broken',
-    connecting: 'warn', prep: 'warn', wait: 'warn', none: 'warn', err: 'broken' }[st] || 'live';
+    connecting: 'warn', paused: 'rest', prep: 'warn', wait: 'warn', none: 'warn', err: 'broken' }[st] || 'live';
   defs.push({ id: 'dsh-hub', a: 'dsh-out', b: 'hub-in', ws: top, at: 'start' });
   defs.push({ id: 'dsh-off', a: 'dsh-alt', b: 'off-in', ws: off ? 'live' : 'hidden', kind: 'alt' });
   const rows = ['grok', ...S.order, 'github'];
   rows.forEach((id) => {
     let ws;
     if (st === 'load') ws = 'hidden';
-    else if (['down', 'cfgerr', 'ctlerr', 'connecting'].includes(st)) ws = 'rest';
+    else if (['down', 'cfgerr', 'ctlerr', 'connecting', 'paused'].includes(st)) ws = 'rest';
     else if (off) ws = isSet(id) ? 'rest' : 'unset';
     else if (!isSet(id)) ws = id === 'grok' && st === 'wait' ? 'warn' : 'unset';
     else if (!isOn(id)) ws = 'rest';
@@ -1026,7 +1060,7 @@ function syncRow(el) {
   const label = !isSet(id) ? `${name} 未配置，打开配置` : id === 'github' ? '启用 GitHub 读取' : id === 'grok' ? '启用 Grok 主搜索' : `启用 ${name}`;
   sw.setAttribute('aria-checked', String(checked));
   sw.setAttribute('aria-label', label);
-  sw.disabled = S.busy || ['down', 'cfgerr', 'ctlerr', 'connecting'].includes(routeStatus());
+  sw.disabled = S.busy || ['down', 'cfgerr', 'ctlerr', 'connecting', 'paused'].includes(routeStatus());
   const unverified = id === 'tavily'
     ? tvKeyIdx().every((slot) => savedCheck(id, slot).tone === 'idle')
     : savedCheck(id).tone === 'idle';
@@ -1103,6 +1137,7 @@ function renderHead() {
   card.classList.toggle('is-loading', st === 'load');
   const pill = $('#statusPill');
   const statusText = S.testing ? testProgressText()
+    : st === 'connecting' && S.control?.phase === 'starting' ? '正在启动…'
     : st === 'backup' && grokDiagnosticFailed() ? '补充来源可用'
     : st === 'err' && !S.lastRoute ? '最近检查未通过' : STATUS_TEXT[st];
   if (pill.dataset.s !== st) {
@@ -1112,9 +1147,10 @@ function renderHead() {
   if ($('#statusText').textContent !== statusText) $('#statusText').textContent = statusText;
   const tb = $('#testBtn');
   tb.innerHTML = S.testing ? `${svg('stop', 'ic ic-sm')}停止测试` : `${svg('play', 'ic ic-sm')}测试连接`;
-  tb.disabled = !S.testing && (S.busy || ['off', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting'].includes(st)
+  tb.disabled = !S.testing && (S.busy || ['off', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'paused'].includes(st)
     || !isOn('github') && ['wait', 'none', 'prep'].includes(st));
-  tb.title = tb.disabled ? { off: '插件已关闭，打开插件开关后可测试', wait: '先配置搜索来源或开启 GitHub 读取', none: '先开启一个待测项目' }[st] || '' : '';
+  tb.title = tb.disabled ? { off: '插件已关闭，打开插件开关后可测试', paused: '搜索已暂停，请在插件页核对原生开关与宿主日志',
+    wait: '先配置搜索来源或开启 GitHub 读取', none: '先开启一个待测项目' }[st] || '' : '';
   $('#testPop .pop-text').textContent = grokOn()
     ? '会逐一测试 Grok 和全部已开启的补充来源，Tavily 的每个 Key 单独检查，各次测试会消耗相应额度。正常搜索仍在补充链首个成功处停止。'
     : `Grok 未启用，会逐一测试 ${enabledSupp().map((id) => META[id].name).join('、') || '补充来源'} 的全部 Key，各次测试会消耗相应额度。正常搜索仍在首个成功处停止。`;
@@ -1541,10 +1577,18 @@ function renderBanner() {
   } else if (st === 'cfgerr') {
     html = B('err', 'info', '配置文件无法读取', `${esc(S.config.error.code || 'CONFIG_ERROR')} · ${esc(S.config.error.message)} 搜索会明确报错，不会回退官方搜索。`, btn('open-file', '打开文件'));
   } else if (st === 'ctlerr') {
-    html = B('err', 'info', '接管状态异常', `${esc(S.control?.error?.code || S.control?.phase || 'CONTROL_ERROR')} · 路由尚未确认；重试继续未完成的停用，否则仅检查状态。`,
+    const code = S.control?.error?.code || S.control?.phase || 'CONTROL_ERROR';
+    const hint = S.control?.available === false || ['CONTROL_SETTINGS_UNAVAILABLE', 'CONTROL_OWNER_ABSENT'].includes(code)
+      ? '搜索控制组件当前未加载；重试尝试恢复或检查状态。若恢复接口不可用，请在插件页核对原生开关与宿主日志。'
+      : '重试继续未完成的搜索恢复或重新检查当前状态；结果以宿主实际确认为准。';
+    html = B('err', 'info', '接管状态异常', `${esc(code)} · ${hint}`,
       `<button type="button" class="btn btn-sm" data-act="retry-control"${controlRetrying ? ' disabled aria-busy="true"' : ''}>${controlRetrying ? '处理中…' : '重试'}</button>`);
   } else if (st === 'connecting') {
-    html = B('info', 'info', '正在确认搜索接管', '此时不把配置记录当成路由完成；等待宿主实际就绪。');
+    html = S.control?.phase === 'starting'
+      ? B('info', 'info', '正在启动搜索组件', '正在等待宿主加载搜索组件，完成后自动更新；当前尚未确认搜索路由。')
+      : B('info', 'info', '正在确认搜索接管', '此时不把配置记录当成路由完成；等待宿主实际就绪。');
+  } else if (st === 'paused') {
+    html = B('info', 'info', '搜索已暂停', '配置已保留；本页不会自动恢复接管，也未确认已恢复原搜索。请在插件页核对原生开关与宿主日志。');
   } else if (st === 'prep') {
     html = B('info', 'info', '正在准备 Grok 程序', `${esc(programPhase())}。可先填写配置；准备期间搜索会明确报错，不回退官方搜索。`);
   } else if (st === 'off') {
@@ -2482,6 +2526,7 @@ dlg.addEventListener('click', async (e) => {
   else if (a === 'step') step(b.dataset.k, +b.dataset.d);
   else if (a === 'adv') toggleAdv(b);
   else if (a === 'redetect') redetect(b);
+  else if (a === 'retry-control') await retryHubControl(b);
   else if (a === 'open-file') openPath('file');
   else if (a === 'open-folder') openPath('folder');
   else if (a === 'reload-draft') void reloadDialogDraft();
@@ -2738,7 +2783,9 @@ async function commitCard(draft = D.draft) {
         mine.fields = clone(configFields());
         mine.draft = clone(draft);
         mine.orig = JSON.stringify(normCard(mine.base));
-        operationError(Object.assign(new Error('共享配置已保存，但 DSH 开关未保存。请核对后再保存开关。'), { code: 'SETTINGS_PARTIAL_SAVE' }), true);
+        operationError(Object.assign(new Error('共享配置已保存，但 DSH 开关未保存。请核对后再保存开关。'),
+          { code: ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_REQUIRED'].includes(error?.code)
+            ? error.code : 'SETTINGS_PARTIAL_SAVE' }), true);
         return;
       }
       throw error;
@@ -2896,8 +2943,12 @@ function vHub(h) {
 function hubBody(h) {
   const config = configLocation();
   const source = S.program?.program?.source;
-  const prog = { tag: `<span class="tag" data-tone="${S.program?.phase === 'ready' ? 'ok' : 'warn'}">${esc(programSource())}</span>`,
-    path: S.program?.program?.path || S.program?.error?.message || '正在自动检测，无需填写路径' };
+  const absent = !S.program;
+  const canRetry = absent && S.control?.available === true && typeof remote.retryControlRelease === 'function'
+    && !['starting', 'stopped', 'released', 'stopping'].includes(S.control.phase);
+  const prog = { tag: absent ? '<span class="tag">组件未加载</span>'
+    : `<span class="tag" data-tone="${S.program?.phase === 'ready' ? 'ok' : 'warn'}">${esc(programSource())}</span>`,
+    path: absent ? '程序管理组件当前未加载。' : S.program?.program?.path || S.program?.error?.message || '正在自动检测，无需填写路径' };
   const version = S.program?.program?.version ? 'v' + S.program.program.version : programPhase();
   const repair = !S.program?.configuration?.executable
     && (S.program?.canRepair === true || S.program?.error?.code === 'GROK_CACHE_DAMAGED');
@@ -2906,11 +2957,19 @@ function hubBody(h) {
   const order = ['插件设置里的程序路径（只读）', '系统 PATH、npm 或 Cargo 的已有安装', '缺失时下载到插件私有缓存']
     .map((t, i) => `<li class="${i === hit ? 'is-hit' : ''}">${t}${i === hit ? ' · 当前使用' : ''}</li>`).join('');
   const cfgTag = S.cfgExists ? '<span class="tag" data-tone="agent">已存在</span>' : '<span class="tag" data-tone="warn">首次保存时创建</span>';
+  const programAction = absent ? canRetry
+    ? `<button type="button" class="btn btn-sm" data-a="retry-control"${S.busy || controlRetrying ? ' disabled' : ''}>${svg('refresh', 'ic ic-sm')}重试恢复</button>` : ''
+    : `<button type="button" class="btn btn-sm" data-a="redetect" data-repair="${repair}">${svg('refresh', 'ic ic-sm')}${repair ? '重新准备' : '重新检测'}</button>`;
+  const programHelp = absent ? canRetry
+    ? '可重试恢复并检查当前运行状态；不会更改原生开关。'
+    : S.control?.phase === 'starting' ? '宿主正在启动搜索组件，当前尚未取得程序状态。'
+      : '请在插件页核对原生开关与宿主日志；已确认的暂停不会自动解除。'
+    : '按以下顺序查找，已有兼容安装直接复用；不会覆盖全局程序：';
   const secProg = [
     '<section class="sec"><h3 class="sec-h">程序</h3>',
-    `<div class="prog"><div class="prog-main"><span class="prog-title">grok-search-rs ${esc(version)} ${prog.tag}</span><span class="prog-path" title="${esc(prog.path)}">${esc(prog.path)}</span></div><button type="button" class="btn btn-sm" data-a="redetect" data-repair="${repair}">${svg('refresh', 'ic ic-sm')}${repair ? '重新准备' : '重新检测'}</button></div>`,
-    '<p class="f-help" style="margin:10px 0 6px">按以下顺序查找，已有兼容安装直接复用；不会覆盖全局程序：</p>',
-    `<ol class="order">${order}</ol></section>`
+    `<div class="prog"><div class="prog-main"><span class="prog-title">grok-search-rs ${esc(version)} ${prog.tag}</span><span class="prog-path" title="${esc(prog.path)}">${esc(prog.path)}</span></div>${programAction}</div>`,
+    `<p class="f-help" style="margin:10px 0 6px">${programHelp}</p>`,
+    (absent ? '' : `<ol class="order">${order}</ol>`) + '</section>'
   ].join('');
   const secCfg = [
     '<section class="sec"><h3 class="sec-h">共享配置文件</h3>',
@@ -2956,6 +3015,28 @@ function toggleAdv(b) {
   box.classList.toggle('is-open', D.advOpen);
   box.firstElementChild.inert = !D.advOpen;
   if (D.advOpen) setTimeout(() => box.scrollIntoView({ block: 'nearest', behavior: reduced() ? 'auto' : 'smooth' }), 140);
+}
+async function retryHubControl(button) {
+  if (disposed || !D || D.kind !== 'hub' || dialogBusy() || button.disabled || S.busy || controlRetrying) return;
+  if (S.program || S.control?.available !== true || typeof remote.retryControlRelease !== 'function'
+    || ['starting', 'stopped', 'released', 'stopping'].includes(S.control.phase)) {
+    renderHub();
+    return;
+  }
+  const mine = D, accessAtStart = accessGeneration;
+  mine.operationError = null;
+  button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
+  button.textContent = '处理中…';
+  try { await retryControl(); }
+  finally {
+    if (!disposed && D === mine && accessAtStart === accessGeneration) {
+      const top = $('.dlg-body', dlg)?.scrollTop || 0;
+      renderHub();
+      const body = $('.dlg-body', dlg);
+      if (body) body.scrollTop = top;
+    }
+  }
 }
 async function redetect(b) {
   if (!D || dialogBusy() || b.disabled) return;
@@ -3165,7 +3246,7 @@ function flashNode(el) {
    No timer invents network progress, result counts, status codes or duration. */
 async function runTest() {
   const st0 = routeStatus();
-  if (S.testing || S.busy || ['off', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting'].includes(st0)
+  if (S.testing || S.busy || ['off', 'load', 'down', 'cfgerr', 'ctlerr', 'connecting', 'paused'].includes(st0)
     || !isOn('github') && ['wait', 'none', 'prep'].includes(st0)) return;
   logView?.cancel();
   const my = ++gen;

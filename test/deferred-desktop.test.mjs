@@ -361,13 +361,14 @@ function freshUserPathClosing({ closed, child, shutdownFailure = null, primaryFa
   const closing = source.slice(catchStart < 0 ? finallyStart : catchStart);
   const execute = new Function('assert', 'renderer', 'requestDesktopShutdown', 'port', 'closed',
     'writeJson', 'join', 'run', 'quotaServer', 'result', 'child', 'primaryFailure', 'setTimeout', 'clearTimeout',
-    `return (async () => { let failure; try { if (primaryFailure) throw primaryFailure; ${closing} })();`);
+    'verifyIdentities',
+    `return (async () => { let failure, finalIdentity, baselineReproduced = false; try { if (primaryFailure) throw primaryFailure; ${closing} })();`);
   const evidence = [], result = {}, state = { quotaClosed: false };
   const verification = execute(assert, { close() {} },
     async () => { if (shutdownFailure) throw shutdownFailure; }, 1234, closed,
     (path, value) => evidence.push({ path, value }), join, { directory: '/isolated-fixture' },
     { closeAllConnections() {}, close(done) { state.quotaClosed = true; done(); } },
-    result, child, primaryFailure, timers, clearTimeout);
+    result, child, primaryFailure, timers, clearTimeout, () => ({ packageSha256: 'fixture-hash', installedFilesVerified: 59 }));
   return { verification, evidence, result, state };
 }
 

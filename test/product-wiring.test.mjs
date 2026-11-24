@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,16 +13,31 @@ import { createSettingsGateway, SETTINGS_DESCRIPTORS } from '../src/settings-ui.
 import {
   PRODUCT_SEARCH_BUNDLE, PRODUCT_RECOVERY_BUNDLE, PRODUCT_HOST_ID, createAcquisition, createLease, createProductStore,
   createProductReleaseController, effectiveFetchProvider, effectiveSearchProvider, routeReceipt, takeOverAuthorRoute,
-  restoreAuthorRoute, effectiveConfig, createSearchConfigHook, readSelection,
+  restoreAuthorRoute, effectiveConfig, createSearchConfigHook, readSelection, holdProductRelease, productReleaseInFlight,
+  onProductReleaseIdle, productRuntimeCleanupInFlight, onProductRuntimeCleanupIdle,
 } from '../src/core/product-control.mjs';
 import { commitExplicitRelease, createReleaseBarrier } from '../src/core/release-transaction.mjs';
 import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
 
 const deferred = () => {
-  let resolve;
-  const promise = new Promise(done => { resolve = done; });
-  return { promise, resolve };
+  let resolve, reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 };
+const nextImmediate = () => new Promise(resolve => setImmediate(resolve));
+async function waitForNotification(promise) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Passive release notification did not arrive.')), 2_000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function waitForRuntimeCleanup(store) {
+  const idle = deferred(), unsubscribe = onProductRuntimeCleanupIdle(store, idle.resolve);
+  try { await waitForNotification(idle.promise); }
+  finally { unsubscribe(); }
+}
 async function withIsolatedHome(work) {
   const home = mkdtempSync(join(tmpdir(), 'dsh-isolated-home-'));
   const pattern = /^(HOME|USERPROFILE|GROK_SEARCH_.*|TAVILY_.*|EXA_.*|TINYFISH_.*|FIRECRAWL_.*|OPENAI_COMPATIBLE_.*|GITHUB_TOKEN)$/i;
@@ -118,6 +133,22 @@ function createRequiredRecord(ctx, store, hostId) {
   lease.hostId = hostId;
   const intent = { schemaVersion: 1, policy: 'required', reason: 'test-product-record', release: null, acquisition, lease };
   return store.compareAndSwap({ expectedRevision: 0, intent });
+}
+
+function createInterruptedReleaseRecord(ctx, store, operationId = randomUUID(), reason = 'native-bundle-disable') {
+  const required = createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const committedAt = '2026-10-26T00:00:00.000Z';
+  const released = store.compareAndSwap({ expectedRevision: required.revision, intent: {
+    ...required.intent, policy: 'released', reason,
+    pause: { confirmed: true, reason, observedAt: committedAt },
+    priorIntent: structuredClone(required.intent), release: {
+      explicit: true, committedAt, kind: 'intent-release-commit', operationId,
+      hostId: PRODUCT_HOST_ID, pid: required.intent.lease.pid,
+      author: required.intent.acquisition.authorSearchProvider, counterBaseline: 0,
+      routeChanged: false, routeVerified: false,
+    },
+  } });
+  return { required, released };
 }
 
 test('damaged product selections expose a stable code without rewriting the manifest', async t => {
@@ -435,6 +466,7 @@ test('a fresh enabled owner reacquires a completed release and preserves immutab
   const released = store.read();
   assert.equal(released.intent.policy, 'released');
   assert.equal((await oldOwner.retry()).phase, 'released');
+  await waitForRuntimeCleanup(store);
   ctx.dispose();
   ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
   await applyControl(ctx);
@@ -450,6 +482,183 @@ test('a fresh enabled owner reacquires a completed release and preserves immutab
   assert.equal(reacquired.intent.priorIntent.priorIntent, null);
   assert.equal(released.intent.priorIntent.policy, 'required');
   ctx.dispose();
+});
+
+test('an authorized fresh native owner supersedes pending release with current author evidence', async t => {
+  for (const reason of ['native-bundle-disable', 'native-component-disable']) {
+    for (const route of ['current-author', 'default-author', 'product']) await t.test(`${reason}: ${route}`, async () => {
+      const previousSearchEnv = process.env.DSH_WEB_SEARCH_PROVIDER;
+      delete process.env.DSH_WEB_SEARCH_PROVIDER;
+      const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+      const entry = ctx.loader.entries()[0];
+      try {
+        await entry.update({ config: { searchProvider: 'ddg', fetchProvider: 'fs-quality-fetch' } });
+        ctx.provide('grokSearchRouteVerifier', { verify: () => { throw new Error('interrupted old verification'); } });
+        await applyControl(ctx, { store });
+        const result = await ctx.get('grokSearchControl').stop(reason);
+        assert.equal(result.completionCommitted, false);
+        await nextImmediate();
+        const released = store.read(), path = join(store.directory, `v${String(released.revision).padStart(12, '0')}.json`);
+        const bytes = readFileSync(path);
+        assert.equal(productReleaseInFlight(store, released.intent.release.operationId), false);
+        ctx.dispose();
+        ctx.provide('grokSearchControl', undefined);
+        ctx.provide('grokSearchRouteVerifier', undefined);
+        ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+        const authorConfig = route === 'default-author' ? { fetchProvider: 'http' }
+          : { searchProvider: 'current-author', fetchProvider: 'http' };
+        await entry.update({ config: authorConfig });
+        entry.options.inject = { currentDependency: { retained: true } };
+        if (route === 'product') {
+          entry.fiber.config.searchProvider = 'grok-search';
+          ctx.get('web').searchProviderId = 'grok-search';
+        }
+        const acquisition = createAcquisition(ctx), lease = createLease(ctx), observations = [];
+        const update = entry.update, updates = [];
+        entry.update = async options => { updates.push(structuredClone(options.config)); return update(options); };
+        await applyControl(ctx, { store, canSupersedeNativeRelease: observation => {
+          observations.push(observation);
+          return observation.record.revision === released.revision && observation.record.operationId === released.operationId;
+        } });
+        const acquired = store.read(), owner = ctx.get('grokSearchControl');
+        assert.equal(owner.publicSnapshot().phase, 'required');
+        assert.equal(owner.publicSnapshot().completionCommitted, false);
+        assert.equal(acquired.revision, released.revision + 1);
+        assert.equal(acquired.intent.release, null);
+        assert.equal(acquired.intent.releaseCompletion, undefined);
+        assert.equal(acquired.intent.recovery, undefined);
+        assert.equal(acquired.intent.pause, undefined);
+        assert.deepEqual(acquired.intent.priorIntent, { ...released.intent, priorIntent: null });
+        assert.equal(acquired.intent.priorIntent.releaseCompletion, undefined);
+        for (const key of ['authorSearchProvider', 'authorSearchProviderPresent', 'authorFetchProvider', 'authorInjectSha256']) {
+          assert.equal(acquired.intent.acquisition[key], acquisition[key]);
+        }
+        assert.deepEqual(acquired.intent.lease, lease);
+        assert.ok(observations.length >= 3, 'authorization is checked initially, at publication and before route takeover');
+        for (const observed of observations) {
+          assert.deepEqual(observed.record, released, 'all checks receive the original release envelope');
+          assert.deepEqual(observed.lease, lease);
+          assert.equal(observed.acquisition.authorInjectSha256, acquisition.authorInjectSha256);
+        }
+        assert.equal(effectiveSearchProvider(entry), 'grok-search');
+        assert.equal(effectiveFetchProvider(entry), 'http');
+        assert.deepEqual(entry.options.config, authorConfig);
+        assert.deepEqual(entry.options.inject, { currentDependency: { retained: true } });
+        assert.deepEqual(updates, route === 'product' ? [] : [{ ...authorConfig, searchProvider: 'grok-search' }]);
+        assert.deepEqual(readFileSync(path), bytes);
+        assert.equal((await owner.stop('settings-ui-explicit-stop')).completionCommitted, true);
+        assert.equal(effectiveSearchProvider(entry), acquisition.authorSearchProvider);
+        assert.equal(effectiveFetchProvider(entry), 'http');
+        assert.deepEqual(entry.options.config, authorConfig);
+        assert.deepEqual(readFileSync(path), bytes);
+      } finally {
+        ctx.dispose();
+        if (previousSearchEnv === undefined) delete process.env.DSH_WEB_SEARCH_PROVIDER;
+        else process.env.DSH_WEB_SEARCH_PROVIDER = previousSearchEnv;
+      }
+    });
+  }
+});
+
+test('native supersession remains opt-in and cannot replace explicit stop, newer pause or a busy owner', async t => {
+  for (const mode of ['default', 'denied', 'truthy', 'async', 'settings-stop', 'other-release', 'historic-release', 'newer-pause', 'busy']) {
+    await t.test(mode, async () => {
+      const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+      const reason = mode === 'settings-stop' ? 'settings-ui-explicit-stop'
+        : mode === 'other-release' ? 'explicit-user-release' : 'native-bundle-disable';
+      let { released } = createInterruptedReleaseRecord(ctx, store, randomUUID(), reason);
+      if (mode === 'historic-release') released = store.compareAndSwap({ expectedRevision: released.revision,
+        intent: { ...released.intent, release: { ...released.intent.release, kind: 'historic-release' } } });
+      if (mode === 'newer-pause') released = store.compareAndSwap({ expectedRevision: released.revision,
+        intent: { ...released.intent, pause: { confirmed: true, reason: 'external-user-pause' } } });
+      const pending = deferred(), entry = ctx.loader.entries()[0];
+      await entry.update({ config: { searchProvider: 'current-author', fetchProvider: 'http' } });
+      let calls = 0;
+      const canSupersedeNativeRelease = () => {
+        calls++;
+        return mode === 'denied' ? false : mode === 'truthy' ? 'yes' : mode === 'async' ? Promise.resolve(true) : true;
+      };
+      if (mode === 'busy') holdProductRelease(store, released.intent.release.operationId, pending.promise);
+      try {
+        await applyControl(ctx, { store, ...(mode === 'default' ? {} : { canSupersedeNativeRelease }) });
+        assert.equal(ctx.get('grokSearchControl').snapshot().phase, 'released');
+        assert.equal(ctx.get('grokSearchControl').publicSnapshot().completionCommitted, false);
+        assert.deepEqual(store.read(), released);
+        assert.equal(effectiveSearchProvider(entry), 'current-author');
+        assert.equal(calls, ['denied', 'truthy', 'async'].includes(mode) ? 1 : 0);
+      } finally { pending.resolve(); await pending.promise; ctx.dispose(); }
+    });
+  }
+});
+
+test('an already acquired owner cannot supersede a later pending native release', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+  let grants = 0;
+  try {
+    await applyControl(ctx, { store, canSupersedeNativeRelease: () => { grants++; return true; } });
+    const required = store.read(), reason = 'native-bundle-disable';
+    const released = store.compareAndSwap({ expectedRevision: required.revision, intent: {
+      ...required.intent, policy: 'released', reason, priorIntent: required.intent,
+      pause: { confirmed: true, reason }, release: { explicit: true, kind: 'intent-release-commit',
+        committedAt: new Date().toISOString(), operationId: randomUUID(), hostId: PRODUCT_HOST_ID, counterBaseline: 0 },
+    } });
+    assert.equal((await ctx.get('grokSearchControl').retry()).phase, 'released');
+    assert.deepEqual(store.read(), released);
+    assert.equal(grants, 0);
+  } finally { ctx.dispose(); }
+});
+
+test('native supersession rechecks authorization and resources after waiting for the writer lock', async t => {
+  for (const change of ['grant', 'busy', 'epoch', 'admission', 'selection', 'author', 'fetch', 'dependencies', 'web-owner', 'record']) {
+    await t.test(change, async () => {
+      const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+      const { released } = createInterruptedReleaseRecord(ctx, store), waiting = deferred(), pending = deferred();
+      const entry = ctx.loader.entries()[0];
+      await entry.update({ config: { searchProvider: 'current-author', fetchProvider: 'http' } });
+      const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+      let authorized = true, current = true, admitted = true, expected = released;
+      const observations = [];
+      const starting = applyControl(ctx, {
+        store: { ...store, compareAndSwapAsync(request) { waiting.resolve(); return store.compareAndSwapAsync(request); } },
+        canSupersedeNativeRelease: observation => { observations.push(observation); return authorized; },
+        canAcquire: () => admitted, isCurrent: () => current, keepAliveOnFailure: true,
+      });
+      try {
+        await waiting.promise;
+        if (change === 'grant') authorized = false;
+        else if (change === 'busy') holdProductRelease(store, released.intent.release.operationId, pending.promise);
+        else if (change === 'epoch') current = false;
+        else if (change === 'admission') admitted = false;
+        else if (change === 'selection') writeProfile(ctx, ['different-bundle']);
+        else if (change === 'author') {
+          entry.options.config.searchProvider = 'changed-author';
+          entry.fiber.config.searchProvider = 'changed-author';
+          ctx.get('web').searchProviderId = 'changed-author';
+        } else if (change === 'fetch') {
+          entry.options.config.fetchProvider = 'changed-fetch';
+          entry.fiber.config.fetchProvider = 'changed-fetch';
+          ctx.get('web').fetchProviderId = 'changed-fetch';
+        } else if (change === 'dependencies') entry.options.inject = { laterDependency: {} };
+        else if (change === 'web-owner') entry.fiber.uid++;
+        else {
+          lock.release();
+          expected = store.compareAndSwap({ expectedRevision: released.revision,
+            intent: { ...released.intent, pause: { confirmed: true, reason: 'newer-explicit-pause' } } });
+        }
+        lock.release();
+        await starting;
+        assert.deepEqual(store.read(), expected);
+        assert.equal(store.read().intent.releaseCompletion, undefined);
+        assert.equal(ctx.get('grokSearchControl').snapshot().phase, 'incomplete');
+        assert.equal(effectiveSearchProvider(entry), change === 'author' ? 'changed-author' : 'current-author');
+        assert.ok(observations.length >= 1);
+        for (const observed of observations) assert.deepEqual(observed.record, released);
+      } finally {
+        lock.release(); pending.resolve();
+        await starting.catch(() => {}); await pending.promise; ctx.dispose();
+      }
+    });
+  }
 });
 
 test('explicit stop cancels a reactivation still waiting for the control writer lock', async () => {
@@ -914,6 +1123,118 @@ test('release without a historical inject baseline does not submit completion', 
   ctx.dispose();
 });
 
+test('a first native release timeout keeps required ownership blocked until the real barrier is idle', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+  const barrier = createReleaseBarrier({ drainTimeoutMs: 1 }), operationId = randomUUID();
+  ctx.provide('grokSearchCore', { releaseBarrier: barrier, dispose: async () => {} });
+  try {
+    await applyControl(ctx, { store });
+    const oldOwner = ctx.get('grokSearchControl'), required = store.read();
+    barrier.begin({ operationId });
+    await assert.rejects(oldOwner.stop('native-bundle-disable'), { code: 'CONTROL_RELEASE_DRAIN_TIMEOUT' });
+    assert.deepEqual(store.read(), required);
+    assert.equal(productRuntimeCleanupInFlight(store), true);
+    ctx.dispose();
+    ctx.provide('grokSearchControl', undefined);
+    ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+    ctx.fiber.uid++;
+    await applyControl(ctx, { store, keepAliveOnFailure: true });
+    const nextOwner = ctx.get('grokSearchControl');
+    assert.equal(nextOwner.snapshot().error.code, 'CONTROL_RUNTIME_CLEANUP_PENDING');
+    assert.deepEqual(store.read(), required, 'a fresh owner cannot adopt the stale required record while cleanup lives');
+    barrier.settle({ operationId });
+    await waitForRuntimeCleanup(store);
+    assert.equal((await nextOwner.retry()).phase, 'required');
+    assert.equal(store.read().revision, required.revision, 'an unchanged lease resumes without inventing a revision');
+    assert.equal(productRuntimeCleanupInFlight(store), false, 'a running owner is not a cleanup lease');
+  } finally { barrier.settle({ operationId }); await nextImmediate(); ctx.dispose(); }
+});
+
+test('early release failures retain real disposal, cancellation and barrier proofs', async t => {
+  for (const failure of ['counter', 'lease', 'read', 'missing-record']) await t.test(failure, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+    const disposal = deferred(), cancellation = deferred(), barrier = createReleaseBarrier(), operationId = randomUUID();
+    let readFailure = false, stopSawBusy = false;
+    const suppliedStore = failure === 'read' ? { ...store, read() {
+      if (readFailure) throw Object.assign(new Error('record unavailable'), { code: 'TEST_RECORD_UNAVAILABLE' });
+      return store.read();
+    } } : store;
+    ctx.provide('grokSearchCore', { releaseBarrier: barrier, dispose: () => disposal.promise });
+    try {
+      await applyControl(ctx, { store: suppliedStore, canAcquire: () => failure !== 'missing-record',
+        onStop: () => { stopSawBusy = productRuntimeCleanupInFlight(store); return cancellation.promise; } });
+      const before = store.read();
+      barrier.begin({ operationId });
+      if (failure === 'counter') ctx.provide('grokSearchOriginalSearchCounter', undefined);
+      if (failure === 'lease') ctx.loader.entries()[0].fiber.uid++;
+      if (failure === 'read') readFailure = true;
+      const errorCode = { counter: 'CONTROL_ROUTE_COUNTER_REQUIRED', lease: 'CONTROL_RELEASE_OWNERSHIP_CONFLICT',
+        read: 'TEST_RECORD_UNAVAILABLE', 'missing-record': 'CONTROL_RELEASE_RECORD_MISSING' }[failure];
+      await assert.rejects(ctx.get('grokSearchControl').stop('native-bundle-disable'), { code: errorCode });
+      readFailure = false;
+      assert.equal(stopSawBusy, true, 'onStop already observes the registered cleanup');
+      assert.equal(productRuntimeCleanupInFlight(store), true);
+      assert.deepEqual(store.read(), before);
+      if (failure === 'missing-record') assert.equal(existsSync(store.directory), false);
+      disposal.resolve(); await disposal.promise; await nextImmediate();
+      assert.equal(productRuntimeCleanupInFlight(store), true);
+      cancellation.resolve(); await cancellation.promise; await nextImmediate();
+      assert.equal(productRuntimeCleanupInFlight(store), true, 'barrier proof is still required before controller.drain was called');
+      barrier.settle({ operationId });
+      await waitForRuntimeCleanup(store);
+      assert.deepEqual(store.read(), before);
+    } finally {
+      readFailure = false; disposal.resolve(); cancellation.resolve(); barrier.settle({ operationId });
+      await Promise.all([disposal.promise, cancellation.promise]); await nextImmediate(); ctx.dispose();
+    }
+  });
+});
+
+test('an early failed cleanup keeps the profile blocked when any resource lacks exit proof', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+  const disposal = deferred(), cancellation = deferred(), exited = deferred();
+  ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: () => disposal.promise });
+  try {
+    await applyControl(ctx, { store, onStop: () => cancellation.promise });
+    ctx.loader.entries()[0].fiber.uid++;
+    await assert.rejects(ctx.get('grokSearchControl').stop('native-bundle-disable'), { code: 'CONTROL_RELEASE_OWNERSHIP_CONFLICT' });
+    disposal.reject(Object.assign(new Error('core has not exited'), { code: 'GROK_PROCESS_REAP_FAILED', whenExited: exited.promise }));
+    cancellation.reject(Object.assign(new Error('program cleanup unproven'), { code: 'GROK_PROGRAM_REAP_FAILED' }));
+    exited.resolve(); await nextImmediate(); await nextImmediate();
+    assert.equal(productRuntimeCleanupInFlight(store), true, 'one successful exit proof cannot hide another unproven cleanup');
+    assert.equal(store.read().intent.policy, 'required');
+  } finally {
+    disposal.resolve(); cancellation.resolve(); exited.resolve();
+    await Promise.allSettled([disposal.promise, cancellation.promise, exited.promise]); ctx.dispose();
+  }
+});
+
+test('all acquisitions recheck profile cleanup at the writer lock and before takeover', async t => {
+  for (const boundary of ['writer', 'takeover']) await t.test(boundary, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+    const before = createRequiredRecord(ctx, store, randomUUID()), waiting = deferred(), cleanup = deferred();
+    let lock, published = null;
+    if (boundary === 'writer') lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+    const observedStore = { ...store, async compareAndSwapAsync(request) {
+      waiting.resolve();
+      const result = await store.compareAndSwapAsync(request);
+      if (boundary === 'takeover') { published = result; holdProductRelease(store, {}, cleanup.promise); }
+      return result;
+    } };
+    const starting = applyControl(ctx, { store: observedStore, keepAliveOnFailure: true });
+    try {
+      await waiting.promise;
+      if (boundary === 'writer') { holdProductRelease(store, {}, cleanup.promise); lock.release(); }
+      await starting;
+      assert.equal(ctx.get('grokSearchControl').snapshot().error.code, 'CONTROL_RUNTIME_CLEANUP_PENDING');
+      assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+      assert.deepEqual(store.read(), published ?? before);
+      cleanup.resolve(); await waitForRuntimeCleanup(store);
+      assert.equal((await ctx.get('grokSearchControl').retry()).phase, 'required');
+    } finally { lock?.release(); cleanup.resolve(); await starting.catch(() => {}); await nextImmediate(); ctx.dispose(); }
+  });
+});
+
 test('release drain has its own timeout when the core never settles', async () => {
   const ctx = makeContext();
   const controller = createProductReleaseController({
@@ -945,6 +1266,57 @@ test('release drain fails closed while a route takeover never settles', async ()
   controller.invalidate({ reason: 'test-takeover-timeout' });
   await assert.rejects(() => controller.drain(), error => error.code === 'CONTROL_RELEASE_DRAIN_TIMEOUT');
   ctx.dispose();
+});
+
+test('native release timeout keeps real disposal, barrier work and late takeover registered', async t => {
+  for (const first of ['dispose', 'barrier']) await t.test(`${first} settles first`, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx);
+    const required = createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+    const operationId = randomUUID(), barrierOperationId = randomUUID();
+    const disposal = deferred(), takeover = deferred(), idle = deferred();
+    const barrier = createReleaseBarrier({ drainTimeoutMs: 1 });
+    barrier.begin({ operationId: barrierOperationId });
+    const controller = createProductReleaseController({
+      ctx, priorIntent: required.intent,
+      core: { releaseBarrier: barrier, dispose: () => disposal.promise },
+      disposeTimeoutMs: 1, pendingTakeovers: () => takeover.promise,
+    });
+    controller.invalidate({ reason: 'native-bundle-disable' });
+    const release = controller.drain(), cleanup = controller.whenDrained();
+    let cleanupFinished = false, notifications = 0;
+    cleanup.then(() => { cleanupFinished = true; }, () => {});
+    holdProductRelease(store, operationId, release, { whenDrained: cleanup });
+    const unsubscribe = onProductReleaseIdle(store, operationId, () => { notifications++; idle.resolve(); });
+    try {
+      await assert.rejects(release, { code: 'CONTROL_RELEASE_DRAIN_TIMEOUT' });
+      await nextImmediate();
+      assert.equal(productReleaseInFlight(store, operationId), true);
+      assert.equal(cleanupFinished, false);
+      assert.equal(notifications, 0);
+      assert.deepEqual(store.read(), required);
+      if (first === 'dispose') disposal.resolve();
+      else barrier.settle({ operationId: barrierOperationId });
+      await nextImmediate();
+      assert.equal(cleanupFinished, false);
+      assert.equal(productReleaseInFlight(store, operationId), true);
+      if (first === 'dispose') barrier.settle({ operationId: barrierOperationId });
+      else disposal.resolve();
+      await nextImmediate();
+      assert.equal(cleanupFinished, false, 'a late host takeover still prevents quiescence');
+      assert.equal(notifications, 0);
+      takeover.resolve();
+      await waitForNotification(idle.promise);
+      assert.equal(cleanupFinished, true);
+      assert.equal(productReleaseInFlight(store, operationId), false);
+      assert.equal(notifications, 1);
+      assert.deepEqual(store.read(), required);
+    } finally {
+      unsubscribe();
+      disposal.resolve(); takeover.resolve(); barrier.settle({ operationId: barrierOperationId });
+      await Promise.allSettled([release, cleanup]);
+      ctx.dispose();
+    }
+  });
 });
 
 test('public snapshot keeps route verification separate from committed completion', () => {
@@ -1212,40 +1584,715 @@ test('public display cache leaves control state and authoritative corruption che
   ctx.dispose();
 });
 
-// D-28 regression: restoring the web route restarts the control fiber, so the owner service can
-// be briefly absent while its release task is still in flight. A release committed by this
-// process must stay with that task even when the owner service is not registered.
-test('product recovery never completes a release committed by the current process', async () => {
+test('profile cleanup covers absent records, object tokens and every outstanding operation', async () => {
+  const ctx = makeContext(), other = makeContext();
+  const store = createProductStore(ctx, { deferMaintenance: true }), otherStore = createProductStore(other, { deferMaintenance: true });
+  const first = deferred(), last = deferred(), idle = deferred(), token = {}, operationId = randomUUID();
+  let notifications = 0, cancelled = 0;
+  assert.equal(existsSync(store.directory), false);
+  assert.equal(productRuntimeCleanupInFlight(store), false);
+  holdProductRelease(store, token, first.promise);
+  holdProductRelease(store, operationId, last.promise);
+  const unsubscribe = onProductRuntimeCleanupIdle(store, () => { notifications++; idle.resolve(); });
+  const cancel = onProductRuntimeCleanupIdle(store, () => { cancelled++; });
+  cancel();
+  try {
+    assert.equal(existsSync(store.directory), false, 'runtime tracking never creates records');
+    assert.equal(productRuntimeCleanupInFlight(otherStore), false);
+    assert.equal(productRuntimeCleanupInFlight(store), true);
+    createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+    assert.equal(productRuntimeCleanupInFlight(createProductStore(ctx, { deferMaintenance: true })), true);
+    first.resolve(); await first.promise; await nextImmediate();
+    assert.equal(productReleaseInFlight(store, token), false);
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(productRuntimeCleanupInFlight(store), true);
+    assert.equal(notifications, 0);
+    last.resolve(); await last.promise;
+    assert.equal(notifications, 0, 'profile notifications are never synchronous with settlement');
+    await waitForNotification(idle.promise);
+    assert.equal(productRuntimeCleanupInFlight(store), false);
+    assert.equal(notifications, 1);
+    assert.equal(cancelled, 0);
+    unsubscribe();
+    const next = deferred();
+    holdProductRelease(store, {}, next.promise);
+    next.resolve(); await next.promise; await nextImmediate();
+    assert.equal(notifications, 1, 'unsubscribed idle listeners are not retained for future operations');
+  } finally {
+    unsubscribe(); cancel(); first.resolve(); last.resolve();
+    await Promise.all([first.promise, last.promise]); ctx.dispose(); other.dispose();
+  }
+});
+
+test('profile cleanup notifications survive aliases and module replacement without awaiting listeners', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx, { deferMaintenance: true });
+  createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const alias = join(ctx.profileContext.dir, 'runtime-cleanup-alias');
+  const task = deferred(), resources = deferred(), listenerWork = deferred(), idle = deferred(), token = {};
+  let unsubscribe;
+  try {
+    symlinkSync(store.directory, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const aliasStore = { ...store, directory: alias };
+    holdProductRelease(store, token, task.promise, { whenDrained: resources.promise });
+    const fresh = await import(new URL(`../src/core/product-control.mjs?cleanup-test=${randomUUID()}`, import.meta.url));
+    assert.equal(fresh.productRuntimeCleanupInFlight(aliasStore), true);
+    unsubscribe = fresh.onProductRuntimeCleanupIdle(aliasStore, () => { idle.resolve(); return listenerWork.promise; });
+    task.resolve(); await task.promise; await nextImmediate();
+    assert.equal(fresh.productRuntimeCleanupInFlight(aliasStore), true);
+    resources.resolve(); await waitForNotification(idle.promise);
+    assert.equal(productRuntimeCleanupInFlight(store), false);
+    assert.equal(fresh.productRuntimeCleanupInFlight(aliasStore), false);
+    await waitForRuntimeCleanup(store);
+  } finally {
+    unsubscribe?.(); task.resolve(); resources.resolve(); listenerWork.resolve();
+    await Promise.all([task.promise, resources.promise, listenerWork.promise]);
+    if (existsSync(alias)) {
+      assert.equal(realpathSync.native(alias), realpathSync.native(store.directory)); unlinkSync(alias);
+    }
+    ctx.dispose();
+  }
+});
+
+test('a queued profile idle notification cannot bypass a newly registered cleanup', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx, { deferMaintenance: true });
+  const first = deferred(), replacement = deferred(), idle = deferred();
+  let notifications = 0;
+  holdProductRelease(store, {}, first.promise);
+  const unsubscribe = onProductRuntimeCleanupIdle(store, () => { notifications++; idle.resolve(); });
+  try {
+    first.resolve(); await first.promise;
+    holdProductRelease(store, {}, replacement.promise);
+    await nextImmediate();
+    assert.equal(notifications, 0);
+    assert.equal(productRuntimeCleanupInFlight(store), true);
+    replacement.resolve(); await waitForNotification(idle.promise);
+    assert.equal(notifications, 1);
+    assert.equal(productRuntimeCleanupInFlight(store), false);
+  } finally {
+    unsubscribe(); first.resolve(); replacement.resolve();
+    await Promise.all([first.promise, replacement.promise]); ctx.dispose();
+  }
+});
+
+test('release task sets stay busy until both owners settle in either order', async t => {
+  for (const first of ['A', 'B']) await t.test(`${first} settles first`, async () => {
+    const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+    createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+    const tasks = { A: deferred(), B: deferred() }, idle = deferred();
+    let notifications = 0;
+    holdProductRelease(store, operationId, tasks.A.promise);
+    assert.equal(holdProductRelease(store, operationId, tasks.A.promise), tasks.A.promise);
+    assert.equal(holdProductRelease(store, operationId, tasks.B.promise), tasks.B.promise);
+    const unsubscribe = onProductReleaseIdle(store, operationId, () => { notifications++; idle.resolve(); });
+    try {
+      tasks[first].resolve();
+      await tasks[first].promise;
+      await nextImmediate();
+      assert.equal(productReleaseInFlight(store, operationId), true);
+      assert.equal(notifications, 0);
+      const last = first === 'A' ? 'B' : 'A';
+      tasks[last].resolve();
+      await waitForNotification(idle.promise);
+      assert.equal(productReleaseInFlight(store, operationId), false);
+      await nextImmediate();
+      assert.equal(notifications, 1);
+    } finally {
+      unsubscribe();
+      tasks.A.resolve(); tasks.B.resolve();
+      await Promise.all([tasks.A.promise, tasks.B.promise]);
+      ctx.dispose();
+    }
+  });
+});
+
+test('an idle notification queued for a retired task cannot bypass its replacement', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+  createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const first = deferred(), replacement = deferred(), idle = deferred();
+  let notifications = 0;
+  holdProductRelease(store, operationId, first.promise);
+  const unsubscribe = onProductReleaseIdle(store, operationId, () => { notifications++; idle.resolve(); });
+  try {
+    first.resolve();
+    await first.promise;
+    holdProductRelease(store, operationId, replacement.promise);
+    await nextImmediate();
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(notifications, 0);
+    replacement.resolve();
+    await waitForNotification(idle.promise);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(notifications, 1);
+  } finally {
+    unsubscribe();
+    first.resolve(); replacement.resolve();
+    await Promise.all([first.promise, replacement.promise]);
+    ctx.dispose();
+  }
+});
+
+test('release tracker identity follows a physical directory alias', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+  createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const alias = join(ctx.profileContext.dir, 'release-records-alias'), release = deferred(), idle = deferred();
+  let unsubscribe;
+  try {
+    symlinkSync(store.directory, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    assert.equal(realpathSync.native(alias), realpathSync.native(store.directory));
+    const aliasStore = { ...store, directory: alias };
+    holdProductRelease(aliasStore, operationId, release.promise);
+    unsubscribe = onProductReleaseIdle(store, operationId, idle.resolve);
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(productReleaseInFlight(aliasStore, operationId), true);
+    release.resolve();
+    await waitForNotification(idle.promise);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(productReleaseInFlight(aliasStore, operationId), false);
+  } finally {
+    unsubscribe?.();
+    release.resolve(); await release.promise;
+    try {
+      if (existsSync(alias)) {
+        assert.equal(realpathSync.native(alias), realpathSync.native(store.directory));
+        unlinkSync(alias);
+      }
+    } finally { ctx.dispose(); }
+  }
+});
+
+test('release tracker shares Windows case aliases only when the filesystem does',
+  { skip: process.platform !== 'win32' }, async t => {
+    const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+    createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+    const directory = join(ctx.profileContext.dir, 'CONTROL-INTENT.RECORDS'), release = deferred(), idle = deferred();
+    let unsubscribe;
+    try {
+      if (!existsSync(directory) || realpathSync.native(directory) !== realpathSync.native(store.directory)) {
+        t.skip('This profile directory is case-sensitive.');
+        return;
+      }
+      const caseStore = { ...store, directory };
+      assert.notEqual(caseStore.directory, store.directory);
+      holdProductRelease(store, operationId, release.promise);
+      unsubscribe = onProductReleaseIdle(caseStore, operationId, idle.resolve);
+      assert.equal(productReleaseInFlight(caseStore, operationId), true);
+      release.resolve();
+      await waitForNotification(idle.promise);
+      assert.equal(productReleaseInFlight(caseStore, operationId), false);
+      assert.equal(productReleaseInFlight(store, operationId), false);
+    } finally { unsubscribe?.(); release.resolve(); await release.promise; ctx.dispose(); }
+  });
+
+test('a fresh product-control module shares outstanding release tasks and idle listeners', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+  createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const oldTask = deferred(), newTask = deferred(), idle = deferred();
+  holdProductRelease(store, operationId, oldTask.promise);
+  let unsubscribe;
+  try {
+    const fresh = await import(new URL(`../src/core/product-control.mjs?release-test=${randomUUID()}`, import.meta.url));
+    assert.notEqual(fresh.holdProductRelease, holdProductRelease);
+    assert.equal(fresh.productReleaseInFlight(store, operationId), true);
+    assert.equal(fresh.holdProductRelease(store, operationId, newTask.promise), newTask.promise);
+    unsubscribe = fresh.onProductReleaseIdle(store, operationId, idle.resolve);
+    newTask.resolve();
+    await newTask.promise;
+    await nextImmediate();
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(fresh.productReleaseInFlight(store, operationId), true);
+    oldTask.resolve();
+    await waitForNotification(idle.promise);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(fresh.productReleaseInFlight(store, operationId), false);
+  } finally {
+    unsubscribe?.();
+    oldTask.resolve(); newTask.resolve();
+    await Promise.all([oldTask.promise, newTask.promise]);
+    ctx.dispose();
+  }
+});
+
+test('idle listeners run passively and unsubscribe without joining release cleanup', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+  createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const release = deferred(), listenerWork = deferred(), idle = deferred(), lateIdle = deferred();
+  let notifications = 0, cancelledCalls = 0, lateCalls = 0, listenerFinished = false;
+  listenerWork.promise.then(() => { listenerFinished = true; });
+  holdProductRelease(store, operationId, release.promise);
+  const unsubscribe = onProductReleaseIdle(store, operationId, () => {
+    notifications++; idle.resolve(); return listenerWork.promise;
+  });
+  const cancel = onProductReleaseIdle(store, operationId, () => { cancelledCalls++; });
+  const removeThrowing = onProductReleaseIdle(store, operationId, () => { throw new Error('listener failed'); });
+  const removeRejecting = onProductReleaseIdle(store, operationId, () => Promise.reject(new Error('listener rejected')));
+  let removeLate;
+  try {
+    cancel();
+    release.resolve();
+    await release.promise;
+    assert.equal(notifications, 0, 'idle notification must not run inside release settlement');
+    await waitForNotification(idle.promise);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(listenerFinished, false);
+    assert.equal(cancelledCalls, 0);
+    unsubscribe(); removeThrowing(); removeRejecting();
+    removeLate = onProductReleaseIdle(store, operationId, () => { lateCalls++; lateIdle.resolve(); });
+    assert.equal(lateCalls, 0, 'subscribing to an idle operation is still asynchronous');
+    await waitForNotification(lateIdle.promise);
+    assert.equal(lateCalls, 1, 'unfinished listener work cannot block later idle observers');
+    assert.equal(listenerFinished, false);
+    assert.equal(notifications, 1);
+  } finally {
+    unsubscribe(); cancel(); removeThrowing(); removeRejecting(); removeLate?.();
+    release.resolve(); listenerWork.resolve();
+    await Promise.all([release.promise, listenerWork.promise]);
+    ctx.dispose();
+  }
+});
+
+test('a rejected release stays registered until its independent resource proof settles in either order', async t => {
+  for (const first of ['release', 'resources']) await t.test(`${first} settles first`, async () => {
+    const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+    createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+    const release = deferred(), resources = deferred(), idle = deferred();
+    const failure = Object.assign(new Error('release deadline elapsed'), { code: 'CONTROL_RELEASE_DRAIN_TIMEOUT' });
+    let notifications = 0;
+    assert.equal(holdProductRelease(store, operationId, release.promise, { whenDrained: resources.promise }), release.promise);
+    const rejected = assert.rejects(release.promise, error => error === failure);
+    const unsubscribe = onProductReleaseIdle(store, operationId, () => { notifications++; idle.resolve(); });
+    try {
+      if (first === 'release') { release.reject(failure); await rejected; }
+      else { resources.resolve(); await resources.promise; }
+      await nextImmediate();
+      assert.equal(productReleaseInFlight(store, operationId), true);
+      assert.equal(notifications, 0);
+      if (first === 'release') resources.resolve();
+      else release.reject(failure);
+      await rejected;
+      await waitForNotification(idle.promise);
+      assert.equal(productReleaseInFlight(store, operationId), false);
+      assert.equal(notifications, 1);
+    } finally {
+      unsubscribe();
+      release.reject(failure); resources.resolve();
+      await Promise.all([rejected, resources.promise]);
+      ctx.dispose();
+    }
+  });
+});
+
+test('a cleanup error with pending exit proof remains busy until actual exit', async () => {
+  const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+  createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+  const release = deferred(), resources = deferred(), exit = deferred(), idle = deferred();
+  const failure = Object.assign(new Error('process has not exited'), { code: 'GROK_PROCESS_REAP_FAILED', whenExited: exit.promise });
+  let notifications = 0;
+  holdProductRelease(store, operationId, release.promise, { whenDrained: resources.promise });
+  const unsubscribe = onProductReleaseIdle(store, operationId, () => { notifications++; idle.resolve(); });
+  try {
+    release.resolve({ kind: 'incomplete' });
+    resources.reject(failure);
+    await nextImmediate();
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(notifications, 0);
+    exit.resolve();
+    await waitForNotification(idle.promise);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(notifications, 1);
+  } finally {
+    unsubscribe();
+    release.resolve(); resources.resolve(); exit.resolve();
+    await Promise.allSettled([release.promise, resources.promise, exit.promise]);
+    ctx.dispose();
+  }
+});
+
+test('unproven cleanup failures stay registered without an idle notification', async t => {
+  for (const kind of ['GROK_PROGRAM_REAP_FAILED', 'GROK_PROCESS_REAP_FAILED', 'unknown-cleanup', 'failed-exit-proof']) {
+    await t.test(kind, async () => {
+      const ctx = makeContext(), store = createProductStore(ctx), operationId = randomUUID();
+      createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
+      const resources = deferred(), exit = deferred();
+      const failure = Object.assign(new Error('cleanup has no successful exit proof'),
+        { code: kind === 'failed-exit-proof' ? 'GROK_PROCESS_REAP_FAILED' : kind });
+      if (kind === 'failed-exit-proof') failure.whenExited = exit.promise;
+      let notifications = 0;
+      holdProductRelease(store, operationId, Promise.resolve({ kind: 'incomplete' }), { whenDrained: resources.promise });
+      const unsubscribe = onProductReleaseIdle(store, operationId, () => { notifications++; });
+      try {
+        resources.reject(failure);
+        await nextImmediate();
+        if (kind === 'failed-exit-proof') exit.reject(new Error('exit observation failed'));
+        await nextImmediate();
+        assert.equal(productReleaseInFlight(store, operationId), true, 'cleanup rejection is not proof of resource exit');
+        assert.equal(notifications, 0);
+      } finally {
+        unsubscribe();
+        resources.resolve(); exit.resolve();
+        await Promise.allSettled([resources.promise, exit.promise]);
+        ctx.dispose();
+      }
+    });
+  }
+});
+
+// Service absence during teardown does not mean the release task has finished.
+test('product recovery waits for the current release task and completes it after the absent owner finishes', async () => {
+  const ctx = makeContext({ originalCalls: 0 });
+  applyRouteVerifier(ctx);
+  const verifier = ctx.get('grokSearchRouteVerifier');
   let verifyCalls = 0;
-  const verifier = {
+  ctx.provide('grokSearchRouteVerifier', { ...verifier,
     verify: observation => {
       verifyCalls += 1;
-      return { atAuthor: true, routeChanged: observation.routeChanged === true,
-        fetchPreserved: true, dependenciesPreserved: true, actualSearchProvider: observation.authorSearchProvider,
-        originalSearchCalls: observation.counterBaseline,
-        originalSearchBaseline: observation.counterBaseline, originalSearchDelta: 0 };
+      return verifier.verify(observation);
     },
-  };
-  const ctx = makeContext({ verifier, originalCalls: 0 });
+  });
   const store = createProductStore(ctx);
-  const required = createRequiredRecord(ctx, store, PRODUCT_HOST_ID);
-  const releaseIntent = { ...required.intent, policy: 'released', reason: 'settings-ui-explicit-stop',
-    pause: { confirmed: true, reason: 'settings-ui-explicit-stop', observedAt: '2026-10-26T00:00:00.000Z' },
-    priorIntent: structuredClone(required.intent), release: { explicit: true,
-      committedAt: '2026-10-26T00:00:00.000Z', kind: 'intent-release-commit',
-      operationId: randomUUID(), hostId: PRODUCT_HOST_ID, pid: required.intent.lease.pid,
-      author: required.intent.acquisition.authorSearchProvider, counterBaseline: 0,
-      routeChanged: false, routeVerified: false } };
-  const released = store.compareAndSwap({ expectedRevision: required.revision, intent: releaseIntent });
-  assert.equal(ctx.get('grokSearchControl'), undefined);
-  applyRecovery(ctx);
-  const state = await ctx.get('grokSearchRecovery').retry();
-  assert.equal(state.phase, 'owner-present');
-  assert.equal(state.outcome.recordCommitted, false);
-  assert.equal(verifyCalls, 0);
-  assert.deepEqual(store.read(), released);
-  ctx.dispose();
-  assert.deepEqual(store.read(), released);
+  const { required, released } = createInterruptedReleaseRecord(ctx, store);
+  const operationId = released.intent.release.operationId, pending = deferred(), completedNotice = deferred(), callbackWork = deferred();
+  assert.equal(holdProductRelease(store, operationId, pending.promise), pending.promise);
+  const entry = ctx.loader.entries()[0];
+  const author = structuredClone(entry.options.config), inject = structuredClone(entry.options.inject);
+  entry.fiber.config.searchProvider = 'grok-search';
+  ctx.get('web').searchProviderId = 'grok-search';
+  const owner = { publicSnapshot: () => ({ phase: 'stopping' }) };
+  ctx.provide('grokSearchControl', owner);
+  let completed;
+  try {
+    applyRecovery(ctx, { onSettled: state => {
+      if (state.phase === 'completed') completedNotice.resolve(state);
+      return callbackWork.promise;
+    } });
+    const recovery = ctx.get('grokSearchRecovery');
+    assert.equal((await recovery.retry()).phase, 'owner-present');
+    ctx.provide('grokSearchControl', undefined);
+    const waiting = await recovery.retry();
+    assert.equal(waiting.phase, 'owner-present');
+    assert.equal(waiting.outcome.recordCommitted, false);
+    assert.equal(productReleaseInFlight(createProductStore(ctx), operationId), true);
+    assert.equal(verifyCalls, 0);
+    assert.deepEqual(store.read(), released);
+    assert.equal(ctx.get('web').searchProviderId, 'grok-search');
+    assert.deepEqual(entry.options.config, author);
+    assert.deepEqual(entry.options.inject, inject);
+
+    pending.resolve({ kind: 'incomplete' });
+    await pending.promise;
+    assert.equal(ctx.get('grokSearchControl'), undefined);
+    const recovered = await waitForNotification(completedNotice.promise);
+    assert.equal(recovered.phase, 'completed');
+    assert.equal(recovered.outcome.completionCommitted, true);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(verifyCalls, 1);
+    completed = store.read();
+    assert.equal(completed.revision, released.revision + 1);
+    assert.deepEqual(completed.intent.release, released.intent.release);
+    assert.deepEqual(completed.intent.priorIntent, required.intent);
+    assert.equal(completed.intent.recovery.action, 'explicit-release-recovery');
+    assert.equal(completed.intent.recovery.observerHostId, PRODUCT_HOST_ID);
+    assert.equal(completed.intent.releaseCompletion.releaseOperationId, operationId);
+    assert.equal(completed.intent.releaseCompletion.routeEvidence.originalSearchDelta, 0);
+    assert.equal(completed.intent.releaseCompletion.routeEvidence.actualSearchProvider, author.searchProvider);
+    assert.equal(ctx.get('web').searchProviderId, author.searchProvider);
+    assert.equal(ctx.get('web').fetchProviderId, author.fetchProvider);
+    assert.deepEqual(entry.options.config, author);
+    assert.deepEqual(entry.options.inject, inject);
+  } finally { pending.resolve(); await pending.promise; ctx.dispose(); callbackWork.resolve(); await callbackWork.promise; }
+  assert.deepEqual(store.read(), completed);
+});
+
+test('recovery settles automatically only after the failed release and late resources are quiescent', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx);
+  const { released } = createInterruptedReleaseRecord(ctx, store), operationId = released.intent.release.operationId;
+  const release = deferred(), resources = deferred(), completion = deferred();
+  const failure = Object.assign(new Error('native release timed out'), { code: 'CONTROL_RELEASE_DRAIN_TIMEOUT' });
+  applyRouteVerifier(ctx);
+  const verifier = ctx.get('grokSearchRouteVerifier');
+  let verifyCalls = 0;
+  ctx.provide('grokSearchRouteVerifier', { ...verifier, verify: observation => {
+    verifyCalls++; return verifier.verify(observation);
+  } });
+  holdProductRelease(store, operationId, release.promise, { whenDrained: resources.promise });
+  const rejected = assert.rejects(release.promise, error => error === failure);
+  try {
+    applyRecovery(ctx, { onSettled: state => { if (state.phase === 'completed') completion.resolve(state); } });
+    const recovery = ctx.get('grokSearchRecovery');
+    assert.equal((await recovery.retry()).phase, 'owner-present');
+    release.reject(failure);
+    await rejected;
+    await nextImmediate();
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(recovery.snapshot().phase, 'owner-present');
+    assert.equal(verifyCalls, 0);
+    assert.deepEqual(store.read(), released);
+    resources.resolve();
+    const recovered = await waitForNotification(completion.promise);
+    assert.equal(recovered.outcome.completionCommitted, true);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(verifyCalls, 1);
+    assert.equal(store.read().revision, released.revision + 1);
+    assert.equal(store.read().intent.releaseCompletion.releaseOperationId, operationId);
+  } finally {
+    ctx.dispose();
+    release.reject(failure); resources.resolve();
+    await Promise.all([rejected, resources.promise]);
+  }
+});
+
+test('disposing recovery before task or queued idle settlement prevents callbacks and publication', async t => {
+  for (const moment of ['before-idle', 'idle-queued']) await t.test(moment, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx);
+    const { released } = createInterruptedReleaseRecord(ctx, store), operationId = released.intent.release.operationId;
+    const release = deferred(), idle = deferred();
+    applyRouteVerifier(ctx);
+    const verifier = ctx.get('grokSearchRouteVerifier');
+    let verifyCalls = 0, callbacks = 0, writes = 0, unsubscribe;
+    ctx.provide('grokSearchRouteVerifier', { ...verifier, verify: observation => {
+      verifyCalls++; return verifier.verify(observation);
+    } });
+    const observedStore = { ...store, compareAndSwapAsync(request) {
+      writes++; return store.compareAndSwapAsync(request);
+    } };
+    holdProductRelease(store, operationId, release.promise);
+    try {
+      applyRecovery(ctx, { store: observedStore, onSettled: () => { callbacks++; } });
+      const recovery = ctx.get('grokSearchRecovery');
+      assert.equal((await recovery.retry()).phase, 'owner-present');
+      const beforeCallbacks = callbacks;
+      unsubscribe = onProductReleaseIdle(store, operationId, () => {
+        // Recovery queued its rerun first; disposal must cancel that queued work.
+        if (moment === 'idle-queued') ctx.dispose();
+        idle.resolve();
+      });
+      if (moment === 'before-idle') ctx.dispose();
+      release.resolve();
+      await waitForNotification(idle.promise);
+      await nextImmediate();
+      await nextImmediate();
+      assert.equal(productReleaseInFlight(store, operationId), false);
+      assert.equal(recovery.snapshot().phase, 'disposed');
+      assert.equal(callbacks, beforeCallbacks);
+      assert.equal(verifyCalls, 0);
+      assert.equal(writes, 0);
+      assert.deepEqual(store.read(), released);
+    } finally { unsubscribe?.(); ctx.dispose(); release.resolve(); await release.promise; }
+  });
+});
+
+test('passive recovery of an explicit settings stop does not reactivate its live control owner', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), firstVerification = deferred(), finishRelease = deferred(), completion = deferred();
+  applyRouteVerifier(ctx);
+  const verifier = ctx.get('grokSearchRouteVerifier');
+  const failure = Object.assign(new Error('native verifier interrupted'), { code: 'TEST_INTERRUPTED_VERIFIER' });
+  let verifyCalls = 0, starts = 0, pending;
+  ctx.provide('grokSearchRouteVerifier', { ...verifier, verify: async observation => {
+    verifyCalls++;
+    if (verifyCalls === 1) { firstVerification.resolve(); await finishRelease.promise; throw failure; }
+    return verifier.verify(observation);
+  } });
+  const store = createProductStore(ctx);
+  try {
+    await applyControl(ctx, { store, onStart: () => { starts++; } });
+    const control = ctx.get('grokSearchControl');
+    pending = control.stop('settings-ui-explicit-stop');
+    await firstVerification.promise;
+    const released = store.read(), operationId = released.intent.release.operationId;
+    assert.equal(released.intent.reason, 'settings-ui-explicit-stop');
+    assert.equal(released.intent.releaseCompletion, undefined);
+    applyRecovery(ctx, { onSettled: state => { if (state.phase === 'completed') completion.resolve(state); } });
+    assert.equal((await ctx.get('grokSearchRecovery').retry()).phase, 'owner-present');
+    finishRelease.resolve();
+    const result = await pending;
+    assert.equal(result.kind, 'incomplete');
+    const recovered = await waitForNotification(completion.promise);
+    assert.equal(recovered.outcome.completionCommitted, true);
+    await nextImmediate();
+    const completed = store.read();
+    assert.equal(completed.revision, released.revision + 1);
+    assert.equal(completed.intent.releaseCompletion.releaseOperationId, operationId);
+    assert.equal(completed.intent.reason, 'settings-ui-explicit-stop');
+    assert.equal(ctx.get('grokSearchControl'), control);
+    assert.equal(control.publicSnapshot().phase, 'released');
+    assert.equal(control.publicSnapshot().available, true);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    assert.equal(verifyCalls, 2);
+    assert.equal(starts, 0);
+    assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+    assert.equal(ctx.get('web').fetchProviderId, 'candidate-fetch');
+    assert.deepEqual(store.read(), completed);
+  } finally { finishRelease.resolve(); await pending?.catch(() => {}); ctx.dispose(); }
+});
+
+test('recovery waits for every cleanup in its profile while other profiles remain independent', async () => {
+  const first = makeContext({ originalCalls: 0 }), other = makeContext({ originalCalls: 0 });
+  const store = createProductStore(first), otherStore = createProductStore(other);
+  const operationId = randomUUID(), unrelatedOperationId = randomUUID();
+  const firstPending = deferred(), unrelatedPending = deferred(), otherCompleted = deferred();
+  applyRouteVerifier(first);
+  applyRouteVerifier(other);
+  const { released } = createInterruptedReleaseRecord(first, store, operationId);
+  const { released: otherReleased } = createInterruptedReleaseRecord(other, otherStore, operationId);
+  holdProductRelease(store, operationId, firstPending.promise);
+  holdProductRelease(otherStore, unrelatedOperationId, unrelatedPending.promise);
+  try {
+    assert.notEqual(store.directory, otherStore.directory);
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal(productReleaseInFlight(store, unrelatedOperationId), false);
+    assert.equal(productReleaseInFlight(otherStore, operationId), false);
+    assert.equal(productReleaseInFlight(otherStore, unrelatedOperationId), true);
+    applyRecovery(first);
+    applyRecovery(other, { onSettled: state => { if (state.phase === 'completed') otherCompleted.resolve(state); } });
+    assert.equal((await first.get('grokSearchRecovery').retry()).phase, 'owner-present');
+    assert.equal((await other.get('grokSearchRecovery').retry()).phase, 'owner-present');
+    assert.deepEqual(otherStore.read(), otherReleased, 'an unrelated operation in this profile still owns live cleanup');
+    assert.deepEqual(store.read(), released);
+    unrelatedPending.resolve();
+    const recovered = await waitForNotification(otherCompleted.promise);
+    assert.equal(recovered.phase, 'completed');
+    assert.equal(recovered.outcome.completionCommitted, true);
+    const completed = otherStore.read();
+    assert.equal(completed.revision, otherReleased.revision + 1);
+    assert.equal(completed.intent.releaseCompletion.releaseOperationId, operationId);
+    assert.equal(productReleaseInFlight(otherStore, unrelatedOperationId), false);
+    assert.equal(productRuntimeCleanupInFlight(otherStore), false);
+    assert.equal(productReleaseInFlight(store, operationId), true);
+    assert.equal((await first.get('grokSearchRecovery').retry()).phase, 'owner-present');
+    assert.deepEqual(store.read(), released);
+  } finally {
+    firstPending.resolve();
+    unrelatedPending.resolve();
+    await Promise.all([firstPending.promise, unrelatedPending.promise]);
+    first.dispose();
+    other.dispose();
+  }
+});
+
+test('recovery CAS refuses newly started cleanup and resumes passively only after actual exit', async t => {
+  for (const kind of ['owner-retry', 'other-operation']) await t.test(kind, async () => {
+    const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+    const waiting = deferred(), exited = deferred(), completedNotice = deferred();
+    const cleanupError = Object.assign(new Error('program exit not observed'), {
+      code: 'GROK_PROGRAM_REAP_FAILED', whenExited: exited.promise,
+    });
+    let failVerification = true, failCancellation = false, verifyCalls = 0, lock, checking, stopping;
+    applyRouteVerifier(ctx);
+    const verifier = ctx.get('grokSearchRouteVerifier');
+    ctx.provide('grokSearchRouteVerifier', { ...verifier, verify: observation => {
+      verifyCalls++;
+      if (failVerification) throw new Error('original release verification interrupted');
+      return verifier.verify(observation);
+    } });
+    try {
+      await applyControl(ctx, { store, onStop: () => failCancellation ? Promise.reject(cleanupError) : Promise.resolve() });
+      const owner = ctx.get('grokSearchControl');
+      assert.equal((await owner.stop('native-bundle-disable')).completionCommitted, false);
+      await waitForRuntimeCleanup(store);
+      const released = store.read(), operationId = released.intent.release.operationId;
+      const recordPath = join(store.directory, `v${String(released.revision).padStart(12, '0')}.json`);
+      const originalBytes = readFileSync(recordPath);
+      failVerification = false;
+      lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
+      applyRecovery(ctx, { store: { ...store, compareAndSwapAsync(request) {
+        waiting.resolve();
+        return store.compareAndSwapAsync(request);
+      } }, onSettled: state => { if (state.phase === 'completed') completedNotice.resolve(state); } });
+      const recovery = ctx.get('grokSearchRecovery');
+      checking = recovery.retry();
+      const blocked = assert.rejects(checking, { code: 'CONTROL_RUNTIME_CLEANUP_PENDING' });
+      await waitForNotification(waiting.promise);
+      assert.equal(verifyCalls, 2, 'recovery reached its writer after route verification');
+      if (kind === 'owner-retry') {
+        failCancellation = true;
+        stopping = owner.stop('native-bundle-disable');
+        await assert.rejects(stopping, error => error.code === 'CONTROL_RELEASE_IN_FLIGHT' && error.cause === cleanupError);
+        assert.equal(productReleaseInFlight(store, operationId), true);
+      } else {
+        holdProductRelease(store, {}, Promise.resolve({ kind: 'incomplete' }), { whenDrained: Promise.reject(cleanupError) });
+        assert.equal(productReleaseInFlight(store, operationId), false);
+      }
+      assert.equal(productRuntimeCleanupInFlight(store), true);
+      lock.release();
+      await blocked;
+      assert.equal(recovery.snapshot().error.code, 'CONTROL_RUNTIME_CLEANUP_PENDING');
+      assert.equal(recovery.snapshot().outcome.completionCommitted, false);
+      assert.deepEqual(store.read(), released, 'new cleanup must invalidate the pending completion CAS');
+      assert.equal(owner.publicSnapshot().completionCommitted, false);
+      await nextImmediate();
+      assert.equal(productRuntimeCleanupInFlight(store), true);
+      assert.equal(verifyCalls, 2, 'failed cleanup is not an idle notification');
+      assert.equal(store.read().intent.releaseCompletion, undefined);
+      exited.resolve();
+      const completed = await waitForNotification(completedNotice.promise);
+      assert.equal(completed.outcome.completionCommitted, true);
+      assert.equal(productRuntimeCleanupInFlight(store), false);
+      assert.equal(verifyCalls, 3, 'idle notification reruns real verification without a manual retry');
+      const record = store.read();
+      assert.equal(record.revision, released.revision + 1);
+      assert.deepEqual(record.intent.release, released.intent.release);
+      assert.deepEqual(record.intent.priorIntent, released.intent.priorIntent);
+      assert.equal(record.intent.releaseCompletion.releaseOperationId, operationId);
+      assert.equal(record.intent.releaseCompletion.routeEvidence.originalSearchDelta, 0);
+      assert.deepEqual(readFileSync(recordPath), originalBytes);
+      assert.equal(owner.publicSnapshot().phase, 'released');
+      assert.equal(ctx.get('web').searchProviderId, 'candidate-original');
+      assert.equal(ctx.get('web').fetchProviderId, 'candidate-fetch');
+    } finally {
+      lock?.release(); exited.resolve();
+      await Promise.allSettled([checking, stopping]); ctx.dispose();
+    }
+  });
+});
+
+test('product recovery leaves a genuinely running control release to its owner', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), verifying = deferred(), finishVerification = deferred();
+  applyRouteVerifier(ctx);
+  const verifier = ctx.get('grokSearchRouteVerifier');
+  const idle = deferred(), settledNotice = deferred();
+  let verifyCalls = 0, pending, unsubscribe;
+  ctx.provide('grokSearchRouteVerifier', { ...verifier, verify: async observation => {
+    verifyCalls += 1;
+    verifying.resolve();
+    await finishVerification.promise;
+    return verifier.verify(observation);
+  } });
+  const store = createProductStore(ctx);
+  try {
+    await applyControl(ctx, { store });
+    const owner = ctx.get('grokSearchControl');
+    pending = owner.stop('native-bundle-disable');
+    await verifying.promise;
+    const released = store.read(), operationId = released.intent.release.operationId;
+    assert.equal(released.intent.policy, 'released');
+    assert.equal(released.intent.releaseCompletion, undefined);
+    assert.equal(productReleaseInFlight(createProductStore(ctx), operationId), true);
+    unsubscribe = onProductReleaseIdle(store, operationId, idle.resolve);
+    applyRecovery(ctx, { onSettled: state => { if (state.phase === 'still-selected') settledNotice.resolve(state); } });
+    const recovery = ctx.get('grokSearchRecovery'), waiting = await recovery.retry();
+    assert.equal(ctx.get('grokSearchControl'), owner);
+    assert.equal(waiting.phase, 'owner-present');
+    assert.equal(waiting.outcome.recordCommitted, false);
+    assert.equal(verifyCalls, 1);
+    assert.deepEqual(store.read(), released);
+    finishVerification.resolve();
+    const result = await pending;
+    assert.equal(result.kind, 'released');
+    assert.equal(result.completionCommitted, true);
+    await waitForNotification(idle.promise);
+    assert.equal(productReleaseInFlight(store, operationId), false);
+    const completed = store.read();
+    assert.equal(completed.intent.releaseCompletion.releaseOperationId, operationId);
+    assert.equal(completed.intent.releaseCompletion.routeEvidence.originalSearchDelta, 0);
+    assert.equal(completed.intent.recovery, undefined);
+    assert.equal((await waitForNotification(settledNotice.promise)).phase, 'still-selected');
+    assert.equal(verifyCalls, 1);
+    assert.deepEqual(store.read(), completed);
+  } finally {
+    unsubscribe?.();
+    finishVerification.resolve();
+    await pending?.catch(() => {});
+    ctx.dispose();
+  }
 });
 
 test('product route verifier prefers a host counter and rejects malformed evidence', async () => {
@@ -1331,6 +2378,43 @@ test('the product manifest ships search, settings and recovery entries in one bu
   assert.ok(root.files.includes('src/bundle.mjs'));
   assert.ok(root.files.includes('src/control.mjs'));
   assert.ok(root.files.includes('src/recovery.mjs'));
+});
+
+test('historical completion cannot admit a new owner while this generation cleanup is running', async () => {
+  const ctx = makeContext({ originalCalls: 0 }), store = createProductStore(ctx, { deferMaintenance: true });
+  const disposal = deferred(), cancellation = deferred();
+  let stopping;
+  try {
+    await applyControl(ctx, { store });
+    await ctx.get('grokSearchControl').stop('native-bundle-disable');
+    await waitForRuntimeCleanup(store);
+    const completed = store.read();
+    ctx.dispose();
+    ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: () => disposal.promise });
+    await applyControl(ctx, { store, canAcquire: () => false, onStop: () => cancellation.promise });
+    stopping = ctx.get('grokSearchControl').stop('native-bundle-disable');
+    assert.equal(productRuntimeCleanupInFlight(store), true);
+    assert.equal(productReleaseInFlight(store, completed.intent.release.operationId), true);
+    ctx.dispose();
+    ctx.provide('grokSearchControl', undefined);
+    ctx.provide('grokSearchCore', { releaseBarrier: createReleaseBarrier(), dispose: async () => {} });
+    await applyControl(ctx, { store, keepAliveOnFailure: true });
+    const replacement = ctx.get('grokSearchControl');
+    assert.equal(replacement.publicSnapshot().phase, 'incomplete');
+    assert.equal(replacement.publicSnapshot().error.code, 'CONTROL_RUNTIME_CLEANUP_PENDING');
+    assert.deepEqual(store.read(), completed);
+    disposal.resolve(); await disposal.promise; await nextImmediate();
+    assert.equal(productRuntimeCleanupInFlight(store), true);
+    cancellation.resolve();
+    assert.equal((await stopping).kind, 'already-released');
+    await waitForRuntimeCleanup(store);
+    assert.deepEqual(store.read(), completed);
+    assert.equal((await replacement.retry()).phase, 'required');
+    assert.equal(productRuntimeCleanupInFlight(store), false);
+    assert.equal(store.read().revision, completed.revision + 1);
+  } finally {
+    disposal.resolve(); cancellation.resolve(); await stopping?.catch(() => {}); await nextImmediate(); ctx.dispose();
+  }
 });
 
 test('an already-released stop waits for this generation cleanup and shares its pending result', async () => {
@@ -1433,16 +2517,12 @@ test('release completion rejects live route changes while waiting for its writer
   });
 });
 
-test('recovery completion rejects live input changes while waiting for its writer lock', async () => {
+test('same-process recovery completion rejects counter and author changes while waiting for its writer lock', async t => {
+  for (const change of ['counter', 'author']) await t.test(change, async () => {
   const ctx = makeContext({ originalCalls: 0 }), waiting = deferred();
   applyRouteVerifier(ctx);
-  const store = createProductStore(ctx), required = createRequiredRecord(ctx, store, randomUUID());
-  const released = store.compareAndSwap({ expectedRevision: required.revision, intent: {
-    ...required.intent, policy: 'released', priorIntent: required.intent, release: {
-      explicit: true, committedAt: new Date().toISOString(), kind: 'intent-release-commit',
-      operationId: randomUUID(), hostId: required.intent.lease.hostId, counterBaseline: 0,
-    },
-  } });
+  const store = createProductStore(ctx), { released } = createInterruptedReleaseRecord(ctx, store);
+  assert.equal(productReleaseInFlight(store, released.intent.release.operationId), false);
   const lock = acquireOwnedLock(join(store.directory, 'control-write.lock'));
   applyRecovery(ctx, { store: { ...store, compareAndSwapAsync(request) {
     waiting.resolve();
@@ -1452,9 +2532,19 @@ test('recovery completion rejects live input changes while waiting for its write
   pending.catch(() => {});
   try {
     await waiting.promise;
-    ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 1 }) });
+    if (change === 'counter') {
+      ctx.provide('grokSearchOriginalSearchCounter', { snapshot: () => ({ calls: 1 }) });
+    } else {
+      const entry = ctx.loader.entries()[0];
+      entry.options.config.searchProvider = 'different-owner';
+      entry.fiber.config.searchProvider = 'different-owner';
+      ctx.get('web').searchProviderId = 'different-owner';
+    }
     lock.release();
     await assert.rejects(pending, error => /^CONTROL_RECOVERY_/.test(error.code));
     assert.deepEqual(store.read(), released);
+    assert.equal(store.read().intent.releaseCompletion, undefined);
+    if (change === 'author') assert.equal(ctx.get('web').searchProviderId, 'different-owner');
   } finally { lock.release(); await pending.catch(() => {}); ctx.dispose(); }
+  });
 });

@@ -344,9 +344,13 @@ test('the release barrier invalidates operations synchronously and drains after 
   barrier.begin({ operationId });
   const invalidated = barrier.invalidate({ reason: 'explicit-stop' });
   assert.equal(invalidated.state, 'stopping');
+  let actuallySettled = false;
+  const quiescent = barrier.whenSettled().then(value => { actuallySettled = true; return value; });
   assert.throws(() => barrier.assertActive(operationId), error => error.code === 'CONTROL_RELEASE_OPERATION_INVALIDATED');
   await assert.rejects(() => barrier.drain(), error => error.code === 'CONTROL_RELEASE_DRAIN_TIMEOUT');
+  assert.equal(actuallySettled, false, 'a deadline does not prove the operations ended');
   assert.equal(barrier.settle({ operationId }), true);
+  assert.deepEqual((await quiescent).activeOperationIds, []);
   const drained = await barrier.drain();
   assert.deepEqual(drained.activeOperationIds, []);
   assert.deepEqual(drained.invalidatedOperationIds, [operationId]);

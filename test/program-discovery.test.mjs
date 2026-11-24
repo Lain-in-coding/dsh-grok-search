@@ -246,6 +246,18 @@ for (const closes of [true, false]) test(`a failed version-process kill waits fo
       const failure = await pending;
       assert.equal(failure.code, 'GROK_PROGRAM_REAP_FAILED');
       assert.equal(failure.diagnostic.exited, false);
+      assert.equal(typeof failure.whenExited?.then, 'function');
+      assert.equal(Object.getOwnPropertyDescriptor(failure, 'whenExited').enumerable, false);
+      let exited = false;
+      const proof = failure.whenExited.then(() => { exited = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(exited, false, 'the cleanup deadline is not proof of exit');
+      child.emit('error', new Error('late signal delivery failure'));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(exited, false, 'a late kill error is not proof of exit');
+      child.emit('close', null, 'SIGKILL');
+      await proof;
+      assert.equal(exited, true, 'the owned close event proves the eventual exit');
     }
   } finally {
     child.emit('close', null, 'SIGKILL');

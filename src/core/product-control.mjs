@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { ControlRecordError, createControlIntentStore } from './control-intent-store.mjs';
 import { createStorageMaintenanceWorker } from './storage-worker.mjs';
 import { resolveRuntimeConfig } from './product-config.mjs';
+import { cleanupFailure } from './errors.mjs';
 
 export const PRODUCT_SEARCH_BUNDLE = 'dsh-grok-search';
 // Single-bundle build (D-28): recovery entries ship in the product bundle itself.
@@ -12,6 +13,105 @@ export const PRODUCT_RECOVERY_BUNDLE = 'dsh-grok-search';
 export const PRODUCT_PROVIDER_ID = 'grok-search';
 // One opaque process identity shared by the search and recovery entries.
 export const PRODUCT_HOST_ID = randomUUID();
+const releaseRegistry = Symbol.for('dsh-grok-search/release-tasks-v1');
+const releaseTasks = globalThis[releaseRegistry] ??= new Map();
+
+function releaseIdentity(store) {
+  try { return realpathSync.native(store.directory); }
+  catch (error) {
+    if (error.code !== 'ENOENT' || lstatSync(store.directory, { throwIfNoEntry: false })) throw error;
+    return join(realpathSync.native(dirname(store.directory)), basename(store.directory));
+  }
+}
+
+const runtimeCleanupBusy = operations => Boolean(operations && [...operations.values()].some(operation => operation.tasks.size));
+
+function releaseProfile(store) {
+  const identity = releaseIdentity(store);
+  let operations = releaseTasks.get(identity);
+  if (!operations) releaseTasks.set(identity, operations = new Map());
+  const listeners = operations.runtimeIdleListeners ??= new Set();
+  const forget = () => {
+    if (!operations.size && !listeners.size && releaseTasks.get(identity) === operations) releaseTasks.delete(identity);
+  };
+  const notify = () => {
+    if (!listeners.size || operations.runtimeIdleQueued) return;
+    operations.runtimeIdleQueued = true;
+    setImmediate(() => {
+      operations.runtimeIdleQueued = false;
+      if (releaseTasks.get(identity) !== operations) return;
+      for (const listener of [...listeners]) {
+        if (runtimeCleanupBusy(operations)) break;
+        if (!listeners.has(listener)) continue;
+        try { Promise.resolve(listener()).catch(() => {}); } catch {}
+      }
+      forget();
+    });
+  };
+  return { operations, listeners, forget, notify };
+}
+
+function releaseOperation(store, operationId) {
+  const profile = releaseProfile(store), { operations } = profile;
+  let operation = operations.get(operationId);
+  if (!operation) operations.set(operationId, operation = { tasks: new Set(), listeners: new Set() });
+  const forget = () => {
+    if (operation.tasks.size || operation.listeners.size) return;
+    if (operations.get(operationId) === operation) operations.delete(operationId);
+    profile.forget();
+  };
+  const notify = () => {
+    setImmediate(() => {
+      if (operation.tasks.size || operations.get(operationId) !== operation) return;
+      for (const listener of [...operation.listeners]) {
+        try { Promise.resolve(listener()).catch(() => {}); } catch {}
+      }
+      forget();
+    });
+    profile.notify();
+  };
+  return { operation, forget, notify };
+}
+
+export function holdProductRelease(store, operationId, task, { whenDrained = null } = {}) {
+  const { operation, forget, notify } = releaseOperation(store, operationId);
+  // A rejected deadline or exit observer is not proof that resources stopped.
+  const drained = whenDrained ? Promise.resolve(whenDrained).catch(error =>
+    typeof error?.whenExited?.then === 'function' ? error.whenExited : Promise.reject(error))
+    .catch(() => new Promise(() => {})) : null;
+  const held = drained ? Promise.allSettled([task, drained]) : task;
+  if (operation.tasks.has(held)) return task;
+  operation.tasks.add(held);
+  const finished = () => {
+    operation.tasks.delete(held);
+    if (!operation.tasks.size) notify();
+    forget();
+  };
+  Promise.resolve(held).then(finished, finished);
+  return task;
+}
+
+export function productReleaseInFlight(store, operationId) {
+  return Boolean(releaseTasks.get(releaseIdentity(store))?.get(operationId)?.tasks.size);
+}
+
+export function onProductReleaseIdle(store, operationId, listener) {
+  const { operation, forget, notify } = releaseOperation(store, operationId);
+  operation.listeners.add(listener);
+  if (!operation.tasks.size) notify();
+  return () => { operation.listeners.delete(listener); forget(); };
+}
+
+export function productRuntimeCleanupInFlight(store) {
+  return runtimeCleanupBusy(releaseTasks.get(releaseIdentity(store)));
+}
+
+export function onProductRuntimeCleanupIdle(store, listener) {
+  const profile = releaseProfile(store);
+  profile.listeners.add(listener);
+  if (!runtimeCleanupBusy(profile.operations)) profile.notify();
+  return () => { profile.listeners.delete(listener); profile.forget(); };
+}
 
 export const selectedId = value => typeof value?.get === 'function' ? value.get() : value;
 
@@ -494,7 +594,12 @@ export function suspendCore(core, reason) {
   let task;
   try { task = Promise.resolve(core.dispose()); }
   catch (error) { task = Promise.reject(error); }
-  task.catch(() => {});
+  task.catch(error => {
+    if (typeof error?.whenExited?.then !== 'function') return;
+    Promise.resolve(error.whenExited).then(() => {
+      if (suspendedCores.get(core) === task) suspendedCores.set(core, Promise.resolve());
+    }, () => {});
+  });
   suspendedCores.set(core, task);
   return task;
 }
@@ -511,6 +616,7 @@ export function createProductReleaseController({ ctx, priorIntent, core, routeVe
   }
   let stopping = false;
   let disposeTask = null;
+  let cleanupTask = null;
   let routeBefore = null;
   const barrier = core.releaseBarrier;
   // Native bundle teardown disposes children concurrently. Hold the public
@@ -558,6 +664,17 @@ export function createProductReleaseController({ ctx, priorIntent, core, routeVe
       if (!stopping) throw new ControlRecordError('CONTROL_RELEASE_BARRIER_NOT_INVALIDATED');
       // A takeover already awaiting the host must settle before the author route is restored.
       const settled = Promise.all([disposeTask ?? Promise.resolve(), pendingTakeovers()]);
+      cleanupTask ??= Promise.allSettled([
+        disposeTask ?? Promise.resolve(), pendingTakeovers(),
+        barrier.whenSettled ? barrier.whenSettled() : barrier.drain(),
+      ]).then(async results => {
+        const failure = cleanupFailure(results);
+        if (failure) {
+          if (typeof failure.whenExited?.then === 'function') await failure.whenExited;
+          else throw failure;
+        }
+      });
+      cleanupTask.catch(() => {});
       let timer;
       const disposeBound = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new ControlRecordError('CONTROL_RELEASE_DRAIN_TIMEOUT',
@@ -567,10 +684,11 @@ export function createProductReleaseController({ ctx, priorIntent, core, routeVe
         Promise.race([settled, disposeBound]),
         barrier.drain(),
       ]).finally(() => clearTimeout(timer));
-      const rejected = results.find(result => result.status === 'rejected');
-      if (rejected) throw rejected.reason;
+      const failure = cleanupFailure(results);
+      if (failure) throw failure;
       return { settled: true, remaining: 0 };
     },
+    whenDrained: () => cleanupTask ?? disposeTask ?? Promise.resolve(),
     async restore() {
       try { await ctx.get?.('grokSearchBudgets')?.release(); }
       catch {

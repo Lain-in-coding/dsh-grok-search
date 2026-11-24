@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
+import { writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mkdtempTracked } from './helpers/temp-fixture.mjs';
+import { createSharedConfigStore } from '../src/core/shared-config.mjs';
+import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { createRouteController } from '../src/ui/route-controller.mjs';
 import { NUM, normCard, normHub, validateHub } from '../src/ui/route-form.mjs';
 
@@ -449,6 +455,60 @@ test('new saves use the existing effective identity and never call the legacy en
   assert.equal(receipt.path, saved.path);
   assert.equal(receipt.quotaRevision, saved.quotaRevision);
   assert.equal(receipt.after, saved.revision);
+});
+
+test('a normalized no-op config save cannot block undo of a changed private switch', async () => {
+  const directory = mkdtempTracked(join(tmpdir(), 'dsh-route-noop-'));
+  const path = join(directory, 'config.toml'), text = 'grok_model = "existing"\n';
+  writeFileSync(path, text);
+  const store = createSharedConfigStore({ path, historyDirectory: join(directory, 'history'), env: () => ({}) });
+  const preferences = createPrivatePreferences({ path: join(directory, 'preferences.json') });
+  const config = { ...store.snapshot(), quotaRevision: 'same-effective' };
+  const base = { model: 'existing', enabled: true };
+  const draft = { model: ' existing ', enabled: false };
+  const mine = { kind: 'card', id: 'grok', base, draft, configBaseline: config, fields: config.fields, saving: true };
+  const writes = [], restores = [], errors = [], notices = [];
+  const context = vm.createContext({
+    disposed: false, secretEpoch: 0, accessGeneration: 0, stateGeneration: 0, snapshotSignature: null,
+    D: mine, S: { config, prefs: preferences.snapshot(), prov: { grok: { ...base } },
+      capabilities: { secretsAllowed: true }, busy: false },
+    clone: structuredClone, normCard, hidden: () => false, fieldReadOnly: () => false,
+    CARD_FIELDS: { grok: { model: 'grok_model' } }, CRED: { grok: ['model'] }, SUPP: [], META: { grok: { name: 'Grok' } },
+    configFields: () => context.S.config.fields,
+    updateConfig(value) { context.S.config = value; },
+    closeDialog() { context.D = null; }, syncAll() {}, bump() {}, rowOf: () => null, reconcileChecks() {},
+    toast(message, options) { notices.push({ message, options }); }, operationError(error) { errors.push(error); },
+    remote: {
+      saveWithIdentity(request) {
+        writes.push(request);
+        return { config: { ...store.save(request), quotaRevision: config.quotaRevision } };
+      },
+      restoreConfigWithIdentity(request) {
+        restores.push(request);
+        return { config: { ...store.restore(request), quotaRevision: config.quotaRevision } };
+      },
+      savePreferences: request => preferences.save(request.expectedRevision, request.value),
+      preferences: () => preferences.snapshot(),
+    },
+  });
+  vm.runInContext([
+    section('async function saveConfig(', 'function normalizeCode('),
+    section('function cardUpdates(', 'async function clearArm('),
+  ].join('\n'), context);
+  await context.commitCard(draft);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].updates.grok_model, 'existing');
+  assert.equal(store.snapshot().revision, config.revision);
+  assert.equal(readFileSync(path, 'utf8'), text);
+  assert.deepEqual(store.history(), []);
+  assert.equal(preferences.snapshot().value.grokEnabled, false);
+  assert.equal(typeof notices.at(-1).options.undo, 'function');
+
+  await notices.at(-1).options.undo();
+  assert.equal(restores.length, 0, 'A no-op did not create a history revision to restore.');
+  assert.equal(errors.length, 0);
+  assert.equal(preferences.snapshot().value.grokEnabled, true);
+  assert.equal(readFileSync(path, 'utf8'), text);
 });
 
 test('a late save reply cannot replace a configuration switched while it was pending', async () => {

@@ -850,6 +850,7 @@
               { code: "CONFIG_COMMIT_UNCERTAIN" }
             );
           }
+          if (result.config.revision === revision) return null;
           if (!disposed) updateConfig(result.config, Object.keys(updates));
           return {
             before: revision,

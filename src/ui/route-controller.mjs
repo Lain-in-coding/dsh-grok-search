@@ -520,6 +520,8 @@ async function saveConfig(build, baseline = null) {
         throw Object.assign(new Error('配置可能已写入，但当前配置或连接已变化；请重新读取确认，不要重复保存。'),
           { code: 'CONFIG_COMMIT_UNCERTAIN' });
       }
+      // An idempotent save creates no history revision or config undo receipt.
+      if (result.config.revision === revision) return null;
       if (!disposed) updateConfig(result.config, Object.keys(updates));
       return { before: revision, after: result.config.revision, undo: starting.exists,
         path: result.config.path, quotaRevision: result.config.quotaRevision };

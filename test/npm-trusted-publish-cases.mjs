@@ -94,6 +94,30 @@ test('frozen archive bytes, checksum and all packed source files must match with
     { ...expected, sha256: digest(extra) }, path => files.get(path)));
 });
 
+test('frozen verification retains duplicate, unsafe archive path and declared target checks', () => {
+  const { files } = fixture();
+  const rows = [...files].map(([path, value]) => ['package/' + path, value]);
+  const verifyRows = entries => {
+    const bytes = tarGzip(entries), sha256 = digest(bytes);
+    return verifyFrozenPackage(bytes, `${sha256}  dsh-grok-search-${request.version}.tgz\n`,
+      { ...request, sha256 }, path => files.get(path));
+  };
+  assert.throws(() => verifyRows([...rows, rows[0]]), { code: 'COMPATIBILITY_PROGRAM_ARCHIVE_INVALID' });
+  for (const path of ['package/../outside.mjs', 'package/src//alias.mjs',
+    'package/src\\alias.mjs', 'package/C:/alias.mjs']) {
+    assert.throws(() => verifyRows([...rows, [path, Buffer.from('not executed')]]),
+      { code: 'COMPATIBILITY_PROGRAM_ARCHIVE_PATH' });
+  }
+  const originalManifest = files.get('package.json');
+  for (const field of ['main', 'files']) {
+    const manifest = JSON.parse(originalManifest);
+    if (field === 'main') manifest.main = '../outside.mjs';
+    else manifest.files.push('../outside.mjs');
+    files.set('package.json', Buffer.from(JSON.stringify(manifest)));
+    assert.throws(() => verifyArchiveFiles(files), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+  }
+});
+
 test('frozen package verification rejects a declared source file omitted from matching archive bytes', () => {
   const { files } = fixture();
   const manifest = JSON.parse(files.get('package.json'));
@@ -114,13 +138,13 @@ test('frozen package verification rejects a declared source file omitted from ma
     completeRequest, path => files.get(path)).fileCount, files.size);
 });
 
-function verifyArchiveFiles(files, omitted = []) {
+function verifyArchiveFiles(files, omitted = [], sourcePaths = [...files.keys()]) {
   const bytes = tarGzip([...files].filter(([path]) => !omitted.includes(path))
     .map(([path, value]) => ['package/' + path, value]));
   const version = JSON.parse(files.get('package.json')).version;
   const expected = { ...request, version, sha256: digest(bytes) };
   return verifyFrozenPackage(bytes, `${expected.sha256}  dsh-grok-search-${version}.tgz\n`,
-    expected, path => files.get(path));
+    expected, path => files.get(path), sourcePaths);
 }
 
 test('frozen verifier rejects missing transitive static imports and re-exports inside a declared directory', () => {
@@ -133,8 +157,22 @@ test('frozen verifier rejects missing transitive static imports and re-exports i
   files.set('src/core/value.mjs', Buffer.from(
     "import 'synthetic-external-not-installed'; export const value = true; throw new Error('must not evaluate');\n"));
   for (const omitted of ['src/core/entry.mjs', 'src/core/value.mjs']) {
-    assert.throws(() => verifyArchiveFiles(files, [omitted]), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+    assert.throws(() => verifyArchiveFiles(files, [omitted], [...files.keys()].filter(path => path !== omitted)),
+      { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
   }
+  assert.equal(verifyArchiveFiles(files).fileCount, files.size);
+});
+
+test('frozen verifier rejects an omitted literal deferred module without evaluating it', () => {
+  const { files } = fixture();
+  const manifest = JSON.parse(files.get('package.json'));
+  manifest.files.push('src/core/');
+  files.set('package.json', Buffer.from(JSON.stringify(manifest)));
+  files.set('src/bundle.mjs', Buffer.from("export const load = () => import('./core/deferred.mjs');\n"));
+  files.set('src/core/deferred.mjs', Buffer.from("throw new Error('must not execute');\n"));
+  assert.throws(() => verifyArchiveFiles(files, ['src/core/deferred.mjs']),
+    { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+  assert.throws(() => verifyArchiveFiles(files, [], null), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
   assert.equal(verifyArchiveFiles(files).fileCount, files.size);
 });
 
@@ -150,12 +188,13 @@ test('frozen verifier requires exact bin and conditional export targets within d
     manifest[field] = value;
     files.set('package.json', Buffer.from(JSON.stringify(manifest)));
     files.set('src/core/cli.mjs', Buffer.from("#!/usr/bin/env node\nthrow new Error('must not execute');\n"));
-    assert.throws(() => verifyArchiveFiles(files, ['src/core/cli.mjs']), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+    assert.throws(() => verifyArchiveFiles(files, ['src/core/cli.mjs'],
+      [...files.keys()].filter(path => path !== 'src/core/cli.mjs')), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
     assert.equal(verifyArchiveFiles(files).fileCount, files.size);
   }
 });
 
-test('current product source passes intact and rejects omitted imported or declared core targets', () => {
+test('current product source passes intact and rejects omitted imported or declared core targets', t => {
   const root = new URL('../', import.meta.url);
   const manifest = JSON.parse(readFileSync(new URL('package.json', root)));
   assert.ok(manifest.files.includes('src/core/'));
@@ -173,9 +212,14 @@ test('current product source passes intact and rejects omitted imported or decla
   };
   for (const directory of manifest.files.filter(path => path.endsWith('/'))) visit(directory);
   const files = new Map([...paths].map(path => [path, readFileSync(new URL(path, root))]));
-  assert.equal(verifyArchiveFiles(files).fileCount, files.size);
+  const result = verifyArchiveFiles(files);
+  assert.equal(result.fileCount, files.size);
+  assert.equal(result.fileCount, 59);
+  t.diagnostic(JSON.stringify({ kind: 'current-source-inventory-verification', name: manifest.name,
+    version: manifest.version, fileCount: result.fileCount, packageCodeExecuted: false,
+    registryDownloadVerified: false }));
   for (const path of ['src/core/original-search-counter.mjs', 'src/core/compatibility-cli.mjs',
-    'src/core/control-intent-store.mjs']) {
+    'src/core/control-intent-store.mjs', 'src/core/github-host.mjs']) {
     assert.throws(() => verifyArchiveFiles(files, [path]), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' }, path);
   }
   assert.throws(() => verifyArchiveFiles(files, [...paths].filter(path => path.startsWith('src/core/'))),

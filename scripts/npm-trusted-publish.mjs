@@ -97,7 +97,7 @@ function verifyModuleTargets(files, manifest) {
   }
 }
 
-export function verifyFrozenPackage(bytes, checksumText, request, source) {
+export function verifyFrozenPackage(bytes, checksumText, request, source, sourcePaths = null) {
   const filename = `${packageName}-${request.version}.tgz`;
   insist(digest(bytes) === request.sha256, 'NPM_CHANNEL_PACKAGE_HASH_MISMATCH');
   const rows = checksumText.split(/\r?\n/).filter(Boolean);
@@ -109,10 +109,16 @@ export function verifyFrozenPackage(bytes, checksumText, request, source) {
     && manifest.publishConfig?.tag === 'latest' && manifest.publishConfig?.access === 'public'
     && manifest.repository?.url === `https://github.com/${repository}.git`
     && Array.isArray(manifest.files), 'NPM_CHANNEL_PACKAGE_IDENTITY_INVALID');
+  const allowed = path => ['package.json', 'README.md', 'LICENSE'].includes(path)
+    || manifest.files.some(entry => entry.endsWith('/') ? path.startsWith(entry) : path === entry);
+  // Directory entries must match the reviewed commit inventory, including deferred modules.
+  insist(!manifest.files.some(entry => entry.endsWith('/')) || Array.isArray(sourcePaths),
+    'NPM_CHANNEL_PACKAGE_INCOMPLETE');
+  for (const path of sourcePaths ?? []) {
+    if (allowed(path)) insist(files.has(path), 'NPM_CHANNEL_PACKAGE_INCOMPLETE');
+  }
   for (const [path, packed] of files) {
-    const allowed = ['package.json', 'README.md', 'LICENSE'].includes(path)
-      || manifest.files.some(entry => entry.endsWith('/') ? path.startsWith(entry) : path === entry);
-    insist(allowed && packed.equals(source(path)), 'NPM_CHANNEL_PACKAGE_SOURCE_MISMATCH');
+    insist(allowed(path) && packed.equals(source(path)), 'NPM_CHANNEL_PACKAGE_SOURCE_MISMATCH');
   }
   for (const path of ['README.md', 'LICENSE', manifest.icon, manifest.main, 'cordis.patch.yml', 'support-matrix.json',
     ...manifest.files.filter(entry => !entry.endsWith('/'))]) {
@@ -286,8 +292,10 @@ export async function runChannel(env = process.env) {
       const bytes = await download(assets.archive.browser_download_url, 16 * 1024 ** 2);
       insist(bytes.length === assets.archive.size, 'NPM_CHANNEL_DOWNLOAD_SIZE_MISMATCH');
       const sums = await download(assets.sums.browser_download_url, 256 * 1024);
+      const sourcePaths = execFileSync('git', ['ls-tree', '-r', '--name-only', '-z', request.commit],
+        { maxBuffer: 16 * 1024 ** 2 }).toString('utf8').split('\0').filter(Boolean);
       const expected = verifyFrozenPackage(bytes, sums.toString('utf8'), request,
-        path => execFileSync('git', ['show', `${request.commit}:${path}`], { maxBuffer: 16 * 1024 ** 2 }));
+        path => execFileSync('git', ['show', `${request.commit}:${path}`], { maxBuffer: 16 * 1024 ** 2 }), sourcePaths);
       Object.assign(result, { package: expected, offlineRun: request.offlineRun,
         offlineRunUrl: run.html_url, releaseUrl: release.html_url });
       const before = await registryJson(packageName), previousTags = before['dist-tags'] ?? {};

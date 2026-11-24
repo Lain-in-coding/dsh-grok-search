@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { digest, packageFiles } from './lib/compatibility-program-checks.mjs';
@@ -66,6 +66,37 @@ export function validateRelease(release, tagCommit, request) {
   return { archive: archive[0], sums: sums[0], filename };
 }
 
+function verifyModuleTargets(files, manifest) {
+  const targets = value => typeof value === 'string' ? [value]
+    : value && typeof value === 'object' ? Object.values(value).flatMap(targets) : [];
+  for (const target of [...targets(manifest.bin), ...targets(manifest.exports)].filter(path => !path.includes('*'))) {
+    insist(files.has(posix.normalize(target)), 'NPM_CHANNEL_PACKAGE_INCOMPLETE');
+  }
+  const modules = [...files].filter(([path]) => path.endsWith('.mjs')
+    || manifest.type === 'module' && path.endsWith('.js'));
+  if (!modules.length) return;
+  // Parse frozen ESM only: never link dependencies or evaluate package code.
+  const parser = "import { SourceTextModule } from 'node:vm';"
+    + "process.stdin.setEncoding('utf8');let input='';for await(const part of process.stdin)input+=part;"
+    + "const rows=JSON.parse(input);console.log(JSON.stringify(rows.map(row=>{"
+    + "const module=new SourceTextModule(row.code,{identifier:row.path});"
+    + "return module.moduleRequests?.map(request=>request.specifier)??module.dependencySpecifiers;})));";
+  let dependencies;
+  try {
+    dependencies = JSON.parse(execFileSync(process.execPath,
+      ['--no-warnings', '--experimental-vm-modules', '--input-type=module', '-e', parser], {
+        input: JSON.stringify(modules.map(([path, bytes]) => ({ path, code: bytes.toString('utf8') }))),
+        encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 ** 2, windowsHide: true, env: {},
+      }));
+  } catch { fail('NPM_CHANNEL_PACKAGE_MODULE_INVALID'); }
+  for (const [index, imports] of dependencies.entries()) {
+    for (const specifier of imports.filter(path => path.startsWith('./') || path.startsWith('../'))) {
+      const target = posix.normalize(posix.join(posix.dirname(modules[index][0]), specifier));
+      insist(files.has(target), 'NPM_CHANNEL_PACKAGE_INCOMPLETE');
+    }
+  }
+}
+
 export function verifyFrozenPackage(bytes, checksumText, request, source) {
   const filename = `${packageName}-${request.version}.tgz`;
   insist(digest(bytes) === request.sha256, 'NPM_CHANNEL_PACKAGE_HASH_MISMATCH');
@@ -83,9 +114,11 @@ export function verifyFrozenPackage(bytes, checksumText, request, source) {
       || manifest.files.some(entry => entry.endsWith('/') ? path.startsWith(entry) : path === entry);
     insist(allowed && packed.equals(source(path)), 'NPM_CHANNEL_PACKAGE_SOURCE_MISMATCH');
   }
-  for (const path of ['README.md', 'LICENSE', manifest.icon, manifest.main, 'cordis.patch.yml', 'support-matrix.json']) {
+  for (const path of ['README.md', 'LICENSE', manifest.icon, manifest.main, 'cordis.patch.yml', 'support-matrix.json',
+    ...manifest.files.filter(entry => !entry.endsWith('/'))]) {
     insist(typeof path === 'string' && files.has(path), 'NPM_CHANNEL_PACKAGE_INCOMPLETE');
   }
+  verifyModuleTargets(files, manifest);
   return { name: packageName, version: request.version, filename, sha256: request.sha256,
     integrity: sha512(bytes), size: bytes.length, fileCount: files.size, sourceCommit: request.commit };
 }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -154,5 +154,63 @@ test('manifest preflight rejects local, git, URL, alias and lockfile-controlled 
   for (const key of ['bundleDependencies', 'bundledDependencies', 'overrides']) {
     assert.throws(() => validateInstallManifest({ manifest: { [key]: {} }, files }),
       { code: 'COMPATIBILITY_PACKAGE_INSTALL_POLICY' });
+  }
+});
+
+test('bounded command diagnostics preserve split UTF-8 while counting raw output bytes', async () => {
+  const expected = '\u6821\u9a8c\u20ac\ud83d\ude00\n';
+  const bytes = [...Buffer.from(expected)];
+  const source = `const bytes=${JSON.stringify(bytes)};
+    (async()=>{for(const byte of bytes){
+      process.stdout.write(Buffer.from([byte]));process.stderr.write(Buffer.from([byte]));
+      await new Promise(done=>setTimeout(done,20));
+    }})();`;
+  const result = await runBoundedCommand(process.execPath, ['-e', source], {
+    timeout: 10_000, limit: bytes.length * 2,
+  });
+  assert.equal(result.code, 0);
+  assert.equal(result.failure, null);
+  assert.equal(result.stdout, expected);
+  assert.equal(result.stderr, expected);
+  const limited = await runBoundedCommand(process.execPath, ['-e', source], {
+    timeout: 10_000, limit: bytes.length * 2 - 1,
+  });
+  assert.equal(limited.failure, 'COMPATIBILITY_SMOKE_OUTPUT_LIMIT');
+});
+
+test('Windows cancellation lets tree termination reap a live parent and its owned descendant', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const root = mkdtempTracked(join(tmpdir(), 'dsh-process-cancel-tree-'));
+  const ready = join(root, 'ready.json');
+  const descendant = `require('node:fs').writeFileSync(${JSON.stringify(ready)},
+    JSON.stringify({pid:process.pid}));setTimeout(()=>process.exit(0),4000);`;
+  const source = `const {spawn}=require('node:child_process');
+    spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{windowsHide:true,stdio:'ignore'});
+    setTimeout(()=>process.exit(0),5000);`;
+  const controller = new AbortController();
+  const task = runBoundedCommand(process.execPath, ['-e', source], {
+    signal: controller.signal, timeout: 10_000, killGraceMs: 1500,
+  });
+  let pid, alive = false;
+  try {
+    const deadline = performance.now() + 3000;
+    while (!existsSync(ready) && performance.now() < deadline) {
+      await new Promise(done => setTimeout(done, 20));
+    }
+    assert.ok(existsSync(ready), 'The owned descendant must start before cancellation.');
+    ({ pid } = JSON.parse(readFileSync(ready)));
+    assert.ok(Number.isSafeInteger(pid) && pid > 0);
+    controller.abort();
+    const result = await task;
+    assert.equal(result.failure, 'COMPATIBILITY_SMOKE_CANCELLED');
+    try { process.kill(pid, 0); alive = true; }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+    assert.equal(alive, false, 'Cancellation must not return with its known descendant still alive.');
+  } finally {
+    controller.abort();
+    await task;
+    // A failing old implementation still leaves only a short-lived synthetic process.
+    if (alive || !pid) await new Promise(done => setTimeout(done, 4500));
   }
 });

@@ -10,6 +10,7 @@ import { runInNewContext } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { mkdtempTracked } from './helpers/temp-fixture.mjs';
 import { connectRenderer } from '../scripts/lib/renderer-cdp.mjs';
+import { commandResult, receipt } from '../scripts/lib/internal-candidate-utils.mjs';
 
 const fixtureHelper = new URL('./helpers/temp-fixture.mjs', import.meta.url).href;
 
@@ -648,4 +649,21 @@ test('README demo lifecycle honors frame retention and unsuccessful scenarios', 
     assert.equal(fixture.summary.passed, options.passed ?? true);
     if (options.passed === false) assert.equal(fixture.process.exitCode, 1);
   }
+});
+
+test('delivery command receipts preserve UTF-8 split across stdout and stderr chunks', async () => {
+  const expected = JSON.stringify({ host: '\u6821\u9a8c\u20ac\ud83d\ude00' }) + '\n';
+  const bytes = [...Buffer.from(expected)];
+  const source = `const bytes=${JSON.stringify(bytes)};
+    (async()=>{for(const byte of bytes){
+      process.stdout.write(Buffer.from([byte]));process.stderr.write(Buffer.from([byte]));
+      await new Promise(done=>setTimeout(done,20));
+    }})();`;
+  const result = await commandResult(process.execPath, ['-e', source], { timeoutMs: 10_000 });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.rawStdout, expected);
+  assert.equal(result.stdout, expected);
+  assert.equal(receipt(result).stderr, expected);
+  assert.deepEqual(JSON.parse(result.rawStdout), JSON.parse(expected));
 });

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 // Only children created here are eligible for termination. An unverified
 // descendant/pipe cleanup is a failed run, never a successful smoke receipt.
@@ -11,6 +12,7 @@ export async function runBoundedCommand(executable, args, {
     cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '', stderr = '', size = 0, failure = null, killTimer, finalTimer, drainTimer;
+  const decoders = { out: new StringDecoder('utf8'), err: new StringDecoder('utf8') };
   let exitCode = null, exitSignal = null, settled = false, terminating = false, finish;
   const done = new Promise(resolve => { finish = resolve; });
   const complete = () => {
@@ -18,6 +20,7 @@ export async function runBoundedCommand(executable, args, {
     settled = true;
     clearTimeout(timer); clearTimeout(killTimer); clearTimeout(finalTimer); clearTimeout(drainTimer);
     signal?.removeEventListener('abort', abort);
+    stdout += decoders.out.end(); stderr += decoders.err.end();
     child.stdout.destroy(); child.stderr.destroy(); child.unref();
     finish({ code: exitCode, signal: exitSignal, stdout, stderr, failure });
   };
@@ -54,7 +57,8 @@ export async function runBoundedCommand(executable, args, {
   const collect = stream => bytes => {
     size += bytes.length;
     if (size > limit) return terminate('COMPATIBILITY_SMOKE_OUTPUT_LIMIT');
-    if (stream === 'out') stdout += bytes; else stderr += bytes;
+    const text = decoders[stream].write(bytes);
+    if (stream === 'out') stdout += text; else stderr += text;
   };
   child.stdout.on('data', collect('out')); child.stderr.on('data', collect('err'));
   child.once('error', () => { failure ??= 'COMPATIBILITY_SMOKE_SPAWN_FAILED'; complete(); });

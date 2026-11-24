@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { digest, tarGzip } from '../scripts/lib/compatibility-program-checks.mjs';
 import { checkTrustedIdentity, repository, validateOfflineRun, validateRelease, validateRequest,
   publishAndVerify, verifyFrozenPackage, verifyRegistryPackage } from '../scripts/npm-trusted-publish.mjs';
@@ -72,7 +72,7 @@ function fixture() {
     repository: { url: `https://github.com/${repository}.git` }, publishConfig: { tag: 'latest', access: 'public' } };
   const files = new Map([['package.json', Buffer.from(JSON.stringify(manifest))],
     ...['README.md', 'LICENSE', 'src/bundle.mjs', 'icon.png', 'cordis.patch.yml', 'support-matrix.json']
-      .map(path => [path, Buffer.from('synthetic-' + path)])]);
+      .map(path => [path, Buffer.from(path.endsWith('.mjs') ? '"synthetic-' + path + '";\n' : 'synthetic-' + path)])]);
   const bytes = tarGzip([...files].map(([path, value]) => ['package/' + path, value]));
   const expected = { ...request, sha256: digest(bytes) };
   const sums = `${expected.sha256}  dsh-grok-search-0.4.2.tgz\n`;
@@ -92,6 +92,94 @@ test('frozen archive bytes, checksum and all packed source files must match with
     .map(([path, value]) => ['package/' + path, value]));
   assert.throws(() => verifyFrozenPackage(extra, sums.replace(expected.sha256, digest(extra)),
     { ...expected, sha256: digest(extra) }, path => files.get(path)));
+});
+
+test('frozen package verification rejects a declared source file omitted from matching archive bytes', () => {
+  const { files } = fixture();
+  const manifest = JSON.parse(files.get('package.json'));
+  const required = 'src/provider.mjs';
+  manifest.files.push(required);
+  files.set('package.json', Buffer.from(JSON.stringify(manifest)));
+  files.set(required, Buffer.from('export const provider = true;\n'));
+  const incomplete = tarGzip([...files].filter(([path]) => path !== required)
+    .map(([path, value]) => ['package/' + path, value]));
+  const expected = { ...request, sha256: digest(incomplete) };
+  const sums = `${expected.sha256}  dsh-grok-search-${request.version}.tgz\n`;
+  assert.throws(() => verifyFrozenPackage(incomplete, sums, expected, path => files.get(path)),
+    { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+  const complete = tarGzip([...files].map(([path, value]) => ['package/' + path, value]));
+  const completeRequest = { ...request, sha256: digest(complete) };
+  assert.equal(verifyFrozenPackage(complete,
+    `${completeRequest.sha256}  dsh-grok-search-${request.version}.tgz\n`,
+    completeRequest, path => files.get(path)).fileCount, files.size);
+});
+
+function verifyArchiveFiles(files, omitted = []) {
+  const bytes = tarGzip([...files].filter(([path]) => !omitted.includes(path))
+    .map(([path, value]) => ['package/' + path, value]));
+  const version = JSON.parse(files.get('package.json')).version;
+  const expected = { ...request, version, sha256: digest(bytes) };
+  return verifyFrozenPackage(bytes, `${expected.sha256}  dsh-grok-search-${version}.tgz\n`,
+    expected, path => files.get(path));
+}
+
+test('frozen verifier rejects missing transitive static imports and re-exports inside a declared directory', () => {
+  const { files } = fixture();
+  const manifest = JSON.parse(files.get('package.json'));
+  manifest.files.push('src/core/');
+  files.set('package.json', Buffer.from(JSON.stringify(manifest)));
+  files.set('src/bundle.mjs', Buffer.from("import './core/entry.mjs';\n"));
+  files.set('src/core/entry.mjs', Buffer.from("export { value } from './value.mjs';\n"));
+  files.set('src/core/value.mjs', Buffer.from(
+    "import 'synthetic-external-not-installed'; export const value = true; throw new Error('must not evaluate');\n"));
+  for (const omitted of ['src/core/entry.mjs', 'src/core/value.mjs']) {
+    assert.throws(() => verifyArchiveFiles(files, [omitted]), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+  }
+  assert.equal(verifyArchiveFiles(files).fileCount, files.size);
+});
+
+test('frozen verifier requires exact bin and conditional export targets within declared directories', () => {
+  for (const [field, value] of [
+    ['bin', './src/core/cli.mjs'],
+    ['bin', { 'synthetic-cli': './src/core/cli.mjs' }],
+    ['exports', { '.': './src/bundle.mjs', './cli': { import: './src/core/cli.mjs', default: './src/core/cli.mjs' } }],
+  ]) {
+    const { files } = fixture();
+    const manifest = JSON.parse(files.get('package.json'));
+    manifest.files.push('src/core/');
+    manifest[field] = value;
+    files.set('package.json', Buffer.from(JSON.stringify(manifest)));
+    files.set('src/core/cli.mjs', Buffer.from("#!/usr/bin/env node\nthrow new Error('must not execute');\n"));
+    assert.throws(() => verifyArchiveFiles(files, ['src/core/cli.mjs']), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
+    assert.equal(verifyArchiveFiles(files).fileCount, files.size);
+  }
+});
+
+test('current product source passes intact and rejects omitted imported or declared core targets', () => {
+  const root = new URL('../', import.meta.url);
+  const manifest = JSON.parse(readFileSync(new URL('package.json', root)));
+  assert.ok(manifest.files.includes('src/core/'));
+  const paths = new Set(['package.json', 'README.md', 'LICENSE',
+    ...manifest.files.filter(path => !path.endsWith('/'))]);
+  const visit = directory => {
+    for (const entry of readdirSync(new URL(directory, root), { withFileTypes: true })) {
+      const path = directory + entry.name;
+      if (entry.isDirectory()) visit(path + '/');
+      else {
+        assert.ok(entry.isFile(), 'The current package fixture uses ordinary source files.');
+        paths.add(path);
+      }
+    }
+  };
+  for (const directory of manifest.files.filter(path => path.endsWith('/'))) visit(directory);
+  const files = new Map([...paths].map(path => [path, readFileSync(new URL(path, root))]));
+  assert.equal(verifyArchiveFiles(files).fileCount, files.size);
+  for (const path of ['src/core/original-search-counter.mjs', 'src/core/compatibility-cli.mjs',
+    'src/core/control-intent-store.mjs']) {
+    assert.throws(() => verifyArchiveFiles(files, [path]), { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' }, path);
+  }
+  assert.throws(() => verifyArchiveFiles(files, [...paths].filter(path => path.startsWith('src/core/'))),
+    { code: 'NPM_CHANNEL_PACKAGE_INCOMPLETE' });
 });
 
 test('registry verification rejects altered archives and changes to next', () => {

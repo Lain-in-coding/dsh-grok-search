@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 import { parse } from 'smol-toml';
 
 export const project = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -108,12 +109,14 @@ export async function commandResult(command, args, { cwd, env, timeoutMs = 120_0
   const started = performance.now();
   const child = spawn(command, args, { cwd, env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '', stderr = '', timedOut = false, spawnError;
+  const outDecoder = new StringDecoder('utf8'), errDecoder = new StringDecoder('utf8');
   const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
-  child.stdout.on('data', chunk => { stdout += chunk; });
-  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.stdout.on('data', chunk => { stdout += outDecoder.write(chunk); });
+  child.stderr.on('data', chunk => { stderr += errDecoder.write(chunk); });
   child.on('error', error => { spawnError = error.message; });
   const exit = await new Promise(done => child.once('close', (code, signal) => done({ code, signal })));
   clearTimeout(timer);
+  stdout += outDecoder.end(); stderr += errDecoder.end();
   const result = { command: sanitize(command), args: args.map(argument => sanitize(argument)), cwd: sanitize(cwd ?? process.cwd()), startedAt,
     elapsedMs: Math.round(performance.now() - started), exitCode: exit.code, signal: exit.signal, timedOut,
     ...(spawnError ? { spawnError: sanitize(spawnError) } : {}), stdout: sanitize(stdout), stderr: sanitize(stderr) };

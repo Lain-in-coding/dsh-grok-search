@@ -46,7 +46,7 @@ export function checkToolBudgetContracts(ctx, budgetMs) {
 /** Runtime-only leases; never edit a profile, enable a tool or patch a method. */
 export function createToolBudgetController({ ctx, budgetMs, required, canLease = () => true,
   resolveConfig = resolveRuntimeConfig, onError = () => {} }) {
-  const leases = new Map(), yielded = new WeakSet(), ownership = new AsyncLocalStorage();
+  const leases = new Map(), pendingRaw = new WeakMap(), yielded = new WeakSet(), ownership = new AsyncLocalStorage();
   const own = fiber => {
     const operation = ownership.getStore();
     return operation?.active === true && operation.fiber === fiber;
@@ -58,6 +58,14 @@ export function createToolBudgetController({ ctx, budgetMs, required, canLease =
     const value = next();
     if (!target(fiber) || releasing || !required() || !canLease() || yielded.has(fiber) || unwrap(value?.search) === false) return value;
     const lease = leases.get(fiber);
+    // Legacy reloads can read a new author commit without an internal/update
+    // event, even while they still run in our original async update chain.
+    const expectedRaw = lease?.raw ?? pendingRaw.get(fiber);
+    if (!modern && fiber.state !== 2 && expectedRaw !== undefined && !isDeepStrictEqual(expectedRaw, plain(input))) {
+      yielded.add(fiber);
+      leases.delete(fiber);
+      return value;
+    }
     // Active candidate resolution may be a validation-only call. Return the
     // author's candidate; yield ownership only if internal/update commits it.
     if (lease && !own(fiber) && fiber.state === 2) return value;
@@ -76,11 +84,12 @@ export function createToolBudgetController({ ctx, budgetMs, required, canLease =
   };
   const refresh = async (fiber, raw) => {
     if (!target(fiber)) return;
+    if (!('effectiveConfig' in fiber) && !leases.has(fiber)) pendingRaw.set(fiber, structuredClone(plain(raw)));
     // Only this update chain owns the lease, not concurrent author updates.
     const operation = { fiber, active: true };
     return ownership.run(operation, async () => {
       try { await fiber.update(raw, true); await fiber.await?.(); }
-      finally { operation.active = false; }
+      finally { operation.active = false; pendingRaw.delete(fiber); }
     });
   };
   const verifyLease = fiber => {

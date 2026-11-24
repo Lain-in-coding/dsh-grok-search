@@ -177,12 +177,12 @@ function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, sett
 
 // Both inspected hosts commit raw input synchronously. Only lifecycle settlement
 // is gated; modern delayed publication also checks the committed revision.
-function orderedHostFixture({ modern, beforeResolve = () => {}, afterCommit = () => {} }) {
+function orderedHostFixture({ modern, beforeResolve = () => {}, afterCommit = () => {}, canLease = () => true }) {
   const hooks = new Map(), calls = [], awaits = [];
   const runtime = { name: 'tool-web', fibers: new Set() };
   const controller = createToolBudgetController({
     ctx: { registry: new Map([['tool-web', runtime]]), on: (name, callback) => hooks.set(name, callback) },
-    budgetMs: BUDGET_MS, required: () => true, resolveConfig: (_runtime, raw) => structuredClone(raw),
+    budgetMs: BUDGET_MS, required: () => true, canLease, resolveConfig: (_runtime, raw) => structuredClone(raw),
   });
   const fiber = {
     uid: 1, state: 2, runtime, config: structuredClone(AUTHOR_CONFIG),
@@ -620,6 +620,93 @@ for (const modern of [false, true]) {
     } finally { await h.controller.release(); }
     assert.deepEqual(effectiveConfig(h.fiber), author);
   });
+
+  if (!modern) {
+    for (const changed of [false, true]) test(`legacy first delayed lease resolution ${changed ? 'preserves an author commit' : 'keeps unchanged raw'} during an existing reload`, async () => {
+      const started = deferred(), gate = deferred();
+      let admitted = false;
+      const h = orderedHostFixture({ modern, canLease: () => admitted, afterCommit: call => {
+        if (call.index !== 1) return;
+        started.resolve();
+        return gate.promise;
+      } });
+      const reloading = h.authorUpdate(AUTHOR_CONFIG);
+      await started.promise;
+      admitted = true;
+      const acquisition = h.controller.acquire();
+      const author = changed ? { ...AUTHOR_CONFIG, searchTimeoutMs: 42_000, fetchTimeoutMs: 27_000 } : AUTHOR_CONFIG;
+      let authorUpdate;
+      try {
+        await nextTurn();
+        assert.equal(h.fiber.state, 5);
+        assert.equal(h.calls.length, 2);
+        assert.equal(h.controller.snapshot().owned, 0, 'the first lease resolution is still pending');
+        if (changed) authorUpdate = h.authorUpdate(author);
+        assert.deepEqual(h.rawConfig(), author);
+      } finally { gate.resolve(); }
+      try {
+        await Promise.all([reloading, acquisition, authorUpdate]);
+        assert.deepEqual(effectiveConfig(h.fiber), changed ? author : { ...author, searchTimeoutMs: BUDGET_MS });
+        assert.equal(h.controller.snapshot().owned, changed ? 0 : 1);
+        await h.controller.acquire();
+        assert.equal(h.calls.length, 3);
+      } finally { await h.controller.release(); }
+      assert.deepEqual(h.fiber.entry.options.config, author);
+      assert.deepEqual(effectiveConfig(h.fiber), author);
+      assert.equal(h.calls.length, changed ? 3 : 4);
+    });
+
+    test('legacy reload preserves an author commit that bypasses internal/update while unloading', async () => {
+      const started = deferred(), gate = deferred();
+      const h = orderedHostFixture({ modern, afterCommit: call => {
+        if (call.index !== 1) return;
+        started.resolve();
+        return gate.promise;
+      } });
+      const acquisition = h.controller.acquire();
+      await started.promise;
+      const author = { ...AUTHOR_CONFIG, searchTimeoutMs: 42_000, fetchTimeoutMs: 27_000 };
+      let authorUpdate;
+      try {
+        assert.equal(h.fiber.state, 5);
+        authorUpdate = h.authorUpdate(author);
+        assert.deepEqual(h.rawConfig(), author);
+      } finally { gate.resolve(); }
+      try {
+        await Promise.all([acquisition, authorUpdate]);
+        assert.deepEqual(effectiveConfig(h.fiber), author);
+        assert.equal(h.controller.snapshot().owned, 0);
+        await h.controller.acquire();
+        assert.equal(h.calls.length, 2, 'a later acquire cannot reclaim the author update');
+      } finally { await h.controller.release(); }
+      assert.deepEqual(effectiveConfig(h.fiber), author);
+      assert.deepEqual(h.fiber.entry.options.config, author);
+      assert.equal(h.calls.length, 2, 'release cannot rewrite a yielded lease');
+    });
+
+    test('legacy reload keeps an unchanged lease even when the host clones its raw configuration', async () => {
+      const started = deferred(), gate = deferred();
+      const h = orderedHostFixture({ modern, afterCommit: call => {
+        if (call.index !== 1) return;
+        started.resolve();
+        return gate.promise;
+      } });
+      const acquisition = h.controller.acquire();
+      await started.promise;
+      try {
+        assert.equal(h.fiber.state, 5);
+        assert.notEqual(h.rawConfig(), h.calls[0].raw);
+        assert.deepEqual(h.rawConfig(), AUTHOR_CONFIG);
+      } finally { gate.resolve(); }
+      try {
+        await acquisition;
+        assert.equal(effectiveConfig(h.fiber).searchTimeoutMs, BUDGET_MS);
+        assert.equal(h.controller.snapshot().owned, 1);
+      } finally { await h.controller.release(); }
+      assert.deepEqual(effectiveConfig(h.fiber), AUTHOR_CONFIG);
+      assert.deepEqual(h.fiber.entry.options.config, AUTHOR_CONFIG);
+    });
+  }
 
   test(`${label}: validating an author candidate does not release a live lease`, async () => {
     const h = fixture({ modern });

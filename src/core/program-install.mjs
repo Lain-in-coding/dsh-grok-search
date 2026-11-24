@@ -105,7 +105,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
   fetchImpl = fetch, inspect = inspectGrokProgram, handshake = probeMcpHandshake } = {}) {
   if (typeof directory !== 'string' || !isAbsolute(directory)) fail('GROK_CACHE_PATH_INVALID', '程序缓存必须使用绝对路径。');
   const packageName = grokPlatformPackage(platform, arch);
-  let pending = null;
+  let pending = null, installationGuard = null;
   const checkCacheRoot = () => {
     let stat;
     try { stat = lstatSync(directory); }
@@ -224,19 +224,22 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     pending = (async () => {
       const lock = join(directory, '.install.lock');
-      let ownedLock;
+      let ownedLock, guard;
       let incomplete = null, staged = null, published = false, validationExited = true, validationExit = null;
       try {
         combined.throwIfAborted();
         checkCacheRoot();
         mkdirSync(directory, { recursive: true, mode: 0o700 });
         checkCacheRoot();
+        // Only a guard whose validator already exited may be retried here.
+        if (installationGuard?.exitConfirmed && installationGuard.lock.release()) installationGuard = null;
         try { ownedLock = acquireOwnedLock(lock, { reclaimStaleAfterMs: 30 * 60 * 1000 }); }
         catch (error) {
           if (error.code === 'EEXIST') fail('GROK_INSTALL_BUSY', '另一个实例正在准备程序，或上次准备被中断。');
           if (['EACCES', 'EPERM'].includes(error.code)) fail('GROK_CACHE_ACCESS_DENIED', '没有写入程序缓存的权限，请检查目录权限。');
           throw error;
         }
+        guard = installationGuard = { lock: ownedLock, exitConfirmed: false };
         notify({ phase: 'checking-version' });
         const selectedVersion = VERIFIED_GROK_VERSIONS.at(-1);
         const version = requestedVersion ?? selectedVersion;
@@ -341,10 +344,17 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
             catch { /* Preserve uncertain leftovers; never change the original installation error. */ }
           }
         };
-        if (validationExited) { cleanup(); ownedLock?.release(); }
+        const release = () => {
+          cleanup();
+          if (guard) {
+            guard.exitConfirmed = true;
+            if (ownedLock.release() && installationGuard === guard) installationGuard = null;
+          }
+        };
+        if (validationExited) release();
         else if (validationExit) {
           // Unknown or rejected exit proof retains both the candidate and its guard.
-          void Promise.resolve(validationExit).then(() => { cleanup(); ownedLock?.release(); }).catch(() => {});
+          void Promise.resolve(validationExit).then(release).catch(() => {});
         }
       }
     })().finally(() => { clearTimeout(timer); pending = null; });

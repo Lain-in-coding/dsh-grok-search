@@ -561,6 +561,173 @@ test('late lock release absorbs an unlink failure without rejecting deferred cle
   } finally { fs.unlinkSync = unlink; syncBuiltinESMExports(); resolveExit(); await whenExited; }
 });
 
+for (const point of ['completed-install', 'late-validator-exit']) {
+  test(`explicit installation retry releases its own transiently blocked guard (${point})`, async () => {
+    let resolveExit, failValidation = point === 'late-validator-exit', releaseAttempts = 0;
+    const whenExited = new Promise(resolve => { resolveExit = resolve; });
+    const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+    Object.defineProperty(failure, 'whenExited', { value: whenExited });
+    Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+    const f = fixture({ handshake: async () => {
+      if (failValidation) throw failure;
+      return { version: VERSION, toolsDeclared: true, exited: true };
+    } });
+    const path = join(f.directory, '.install.lock'), unlink = fs.unlinkSync;
+    fs.unlinkSync = target => {
+      if (target === path && ++releaseAttempts === 1) {
+        throw Object.assign(new Error('synthetic transient lock unlink failure'), { code: 'EACCES' });
+      }
+      return unlink(target);
+    };
+    syncBuiltinESMExports();
+    try {
+      if (failValidation) {
+        await assert.rejects(f.installer.install(), error => error === failure);
+        const requests = f.urls.length;
+        await assert.rejects(f.installer.install(), { code: 'GROK_INSTALL_BUSY' });
+        assert.equal(f.urls.length, requests, 'no retry may bypass a live validator');
+        assert.equal(releaseAttempts, 0);
+        resolveExit();
+        await whenExited;
+        await new Promise(resolve => setImmediate(resolve));
+        failValidation = false;
+      } else {
+        assert.equal((await f.installer.install()).version, VERSION);
+      }
+      assert.equal(releaseAttempts, 1, 'the failed release does not start a background retry loop');
+      const before = readFileSync(path);
+      assert.equal(JSON.parse(before).pid, process.pid);
+      assert.equal((await f.installer.install()).version, VERSION, 'an explicit retry need not wait for the parent PID to exit');
+      assert.ok(releaseAttempts >= 2);
+      assert.equal(existsSync(path), false);
+      assert.equal((await f.installer.active()).version, VERSION);
+    } finally { fs.unlinkSync = unlink; syncBuiltinESMExports(); resolveExit(); await whenExited; }
+  });
+}
+
+test('a real controller retry recovers a proven validator exit followed by transient lock failure', async () => {
+  let resolveExit, failValidation = true, releaseAttempts = 0;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'validator has not exited');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => {
+    if (failValidation) throw failure;
+    return { version: VERSION, toolsDeclared: true, exited: true };
+  } });
+  const configuration = { configPath: join(f.directory, 'shared-config.toml') };
+  writeFileSync(configuration.configPath, 'config-fixture-not-a-real-key');
+  const configBytes = readFileSync(configuration.configPath);
+  const manager = createProgramController({ configuration, directory: f.directory, installer: f.installer,
+    resolveProgram: ({ signal, installer }) => installer.install({ signal }) });
+  const lockPath = join(f.directory, '.install.lock'), unlink = fs.unlinkSync;
+  fs.unlinkSync = target => {
+    if (target === lockPath && ++releaseAttempts === 1) {
+      throw Object.assign(new Error('synthetic transient lock unlink failure'), { code: 'EPERM' });
+    }
+    return unlink(target);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(manager.prepare(), error => error === failure);
+    const requests = f.urls.length;
+    await assert.rejects(manager.prepare(), error => error === failure);
+    assert.equal(f.urls.length, requests, 'a controller recheck must respect pending exit ownership');
+    resolveExit();
+    await whenExited;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(manager.snapshot().phase, 'error', 'process exit alone is not program readiness');
+    assert.equal(existsSync(lockPath), true);
+    failValidation = false;
+    const first = manager.prepare(), second = manager.prepare();
+    assert.equal(first, second, 'overlapping explicit rechecks remain deduplicated');
+    assert.equal((await first).phase, 'ready');
+    assert.equal(existsSync(lockPath), false);
+    assert.deepEqual(readFileSync(configuration.configPath), configBytes);
+    assert.equal(manager.execution().executable, f.versions.at(-1));
+  } finally { fs.unlinkSync = unlink; syncBuiltinESMExports(); resolveExit(); await whenExited; await manager.dispose(); }
+});
+
+for (const replacement of ['new-owner', 'changed-bytes', 'linked-cache']) {
+  test(`explicit installation retry cannot release a retained guard through ${replacement}`, async () => {
+    const f = fixture(), lockPath = join(f.directory, '.install.lock'), unlink = fs.unlinkSync;
+    let releaseAttempts = 0, successor = null, linked = false;
+    fs.unlinkSync = target => {
+      if (target === lockPath && ++releaseAttempts === 1) {
+        throw Object.assign(new Error('synthetic transient lock unlink failure'), { code: 'EBUSY' });
+      }
+      return unlink(target);
+    };
+    syncBuiltinESMExports();
+    try {
+      await f.installer.install();
+      const original = readFileSync(lockPath), requests = f.urls.length;
+      let expected;
+      if (replacement === 'new-owner') {
+        unlink(lockPath);
+        successor = acquireOwnedLock(lockPath);
+        expected = readFileSync(lockPath);
+      } else if (replacement === 'changed-bytes') {
+        expected = Buffer.from(original.toString().replace(/\n$/, ' '));
+        writeFileSync(lockPath, expected);
+      } else {
+        const relocated = f.directory + '-original';
+        fs.renameSync(f.directory, relocated);
+        symlinkSync(relocated, f.directory, process.platform === 'win32' ? 'junction' : 'dir');
+        linked = true;
+        expected = original;
+      }
+      await assert.rejects(f.installer.install(), { code: replacement === 'linked-cache' ? 'GROK_CACHE_PATH_INVALID' : 'GROK_INSTALL_BUSY' });
+      assert.equal(f.urls.length, requests, 'refusal occurs before any download');
+      assert.equal(releaseAttempts, 1, 'the retained receipt cannot unlink another owner or follow a cache link');
+      assert.deepEqual(readFileSync(lockPath), expected);
+    } finally {
+      fs.unlinkSync = unlink;
+      syncBuiltinESMExports();
+      successor?.release();
+      if (linked) {
+        if (process.platform === 'win32') fs.rmdirSync(f.directory);
+        else fs.unlinkSync(f.directory);
+      }
+    }
+  });
+}
+
+test('late old validation cannot replace a newer installation guard awaiting release retry', async () => {
+  let resolveExit, firstValidation = true, releaseAttempts = 0;
+  const whenExited = new Promise(resolve => { resolveExit = resolve; });
+  const failure = new GrokSearchError('GROK_PROCESS_REAP_FAILED', 'old validator has not exited');
+  Object.defineProperty(failure, 'whenExited', { value: whenExited });
+  Object.defineProperty(failure, 'diagnostic', { value: { exited: false } });
+  const f = fixture({ handshake: async () => {
+    if (firstValidation) { firstValidation = false; throw failure; }
+    return { version: VERSION, toolsDeclared: true, exited: true };
+  } });
+  const lockPath = join(f.directory, '.install.lock'), unlink = fs.unlinkSync;
+  try {
+    await assert.rejects(f.installer.install(), error => error === failure);
+    // Simulate this test's interrupted guard being moved by another cache owner.
+    fs.renameSync(lockPath, lockPath + '.old');
+    fs.unlinkSync = target => {
+      if (target === lockPath && ++releaseAttempts === 1) {
+        throw Object.assign(new Error('synthetic transient newer lock unlink failure'), { code: 'EACCES' });
+      }
+      return unlink(target);
+    };
+    syncBuiltinESMExports();
+    const current = await f.installer.install(), activeBytes = readFileSync(join(f.directory, 'active.json'));
+    const successorBytes = readFileSync(lockPath);
+    resolveExit();
+    await whenExited;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(readFileSync(lockPath), successorBytes, 'the old validator must not unlink the successor');
+    assert.deepEqual(readFileSync(join(f.directory, 'active.json')), activeBytes);
+    assert.equal(existsSync(current.path), true);
+    assert.equal((await f.installer.install()).version, VERSION, 'the old callback must not discard the newer retry receipt');
+    assert.equal(existsSync(lockPath), false);
+  } finally { fs.unlinkSync = unlink; syncBuiltinESMExports(); resolveExit(); await whenExited; }
+});
+
 test('a rejected validator exit proof never releases the installation lock', async () => {
   let rejectExit;
   const whenExited = new Promise((_, reject) => { rejectExit = reject; });

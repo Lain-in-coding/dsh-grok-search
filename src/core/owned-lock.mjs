@@ -144,29 +144,47 @@ export function acquireOwnedLock(path, {
     // Retry only once. A normal contender may have acquired the lock first.
     create();
   }
-  let released = false;
+  let releaseState = 'held';
   return Object.freeze({
     token,
     release() {
-      if (released) return false;
-      released = true;
-      try { closeSync(descriptor); }
-      catch { return false; }
+      if (releaseState === 'finished') return false;
+      if (releaseState === 'held') {
+        // A failed close may have consumed the descriptor; never close it twice.
+        releaseState = 'finished';
+        try { closeSync(descriptor); }
+        catch { return false; }
+        releaseState = 'closed';
+      }
       let before;
       try {
         before = lstatSync(path);
-        if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_OWNER_BYTES) return false;
-        if (before.dev !== identity.dev || before.ino !== identity.ino) return false;
-        if (readFileSync(path, 'utf8') !== record) return false;
-      } catch { return false; }
+        if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_OWNER_BYTES
+          || before.dev !== identity.dev || before.ino !== identity.ino
+          || readFileSync(path, 'utf8') !== record) {
+          releaseState = 'finished';
+          return false;
+        }
+      } catch (error) {
+        if (error.code === 'ENOENT') releaseState = 'finished';
+        return false;
+      }
       // Re-check immediately before unlinking. This is a cooperative local
       // lock, not an atomic defense against a hostile filesystem writer.
       try {
         const after = lstatSync(path);
-        if (after.dev !== before.dev || after.ino !== before.ino) return false;
+        if (!after.isFile() || after.isSymbolicLink() || after.size > MAX_OWNER_BYTES
+          || after.dev !== before.dev || after.ino !== before.ino) {
+          releaseState = 'finished';
+          return false;
+        }
         unlinkSync(path);
+        releaseState = 'finished';
         return true;
-      } catch { return false; }
+      } catch (error) {
+        if (error.code === 'ENOENT') releaseState = 'finished';
+        return false;
+      }
     },
   });
 }

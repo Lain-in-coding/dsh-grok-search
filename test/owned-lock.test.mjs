@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import test from 'node:test';
 import { acquireOwnedLock, DEFAULT_STALE_LOCK_MS, reclaimStaleOwnedLock } from '../src/core/owned-lock.mjs';
 
@@ -85,6 +86,225 @@ test('release removes only the exact owner file and never a replacement', () => 
   assert.equal(lock.release(), false);
   assert.equal(existsSync(path), true);
 });
+
+for (const code of ['EACCES', 'EPERM', 'EBUSY']) {
+  test(`release can explicitly retry ${code} unlink failure without closing its fd again`, () => {
+    const path = fixture();
+    const lock = acquireOwnedLock(path);
+    const original = readFileSync(path, 'utf8');
+    const unrelatedPath = `${path}.unrelated`;
+    writeFileSync(unrelatedPath, 'unrelated open file', { flag: 'wx' });
+    const close = fs.closeSync, unlink = fs.unlinkSync;
+    let ownedFd, unrelatedFd, closeCalls = 0, unlinkCalls = 0, releasing = false;
+    const release = () => {
+      releasing = true;
+      try { return lock.release(); }
+      finally { releasing = false; }
+    };
+    fs.closeSync = fd => {
+      if (!releasing) return close(fd);
+      if (ownedFd === undefined) ownedFd = fd;
+      if (fd === ownedFd) {
+        closeCalls++;
+        // Observe unsafe retries without actually closing a recycled descriptor.
+        if (closeCalls > 1) throw Object.assign(new Error('Owned fd was already closed'), { code: 'EBADF' });
+      }
+      return close(fd);
+    };
+    fs.unlinkSync = (target, ...args) => {
+      if (target === path && ++unlinkCalls === 1) {
+        throw Object.assign(new Error('Transient owned-lock unlink failure'), { code });
+      }
+      return unlink(target, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(release(), false);
+      assert.equal(closeCalls, 1);
+      assert.equal(unlinkCalls, 1);
+      assert.equal(readFileSync(path, 'utf8'), original);
+
+      unrelatedFd = fs.openSync(unrelatedPath, 'r');
+      assert.equal(release(), true, 'An explicit retry of the same owned lock must succeed');
+      assert.equal(closeCalls, 1, 'Retry must not close the already released fd');
+      assert.equal(unlinkCalls, 2);
+      assert.equal(fs.fstatSync(unrelatedFd).isFile(), true);
+      assert.equal(existsSync(path), false);
+      assert.equal(release(), false);
+      assert.equal(closeCalls, 1);
+      assert.equal(unlinkCalls, 2);
+    } finally {
+      fs.closeSync = close;
+      fs.unlinkSync = unlink;
+      syncBuiltinESMExports();
+      if (unrelatedFd !== undefined) close(unrelatedFd);
+    }
+  });
+}
+
+for (const scenario of [
+  'byte-identical replacement inode',
+  'changed owner token on the original inode',
+  'changed bytes with unchanged owner fields',
+  'symbolic link at retry inspection',
+  'symbolic link at the final retry recheck',
+  'missing original followed by a byte-identical successor',
+]) {
+  test(`release retry refuses ${scenario}`, () => {
+    const path = fixture();
+    const lock = acquireOwnedLock(path);
+    const original = readFileSync(path, 'utf8');
+    const identity = fs.lstatSync(path);
+    const close = fs.closeSync, unlink = fs.unlinkSync;
+    const lstat = fs.lstatSync, read = fs.readFileSync;
+    const replacementPath = `${path}.replacement`;
+    if (scenario.startsWith('symbolic link')) writeFileSync(replacementPath, original, { flag: 'wx' });
+    let ownedFd, closeCalls = 0, unlinkCalls = 0, retryStats = 0, retryReads = 0, releasing = false;
+    const release = () => {
+      releasing = true;
+      try { return lock.release(); }
+      finally { releasing = false; }
+    };
+    let expected = original;
+    fs.closeSync = fd => {
+      if (!releasing) return close(fd);
+      if (ownedFd === undefined) ownedFd = fd;
+      if (fd === ownedFd && ++closeCalls > 1) {
+        throw Object.assign(new Error('Owned fd was already closed'), { code: 'EBADF' });
+      }
+      return close(fd);
+    };
+    fs.unlinkSync = (target, ...args) => {
+      if (target === path && ++unlinkCalls === 1) {
+        throw Object.assign(new Error('Transient owned-lock unlink failure'), { code: 'EACCES' });
+      }
+      return unlink(target, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(release(), false);
+      assert.equal(closeCalls, 1);
+      assert.equal(unlinkCalls, 1);
+      assert.equal(read(path, 'utf8'), original);
+
+      if (scenario === 'byte-identical replacement inode') {
+        fs.renameSync(path, `${path}.original`);
+        writeFileSync(path, original, { flag: 'wx' });
+        assert.notEqual(lstat(path).ino, identity.ino);
+      } else if (scenario === 'changed owner token on the original inode') {
+        expected = owner({ ...JSON.parse(original), token: randomUUID() });
+        writeFileSync(path, expected);
+        assert.equal(lstat(path).ino, identity.ino);
+      } else if (scenario === 'changed bytes with unchanged owner fields') {
+        expected = original.slice(0, -1) + ' ';
+        writeFileSync(path, expected);
+        assert.notEqual(expected, original);
+        assert.deepEqual(JSON.parse(expected), JSON.parse(original));
+        assert.equal(lstat(path).ino, identity.ino);
+        assert.equal(lstat(path).size, identity.size);
+      } else if (scenario.startsWith('symbolic link')) {
+        fs.readFileSync = (target, ...args) => {
+          if (target === path) retryReads++;
+          return read(target, ...args);
+        };
+        fs.lstatSync = (target, ...args) => {
+          if (target !== path) return lstat(target, ...args);
+          retryStats++;
+          const linked = scenario === 'symbolic link at retry inspection' || retryStats === 2;
+          if (!linked) return lstat(target, ...args);
+          if (retryStats === (scenario === 'symbolic link at retry inspection' ? 1 : 2)) {
+            fs.renameSync(path, `${path}.original`);
+            fs.renameSync(replacementPath, path);
+          }
+          // Inject link metadata without Windows symlink privileges. Matching
+          // identity and bytes must not override the non-link requirement.
+          return Object.assign(Object.create(lstat(target, ...args)), {
+            dev: identity.dev, ino: identity.ino,
+            isFile: () => true, isSymbolicLink: () => true,
+          });
+        };
+        syncBuiltinESMExports();
+      } else {
+        fs.renameSync(path, `${path}.original`);
+        assert.equal(existsSync(path), false);
+      }
+
+      assert.equal(release(), false);
+      assert.equal(closeCalls, 1);
+      assert.equal(unlinkCalls, 1, 'Refusing a replacement must not attempt another unlink');
+      if (scenario === 'missing original followed by a byte-identical successor') {
+        assert.equal(existsSync(path), false);
+        writeFileSync(path, original, { flag: 'wx' });
+        assert.notEqual(lstat(path).ino, identity.ino);
+        assert.equal(release(), false);
+        assert.equal(closeCalls, 1);
+        assert.equal(unlinkCalls, 1);
+      }
+      if (scenario === 'symbolic link at retry inspection') {
+        assert.equal(retryReads, 0, 'Retry must not read through a link');
+      }
+      assert.equal(read(path, 'utf8'), expected);
+    } finally {
+      fs.closeSync = close;
+      fs.unlinkSync = unlink;
+      fs.lstatSync = lstat;
+      fs.readFileSync = read;
+      syncBuiltinESMExports();
+    }
+  });
+}
+
+for (const closedBeforeError of [false, true]) {
+  test(`release never retries an uncertain close (${closedBeforeError ? 'fd already closed' : 'fd still open'})`, () => {
+    const path = fixture();
+    const lock = acquireOwnedLock(path);
+    const original = readFileSync(path, 'utf8');
+    const unrelatedPath = `${path}.unrelated`;
+    writeFileSync(unrelatedPath, 'unrelated open file', { flag: 'wx' });
+    const close = fs.closeSync, unlink = fs.unlinkSync;
+    let ownedFd, unrelatedFd, closeCalls = 0, unlinkCalls = 0, releasing = false;
+    const release = () => {
+      releasing = true;
+      try { return lock.release(); }
+      finally { releasing = false; }
+    };
+    fs.closeSync = fd => {
+      if (!releasing) return close(fd);
+      closeCalls++;
+      if (closeCalls === 1) {
+        ownedFd = fd;
+        if (closedBeforeError) {
+          close(fd);
+          unrelatedFd = fs.openSync(unrelatedPath, 'r');
+        }
+      }
+      // A close error does not prove that the descriptor is still ours.
+      throw Object.assign(new Error('Uncertain owned-lock close failure'), { code: 'EIO' });
+    };
+    fs.unlinkSync = (target, ...args) => {
+      if (target === path) unlinkCalls++;
+      return unlink(target, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(release(), false);
+      assert.equal(closeCalls, 1);
+      assert.equal(unlinkCalls, 0);
+      assert.equal(release(), false);
+      assert.equal(release(), false);
+      assert.equal(closeCalls, 1, 'A close error must not authorize retrying a potentially recycled fd');
+      assert.equal(unlinkCalls, 0);
+      assert.equal(readFileSync(path, 'utf8'), original);
+      assert.equal(fs.fstatSync(unrelatedFd ?? ownedFd).isFile(), true);
+    } finally {
+      fs.closeSync = close;
+      fs.unlinkSync = unlink;
+      syncBuiltinESMExports();
+      if (unrelatedFd !== undefined) close(unrelatedFd);
+      else if (ownedFd !== undefined) close(ownedFd);
+    }
+  });
+}
 
 test('owner record is small, regular and closed before release', () => {
   const path = fixture();

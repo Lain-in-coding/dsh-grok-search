@@ -3,6 +3,8 @@
 
 # dsh-grok-search
 
+**Rust 原生搜索内核驱动，让 DSH 搜索轻快、强大、来源可追溯。**
+
 **装上直接接管 DSH 搜索，不再走官方付费搜索，也不耗模型 Token。**
 
 可视化配置 · 自动回退 · 日志回放 · 账户额度 · GitHub 分段读取
@@ -28,19 +30,20 @@
 </div>
 
 
-`dsh-grok-search` 是 DeepSeek Harness（DSH）的可视化搜索插件，以 [Episkey-G](https://github.com/Episkey-G) 开发的 [grok-search-rs](https://github.com/Episkey-G/GrokSearch-rs) 为 MCP 核心后端，接入 DSH 原有的 `web_search`。照常在聊天里提问，由插件提供 Grok 主搜索与补充来源回退，安装一个 DSH 插件即可。
-
-<p align="center">
-  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-intro.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-intro.png" alt="0.4.3 功能总览展示图：以 grok-search-rs 为后端接管 DSH 搜索，提供多来源回退、共享配置、最近搜索、链路回放和账户额度" width="960"></a>
-</p>
-
+- **Rust 原生内核，让搜索极致轻快**：Grok 主搜索由 Rust 编写的原生程序执行，连续查询复用受管 MCP 会话，空闲后自动退出；无需手动部署后端，也不会每次搜索都累积一个后台进程。
 - **自动接管官方搜索，告别 401 报错**：无需绑定或充值官方账号，接管 DSH 原生链路，消除未配 Key 引发的 `401` 报错。
 - **不消耗官方搜索次数，也不烧模型 Token**：绕开官方内置搜索模型，搭配任意第三方搜索模型独立联网，不再为搜索向官方付费。
-- **五源自动回退，绝不偷切官方**：Grok 主搜索搭配 Tavily、Exa、TinyFish、Firecrawl 自由排序（支持 Tavily 多 Key 轮换），故障顺次兜底、**全挂直接报错**，绝不偷切官方付费搜索。
+- **五源协同，搜索有据可查**：Grok 主搜索搭配 Tavily、Exa、TinyFish、Firecrawl，自由排序并保留上游返回的摘要与引用来源（支持 Tavily 多 Key 轮换）。故障顺次兜底、**全挂直接报错**，绝不偷切官方付费搜索。
 - **全程界面配置，零文件折腾**：免改 `config.toml` 或手动部署 MCP；页面填 Key、拖拽排序即生效，自动复用兼容后端或校验下载。
 - **启用即接管，停用即秒回落**：不影响普通聊天与网页抓取设置；关闭或卸载即恢复原官方搜索，已填 Key 与共享配置跨升级保留。
 - **全链路透明，告别搜索黑盒**：自带全来源逐 Key 连通性测试、最近记录、零消耗回放与实时额度，来源、耗时与实报消耗一目了然。
 - **聊天搜索看得见，直读 GitHub 链接**：对话内直接展示可追溯的执行路由卡片；开启 GitHub 抽取器后，发 GitHub Issue / PR / Release 链接即可直读正文、评论与发布说明，免去来回切屏。
+
+
+
+<p align="center">
+  <a href="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-intro.png"><img src="https://raw.githubusercontent.com/Lain-in-coding/dsh-grok-search/main/docs/images/readme-intro.png" alt="0.4.3 功能总览展示图：以 grok-search-rs 为后端接管 DSH 搜索，提供多来源回退、共享配置、最近搜索、链路回放和账户额度" width="960"></a>
+</p>
 
 > **0.4.3 更新重点：卸载重装后的搜索接管恢复。** 修复未完成的旧释放记录导致控制组件无法重新加载、重试无效及重启后仍报接管异常的问题，完善旧任务回收、程序准备退出证明和设置页状态。保留原专属插件图标与官方 `grok-search-rs 0.1.26` 后端。沿用 DSH ≥ `0.2.1-rc.2` 的兼容策略，不设未来版本上限、不增加搜索预检；可选功能异常独立处理，不影响已正常运行的核心搜索。
 
@@ -49,7 +52,7 @@
 
 | 名词 | 含义 |
 | --- | --- |
-| `grok-search-rs` | 本机运行的 MCP 搜索后端，界面名称为「Grok Search Rs」；`0.1.26` 是程序版本 |
+| `grok-search-rs` | Rust 编写、编译为本机原生程序的 MCP 搜索后端，承载 Grok 主搜索；界面名称为「Grok Search Rs」，`0.1.26` 是程序版本 |
 | Grok 主搜索 | 使用 xAI Grok 模型的搜索服务；模型版本不是后端程序版本 |
 | 补充来源 | Tavily、Exa、TinyFish、Firecrawl；关闭 Grok 后也能单独使用 |
 | 回退 | 当前来源失败或返回空结果时，在剩余请求预算内尝试下一个来源 |
@@ -475,13 +478,15 @@ RC、alpha、beta 和其他预发布版本都直接尝试运行；无法读取�
 </details>
 
 <details>
-<summary>为什么还需要 grok-search-rs？需要再手动安装吗？</summary>
+<summary>Rust 内核有什么优势？需要再手动安装 grok-search-rs 吗？</summary>
 
-`grok-search-rs` 是由 [Episkey-G](https://github.com/Episkey-G) 开发的独立 MCP 搜索后端；本插件调用它执行 Grok 主搜索，并提供 DSH 原搜索工具接入、可视化配置、补充来源回退、诊断、进程管理和恢复。单独配置 `grok-search-rs` MCP 不会自动接管 DSH 原有的 `web_search`。
+`grok-search-rs` 是由 [Episkey-G](https://github.com/Episkey-G) 开发的 **Rust 原生 MCP 搜索后端**。本插件调用它执行 Grok 主搜索，并提供 DSH 原搜索工具接入、可视化配置、补充来源回退、诊断、进程管理和恢复。单独配置 `grok-search-rs` MCP 不会自动接管 DSH 原有的 `web_search`。
 
 通常不用手动安装：已有兼容的 `grok-search-rs` 程序就复用，没有才下载到当前 DSH profile 的私有缓存，不改变其他 Agent 的程序路径或创建第二份 `grok-search-rs` 配置。上游程序新版未经验证时会明确提示，不盲目安装。
 
 一个 DSH 实例串行复用一个受管的 `grok-search-rs` MCP 会话，程序空闲五分钟后退出；最多一个活动查询、十六个排队查询，不会每次搜索都累积一个后台进程。DSH `0.2.2-rc.2` 默认单次可派发十条查询；排队容量有界且不增加上游并发或总等待预算，持续过载时仍会明确报忙。
+
+**原生执行与多源搜索，是两层不同的优势。** Rust 内核承担 Grok 主搜索的本地执行；DSH 接入、设置界面和直接补充来源调用由 JavaScript 实现，不是整套插件都由 Rust 编写。搜索能力来自实际使用的模型与来源，插件保留返回的摘要、引用和路由信息，方便核对结果。
 
 </details>
 

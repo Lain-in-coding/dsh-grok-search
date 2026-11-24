@@ -293,6 +293,11 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       if (signal.aborted) abort();
     });
   };
+  const forgetReplay = item => {
+    if (!item.replay) return;
+    cursors.delete(item.replay.cursor);
+    bytes -= item.replay.bytes; item.bytes -= item.replay.bytes; item.replay = null;
+  };
   const append = (item, entries) => {
     const pageIds = new Set();
     const fresh = entries.filter(entry => {
@@ -301,6 +306,8 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       pageIds.add(id); return true;
     });
     const needed = fresh.reduce((sum, entry) => sum + entry.bytes + 80, 0);
+    // Under pressure, new unread content wins over this resource's old replay.
+    if (bytes + needed > cacheBytes && item.replay && bytes - item.replay.bytes + needed <= cacheBytes) forgetReplay(item);
     if (bytes + needed > cacheBytes) return false;
     for (const entry of fresh) {
       item.seen.add(`${entry.meta.type}:${entry.meta.id}`); item.entries.push(entry);
@@ -463,10 +470,7 @@ export function createGithubReader({ getState, fetchImpl = globalThis.fetch, now
       if (overhead > limit || !delivered.parts.length && item.entries.length) {
         throw error('OUTPUT_LIMIT', '当前输出上限不足以容纳这一条内容的标识，请提高宿主输出上限后续读。');
       }
-      if (item.replay) {
-        cursors.delete(item.replay.cursor);
-        bytes -= item.replay.bytes; item.bytes -= item.replay.bytes; item.replay = null;
-      }
+      forgetReplay(item);
       const hasMore = !item.complete || item.entries.length > 0;
       const nextCursor = hasMore ? candidateCursor : null;
       const result = { ...envelope, content: delivered.content, parts: delivered.parts,

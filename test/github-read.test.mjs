@@ -346,6 +346,34 @@ test('small cache makes progress by shrinking a page without losing comments', a
   f.reader.dispose();
 });
 
+test('continuation reclaims a preceding replay when the next comment fits the cache by itself', async () => {
+  const f = fixture(2, { reader: { cacheBytes: 26000 } });
+  f.comments[0].body = 'first-body-' + 'f'.repeat(5000);
+  f.comments[1].body = 'later-body-' + 'x'.repeat(12400);
+  const results = [];
+  let cursor;
+  try {
+    for (let i = 0; i < 6; i++) {
+      const result = await f.reader.read({ url, scope, cursor });
+      results.push(result);
+      assert.ok(f.reader.snapshot().bytes <= 26000);
+      if (!result.hasMore) break;
+      cursor = result.nextCursor;
+    }
+    assert.equal(results.at(-1).hasMore, false, 'a retained replay must not cause endless empty continuations');
+    assert.equal(results.at(-1).deliveredItems, 3);
+    for (const comment of f.comments) {
+      const parts = results.flatMap(result => result.parts).filter(part => part.id === String(comment.id));
+      assert.equal(parts[0]?.start, 0);
+      for (let i = 1; i < parts.length; i++) assert.equal(parts[i].start, parts[i - 1].end);
+      assert.equal(parts.at(-1)?.end, comment.body.length);
+      assert.ok(results.some(result => result.content.includes(comment.body)));
+    }
+    assert.ok(results.every(result => result.parts.length > 0));
+    assert.ok(results.every(result => formatGithubRead(result).length <= 16000));
+  } finally { f.reader.dispose(); }
+});
+
 test('secondary limits without headers are classified and observed without immediate retry', async () => {
   const f = fixture(0, { fetch: async () => response({ message: 'You have exceeded a secondary rate limit.' }, 403) });
   await assert.rejects(f.reader.read({ url, scope }), { code: 'GITHUB_RATE_LIMIT' });

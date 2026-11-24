@@ -166,7 +166,7 @@ async function readBoundedJson(response, signal) {
     void reader.cancel().catch(() => {});
     reader.releaseLock();
   }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  try { return JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks))); }
   catch { throw sourceFailure('SOURCE_INVALID_RESPONSE', '服务返回的不是有效 JSON。'); }
 }
 

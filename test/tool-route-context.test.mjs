@@ -90,6 +90,39 @@ test('an inner kernel fallback reports supplier evidence without inventing indiv
   context.dispose();
 });
 
+test('native MCP fallback through real routed callbacks keeps unobserved supplier timings unknown', async () => {
+  let clock = 100;
+  const history = createSearchLog({ now: () => clock });
+  const context = createToolRouteContext({ searchLog: history, now: () => clock });
+  const session = randomUUID();
+  const routed = createRoutedSearch({
+    now: () => clock, searchLog: history, releaseBarrier: createReleaseBarrier(),
+    sourceRouter: { snapshot: () => ({ available: false }) },
+    grok: { search: async () => {
+      clock = 9100;
+      return { sources: [{ url: 'https://example.test/kernel-result', provider: 'exa_fallback' }],
+        diagnostic: { fallbackUsed: true, fallbackReason: 'grok_timeout', sourceProvenance: {} } };
+    } },
+  });
+  try {
+    await context.run(exec(session, 'native-route'), () =>
+      routed.search({ query: 'synthetic native route' }, undefined, 'search', context.capture()));
+    const value = context.readTrace(session, 'native-route'), calls = value.routes[0].calls;
+    assert.equal(value.elapsedMs, 9000);
+    assert.equal(calls[0].provider, 'grok');
+    assert.equal(calls[0].result, 'failed');
+    assert.equal(calls[0].elapsedMs, null, 'the full kernel window is not an observed Grok-only duration');
+    assert.equal(calls[0].evidence, 'kernel-summary');
+    assert.equal(calls[1].provider, 'exa');
+    assert.equal(calls[1].elapsedMs, null);
+    assert.equal(calls[1].evidence, 'source-label');
+    assert.equal(value.routes[0].callsComplete, false);
+    assert.deepEqual(SETTINGS_DESCRIPTORS.find(row => row.method === 'toolCallTrace').result.create().parse(value), value);
+  } finally {
+    await routed.dispose(); context.dispose(); history.dispose();
+  }
+});
+
 test('real routing callbacks expose each active retry without extra requests or duplicate history rows', async () => {
   const history=createSearchLog(),context=createToolRouteContext({searchLog:history}),session=randomUUID();
   const configuration={source_providers:['tavily','exa','tinyfish','firecrawl'],

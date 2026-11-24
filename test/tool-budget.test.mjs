@@ -175,6 +175,79 @@ function fixture({ modern, beforeUpdate = () => {}, afterUpdate = () => {}, sett
   return { controller, fiber, calls, awaits, errors, addFiber, rawConfig, authorUpdate, resolveCandidate };
 }
 
+// Both inspected hosts commit raw input synchronously. Only lifecycle settlement
+// is gated; modern delayed publication also checks the committed revision.
+function orderedHostFixture({ modern, beforeResolve = () => {}, afterCommit = () => {} }) {
+  const hooks = new Map(), calls = [], awaits = [];
+  const runtime = { name: 'tool-web', fibers: new Set() };
+  const controller = createToolBudgetController({
+    ctx: { registry: new Map([['tool-web', runtime]]), on: (name, callback) => hooks.set(name, callback) },
+    budgetMs: BUDGET_MS, required: () => true, resolveConfig: (_runtime, raw) => structuredClone(raw),
+  });
+  const fiber = {
+    uid: 1, state: 2, runtime, config: structuredClone(AUTHOR_CONFIG),
+    _config: structuredClone(AUTHOR_CONFIG),
+    entry: { options: { name: '@deepseek-ai/dsh-tool-web', config: structuredClone(AUTHOR_CONFIG) } },
+  };
+  if (modern) {
+    fiber.effectiveConfig = structuredClone(AUTHOR_CONFIG);
+    fiber.resolveConfig = raw => resolveCandidate(raw);
+  }
+  runtime.fibers.add(fiber);
+  const resolveCandidate = raw => hooks.get('internal/config').call(fiber, modern ? fiber : raw,
+    () => structuredClone(raw));
+  let revision = 0;
+  fiber.update = (raw, noSave) => {
+    const call = { fiber, index: calls.length + 1, raw: structuredClone(raw), noSave, committed: false };
+    calls.push(call);
+    if (!modern) {
+      fiber._config = structuredClone(raw);
+      call.committed = true;
+      if (fiber.state !== 2) return;
+    }
+    beforeResolve(call);
+    const resolved = resolveCandidate(raw);
+    if (modern) fiber.config = structuredClone(raw);
+    const mine = ++revision;
+    call.committed = true;
+    if (modern) {
+      const publish = () => { if (revision === mine) fiber.effectiveConfig = resolved; };
+      const result = hooks.get('internal/update').call(fiber, resolved, () => afterCommit(call));
+      if (result === undefined) { publish(); return; }
+      const task = Promise.resolve(result).then(publish);
+      task.catch(() => {});
+      return task;
+    }
+    hooks.get('internal/update').call(fiber, resolved, noSave, () => {
+      fiber.config = resolved;
+      const result = afterCommit(call);
+      if (result === undefined) return;
+      fiber.state = 5;
+      const task = Promise.resolve(result).then(() => {
+        fiber.config = resolveCandidate(fiber._config);
+        fiber.state = 2;
+      });
+      fiber.inertia = task;
+      task.finally(() => { if (fiber.inertia === task) fiber.inertia = null; }).catch(() => {});
+      return task;
+    });
+    // Cordis 4.0 update() drops the restart task; await() owns its settlement.
+  };
+  fiber.await = async () => {
+    awaits.push(calls.at(-1));
+    while (fiber.inertia) await fiber.inertia;
+  };
+  return {
+    controller, fiber, calls, awaits,
+    rawConfig: () => modern ? fiber.config : fiber._config,
+    async authorUpdate(raw) {
+      fiber.entry.options.config = structuredClone(raw);
+      await fiber.update(raw, true);
+      await fiber.await();
+    },
+  };
+}
+
 for (const modern of [false, true]) {
   const label = modern ? 'modern raw/effective config' : 'legacy resolved config';
 
@@ -313,6 +386,147 @@ for (const modern of [false, true]) {
     assert.equal(h.calls.length, 2);
   });
 
+  test(`${label}: overlapping releases share one restoration and its settlement`, async () => {
+    const started = deferred(), gate = deferred();
+    const h = fixture({ modern, afterUpdate: async ({ index }) => {
+      if (index !== 2) return;
+      started.resolve();
+      await gate.promise;
+    } });
+    await h.controller.acquire();
+    const first = h.controller.release();
+    await started.promise;
+    let secondSettled = false, overlapping, settledBeforeRestore;
+    const second = h.controller.release().then(() => { secondSettled = true; });
+    try {
+      await nextTurn();
+      overlapping = h.calls.length;
+      settledBeforeRestore = secondSettled;
+    } finally { gate.resolve(); }
+    await Promise.all([first, second]);
+    assert.equal(settledBeforeRestore, false, 'a second release must await the outstanding restoration');
+    assert.equal(overlapping, 2, 'one acquire and one restore, not two concurrent fiber updates');
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(effectiveConfig(h.fiber), AUTHOR_CONFIG);
+    assert.equal(h.controller.snapshot().owned, 0);
+  });
+
+  test(`${label}: overlapping failed releases preserve one failure and allow a later retry`, async () => {
+    const started = deferred(), gate = deferred(), failure = new Error('synthetic restore failure');
+    const h = fixture({ modern, beforeUpdate: async ({ index }) => {
+      if (index !== 2) return;
+      started.resolve();
+      await gate.promise;
+      throw failure;
+    } });
+    await h.controller.acquire();
+    const first = h.controller.release();
+    const firstOutcome = first.then(() => null, error => error);
+    await started.promise;
+    const secondOutcome = h.controller.release().then(() => null, error => error);
+    await nextTurn();
+    gate.resolve();
+    const outcomes = await Promise.all([firstOutcome, secondOutcome]);
+    assert.ok(outcomes.every(error => error === failure));
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.controller.snapshot().owned, 1);
+    assert.equal(effectiveConfig(h.fiber).searchTimeoutMs, BUDGET_MS);
+    await h.controller.release();
+    assert.equal(h.calls.length, 3);
+    assert.deepEqual(effectiveConfig(h.fiber), AUTHOR_CONFIG);
+    assert.equal(h.controller.snapshot().owned, 0);
+  });
+
+  test(`${label}: release settlement cannot republish old raw over a synchronously committed author edit`, async () => {
+    const started = deferred(), gate = deferred();
+    const h = orderedHostFixture({ modern, afterCommit: call => {
+      if (call.index !== 2) return;
+      started.resolve();
+      return gate.promise;
+    } });
+    await h.controller.acquire();
+    const release = h.controller.release();
+    await started.promise;
+    await nextTurn();
+    assert.equal(h.calls[1].committed, true);
+    assert.deepEqual(h.rawConfig(), AUTHOR_CONFIG, 'the real-host raw commit precedes any await');
+    const author = { ...AUTHOR_CONFIG, searchTimeoutMs: 42000, fetchTimeoutMs: 27000 };
+    const authorUpdate = h.authorUpdate(author);
+    try {
+      await nextTurn();
+      assert.deepEqual(h.rawConfig(), author);
+      if (modern) assert.deepEqual(effectiveConfig(h.fiber), author);
+      else assert.equal(h.fiber.state, 5, 'legacy author edit waits for the already outstanding reload');
+    } finally { gate.resolve(); }
+    await Promise.all([release, authorUpdate]);
+    assert.deepEqual(h.rawConfig(), author);
+    assert.deepEqual(effectiveConfig(h.fiber), author);
+    assert.deepEqual(h.fiber.entry.options.config, author);
+    assert.equal(h.controller.snapshot().owned, 0);
+    await h.controller.release();
+    await h.controller.acquire();
+    assert.equal(h.calls.length, 3, 'settled release never writes the previous raw again');
+  });
+
+  test(`${label}: disabled ownership after a failed release permits retry without claiming an old callback`, async () => {
+    const late = deferred(), started = deferred(), gate = deferred();
+    const failure = new Error('synthetic synchronous restore failure');
+    const author = { ...AUTHOR_CONFIG, searchTimeoutMs: 41000, fetchTimeoutMs: 29000 };
+    let callback;
+    const h = orderedHostFixture({
+      modern,
+      beforeResolve: call => {
+        if (call.index !== 2) return;
+        callback = late.promise.then(() => h.authorUpdate(author));
+        throw failure;
+      },
+      afterCommit: call => {
+        if (call.index !== 3) return;
+        started.resolve();
+        return gate.promise;
+      },
+    });
+    await h.controller.acquire();
+    await assert.rejects(h.controller.release(), error => error === failure);
+    assert.equal(h.controller.snapshot().owned, 1);
+    assert.equal(effectiveConfig(h.fiber).searchTimeoutMs, BUDGET_MS);
+    const retry = h.controller.release();
+    await started.promise;
+    try {
+      late.resolve();
+      await nextTurn();
+      assert.deepEqual(h.rawConfig(), author);
+      if (modern) assert.deepEqual(effectiveConfig(h.fiber), author);
+      else assert.equal(h.fiber.state, 5);
+    } finally { gate.resolve(); }
+    await Promise.all([retry, callback]);
+    assert.deepEqual(h.rawConfig(), author);
+    assert.deepEqual(effectiveConfig(h.fiber), author);
+    assert.equal(h.controller.snapshot().owned, 0);
+    await h.controller.release();
+    await h.controller.acquire();
+    assert.equal(h.calls.length, 4);
+  });
+
+  test(`${label}: a callback created during release stays external after disable and later release calls`, async () => {
+    const late = deferred();
+    const author = { ...AUTHOR_CONFIG, searchTimeoutMs: 39000, fetchTimeoutMs: 28000 };
+    let callback;
+    const h = orderedHostFixture({ modern, afterCommit: call => {
+      if (call.index === 2) callback = late.promise.then(() => h.authorUpdate(author));
+    } });
+    await h.controller.acquire();
+    await h.controller.release();
+    assert.equal(h.controller.snapshot().owned, 0);
+    late.resolve();
+    await callback;
+    await h.controller.release();
+    await h.controller.acquire();
+    assert.deepEqual(h.rawConfig(), author);
+    assert.deepEqual(effectiveConfig(h.fiber), author);
+    assert.equal(h.calls.length, 3);
+  });
+
   test(`${label}: release reports a settled acquire failure and restores its partial lease`, async () => {
     const failure = new Error('fiber settlement failed');
     const h = fixture({ modern, settle: ({ index }) => { if (index === 1) throw failure; } });
@@ -378,6 +592,33 @@ for (const modern of [false, true]) {
     assert.deepEqual(effectiveConfig(unrelated), AUTHOR_CONFIG);
     assert.equal(h.calls.filter(call => call.fiber === h.fiber).length, 2);
     assert.equal(h.controller.snapshot().owned, 0);
+  });
+
+  test(`${label}: an author update during lease settlement still yields runtime ownership`, async () => {
+    const started = deferred(), gate = deferred();
+    const h = fixture({ modern, afterUpdate: async ({ index }) => {
+      if (index !== 1) return;
+      started.resolve();
+      await gate.promise;
+    } });
+    const acquisition = h.controller.acquire();
+    await started.promise;
+    const author = { ...AUTHOR_CONFIG, searchTimeoutMs: 42000, fetchTimeoutMs: 27000 };
+    let observed, owned;
+    try {
+      await h.authorUpdate(h.fiber, author);
+      observed = structuredClone(effectiveConfig(h.fiber));
+      owned = h.controller.snapshot().owned;
+    } finally { gate.resolve(); }
+    await acquisition;
+    try {
+      assert.deepEqual(observed, author, 'another call chain must not inherit the lease update ownership');
+      assert.equal(owned, 0);
+      assert.deepEqual(effectiveConfig(h.fiber), author);
+      await h.controller.acquire();
+      assert.equal(h.calls.length, 2);
+    } finally { await h.controller.release(); }
+    assert.deepEqual(effectiveConfig(h.fiber), author);
   });
 
   test(`${label}: validating an author candidate does not release a live lease`, async () => {

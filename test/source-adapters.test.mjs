@@ -156,6 +156,69 @@ test('real HTTP source timeout closes its stalled connection before a later sour
   }
 });
 
+test('invalid UTF-8 from a source cannot invent a replacement-character reference and stop fallback', async () => {
+  const { createServer } = await import('node:http');
+  const paths = [], calls = [];
+  const server = createServer((request, response) => {
+    paths.push(request.url);
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    if (request.url === '/tavily/search') response.end(Buffer.concat([
+      Buffer.from('{"results":[{"url":"https://example.test/invalid/'),
+      Buffer.from([0x80]),
+      Buffer.from('","content":"not-valid-utf8"}]}'),
+    ]));
+    else response.end(JSON.stringify({ results: [{ url: 'https://example.test/valid-fallback' }] }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const instance = createSourceRouter({ getConfig: () => ({
+    tavily_api_url: origin + '/tavily', tavily_api_key: 'synthetic-loopback-key',
+    exa_api_url: origin + '/exa', exa_api_key: 'synthetic-loopback-key',
+    source_providers: ['tavily', 'exa'],
+  }) });
+  try {
+    const result = await instance.search({ query: 'synthetic invalid encoding', onCall: call => calls.push(call) });
+    assert.equal(result.search_provider, 'exa');
+    assert.deepEqual(result.sources, [{ url: 'https://example.test/valid-fallback' }]);
+    assert.deepEqual(paths, ['/tavily/search', '/exa/search']);
+    assert.deepEqual(calls.map(call => [call.provider, call.result, call.code ?? '']),
+      [['tavily', 'failed', 'INVALID_RESPONSE'], ['exa', 'ok', '']]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('valid Unicode split across response chunks remains exact, including literal replacement characters', async () => {
+  const reference = 'https://example.test/unicode/\uFFFD';
+  const content = 'valid \u{1F642} \uFFFD text';
+  const bytes = Buffer.from(JSON.stringify({ results: [{ url: reference, content }] }));
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
+      controller.close();
+    },
+  }));
+  const { instance, calls } = router({ config: without(baseConfig(), 'exa', 'firecrawl', 'tinyfish'),
+    fetchImpl: async () => response });
+  const result = await instance.search({ query: 'synthetic valid encoding' });
+  assert.deepEqual(result.sources, [{ url: reference, snippet: content }]);
+  assert.equal(calls.length, 1);
+  assert.equal(response.body.locked, false);
+});
+
+test('strict UTF-8 decoding does not silently repair a BOM-prefixed invalid JSON response', async () => {
+  const response = new Response(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(JSON.stringify({ results: [{ url: 'https://example.test/bom' }] }))]));
+  const { instance, calls } = router({ config: without(baseConfig(), 'exa', 'firecrawl', 'tinyfish'),
+    fetchImpl: async () => response });
+  await assert.rejects(instance.search({ query: 'synthetic BOM response' }), error =>
+    error.code === 'SOURCE_ALL_FAILED' && error.details.failures[0].code === 'INVALID_RESPONSE');
+  assert.equal(calls.length, 1);
+  assert.equal(response.body.locked, false);
+});
+
 test('request contracts follow grok-search-rs v0.1.26 for every source', async () => {
   const config = { ...baseConfig(), tinyfish_api_key: 'tf-key' };
   const { instance, calls } = router({ config, fetchImpl: async () => json({}, 503) });

@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { effectiveConfig } from './product-control.mjs';
 import { resolveRuntimeConfig } from './product-config.mjs';
 
@@ -45,8 +46,12 @@ export function checkToolBudgetContracts(ctx, budgetMs) {
 /** Runtime-only leases; never edit a profile, enable a tool or patch a method. */
 export function createToolBudgetController({ ctx, budgetMs, required, canLease = () => true,
   resolveConfig = resolveRuntimeConfig, onError = () => {} }) {
-  const leases = new Map(), own = new Set(), yielded = new WeakSet();
-  let releasing = false, serial = Promise.resolve();
+  const leases = new Map(), yielded = new WeakSet(), ownership = new AsyncLocalStorage();
+  const own = fiber => {
+    const operation = ownership.getStore();
+    return operation?.active === true && operation.fiber === fiber;
+  };
+  let releasing = false, serial = Promise.resolve(), releaseTask = null;
   const hook = function (input, next) {
     const modern = typeof input?.resolveConfig === 'function';
     const fiber = modern ? input : this;
@@ -55,7 +60,7 @@ export function createToolBudgetController({ ctx, budgetMs, required, canLease =
     const lease = leases.get(fiber);
     // Active candidate resolution may be a validation-only call. Return the
     // author's candidate; yield ownership only if internal/update commits it.
-    if (lease && !own.has(fiber) && fiber.state === 2) return value;
+    if (lease && !own(fiber) && fiber.state === 2) return value;
     if (!lease) leases.set(fiber, { raw: structuredClone(plain(modern ? fiber.config : input)),
       before: unwrap(value?.searchTimeoutMs) });
     const candidate = { ...plain(value), searchTimeoutMs: budgetMs };
@@ -63,7 +68,7 @@ export function createToolBudgetController({ ctx, budgetMs, required, canLease =
   };
   const updateHook = function (...args) {
     const next = args.at(-1);
-    if (leases.has(this) && !own.has(this) && !releasing) {
+    if (leases.has(this) && !own(this) && !releasing) {
       yielded.add(this);
       leases.delete(this);
     }
@@ -71,9 +76,12 @@ export function createToolBudgetController({ ctx, budgetMs, required, canLease =
   };
   const refresh = async (fiber, raw) => {
     if (!target(fiber)) return;
-    own.add(fiber);
-    try { await fiber.update(raw, true); await fiber.await?.(); }
-    finally { own.delete(fiber); }
+    // Only this update chain owns the lease, not concurrent author updates.
+    const operation = { fiber, active: true };
+    return ownership.run(operation, async () => {
+      try { await fiber.update(raw, true); await fiber.await?.(); }
+      finally { operation.active = false; }
+    });
   };
   const verifyLease = fiber => {
     if (yielded.has(fiber) || !canLease() || releasing) return;
@@ -110,18 +118,27 @@ export function createToolBudgetController({ ctx, budgetMs, required, canLease =
       attempt.catch(() => {});
       return attempt;
     },
-    async release() {
+    release() {
+      if (releaseTask) return releaseTask;
       releasing = true;
-      await serial.catch(onError);
-      for (const [fiber, lease] of leases) {
-        if (!target(fiber)) { leases.delete(fiber); continue; }
-        const effective = effectiveConfig(fiber);
-        if (unwrap(effective?.search) === false || unwrap(effective?.searchTimeoutMs) !== budgetMs) { leases.delete(fiber); continue; }
-        // A later unrelated author edit is retained, and only our live field is restored.
-        const raw = 'effectiveConfig' in fiber ? fiber.config : fiber.entry.options.config ?? lease.raw;
-        await refresh(fiber, raw);
-        leases.delete(fiber);
-      }
+      const task = (async () => {
+        try {
+          await serial.catch(onError);
+          for (const [fiber, lease] of leases) {
+            if (!target(fiber)) { leases.delete(fiber); continue; }
+            const effective = effectiveConfig(fiber);
+            if (unwrap(effective?.search) === false || unwrap(effective?.searchTimeoutMs) !== budgetMs) { leases.delete(fiber); continue; }
+            // A later unrelated author edit is retained, and only our live field is restored.
+            const raw = 'effectiveConfig' in fiber ? fiber.config : fiber.entry.options.config ?? lease.raw;
+            await refresh(fiber, raw);
+            leases.delete(fiber);
+          }
+        } finally { ownership.disable(); }
+      })();
+      releaseTask = task;
+      // Share outstanding restoration, but retain retry after a real failure.
+      task.catch(() => { if (releaseTask === task) releaseTask = null; });
+      return task;
     },
     snapshot: () => ({ budgetMs, owned: leases.size, releasing }),
   };

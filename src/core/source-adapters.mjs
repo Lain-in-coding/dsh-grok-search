@@ -289,9 +289,10 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     return { provider: source.id, ...summary, keyCount: keys.length, elapsedMs, keys };
   };
 
+  const githubDiagnosisEnabled = prefs => prefs.githubEnabled !== false && prefs.githubReadEnabled === true;
   const diagnoseGithub = async (signal, configuration, remainingMs = () => Infinity) => {
     const { config, prefs } = current(configuration);
-    if (prefs.githubEnabled === false || prefs.githubReadEnabled === false) {
+    if (!githubDiagnosisEnabled(prefs)) {
       return { provider: 'github', status: 'disabled', code: 'DISABLED', message: '已停用，测试时跳过。', keyCount: 0, elapsedMs: 0, keys: [] };
     }
     const token = text(config.github_token);
@@ -383,7 +384,7 @@ export function createSourceRouter({ getConfig, getPreferences, fetchImpl = glob
     async diagnoseProvider(provider, { signal, configuration, schedule } = {}) {
       if (provider === 'github') {
         const { config, prefs } = current(configuration);
-        if (prefs.githubEnabled === false || prefs.githubReadEnabled === false || !text(config.github_token) || !schedule) {
+        if (!githubDiagnosisEnabled(prefs) || !text(config.github_token) || !schedule) {
           return diagnoseGithub(signal, configuration);
         }
         const started = performance.now();

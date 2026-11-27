@@ -677,7 +677,7 @@ export function apply(ctx, configuration, { load = loadModule,
                 catch (error) { if (!required()) return { enabled: false, token: '' }; throw error; }
                 if (prefSnapshot.value.githubReadEnabled !== true || !required()) return { enabled: false, token: '' };
                 if (!current(value.token)) return { enabled: true, token: '', identity: 'compatibility-blocked' };
-                const path = scope.get('grokSearchProgram')?.snapshot?.()?.configPath || resolveSharedConfigPath({});
+                const path = scope.get('grokSearchProgram')?.snapshot?.()?.configPath || resolveSharedConfigPath({ override: configuration.configPath });
                 const effective = createSharedConfigStore({ path }).readEffective();
                 return { enabled: true, token: effective.github_token.value, identity: path };
               } });

@@ -30,7 +30,8 @@ export function projectPublicSnapshot(current, disposed = false) {
       || current.record?.releaseCompletion?.routeVerified === true
       || current.record?.recovery?.routeVerified === true,
     routeChanged: current.releaseOutcome?.routeChanged === true
-      || current.record?.releaseCompletion?.routeChanged === true,
+      || current.record?.releaseCompletion?.routeChanged === true
+      || current.record?.recovery?.routeChanged === true,
     error: current.error ? {
       code: typeof current.error.code === 'string' ? current.error.code : null,
       message: typeof current.error.message === 'string' ? current.error.message : '',

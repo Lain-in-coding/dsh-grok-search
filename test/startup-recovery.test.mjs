@@ -8,6 +8,7 @@ import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { projectPublicSnapshot } from '../src/control.mjs';
 import { ControlRecordError, createControlIntentStore } from '../src/core/control-intent-store.mjs';
 import { acquireOwnedLock } from '../src/core/owned-lock.mjs';
 import { completeDeferredStartup, completeReleaseRecovery } from '../src/core/startup-recovery.mjs';
@@ -349,6 +350,9 @@ test('startup correction can restore the recorded author route and reports route
   assert.equal(result.routeChanged, true);
   assert.equal(result.envelope.intent.recovery.routeChanged, true);
   assert.equal(result.envelope.intent.recovery.routeEvidence.routeChanged, true);
+  const saved = store.read();
+  const snapshot = projectPublicSnapshot({ phase: 'released', record: saved.intent, revision: saved.revision, releaseOperationId: null });
+  assert.deepEqual([snapshot.completionCommitted, snapshot.routeVerified, snapshot.routeChanged], [true, true, true]);
   assert.equal(result.envelope.intent.release, null);
   assert.equal(result.envelope.intent.recovery.historicReleaseCommitted, false);
   assert.deepEqual(result.envelope.intent.priorIntent, before.intent);

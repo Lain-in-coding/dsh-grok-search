@@ -9,6 +9,10 @@ import { probeMcpHandshake } from './mcp-search.mjs';
 import { acquireOwnedLock } from './owned-lock.mjs';
 
 const fail = (code, message) => { throw new GrokSearchError(code, message); };
+export const isRepairableProgramCode = code => [
+  'GROK_CACHE_DAMAGED', 'GROK_PROGRAM_CHANGED', 'GROK_VERSION_UNVERIFIED', 'GROK_PROGRAM_NOT_NATIVE',
+  'GROK_PROGRAM_MISSING', 'GROK_PROGRAM_IDENTITY_INVALID', 'GROK_PROGRAM_START_FAILED', 'GROK_PROGRAM_TIMEOUT',
+].includes(code);
 const REGISTRIES = Object.freeze(['https://registry.npmjs.org', 'https://registry.npmmirror.com']);
 const DOWNLOAD_ORIGINS = new Set([...REGISTRIES, 'https://cdn.npmmirror.com']);
 const sha256 = data => createHash('sha256').update(data).digest('hex');
@@ -196,6 +200,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       if (lstatSync(path).size > 50 * 1024 * 1024) throw new Error();
       if (sha256(readFileSync(path)) !== record.sha256) fail('GROK_CACHE_DAMAGED', '私有 Grok 程序校验失败，请重新准备。');
       const result = await inspect(path, { signal, platform });
+      signal?.throwIfAborted();
       if (result.version !== record.version || result.sha256 !== record.sha256) throw new Error();
       return { ...result, source: 'private-cache', found: true };
     } catch (error) {
@@ -369,7 +374,7 @@ export function createPrivateProgramInstaller({ directory, platform = process.pl
       // Repair content damage only. Unsafe paths, access denial and uncertain
       // process ownership must retain their original errors.
       if (error.code !== 'GROK_CACHE_DAMAGED'
-        && !(error.code === 'GROK_PROGRAM_CHANGED' && error.diagnostic?.exited === true)) throw error;
+        && !(isRepairableProgramCode(error.code) && error.diagnostic?.exited === true)) throw error;
     }
     // Both first installation and explicit repair use a verified version.
     return install({ signal, onProgress, version: VERIFIED_GROK_VERSIONS.at(-1) });

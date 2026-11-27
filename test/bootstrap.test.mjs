@@ -721,6 +721,32 @@ test('compatibility regression: recheck retries optional imports and reports onl
   assert.equal(active, 0);
 });
 
+test('GitHub settings use the configured file before the program reports its path', async () => {
+  const paths = [];
+  let programPath = null;
+  const fixture = bootstrapFixture({ githubEnabled: true, overrides: {
+    program: { name: 'program', apply(child) { child.provide('grokSearchProgram', { snapshot: () => ({ configPath: programPath }) }); } },
+    sharedConfig: {
+      resolveSharedConfigPath: ({ override }) => override || 'fixture-default.toml',
+      createSharedConfigStore: ({ path }) => ({ readEffective() {
+        paths.push(path);
+        return { github_token: { value: '' } };
+      } }),
+    },
+  } });
+  const configured = join(fixture.ctx.profileContext.dir, 'configured.toml');
+  try {
+    fixture.start({ ...defaults, configPath: configured });
+    await fixture.settle();
+    assert.equal(fixture.ctx.get('grokSearchGithub').snapshot().enabled, true);
+    assert.ok(paths.length > 0);
+    assert.deepEqual([...new Set(paths)], [configured]);
+    programPath = join(fixture.ctx.profileContext.dir, 'program.toml');
+    fixture.ctx.get('grokSearchGithub').snapshot();
+    assert.equal(paths.at(-1), programPath);
+  } finally { await fixture.ctx.dispose(); }
+});
+
 test('compatibility regression: optional report follows real GitHub registration and intent changes', async () => {
   let enabled = false;
   const f = bootstrapFixture({

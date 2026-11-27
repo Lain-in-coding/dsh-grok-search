@@ -176,8 +176,11 @@ export async function findExistingGrok(options = {}) {
   const failures = [];
   for (const candidate of candidates) {
     options.signal?.throwIfAborted();
-    try { return { ...await inspect(candidate.path, options), source: candidate.source, found: true }; }
-    catch (error) {
+    try {
+      const result = await inspect(candidate.path, options);
+      options.signal?.throwIfAborted();
+      return { ...result, source: candidate.source, found: true };
+    } catch (error) {
       if (options.signal?.aborted || error.code === 'GROK_PROGRAM_REAP_FAILED' || candidate.explicit) throw error;
       // npm's Unix bin entry has no extension. Ignore an automatically found
       // script after inspection refused it; never execute or rewrite it.

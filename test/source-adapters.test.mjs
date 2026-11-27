@@ -452,21 +452,34 @@ test('diagnosis covers every key, skips disabled sources and separates empty fro
   await assert.rejects(() => instance.diagnoseProvider('unknown'), error => error.code === 'SOURCE_UNKNOWN');
 });
 
+test('a legacy preference snapshot without read consent skips GitHub diagnostics before scheduling', async () => {
+  const config = { ...baseConfig(), github_token: 'synthetic-token' };
+  const { instance, calls } = router({ config, prefs: prefsOf({ sidebarShortcutEnabled: true }), fetchImpl: async () => json({}) });
+  let scheduled = 0;
+  const schedule = work => { scheduled++; return work(undefined, () => 1000); };
+  for (const options of [{}, { schedule }]) {
+    assert.equal((await instance.diagnoseProvider('github', options)).status, 'disabled');
+    assert.equal(calls.length, 0);
+    assert.equal(scheduled, 0);
+  }
+});
+
 test('github diagnosis skips unconfigured and disabled targets and reports actual token failure', async () => {
-  const anonymous = router({ fetchImpl: async () => assert.fail('unconfigured GitHub must not be requested') });
+  const prefs = prefsOf({ githubReadEnabled: true });
+  const anonymous = router({ prefs, fetchImpl: async () => assert.fail('unconfigured GitHub must not be requested') });
   const open = await anonymous.instance.diagnoseProvider('github');
   assert.equal(open.status, 'not-configured');
   assert.equal(anonymous.calls.length, 0);
 
   const config = { ...baseConfig(), github_token: 'ghp_bad' };
-  const rejected = router({ config, fetchImpl: async () => json({ message: 'Bad credentials ghp_bad' }, 401) });
+  const rejected = router({ config, prefs, fetchImpl: async () => json({ message: 'Bad credentials ghp_bad' }, 401) });
   const failed = await rejected.instance.diagnoseProvider('github');
   assert.equal(failed.status, 'failed');
   assert.equal(failed.httpStatus, 401);
   assert.match(failed.message, /Token/);
   assert.ok(!JSON.stringify(failed).includes('ghp_bad'));
 
-  const disabled = router({ config, prefs: prefsOf({ githubEnabled: false }), fetchImpl: async () => assert.fail() });
+  const disabled = router({ config, prefs: prefsOf({ githubEnabled: false, githubReadEnabled: true }), fetchImpl: async () => assert.fail() });
   assert.equal((await disabled.instance.diagnoseProvider('github')).status, 'disabled');
   assert.equal(disabled.calls.length, 0);
 });

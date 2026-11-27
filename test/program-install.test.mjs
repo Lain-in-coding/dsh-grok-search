@@ -948,6 +948,22 @@ for (const code of ['EACCES', 'EPERM']) for (const stage of ['root', 'binary', '
   });
 }
 
+test('cancelled verification cannot report a cached or configured program as successfully selected', async t => {
+  const { directory, installer } = fixture();
+  const installed = await installer.install();
+  const active = readFileSync(join(directory, 'active.json'));
+  for (const selection of ['cached', 'configured']) await t.test(selection, async () => {
+    const controller = new AbortController(), reason = new Error('cancel selection');
+    const inspect = async () => { controller.abort(reason); return installed; };
+    const checking = createPrivateProgramInstaller({ directory, platform: 'win32', arch: 'x64', inspect,
+      fetchImpl: async () => assert.fail('selection must not initiate a download') });
+    const result = selection === 'cached' ? checking.active({ signal: controller.signal })
+      : resolveGrokProgram({ configured: installed.path, platform: 'win32', arch: 'x64', signal: controller.signal, inspect, installer: checking });
+    await assert.rejects(result, error => error === reason);
+    assert.deepEqual(readFileSync(join(directory, 'active.json')), active);
+  });
+});
+
 test('cache inspection preserves an unreaped verification failure over caller cancellation', async () => {
   const { installer, directory } = fixture();
   await installer.install();
@@ -960,6 +976,7 @@ test('cache inspection preserves an unreaped verification failure over caller ca
 });
 for (const [code, exited] of [
   ['GROK_PROGRAM_CHANGED', undefined], ['GROK_PROGRAM_CHANGED', false],
+  ['GROK_PROGRAM_IDENTITY_INVALID', false], ['GROK_PROGRAM_TIMEOUT', undefined],
   ['GROK_PROGRAM_REAP_FAILED', false], ['GROK_PROCESS_REAP_FAILED', false],
 ]) {
   test(`cache repair requires confirmed inspection exit for a changed program (${code}, ${exited})`, async () => {
@@ -1087,6 +1104,30 @@ test('the real controller and resolver recover a damaged private cache without r
     assert.equal(readFileSync(configPath, 'utf8'), configuration);
   } finally { await manager.dispose(); }
 });
+test('explicit repair of an unusable cached program succeeds after a confirmed validator exit', async t => {
+  for (const code of ['GROK_PROGRAM_IDENTITY_INVALID', 'GROK_PROGRAM_TIMEOUT']) await t.test(code, async () => {
+    let oldPath;
+    const failure = Object.assign(new GrokSearchError(code, 'fixture validation failed'), { diagnostic: { exited: true } });
+    const { installer, directory, urls } = fixture({ inspect: async path => {
+      if (path === oldPath) throw failure;
+      return { path, version: VERSION, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
+    } });
+    oldPath = (await installer.install()).path;
+    const oldBytes = readFileSync(oldPath);
+    const manager = createProgramController({ directory, installer, configuration: {},
+      env: () => ({ HOME: directory, USERPROFILE: directory, CARGO_HOME: join(directory, 'cargo'), PATH: '' }) });
+    try {
+      await assert.rejects(manager.prepare(), { code });
+      assert.equal(manager.snapshot().canRepair, true);
+      assert.equal(urls.length, 2);
+      const repaired = await manager.repair();
+      assert.equal(repaired.phase, 'ready');
+      assert.notEqual(repaired.program.path, oldPath);
+      assert.deepEqual(readFileSync(oldPath), oldBytes);
+    } finally { await manager.dispose(); }
+  });
+});
+
 test('explicit controller repair recovers content changed during active inspection and preserves the old directory', async () => {
   let activePath;
   let changes = 0;

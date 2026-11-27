@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
@@ -8,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import vm from 'node:vm';
 import * as pack from '../scripts/pack-internal.mjs';
+import { npmCli } from '../scripts/lib/internal-candidate-utils.mjs';
 const { validatePackChannel } = pack;
 
 const read = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
@@ -20,6 +22,7 @@ test('browser gate preserves diagnostic evidence but rejects a failed run', asyn
   const page = {
     on() {},
     async setViewportSize() {},
+    async emulateMedia() {},
     async evaluate(_fn, value) {
       if (value?.scope) { evidence = value; return { ok: true, text: 'evidence recorded' }; }
       if (value !== undefined) throw new Error('synthetic-browser-failure');
@@ -79,6 +82,25 @@ test('release packaging refuses self-dependencies and preserves the intended CLI
   assert.equal(lock.packages[`node_modules/${manifest.name}`], undefined);
   assert.equal(manifest.bin['dsh-grok-search-compatibility'], './src/core/compatibility-cli.mjs');
   assert.ok(read('src/core/compatibility-cli.mjs').startsWith('#!/usr/bin/env node'));
+});
+
+test('npm ships the locked L22 icon and the built client, without raw sidebar inputs or masters', () => {
+  assert.equal(manifest.icon, 'icon.png');
+  const png = readFileSync(new URL('../icon.png', import.meta.url));
+  assert.equal(png.length, 84_488);
+  assert.equal(createHash('sha256').update(png).digest('hex'), 'e373d8278e97dd5019709240bd81121e694d0abcce4289291f2db742e530898f');
+  assert.deepEqual([png.readUInt32BE(16), png.readUInt32BE(20), png[24], png[25]], [256, 256, 8, 6]);
+  const scratch = mkdtempSync(join(tmpdir(), 'dsh-pack-inventory-'));
+  const [metadata] = JSON.parse(execFileSync(process.execPath, [npmCli, 'pack', '--dry-run', '--json', '--ignore-scripts',
+    '--offline', '--no-update-notifier', '--cache', scratch, '--userconfig', join(scratch, 'unused.npmrc')], {
+    cwd: new URL('..', import.meta.url), encoding: 'utf8', windowsHide: true, timeout: 60_000,
+  }));
+  const paths = metadata.files.map(({ path }) => path);
+  assert.deepEqual(metadata.files.filter(({ path }) => /\.png$/i.test(path)).map(({ path, size }) => [path, size]),
+    [[manifest.icon, png.length]]);
+  assert.ok(paths.includes('src/client.js'));
+  assert.ok(!paths.includes('src/ui/sidebar-shortcut.mjs'));
+  assert.deepEqual(paths.filter(path => /^(?:src\/assets|artifacts|prototypes)\/|master/i.test(path)), []);
 });
 
 test('开发通道拒绝latest、错误版本和混合通道，保留正式通道正向验证', () => {
@@ -164,6 +186,7 @@ test('pack receipts derive every file hash from the actual tarball and reject a 
   assert.equal(typeof pack.inspectPackedSources, 'function');
   const root = mkdtempSync(join(tmpdir(), 'dsh-pack-source-audit-'));
   const files = new Map([['package.json', Buffer.from(JSON.stringify({ name: 'dsh-grok-search', version: '0.4.0' }))],
+    ['icon.png', readFileSync(new URL('../icon.png', import.meta.url))],
     ['empty.md', Buffer.alloc(0)], ['entry.mjs', Buffer.from('export const value = 1;\n')]]);
   const blocks = [];
   for (const [path, bytes] of files) {

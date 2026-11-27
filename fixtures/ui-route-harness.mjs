@@ -202,7 +202,11 @@ const settings = new Proxy({}, { get: (_, method) => async request => {
 
 // Minimal host hook/slot shim. Real React lifecycle is checked by Desktop gates.
 // Slot props come only from each registration's inject(), as in the host.
-let client, component, badge, routeOptions = null, badgeOptions = null;
+const slotNames = new Set(['plugins.bundle.config', 'plugins.detail.badge', 'main', 'sidebar.panellist']);
+const entries = new Map();
+const connectionListeners = new Set();
+let connectionGeneration = 1;
+let client, setThemeAvailable, currentPage = 'detail';
 let hooks = [], effects = [], currentHook = 0, element = null, projectHost = null, disposers = [];
 let subject = { kind: 'bundle', pkg: { name: 'dsh-grok-search' } };
 const React = {
@@ -221,17 +225,26 @@ const jsx = (type, props) => {
     props.ref.current = projectHost;
   }
   if (type === 'div' && props.ref) {
-    element ||= document.getElementById('preview');
+    element ||= document.createElement('div');
     props.ref.current = element;
-    element.dataset.dsgRoute = '1';
+    for (const [name, value] of Object.entries(props)) {
+      if (name.startsWith('data-') && value != null) element.setAttribute(name, value);
+    }
+    Object.assign(element.style, props.style);
+    document.getElementById('preview').replaceChildren(element);
   }
   return {};
 };
 function mount() {
+  const route = entries.get(currentPage === 'panel' ? 'main' : 'plugins.bundle.config');
+  if (!route || currentPage === 'panel' && route.options.key !== entries.get('sidebar.panellist')?.options.id) {
+    throw new Error(`No registered ${currentPage} page`);
+  }
   currentHook = 0; effects = [];
-  component({ ...routeOptions?.inject?.() });
+  route.view(route.options.inject());
   const routeEffects = effects.length;
-  badge?.({ subject, ...badgeOptions?.inject?.() });
+  const badge = currentPage === 'detail' && entries.get('plugins.detail.badge');
+  if (badge) badge.view({ subject, ...badge.options.inject() });
   const cleanups = effects.map(effect => effect());
   // StrictMode replays the badge setup on the same host: cleanup, then setup again.
   for (let index = routeEffects; index < effects.length; index++) {
@@ -243,6 +256,7 @@ function mount() {
 }
 function unmount() {
   disposers.forEach(dispose => dispose()); disposers = [];
+  element?.remove(); element = null;
   projectHost?.remove(); projectHost = null;
   document.getElementById('project-badge').replaceChildren();
   counters.removed++;
@@ -251,25 +265,36 @@ window.__ModuleLoader__ = { load(definition) { client = definition.factory(name 
 await import('/src/client.js');
 const ctx = {
   locale: { register: () => () => {} }, effect: effect => effect(),
+  connection: { generation: { getSnapshot: () => connectionGeneration,
+    subscribe(fn) { connectionListeners.add(fn); return () => connectionListeners.delete(fn); } } },
   remote: { grokSearchSettings: settings, $mount: async () => () => {} },
   theme: { getTheme: () => ({ active: { colorScheme: theme } }) },
   on: (event, fn) => { if (event === 'theme/change') themeListener = fn; },
   inject(names, callback) {
-    const value = callback(ctx);
+    let value = callback(ctx);
     const promise = Promise.resolve(value);
-    promise.dispose = async () => { if (typeof value === 'function') await value(); };
+    promise.dispose = async () => {
+      const cleanup = value;
+      value = null;
+      if (typeof cleanup === 'function') await cleanup();
+    };
+    if (names.includes('theme')) setThemeAvailable = async available => {
+      if (!available) { await promise.dispose(); themeListener = null; }
+      else if (!value) value = callback(ctx);
+    };
     return promise;
   },
   slots: {
-    inject: (name, fn) => ['plugins.bundle.config', 'plugins.detail.badge'].includes(name) ? fn() : () => {},
+    spec: name => slotNames.has(name) ? { name } : undefined,
+    inject: (name, fn) => slotNames.has(name) ? fn() : () => {},
     register: (options, view) => {
-      if (options.name === 'plugins.detail.badge') { badge = view; badgeOptions = options; }
-      else { component = view; routeOptions = options; }
-      return () => {};
+      const entry = { options, view };
+      entries.set(options.name, entry);
+      return () => { if (entries.get(options.name) === entry) entries.delete(options.name); };
     },
   },
 };
-await client.apply(ctx);
+const stopClient = await client.apply(ctx);
 function reset(state = 'returning') {
   activeDiagnostics.forEach(done => done()); activeDiagnostics.clear(); cancelledOperations.clear();
   content = state === 'fresh' ? {} : {
@@ -305,10 +330,18 @@ function reset(state = 'returning') {
 reset(new URL(location.href).searchParams.get('state') || 'returning');
 mount();
 window.harness = {
+  stopClient,
+  transport(generation) { connectionGeneration = generation; for (const listener of connectionListeners) listener(); },
+  showPage(name) {
+    if (!['panel', 'detail'].includes(name)) throw new Error(`Unknown page: ${name}`);
+    if (element) unmount();
+    hooks = []; currentPage = name; mount();
+  },
   reset(state) { unmount(); hooks = []; reset(state); mount(); },
   remount() { unmount(); mount(); },
   subject(value) { unmount(); subject = value; mount(); },
   unmount, mount,
+  themeAvailable: available => setThemeAvailable(available),
   theme(value) { theme = value; document.body.dataset.theme = value; themeListener?.({ active: { colorScheme: value } }); },
   inject(updates) { Object.assign(content, updates); currentRevision = revision(); },
   environment(updates) {

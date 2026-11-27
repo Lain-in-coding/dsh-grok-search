@@ -169,14 +169,15 @@ class GrokSearchSettingsGateway extends Service {
     }
   }
 
-  _commitSettings(write, affectsGithub) {
+  _commitSettings(write, affectsGithub = () => true) {
     let result;
     try { result = write(); }
     catch (error) {
-      if (error?.code === 'CONFIG_COMMIT_UNCERTAIN' || error?.code === 'PREFERENCES_COMMIT_UNCERTAIN') this._syncGithubAfterWrite();
+      if (error?.code === 'CONFIG_COMMIT_UNCERTAIN'
+        || error?.code === 'PREFERENCES_COMMIT_UNCERTAIN' && affectsGithub(true)) this._syncGithubAfterWrite();
       throw error;
     }
-    if (affectsGithub) this._syncGithubAfterWrite();
+    if (affectsGithub(false)) this._syncGithubAfterWrite();
     return result;
   }
 
@@ -254,7 +255,7 @@ class GrokSearchSettingsGateway extends Service {
       updates,
       verify: requireIdentity ? before => this._verifyCapturedIdentity(before, request) : undefined,
       paired: true,
-    }), Object.hasOwn(updates, 'github_token'));
+    }), () => Object.hasOwn(updates, 'github_token'));
     const paired = committed?.snapshot && committed?.effective ? committed : null;
     const config = paired ? paired.snapshot : committed;
     return { config: { ...config, quotaRevision: this._quotaRevision(paired ?? store.readSnapshot()) } };
@@ -305,7 +306,7 @@ class GrokSearchSettingsGateway extends Service {
       revision: request.revision,
       verify: requireIdentity ? before => this._verifyCapturedIdentity(before, request) : undefined,
       paired: true,
-    }), true);
+    }));
     const paired = committed?.snapshot && committed?.effective ? committed : null;
     const config = paired ? paired.snapshot : committed;
     return { config: { ...config, quotaRevision: this._quotaRevision(paired ?? store.readSnapshot()) } };
@@ -355,12 +356,12 @@ class GrokSearchSettingsGateway extends Service {
     const sourceRouter = this.sourceRouter;
     if (!sourceRouter?.diagnose) throw new GrokSearchError('SOURCE_UNAVAILABLE', '补充来源诊断当前不可用。');
     const captured = this._store().readSnapshot(), identity = this._quotaRevision(captured);
-    const preferences = this.preferenceStore.snapshot();
+    const preferences = this.preferenceStore.diagnosisSnapshot();
     return this._diagnosisWork({}, async signal => {
       const result = await sourceRouter.diagnose({ signal });
       const current = this._store().readSnapshot();
       if (current.snapshot.revision !== captured.snapshot.revision || this._quotaRevision(current) !== identity
-        || this.preferenceStore.snapshot().revision !== preferences.revision) {
+        || this.preferenceStore.diagnosisSnapshot().identity !== preferences.identity) {
         throw new GrokSearchError('CONFIG_CONFLICT', '配置已更新，本次结果不再用于当前配置；请重新测试。');
       }
       return result;
@@ -375,7 +376,7 @@ class GrokSearchSettingsGateway extends Service {
     }
     const captured = this._store().readSnapshot();
     const identity = this._quotaRevision(captured);
-    const preferences = this.preferenceStore.snapshot();
+    const preferences = this.preferenceStore.diagnosisSnapshot();
     const conflict = () => new GrokSearchError('CONFIG_CONFLICT', '配置已更新，本次结果不再用于当前配置；请重新测试。');
     if (request.expectedRevision !== undefined && request.expectedRevision !== captured.snapshot.revision
       || request.configIdentity !== undefined && request.configIdentity !== identity) throw conflict();
@@ -386,12 +387,12 @@ class GrokSearchSettingsGateway extends Service {
       const result = provider === 'github' ? preferences.value.githubReadEnabled !== true
         ? { provider, status: 'disabled', code: 'DISABLED', message: 'GitHub 读取未开启，测试时跳过。', keys: [], elapsedMs: 0 }
         : await this._githubTest({ token: captured.effective.github_token.value, signal })
-        : provider === 'grok' ? await this._diagnoseGrok(signal, captured, core)
+        : provider === 'grok' ? await this._diagnoseGrok(signal, captured, core, preferences.value.grokEnabled)
         : await sourceRouter.diagnoseProvider(provider, { signal, configuration: captured.effective,
           schedule: core?.scheduleDiagnosis });
       const current = this._store().readSnapshot();
       if (current.snapshot.revision !== captured.snapshot.revision || this._quotaRevision(current) !== identity
-        || this.preferenceStore.snapshot().revision !== preferences.revision) throw conflict();
+        || this.preferenceStore.diagnosisSnapshot().identity !== preferences.identity) throw conflict();
       return result;
     });
   }
@@ -479,6 +480,7 @@ class GrokSearchSettingsGateway extends Service {
     this._diagnosisId(operationId);
     // Cancellation can arrive before the original HTTP request is dispatched.
     // A small, bounded tombstone window closes that race, without disk writes.
+    this.cancelledDiagnostics.delete(operationId);
     if (this.cancelledDiagnostics.size >= 32) {
       this.cancelledDiagnostics.delete(this.cancelledDiagnostics.keys().next().value);
     }
@@ -488,9 +490,9 @@ class GrokSearchSettingsGateway extends Service {
     return { cancelled: Boolean(controller) };
   }
 
-  async _diagnoseGrok(signal, captured, core) {
+  async _diagnoseGrok(signal, captured, core, grokEnabled) {
     const base = { provider: 'grok', keys: [] };
-    if (this.preferenceStore.snapshot().value?.grokEnabled === false) {
+    if (grokEnabled === false) {
       return { ...base, status: 'disabled', code: 'DISABLED', message: '已关闭，搜索直接走补充来源。', elapsedMs: 0 };
     }
     if (!core?.testGrok) throw new GrokSearchError('GROK_UNAVAILABLE', 'Grok 查询核心当前未加载。');
@@ -543,7 +545,7 @@ class GrokSearchSettingsGateway extends Service {
 
   async preferences() {
     this._owner();
-    // Only DSH-only switches live here (Grok on/off for DSH, GitHub in tests).
+    // DSH-only switches, including the sidebar shortcut, live here.
     // Source order and on/off are the shared config's source_providers/*_enabled.
     return this.preferenceStore.snapshot();
   }
@@ -626,8 +628,18 @@ class GrokSearchSettingsGateway extends Service {
 
   async savePreferences(request = {}) {
     this._owner();
-    if (request.value?.githubReadEnabled === true && this.preferenceStore.snapshot().value.githubReadEnabled !== true) this._privateView();
-    return this._commitSettings(() => this.preferenceStore.save(request.expectedRevision, request.value), true);
+    const store = this.preferenceStore;
+    let searchChanged, previousConsent;
+    return this._commitSettings(() => store.save(request.expectedRevision, request.value, (before, next, changed) => {
+      previousConsent = before.githubReadEnabled;
+      if (next.githubReadEnabled && !previousConsent) this._privateView();
+      searchChanged = changed;
+    }), uncertain => {
+      if (!uncertain || searchChanged) return searchChanged;
+      // A competing post-publish edit (or unreadable consent) still needs a fail-closed refresh.
+      try { return store.snapshot().value.githubReadEnabled !== previousConsent; }
+      catch { return true; }
+    });
   }
 
   async stop() {

@@ -200,10 +200,15 @@ const testSearchSchema = {
   required: ['sources', 'fallbackUsed', 'provider'],
   additionalProperties: false,
 };
+const preferenceValueSchema = {
+  type: 'object',
+  properties: { sidebarShortcutEnabled: { type: 'boolean' } },
+  additionalProperties: true,
+};
 const preferencesSchema = {
   type: 'object',
   properties: {
-    value: { type: 'object', additionalProperties: true },
+    value: preferenceValueSchema,
     revision: { type: 'string' },
   },
   required: ['value', 'revision'],
@@ -535,7 +540,7 @@ export const SETTINGS_DESCRIPTORS = [
       name: 'request', wire: 'request', source: 'json',
       codec: codec('dsh-grok-search/settings#SavePreferencesRequest', {
         type: 'object',
-        properties: { expectedRevision: { type: 'string' }, value: { type: 'object', additionalProperties: true } },
+        properties: { expectedRevision: { type: 'string' }, value: preferenceValueSchema },
         required: ['expectedRevision', 'value'], additionalProperties: false,
       }),
     }],

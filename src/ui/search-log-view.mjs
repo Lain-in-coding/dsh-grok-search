@@ -680,8 +680,9 @@ function mountHistoryRoute(play) {
     const parent = card.getBoundingClientRect();
     const computed = getComputedStyle(liveStage);
     const sx = root.width / parseFloat(computed.width), sy = root.height / parseFloat(computed.height);
-    stage.style.left = (root.left - parent.left) / sx - card.clientLeft + 'px';
-    stage.style.top = (root.top - parent.top) / sy - card.clientTop + 'px';
+    // Both stages share an offset parent. Scroll and CSS zoom must not be applied twice.
+    stage.style.left = liveStage.offsetLeft + 'px';
+    stage.style.top = liveStage.offsetTop + 'px';
     stage.style.width = root.width / sx + 'px';
     stage.style.height = root.height / sy + 'px';
     const place = (target, bounds) => {

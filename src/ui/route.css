@@ -69,7 +69,27 @@ a{color:inherit}
 
 /* ---------- 路由卡 ---------- */
 .plugin-intro{margin:0 0 18px;padding:12px 0;border-block:.5px solid var(--line-2)}
+.intro-topline{display:flex;align-items:flex-start;justify-content:space-between;gap:10px 16px;flex-wrap:wrap}
 .intro-title{display:flex;align-items:center;gap:7px;margin:0 0 4px;font-size:15px;line-height:22px;font-weight:600;letter-spacing:.01em}
+.intro-topline:has(.shortcut-setting:not([hidden])) .intro-title{padding-top:3px}
+.shortcut-setting{min-width:0;max-width:100%;margin-inline-start:auto;display:flex;flex-direction:column;align-items:flex-end}
+.shortcut-setting-control{display:flex;align-items:center;gap:6px;min-height:32px;font-size:13px;cursor:pointer}
+.shortcut-feedback{display:flex;align-items:center;justify-content:flex-end;gap:6px;max-width:min(34ch,100%)}
+.shortcut-feedback p{margin:0;font-size:12px;line-height:1.45;color:var(--text-3);text-align:right;overflow-wrap:anywhere}
+.shortcut-setting[data-error=true] .shortcut-feedback p{color:var(--err-text)}
+#sidebarShortcutSwitch[aria-checked=false]{background:#949ba7;box-shadow:inset 0 0 0 1px #818997}
+[data-theme=dark] #sidebarShortcutSwitch[aria-checked=false]{background:#565f6e;box-shadow:inset 0 0 0 1px #828c9c}
+#sidebarShortcutSwitch[aria-disabled=true]{opacity:.58;cursor:not-allowed;filter:none}
+#sidebarShortcutSwitch[aria-busy=true]{cursor:progress}
+.shortcut-setting[data-pending=true] .shortcut-feedback p::before{content:"";display:inline-block;width:10px;height:10px;margin-inline-end:6px;vertical-align:-1px;border:1.5px solid currentColor;border-right-color:transparent;border-radius:50%;animation:shortcut-spin .7s linear infinite}
+@keyframes shortcut-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.shortcut-setting[data-pending=true] .shortcut-feedback p::before{animation:none}}
+@container(max-width:700px){
+  .intro-topline{align-items:center;gap:8px 12px}
+  .intro-topline .intro-title{margin-bottom:0;font-size:14px}
+  .shortcut-setting-control{gap:4px}
+  .intro-topline:has(.shortcut-setting:not([hidden])) + .intro-illustration{margin-top:7px}
+}
 .intro-github{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;opacity:.68;transition:opacity 140ms var(--ease),background-color 140ms var(--ease)}
 .intro-github .tile{width:15px;height:15px;background:none;box-shadow:none}
 .intro-github:hover,.intro-github:focus-visible{opacity:1;background:var(--surface-2)}
@@ -304,7 +324,7 @@ a{color:inherit}
 
 /* 中继节点（对应 magpie 网关卡）：深色描边 + 黑色“按顺序”胶囊 */
 .col-hub{display:flex;justify-content:center;align-items:center;transition:opacity .35s var(--ease),filter .35s var(--ease)}
-.node-hub{display:flex;flex-direction:column;align-items:center;text-align:center;gap:1px;width:100%;padding:14px 8px 11px;color:inherit;font:inherit;cursor:pointer;border:1.5px solid color-mix(in srgb,var(--text) 82%,transparent)}
+.node-hub{display:flex;flex-direction:column;align-items:center;text-align:center;gap:1px;width:100%;padding:14px 8px 11px;color:inherit;font:inherit;cursor:pointer;border:1.5px solid var(--shortcut-node-edge,color-mix(in srgb,var(--text) 82%,transparent))}
 .node-hub:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}
 .node-hub:active{transform:none}
 .node-hub.is-busy{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm)}
@@ -343,7 +363,7 @@ a{color:inherit}
 .row[data-st=off]{border-style:dashed;border-color:var(--line-2);box-shadow:none}
 .row[data-st=off] .row-name{color:var(--text-3)}
 .row[data-st=off] .tile{filter:grayscale(1);opacity:.42}
-.row[data-st=live]{border-color:var(--text);box-shadow:var(--shadow-sm)}
+.row[data-st=live]{border-color:var(--shortcut-live-edge,var(--text));box-shadow:var(--shadow-sm)}
 .row[data-st=wait]{border-style:dashed;border-color:var(--warn-line);background:var(--warn-soft);box-shadow:none}
 .row[data-st=wait] .tile{filter:grayscale(1);opacity:.5}
 .row[data-st=bad],.row[data-st=err]{border-color:var(--line);background:color-mix(in srgb,var(--surface-2) 62%,var(--surface))}
@@ -575,6 +595,57 @@ a{color:inherit}
 @keyframes toast-in{from{opacity:0;transform:translateY(10px) scale(.96)}}
 @keyframes toast-out{to{opacity:0;transform:translateY(6px) scale(.98)}}
 
+/* The standalone main panel owns its frame; plugin-manager owns the ordinary detail. */
+.dsg-shortcut{
+  container:dsg-shortcut / inline-size;min-height:100%;display:flow-root;padding-block:20px 64px;background:var(--surface-2);
+  --shortcut-frame:color-mix(in srgb,var(--text) 13%,var(--surface));
+  --shortcut-divider:color-mix(in srgb,var(--text) 9%,var(--surface));
+  --shortcut-elevation:0 1px 2px rgb(22 26 34 / .04),0 4px 12px -6px rgb(22 26 34 / .12);
+  --shortcut-node-edge:color-mix(in srgb,var(--line-2) 75%,var(--surface));
+  --shortcut-live-edge:color-mix(in srgb,var(--agent) 34%,var(--line-2));
+  --shortcut-live-fill:color-mix(in srgb,var(--agent) 8%,var(--surface))
+}
+.dsg-shortcut[data-theme=dark]{
+  background:color-mix(in srgb,var(--page) 68%,var(--surface));
+  --shortcut-elevation:0 1px 3px rgb(0 0 0 / .22);
+  --shortcut-live-fill:color-mix(in srgb,var(--agent) 15%,var(--surface))
+}
+.dsg-shortcut>:is([data-dsg-compatibility],[data-dsg-settings],[data-dsg-settings-unavailable]){
+  --shortcut-inset:20px;padding-inline:var(--shortcut-inset)
+}
+.dsg-shortcut :is(.shortcut-workbench,.log-card){
+  border:1px solid var(--shortcut-frame);border-radius:18px;background:var(--surface);box-shadow:var(--shortcut-elevation)
+}
+.dsg-shortcut .plugin-intro{margin:0;padding:14px var(--shortcut-inset);border:0;border-bottom:1px solid var(--shortcut-divider)}
+.dsg-shortcut .route-card{padding-inline:var(--shortcut-inset);background:transparent;border:0;border-radius:0;box-shadow:none}
+#stageViewport{position:relative;margin:14px calc(0px - var(--shortcut-inset)) 0;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
+#stageViewport:focus-visible{outline-offset:-2px}
+.dsg-shortcut .stage{
+  min-width:640px;margin:0;padding-inline:var(--shortcut-inset);justify-content:stretch;
+  grid-template-columns:minmax(128px,148px) minmax(132px,150px) minmax(202px,1fr);column-gap:clamp(16px,5cqi,56px)
+}
+.dsg-shortcut :is(.stage,.history-stage){border-block-color:var(--shortcut-divider)}
+.dsg-shortcut .rc-foot{padding-inline:0}
+.dsg-shortcut .node-hub{border-width:1px}
+.dsg-shortcut .stage .node-hub:hover{transform:none}
+:where(.dsg-shortcut) .row[data-st=live]{--row-fill:var(--shortcut-live-fill);--row-edge:var(--shortcut-live-edge);background-color:var(--row-fill)}
+@media (hover:hover){
+  :where(.dsg-shortcut .route-card:not([data-plugin=off],[data-s=err],.is-loading) .stage)
+  :is(.row[data-st=on],.row[data-st=live],.node-hub):hover:where(:not(.is-dragging,.is-fault-flash,.is-hl,.is-busy,.is-falling)){
+    border-color:color-mix(in srgb,var(--text) 12%,var(--row-edge,var(--shortcut-node-edge)));
+    background-color:color-mix(in srgb,var(--text) 4%,var(--row-fill,var(--surface)));box-shadow:var(--shadow-sm)
+  }
+}
+@container dsg-shortcut (max-width:700px){
+  .dsg-shortcut>:is([data-dsg-compatibility],[data-dsg-settings],[data-dsg-settings-unavailable]){--shortcut-inset:12px}
+}
+@container dsg-shortcut (max-width:540px){
+  .dsg-shortcut .rc-actions{margin:0;justify-content:flex-start}
+  .dsg-shortcut .strip{flex-wrap:wrap}
+  .dsg-shortcut .s-end{white-space:normal}
+  .dsg-shortcut .popover{left:0;right:auto;width:min(268px,calc(100cqi - 28px))}
+  .dsg-shortcut .cf-path{overflow-wrap:anywhere;white-space:normal}
+}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.001ms !important;animation-delay:0s !important;animation-iteration-count:1 !important;transition-duration:.001ms !important;transition-delay:0s !important;scroll-behavior:auto !important}
 }

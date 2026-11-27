@@ -80,6 +80,22 @@ test('settings codec enforces numeric bounds, integer unions and scalar enum cho
   rejects(choice, [true, 1, '0', 'other', {}, []]);
 });
 
+test('the existing preference RPCs carry an optional strict sidebar boolean inside value', () => {
+  const read = SETTINGS_DESCRIPTORS.find(row => row.method === 'preferences');
+  const save = SETTINGS_DESCRIPTORS.find(row => row.method === 'savePreferences');
+  const request = save.parameters[0].codec.create();
+  const parsers = [[request, { expectedRevision: 'missing' }], [read.result.create(), { revision: 'missing' }],
+    [save.result.create(), { revision: 'missing' }]];
+  for (const [parser, envelope] of parsers) {
+    for (const fields of [{}, { sidebarShortcutEnabled: true }, { sidebarShortcutEnabled: false }]) {
+      const payload = { ...envelope, value: { grokEnabled: true, ...fields } };
+      assert.equal(parser.parse(payload), payload);
+    }
+    rejects(parser, [null, 'true', 0, 1, {}].map(value => ({ ...envelope, value: { sidebarShortcutEnabled: value } })));
+    rejects(parser, [{ ...envelope, value: {}, sidebarShortcutEnabled: true }]);
+  }
+});
+
 test('identity-aware save has an additive strict request while legacy save and reveal stay exact', () => {
   const descriptor = SETTINGS_DESCRIPTORS.find(row => row.method === 'saveWithIdentity');
   assert.ok(descriptor);

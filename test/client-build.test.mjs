@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, rmSync, rmdirSync, statSync } from 'node:fs';
 import { mkdtempTracked as mkdtempSync } from './helpers/temp-fixture.mjs';
 import { tmpdir } from 'node:os';
@@ -60,6 +61,7 @@ test('browser metafile contains real UI imports and no server, Node or bundled R
     'src/ui/route-form.mjs',
     'src/ui/shared-styles.mjs',
     'src/ui/search-log-view.mjs',
+    'src/ui/sidebar-shortcut.mjs',
     'src/ui/tool-route-view.mjs',
   ].sort());
   assert.equal(inputs.some(path => /node_modules|settings-ui|node:/.test(path)), false);
@@ -102,13 +104,26 @@ test('virtual input data preserves approved HTML, CSS and all theme assets exact
   assert.equal(data.TOOL_ROUTE_CSS, text('tool-route.css'));
   assert.equal(data.ROUTE_CARD, text('route-card.html'));
   assert.equal(data.ROUTE_LAYER, text('route-layer.html'));
-  assert.equal(Object.keys(data.LOGOS).length, 13);
+  assert.deepEqual(Object.keys(data.LOGOS).sort(), [
+    'deepseek', 'exa', 'exaDark', 'firecrawl', 'github', 'githubDark', 'grok', 'harness', 'harnessChat',
+    'harnessChatDark', 'sidebarDark', 'sidebarLight', 'tavily', 'tavilyDark', 'tinyfish',
+  ]);
   for (const [key, file] of [
     ['harness', 'deepseek-harness-settings.png'],
     ['harnessChat', 'deepseek-harness-chat-light.png'],
     ['harnessChatDark', 'deepseek-harness-chat-dark.png'],
   ]) {
     assert.equal(data.LOGOS[key], `data:image/png;base64,${readFileSync(join(root, 'src/assets/logos', file)).toString('base64')}`);
+  }
+  for (const [key, file, size, hash] of [
+    ['sidebarLight', 'sidebar-r20-light.png', 12_720, 'e69f3e266ecac5721d36a4a2ef43d23bab62ae42fd204e64f9121ff3cf47899b'],
+    ['sidebarDark', 'sidebar-r20-dark.png', 12_629, '2500e6fd904bbdf0f5f07de936e027e0ca9dca2c271dee3a0f1ce4784dcef4be'],
+  ]) {
+    const png = readFileSync(join(root, 'src/assets/logos', file));
+    assert.equal(png.length, size, file);
+    assert.equal(createHash('sha256').update(png).digest('hex'), hash, file);
+    assert.deepEqual([png.readUInt32BE(16), png.readUInt32BE(20), png[24], png[25]], [72, 72, 8, 6], file);
+    assert.ok(data.LOGOS[key] === `data:image/png;base64,${png.toString('base64')}`, key);
   }
 });
 

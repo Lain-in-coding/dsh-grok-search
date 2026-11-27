@@ -8,6 +8,7 @@ import { COMPATIBILITY_DESCRIPTORS } from '../src/core/compatibility-contract.mj
 import { createQuotaView } from '../src/ui/quota-view.mjs';
 import { createSourceChain } from '../src/core/source-chain.mjs';
 import { createToolRouteView } from '../src/ui/tool-route-view.mjs';
+import { createSidebarShortcut, createSidebarTheme } from '../src/ui/sidebar-shortcut.mjs';
 
 const { code: clientSource } = await buildClient();
 
@@ -15,7 +16,7 @@ function loadClient(globals = {}) {
   let factory;
   const document = {
     querySelector: () => null,
-    createElement: () => ({ dataset: {}, style: {}, set textContent(_) {} }),
+    createElement: () => ({ dataset: {}, style: {}, set textContent(_) {}, remove() {} }),
     head: { appendChild() {} },
   };
   const window = { __ModuleLoader__: { load(definition) { factory = definition.factory; } } };
@@ -31,6 +32,7 @@ function loadClient(globals = {}) {
     useState: () => [null, () => {}],
     useCallback: value => value,
     useEffect() {},
+    useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
     useMemo: value => value(),
     useRef: () => ({ current: null }),
   };
@@ -53,6 +55,387 @@ test('optional client package owners no longer gate the product bundle', () => {
     assert.equal((manifest.dsh.client.inject ?? []).includes(dependency), false);
   }
   assert.deepEqual(Array.from(loadClient().inject), ['slots', 'locale', 'remote']);
+});
+
+test('shortcut uses native panel registration, locale, icon props, and native return on removal', async () => {
+  const client = loadClient(), rows = new Map(), events = [], scopes = new Set(), warnings = [];
+  let active = 'plugins', nextRevision = 0, reads = 0, saves = 0, themeCallback;
+  let prefs = { revision: 'missing', value: { grokEnabled: true } };
+  const ctx = {
+    logger: { warn: value => warnings.push(value) }, effect: fn => fn(),
+    locale: { register: () => () => {}, bind: () => () => 'Web search' },
+    theme: { getTheme: () => ({ active: { colorScheme: 'light' } }) },
+    on: (event, cb) => { if (event === 'theme/change') themeCallback = cb; },
+    remote: { $mount: async () => () => {}, grokSearchSettings: {
+      preferences() { reads++; return { ok: true, value: prefs }; },
+      savePreferences({ expectedRevision, value }) {
+        assert.equal(expectedRevision, prefs.revision);
+        prefs = { revision: String(++nextRevision), value };
+        saves++; return { ok: true, value: prefs };
+      },
+    } },
+    inject(names, fn) {
+      if (['theme', 'remote.grokSearchSettings'].includes(names[0])) {
+        const dispose = fn(ctx);
+        return { dispose };
+      }
+      return { dispose() {} };
+    },
+    layout: { selectPanel() { assert.fail('the plugin must not issue host navigation'); } },
+    slots: {
+      spec: name => ['main', 'sidebar.panellist'].includes(name) ? {} : undefined,
+      inject(name, setup) {
+        if (name === 'tool.call.toolview') return () => {};
+        scopes.add(name);
+        const dispose = setup();
+        return () => { dispose?.(); scopes.delete(name); };
+      },
+      register(options, component) {
+        rows.set(options.name, { options, component }); events.push('+' + options.name);
+        return () => {
+          if (!rows.delete(options.name)) return;
+          events.push('-' + options.name);
+          if (options.name === 'main' && active === options.key) active = 'conversation';
+        };
+      },
+    },
+  };
+  const stop = await client.apply(ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  const settings = rows.get('plugins.bundle.config'), { sidebar } = settings.options.inject().connection;
+  assert.ok(reads > 0);
+  assert.equal(sidebar.getSnapshot().enabled, false);
+  assert.ok(!scopes.has('main') && !scopes.has('sidebar.panellist'));
+  await sidebar.toggle();
+  const main = rows.get('main'), nav = rows.get('sidebar.panellist');
+  assert.deepEqual(events.slice(-2), ['+main', '+sidebar.panellist']);
+  assert.equal(main.component, settings.component);
+  assert.equal(nav.options.id, main.options.key);
+  assert.equal(nav.options.label(), 'Web search');
+  for (const [size, activeIcon] of [[undefined, false], [16, true], [18, false]]) {
+    const image = nav.component({ size, active: activeIcon });
+    assert.equal(image.type, 'img');
+    assert.equal(image.props.src, client.__test.LOGOS.sidebarLight);
+    assert.equal(image.props.draggable, false);
+    assert.equal(image.props.style.width, `${size ?? 16}px`);
+    assert.equal(image.props.style.height, `${size ?? 16}px`);
+    assert.equal(image.props.style.objectFit, 'contain');
+    assert.equal(image.props.style.filter, undefined);
+  }
+  themeCallback({ active: { colorScheme: 'dark' } });
+  assert.equal(nav.component({ size: 18, active: true }).props.src, client.__test.LOGOS.sidebarDark);
+  active = main.options.key;
+  await sidebar.toggle();
+  assert.equal(active, 'conversation');
+  assert.deepEqual(events.slice(-2), ['-sidebar.panellist', '-main']);
+  assert.ok(!scopes.has('main') && !scopes.has('sidebar.panellist'));
+  assert.ok(rows.has('plugins.bundle.config'));
+  await sidebar.toggle();
+  active = 'elsewhere';
+  await stop();
+  assert.equal(active, 'elsewhere');
+  assert.equal(saves, 3);
+  assert.deepEqual(warnings, []);
+});
+
+test('sidebar ignores late reads, failed reads never write false, and detached work cannot remount it', async () => {
+  let mounts = 0, writes = 0, read, fail, mode = 'good', resolveWrite;
+  const service = {
+    preferences() {
+      if (mode === 'wait') return new Promise((resolve, reject) => { read = resolve; fail = reject; });
+      return Promise.resolve({ revision: 'one', value: { sidebarShortcutEnabled: mode === 'good' } });
+    },
+    savePreferences() { writes++; return new Promise(resolve => { resolveWrite = resolve; }); },
+  };
+  const state = createSidebarShortcut({ supported: () => true, mount: () => { mounts++; return () => mounts--; },
+    warn: () => assert.fail('unexpected warning') });
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  const first = state.bind(service);
+  await tick();
+  assert.equal(mounts, 1);
+  mode = 'wait';
+  const bad = state.refresh(); fail(Error('network')); await bad;
+  assert.equal(state.getSnapshot().enabled, true);
+  assert.equal(state.getSnapshot().error, 'read');
+  await state.toggle(); assert.equal(writes, 0);
+  const stale = state.refresh(), oldRead = read;
+  mode = 'off'; await state.retry(); assert.equal(mounts, 0);
+  oldRead({ revision: 'late', value: { sidebarShortcutEnabled: true } }); await stale;
+  assert.equal(mounts, 0);
+  const pending = state.toggle(); assert.equal(writes, 1);
+  first.dispose();
+  const other = state.bind(service);
+  await tick();
+  resolveWrite({ revision: 'late', value: { sidebarShortcutEnabled: true } }); await pending;
+  assert.equal(mounts, 0);
+  mode = 'wait';
+  const lastRead = other.remote.preferences();
+  state.dispose(); read({ revision: 'late', value: { sidebarShortcutEnabled: true } }); await lastRead;
+  assert.equal(mounts, 0);
+});
+
+test('sidebar owns both registrations even when a host slot watcher has no disposer', async () => {
+  const client = loadClient(), entries = new Map(), callbacks = new Map(), removed = [];
+  let revision = 0, value = { sidebarShortcutEnabled: true };
+  const ctx = {
+    effect: setup => setup(), locale: { register: () => () => {} },
+    inject: (names, setup) => ({ dispose: names[0] === 'remote.grokSearchSettings' ? setup(ctx) : undefined }),
+    remote: { $mount: async () => () => {}, grokSearchSettings: {
+      preferences: async () => ({ ok: true, value: { revision: String(revision), value } }),
+      savePreferences: async request => {
+        value = request.value;
+        return { ok: true, value: { revision: String(++revision), value } };
+      },
+    } },
+    slots: { spec: () => ({}), inject(name, setup) {
+      callbacks.set(name, setup);
+      if (name !== 'tool.call.toolview') setup();
+    }, register(options) {
+      entries.set(options.name, options);
+      return () => { removed.push(options.name); entries.delete(options.name); };
+    } },
+  };
+  const stop = await client.apply(ctx);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    const { sidebar } = entries.get('plugins.bundle.config').inject().connection;
+    const late = callbacks.get('sidebar.panellist');
+    assert.ok(entries.has('main') && entries.has('sidebar.panellist'));
+    await sidebar.toggle();
+    assert.deepEqual(removed, ['sidebar.panellist', 'main']);
+    late();
+    assert.ok(!entries.has('main') && !entries.has('sidebar.panellist'));
+    await sidebar.toggle();
+    assert.ok(entries.has('main') && entries.has('sidebar.panellist'));
+  } finally { await stop(); }
+  callbacks.get('main')();
+  callbacks.get('sidebar.panellist')();
+  assert.equal(entries.size, 0);
+  assert.equal(removed.filter(name => name === 'main').length, 2);
+});
+
+test('failed sidebar save preserves the confirmed value; an explicit retry merges the newly read search fields', async () => {
+  let fail = true, saved, installed = 0;
+  let current = { revision: 'a', value: { sidebarShortcutEnabled: false, grokEnabled: true } };
+  const sidebar = createSidebarShortcut({ supported: () => true, warn() {},
+    mount() { installed++; return () => { installed--; }; } });
+  sidebar.bind({
+    preferences: async () => current,
+    savePreferences(request) {
+      if (fail) throw Error('CAS conflict');
+      saved = request;
+      return (current = { revision: 'c', value: request.value });
+    },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  await sidebar.toggle();
+  assert.equal(installed, 0); assert.equal(sidebar.getSnapshot().error, 'save');
+  current = { revision: 'b', value: { sidebarShortcutEnabled: false, grokEnabled: false } };
+  fail = false; await sidebar.retry();
+  assert.deepEqual(saved, { expectedRevision: 'b', value: { sidebarShortcutEnabled: true, grokEnabled: false } });
+  assert.equal(installed, 1); assert.equal(sidebar.getSnapshot().error, null);
+  sidebar.dispose();
+});
+
+test('a preference poll cannot declare a failed sidebar registration usable', async () => {
+  let announce, mounts = 0;
+  const sidebar = createSidebarShortcut({ supported: () => true, warn() {},
+    mount(notify) { mounts++; announce = notify; notify(false); return () => {}; } });
+  sidebar.bind({ preferences: async () => ({ revision: 'a', value: { sidebarShortcutEnabled: true } }) });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sidebar.getSnapshot().available, false);
+    await sidebar.refresh();
+    assert.equal(sidebar.getSnapshot().available, false);
+    assert.equal(mounts, 1);
+    announce(true);
+    assert.equal(sidebar.getSnapshot().available, true);
+  } finally { sidebar.dispose(); }
+});
+
+test('a transient read failure while retrying a sidebar write keeps a usable read retry', async () => {
+  let online = true, writes = 0;
+  const state = createSidebarShortcut({ supported: () => true, warn() {}, mount: () => () => {} });
+  const service = { preferences: async () => {
+    if (!online) throw Error('offline');
+    return { revision: 'a', value: { sidebarShortcutEnabled: false } };
+  }, savePreferences(request) {
+    writes++;
+    if (!online) throw Error('offline');
+    return { revision: 'b', value: request.value };
+  } };
+  state.bind(service);
+  await new Promise(resolve => setImmediate(resolve));
+  online = false; await state.toggle(); await state.retry();
+  assert.equal(state.getSnapshot().error, 'read');
+  online = true; await state.retry();
+  assert.equal(state.getSnapshot().enabled, false);
+  assert.equal(writes, 1, 'a button labelled read must not replay a failed write');
+  await state.toggle();
+  assert.equal(state.getSnapshot().enabled, true);
+  state.dispose();
+});
+
+test('a reconnect with the same RPC proxy retires a delayed write and accepts the new host immediately', async () => {
+  let finish, mounts = 0;
+  const state = createSidebarShortcut({ supported: () => true, warn() {},
+    mount() { mounts++; return () => mounts--; } });
+  const service = { preferences: async () => ({ revision: 'missing', value: {} }),
+    savePreferences: () => new Promise(resolve => { finish = resolve; }) };
+  state.setTransport({ id: 1 });
+  state.bind(service);
+  await new Promise(resolve => setImmediate(resolve));
+  const old = state.toggle();
+  state.setTransport(undefined);
+  state.setTransport({ id: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.getSnapshot().ready, true);
+  finish({ revision: 'old-write', value: { sidebarShortcutEnabled: true } }); await old;
+  assert.equal(state.getSnapshot().enabled, false);
+  assert.equal(mounts, 0);
+  state.dispose();
+});
+
+test('a host without the panel list keeps its ordinary settings, warns once and never writes any preferences', async () => {
+  const client = loadClient(), warnings = [], entries = new Map(), watched = new Map();
+  let writes = 0, reads = 0;
+  const ctx = {
+    logger: { warn: text => warnings.push(text) }, effect: fn => fn(), locale: { register: () => () => {} },
+    slots: {
+      spec: key => key === 'main' ? {} : undefined,
+      inject(key, setup) {
+        watched.set(key, setup);
+        const dispose = ['main', 'plugins.bundle.config'].includes(key) ? setup() : null;
+        return () => { dispose?.(); watched.delete(key); };
+      },
+      register({ name, inject }, component) {
+        entries.set(name, { inject, component }); return () => entries.delete(name);
+      },
+    },
+    remote: { $mount: async () => () => {}, grokSearchSettings: {
+      preferences: async () => { reads++; return { ok: true, value: { revision: '1', value: { sidebarShortcutEnabled: true } } }; },
+      savePreferences: () => { writes++; throw Error('unexpected write'); },
+      snapshot: async () => ({ ok: true, value: 'still-available' }),
+    } },
+    inject: (names, fn) => ({ dispose: names[0] === 'remote.grokSearchSettings' ? fn(ctx) : undefined }),
+  };
+  const stop = await client.apply(ctx);
+  await new Promise(resolve => setImmediate(resolve));
+  const { connection } = entries.get('plugins.bundle.config').inject(), state = connection.sidebar;
+  assert.equal(state.getSnapshot().available, false);
+  assert.equal(entries.has('main'), false);
+  assert.equal(entries.has('sidebar.panellist'), false);
+  assert.equal(await connection.settings.snapshot(), 'still-available');
+  await state.refresh(); await state.toggle();
+  assert.equal(writes, 0); assert.equal(reads, 2);
+  assert.equal(warnings.filter(value => value.startsWith('DSH_CLIENT_SIDEBAR_UNAVAILABLE')).length, 1);
+  await stop(); assert.equal(watched.size, 0);
+});
+
+test('connection generations retire settings, compatibility and chat even when the RPC proxy is reused', async () => {
+  const client = loadClient(), tools = fakeToolSlots(), registrations = new Map(), listeners = new Set();
+  let generation = 1, reads = 0, resolveOld, stopConnection, installConnection;
+  const change = next => { generation = next; for (const listener of listeners) listener(); };
+  const ctx = {
+    effect: setup => setup(), locale: { register: () => () => {} },
+    inject(names, setup) {
+      const dispose = setup(ctx);
+      if (names[0] === 'connection') { stopConnection = dispose; installConnection = setup; }
+      return { dispose };
+    },
+    connection: { generation: { getSnapshot: () => generation,
+      subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); } } },
+    slots: { ...tools, spec: () => ({}), inject: (_name, setup) => setup(),
+      register(options, component) {
+        if (options.name === 'tool.call.toolview') return tools.register(options, component);
+        registrations.set(options.name, options);
+        return () => registrations.delete(options.name);
+      } },
+    remote: { $mount: async () => () => {}, grokSearchSettings: {
+      preferences: async () => ({ ok: true, value: { revision: 'a', value: {} } }),
+      snapshot: () => { reads++; return new Promise(resolve => { resolveOld = resolve; }); },
+    }, grokSearchCompatibility: {} },
+  };
+  const original = () => null;
+  tools.register({ name: 'tool.call.toolview', key: 'web_search' }, original);
+  const stop = await client.apply(ctx);
+  try {
+    const { connection } = registrations.get('plugins.bundle.config').inject();
+    const old = connection.settings, oldReport = connection.compatibility, oldChat = tools.rows[0].component;
+    const pending = old.snapshot();
+    const seen = [];
+    connection.listeners.add(() => seen.push([connection.settings, connection.compatibility]));
+    change(null);
+    assert.equal(connection.settings, null, 'a mounted page must release its controller on disconnect');
+    assert.equal(connection.compatibility, null);
+    assert.deepEqual(tools.rows.map(entry => entry.component), [original]);
+    change(1);
+    assert.notEqual(connection.settings, old);
+    assert.notEqual(connection.compatibility, oldReport);
+    assert.notEqual(tools.rows[0].component, oldChat);
+    assert.notEqual(tools.rows[0].component, original);
+    const current = connection.settings;
+    change(1);
+    assert.equal(connection.settings, current, 'duplicate notifications must preserve an open draft');
+    resolveOld({ ok: true, value: 'first connection only' });
+    await assert.rejects(pending, { code: 'SETTINGS_UNAVAILABLE' });
+    await assert.rejects(old.snapshot(), { code: 'SETTINGS_UNAVAILABLE' });
+    assert.equal(reads, 1);
+    const stopReplacement = installConnection({ connection: { generation: {
+      getSnapshot: () => 1, subscribe: () => () => {},
+    } } });
+    const replacement = connection.settings;
+    assert.ok(replacement && replacement !== current, 'replacing the store must retire its identity even when serials match');
+    stopConnection();
+    assert.equal(connection.settings, replacement, 'the old service cannot disconnect its live replacement');
+    stopReplacement();
+    assert.ok(connection.settings && connection.settings !== replacement,
+      'losing only an optional observer must fall back to the independently available settings RPC');
+    assert.ok(seen.some(([settings, compatibility]) => !settings && !compatibility));
+    assert.equal(listeners.size, 0);
+  } finally {
+    resolveOld?.({ ok: true, value: null });
+    await stop();
+  }
+});
+
+test('stopping publishes disconnection to already mounted pages before dropping their listeners', async () => {
+  const client = loadClient(), registrations = new Map();
+  const ctx = {
+    effect: setup => setup(), locale: { register: () => () => {} },
+    inject: (names, setup) => ({ dispose: names[0].startsWith('remote.') ? setup(ctx) : undefined }),
+    slots: { spec: () => ({}), inject: (name, setup) => name === 'tool.call.toolview' ? () => {} : setup(),
+      register(options) { registrations.set(options.name, options); return () => registrations.delete(options.name); } },
+    remote: { $mount: async () => () => {}, grokSearchSettings: {
+      preferences: async () => ({ ok: true, value: { revision: 'a', value: {} } }),
+    }, grokSearchCompatibility: {} },
+  };
+  const stop = await client.apply(ctx);
+  const { connection } = registrations.get('plugins.bundle.config').inject();
+  const seen = [];
+  connection.listeners.add(() => seen.push([connection.settings, connection.compatibility]));
+  await stop();
+  await stop();
+  assert.deepEqual(seen, [[null, null]]);
+  assert.equal(connection.listeners.size, 0);
+});
+
+test('sidebar theme reacts to host, document and media in order and drops every fallback listener', () => {
+  const theme = { current: null, listeners: new Set() }, attrs = new Set(), bodyAttrs = new Set(), listeners = new Set();
+  let mutation, disconnected = false;
+  const media = { matches: false, addEventListener: (_, fn) => listeners.add(fn), removeEventListener: (_, fn) => listeners.delete(fn) };
+  const source = createSidebarTheme(theme, { documentElement: { hasAttribute: name => attrs.has(name) },
+    body: { hasAttribute: name => bodyAttrs.has(name) } }, { matchMedia: () => media,
+    MutationObserver: class { constructor(fn) { mutation = fn; } observe() {} disconnect() { disconnected = true; } } });
+  const seen = [], off = source.subscribe(() => seen.push(source.dark()));
+  assert.equal(source.dark(), false);
+  media.matches = true; listeners.forEach(fn => fn());
+  attrs.add('data-ds-theme-source'); mutation();
+  attrs.add('data-ds-dark-theme'); mutation();
+  attrs.delete('data-ds-dark-theme'); bodyAttrs.add('data-ds-dark-theme'); mutation();
+  theme.current = false; theme.listeners.forEach(fn => fn());
+  assert.deepEqual(seen, [true, false, true, true, false]);
+  off(); assert.ok(disconnected); assert.equal(listeners.size, 0); assert.equal(theme.listeners.size, 0);
 });
 
 test('client mounts old settings and independent compatibility descriptors once without changing old codecs', async () => {
@@ -904,10 +1287,19 @@ test('route browser verifies the current source build without writing the genera
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(external, []);
     assert.deepEqual(readFileSync(join(project, 'src/client.js')), generated);
-    console.log('ROUTE_BROWSER_SOURCE ' + JSON.stringify({
+    const evidence = {
       assertionsPassed: result.passed, sourceBuildSha256: createHash('sha256').update(clientSource).digest('hex'),
-      generatedArtifactUnchanged: true, upstreamRequests: 0, desktopVerified: false,
-    }));
+      generatedArtifactSha256: createHash('sha256').update(generated).digest('hex'),
+      generatedArtifactUnchanged: true, upstreamRequests: external.length, pageErrors: pageErrors.length, desktopVerified: false,
+    };
+    const artifacts = process.env.DSH_VALIDATION_ARTIFACT_ROOT;
+    if (artifacts && artifacts === join(dirname(tmpdir()), 'artifacts')) {
+      const { writeFileSync } = await import('node:fs');
+      const { failed, sidebarMeasurements } = JSON.parse(readFileSync(join(result.directory, 'summary.json'), 'utf8'));
+      writeFileSync(join(dirname(artifacts), 'ui-source-evidence.json'),
+        JSON.stringify({ ...evidence, failed, sidebarMeasurements }, null, 2) + '\n', { flag: 'wx' });
+    }
+    console.log('ROUTE_BROWSER_SOURCE ' + JSON.stringify(evidence));
   } finally {
     clearTimeout(deadline);
     try { await context?.close(); } finally { await stopPreviewService(service); }

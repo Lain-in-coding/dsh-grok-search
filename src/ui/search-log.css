@@ -19,7 +19,7 @@
 .history-bar[data-phase=done] .history-phase{display:none}
 .history-bar[data-phase=done] .history-return{color:var(--text-2)}
 .history-bar[data-phase=done] .history-dismiss{width:22px}
-.route-card[data-history=true] > #stage,.route-card[data-history=true] > #bannerSlot,.route-card[data-history=true] > .rc-foot{visibility:hidden}
+.route-card[data-history=true] #stage,.route-card[data-history=true] > #bannerSlot,.route-card[data-history=true] > .rc-foot{visibility:hidden}
 .route-card[data-history=true] #statusPill,.route-card[data-history=true] .rc-actions{visibility:hidden}
 .history-stage{position:absolute;overflow:visible;background:var(--stage);background-image:radial-gradient(var(--dot) 1px,transparent 1.3px);background-size:16px 16px;background-position:8px 8px;border-block:1px solid var(--line);pointer-events:none}
 .history-stage .hr-node{position:absolute;z-index:2;box-sizing:border-box}
@@ -27,7 +27,7 @@
 .history-stage .node-name::before{display:none}
 .history-stage .hr-node[data-hs] .node-logo,.history-stage .hr-node[data-hs] .hub-glyph{filter:none;opacity:1}
 .history-stage .hr-node[data-hs] .hub-glyph{color:var(--agent)}
-.history-stage .hr-node.node-hub{border-color:color-mix(in srgb,var(--text) 82%,transparent);box-shadow:var(--shadow-sm)}
+.history-stage .hr-node.node-hub{border-color:var(--shortcut-node-edge,color-mix(in srgb,var(--text) 82%,transparent));box-shadow:var(--shadow-sm)}
 .history-stage .hr-node.node-hub.is-busy{border-color:var(--agent);box-shadow:0 0 0 3px var(--agent-soft),var(--shadow-sm)}
 .history-stage .hr-node.node-hub.is-falling{border-color:var(--warn-line);box-shadow:0 0 0 3px var(--warn-soft),var(--shadow-sm)}
 .history-stage .hr-node.node-hub.is-falling .hub-glyph{color:var(--warn)}
@@ -42,7 +42,7 @@
 .hr-provider[data-hs=idle] .hr-provider-name{color:var(--text-3)}
 .history-stage .hr-provider[data-st=on],.history-stage .hr-provider[data-st=live]{box-shadow:var(--shadow-sm);border-style:solid}
 .history-stage .hr-provider[data-st=on] .tile,.history-stage .hr-provider[data-st=live] .tile{filter:none;opacity:1}
-.history-stage .hr-provider[data-st=live]{border-color:var(--text)}
+.history-stage .hr-provider[data-st=live]{border-color:var(--shortcut-live-edge,var(--text))}
 .history-stage .hr-provider.is-fault-flash{border-color:var(--err);box-shadow:0 0 0 2px var(--err-soft)}
 .hr-provider-name{font-size:13px;font-weight:600;flex:1;min-width:0;white-space:nowrap}
 .hr-result{font-size:11px;color:var(--text-3);white-space:nowrap;display:inline-flex;align-items:center;gap:5px}

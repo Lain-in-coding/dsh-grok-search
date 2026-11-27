@@ -1,5 +1,17 @@
 <section class="plugin-intro" aria-label="插件介绍">
-  <p class="intro-title">搜索不止一条路<a class="intro-github" href="https://github.com/Lain-in-coding/dsh-grok-search" target="_blank" rel="noopener noreferrer" aria-label="打开 dsh-grok-search 的 GitHub 仓库（新窗口）" title="用着还行？给个 star"><span class="tile" data-logo="github" data-fit="contain" style="--k:100%"><img alt="" draggable="false"></span></a></p>
+  <div class="intro-topline">
+    <p class="intro-title">搜索不止一条路<a class="intro-github" href="https://github.com/Lain-in-coding/dsh-grok-search" target="_blank" rel="noopener noreferrer" aria-label="打开 dsh-grok-search 的 GitHub 仓库（新窗口）" title="用着还行？给个 star"><span class="tile" data-logo="github" data-fit="contain" style="--k:100%"><img alt="" draggable="false"></span></a></p>
+    <div class="shortcut-setting" id="shortcutSetting" hidden>
+      <label class="shortcut-setting-control" for="sidebarShortcutSwitch">
+        <span id="sidebarShortcutLabel">允许在侧边栏显示</span>
+        <button type="button" class="switch" id="sidebarShortcutSwitch" role="switch" aria-checked="false" aria-disabled="true" aria-labelledby="sidebarShortcutLabel" aria-describedby="sidebarShortcutFeedback"><i aria-hidden="true"></i></button>
+      </label>
+      <div class="shortcut-feedback">
+        <p id="sidebarShortcutFeedback" role="status" aria-live="polite" aria-atomic="true"></p>
+        <button type="button" class="btn btn-ghost btn-sm" id="shortcutRetry" hidden>重试</button>
+      </div>
+    </div>
+  </div>
   <nav class="intro-illustration" aria-label="搜索服务官方网站">
     <a class="intro-host" href="https://deepseek.com/harness" target="_blank" rel="noopener noreferrer" aria-label="打开 DeepSeek Harness 官网（新窗口）" title="DeepSeek Harness 官网"><span class="tile" data-logo="dsh" data-fit="cover"><img alt="" draggable="false"></span></a>
     <div class="intro-network">

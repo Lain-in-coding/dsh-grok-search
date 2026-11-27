@@ -26,6 +26,136 @@ function element(value = '') {
     setAttribute: (name, next) => attrs.set(name, next), focus() {}, setSelectionRange() {},
   };
 }
+
+if (process.argv.includes('--sidebar-browser')) test('Chromium: the mounted intro switch follows only confirmed sidebar state', async () => {
+  const { chromium } = await import('playwright');
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage({ viewport: { width: 960, height: 840 }, reducedMotion: 'reduce' });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    const asset = path => readFileSync(new URL(`../src/${path}`, import.meta.url), 'utf8');
+    const modules = new Map(['ui/route-controller.mjs', 'ui/route-form.mjs', 'core/source-chain.mjs']
+      .map(path => [`/${path}`, asset(path)]));
+    await page.route('**/*', route => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === '/') return route.fulfill({ contentType: 'text/html', body: '<!doctype html><div id="root"></div><div id="layer"></div>' });
+      if (modules.has(path)) return route.fulfill({ contentType: 'text/javascript', body: modules.get(path) });
+      return route.abort();
+    });
+    await page.goto('http://127.0.0.1/');
+    await page.evaluate(async ({ card, layer, css }) => {
+      const { createRouteController } = await import('/ui/route-controller.mjs');
+      const { createSourceChain } = await import('/core/source-chain.mjs');
+      const shadow = (id, markup, name) => {
+        const host = document.getElementById(id).attachShadow({ mode: 'open' });
+        host.innerHTML = `<style>${css}</style><div class="dsg-surface ${name}">${markup}</div>`;
+        return host.querySelector('div');
+      };
+      const root = shadow('root', card, 'dsg-root'), overlay = shadow('layer', layer, 'dsg-layer');
+      const subscribers = new Set(), actions = [], cancelled = [];
+      const initial = { revision: 'initial', value: { grokEnabled: true, githubReadEnabled: false, sidebarShortcutEnabled: false } };
+      let state = { ready: false, available: true, enabled: false, saving: false, error: null, preferences: null };
+      let finishDiagnosis = null;
+      const publish = changes => { state = { ...state, ...changes }; subscribers.forEach(render => render()); };
+      const confirm = (enabled, revision) => publish({ ready: true, available: true, enabled, saving: false, error: null,
+        preferences: { revision, value: { ...initial.value, sidebarShortcutEnabled: enabled } } });
+      const sidebar = {
+        getSnapshot: () => state,
+        subscribe(render) { subscribers.add(render); return () => subscribers.delete(render); },
+        toggle() { actions.push('toggle'); publish({ saving: true }); },
+        retry() { actions.push('retry'); publish({ saving: state.ready, error: null }); },
+      };
+      const controller = createRouteController({
+        root, layer: overlay, sidebar, sourceChain: createSourceChain(),
+        logos: new Proxy({}, { get: () => 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>' }),
+        createSearchLogView: () => null, createQuotaView: () => null,
+        remote: {
+          snapshot: async () => ({ config: { path: '/config.toml', revision: 'file', fields: { grok_api_key: { configured: true } } },
+            control: { phase: 'required', available: true }, program: { phase: 'ready' }, capabilities: { secretsAllowed: true } }),
+          preferences: async () => state.preferences ?? initial,
+          diagnoseProvider: ({ provider }) => new Promise(resolve => {
+            finishDiagnosis = () => resolve({ provider, status: 'ok', code: 'OK', keys: [] });
+          }),
+          cancelDiagnosis: async request => cancelled.push(request.operationId),
+        },
+      });
+      window.fixture = { publish, confirm, actions, subscribers, controller, cancelled, get finishDiagnosis() { return finishDiagnosis; } };
+    }, { card: asset('ui/route-card.html'), layer: asset('ui/route-layer.html'), css: asset('ui/route.css') });
+    const toggle = page.getByRole('switch', { name: '允许在侧边栏显示', exact: true });
+    const status = page.locator('#sidebarShortcutFeedback'), retry = page.locator('#shortcutRetry');
+    const publish = changes => page.evaluate(patch => window.fixture.publish(patch), changes);
+    const confirm = (enabled, revision) => page.evaluate(args => window.fixture.confirm(...args), [enabled, revision]);
+    const actions = () => page.evaluate(() => window.fixture.actions);
+    const focused = locator => locator.evaluate(node => node === node.getRootNode().activeElement);
+    assert.equal(await toggle.getAttribute('aria-busy'), 'true');
+    await publish({ error: 'read', available: false });
+    assert.equal(await retry.textContent(), '重新读取');
+    assert.equal(await retry.isEnabled(), true);
+    await retry.press('Enter');
+    assert.equal(await focused(toggle), true);
+    assert.deepEqual(await actions(), ['retry']);
+    await confirm(false, 'initial');
+    assert.equal(await toggle.isEnabled(), true);
+    assert.equal(await status.textContent(), '');
+    assert.equal(await retry.isVisible(), false);
+    assert.equal(await page.locator('.shortcut-feedback').evaluate(node => node.getBoundingClientRect().height), 0);
+    await page.locator('.intro-github').focus();
+    await page.keyboard.press('Tab');
+    assert.equal(await toggle.evaluate(node => node.matches(':focus-visible')), true);
+    await page.keyboard.press('Space');
+    await page.keyboard.press('Enter');
+    assert.deepEqual(await actions(), ['retry', 'toggle']);
+    assert.equal(await toggle.isEnabled(), false);
+    assert.equal(await toggle.getAttribute('aria-checked'), 'false');
+    assert.match(await status.textContent(), /正在保存/);
+    await publish({ saving: false, error: 'save' });
+    assert.match(await status.textContent(), /隐藏/);
+    assert.equal(await retry.textContent(), '重新保存');
+    await retry.press('Space');
+    assert.equal(await focused(toggle), true);
+    await confirm(true, 'sidebar-on');
+    assert.equal(await toggle.getAttribute('aria-checked'), 'true');
+    assert.equal(await status.textContent(), '');
+    await page.keyboard.press('Enter');
+    await publish({ saving: false, error: 'save' });
+    assert.match(await status.textContent(), /显示/);
+    await publish({ available: false });
+    assert.equal(await retry.isEnabled(), false);
+    await page.keyboard.press('Space');
+    assert.deepEqual(await actions(), ['retry', 'toggle', 'retry', 'toggle']);
+    await page.setViewportSize({ width: 390, height: 840 });
+    await page.evaluate(() => window.fixture.controller.setTheme('dark'));
+    assert.ok(await page.locator('#shortcutSetting').evaluate(node =>
+      node.getBoundingClientRect().right <= innerWidth && node.scrollWidth <= node.clientWidth));
+    await publish({ available: true, error: null });
+    await page.locator('#testBtn').click();
+    await page.locator('[data-pop=go]').click();
+    await page.waitForFunction(() => Boolean(window.fixture.finishDiagnosis));
+    await toggle.press('Space');
+    await confirm(false, 'sidebar-off-during-diagnosis');
+    await page.evaluate(() => window.fixture.controller.refresh());
+    assert.deepEqual(await page.evaluate(() => window.fixture.cancelled), []);
+    await page.evaluate(() => window.fixture.finishDiagnosis());
+    await page.locator('#announcer').filter({ hasText: '已检查全部开启的来源' }).waitFor({ state: 'attached' });
+    await page.locator('.row[data-id=grok] .row-main').click();
+    const model = page.locator('#dialog input[data-k=model]');
+    await model.fill('unsaved model');
+    await confirm(true, 'sidebar-on-during-edit');
+    assert.equal(await model.inputValue(), 'unsaved model');
+    assert.equal(await focused(model), true);
+    const subscriptions = await page.evaluate(() => {
+      const fixture = window.fixture, late = [...fixture.subscribers][0];
+      fixture.controller.dispose();
+      late();
+      return fixture.subscribers.size;
+    });
+    assert.equal(subscriptions, 0);
+    assert.equal(await toggle.count(), 0);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
 function harness() {
   const inputs = [], buttons = [], requests = [], commits = [], errors = [], timers = [];
   const dlg = element(), overlay = element(), saveButton = element();
@@ -290,7 +420,8 @@ test('accepted external config changes invalidate a reveal even if the original 
   });
   Object.assign(h.context.S, { order: [], identity: {}, checked: {}, bad: {}, providerBad: {}, hub: {},
     configRevision: before.revision, configIdentity: before.quotaRevision, configPath: before.path });
-  vm.runInContext(section('function acceptSnapshot(', 'let readTask ='), h.context);
+  vm.runInContext([section('function withSidebarRevision(', 'function configUndo('),
+    section('function acceptSnapshot(', 'let readTask =')].join('\n'), h.context);
   const revealing = h.context.revealFor('key');
   const snapshot = config => ({ config, control: { policy: 'required' }, capabilities: { secretsAllowed: true }, plugin: {} });
   h.context.acceptSnapshot(snapshot({ ...before, quotaRevision: 'effective-other' }), { value: {} });
@@ -552,6 +683,37 @@ test('a late private switch reply cannot replace newer preference state', async 
   assert.equal(context.S.prefs, current);
   assert.equal(context.S.prov.grok.enabled, true);
   assert.equal(context.S.prov.github.enabled, true);
+});
+
+test('source save and undo rebase with full CAS without writing the sidebar preference', async () => {
+  for (const [id, key] of [['grok', 'grokEnabled'], ['github', 'githubReadEnabled']]) {
+    const directory = mkdtempTracked(join(tmpdir(), 'dsh-sidebar-cas-'));
+    const store = createPrivatePreferences({ path: join(directory, 'preferences.json') });
+    const before = store.snapshot();
+    const shown = store.save(before.revision, { ...before.value, sidebarShortcutEnabled: true });
+    const requests = [];
+    const context = vm.createContext({
+      disposed: false, accessGeneration: 0, stateGeneration: 0, snapshotSignature: null,
+      S: { prefs: before, prov: { grok: {}, github: {} } }, toast() {}, syncAll() {}, operationError: assert.fail,
+      remote: {
+        preferences: () => store.snapshot(),
+        savePreferences({ expectedRevision, value }) {
+          requests.push(expectedRevision);
+          assert.equal(Object.hasOwn(value, 'sidebarShortcutEnabled'), false);
+          return store.save(expectedRevision, value);
+        },
+      },
+    });
+    vm.runInContext(section('async function savePreference(', 'async function restoreReceipt('), context);
+    const previous = before.value[key];
+    const saved = await context.savePreference(id, !previous);
+    assert.deepEqual(store.snapshot().value, { ...shown.value, [key]: !previous });
+    const undo = context.cardUndo(null, id, previous, true);
+    const hidden = store.save(saved.revision, { ...saved.value, sidebarShortcutEnabled: false, sourceOrder: [...saved.value.sourceOrder].reverse() });
+    await undo();
+    assert.deepEqual(store.snapshot().value, { ...hidden.value, [key]: previous });
+    assert.deepEqual(requests, [before.revision, shown.revision, saved.revision, hidden.revision]);
+  }
 });
 
 function undoHarness({ changed = {}, failure = null, missing = false } = {}) {
@@ -1143,6 +1305,7 @@ for (const revocation of ['SETTINGS_AUTH_REQUIRED', 'SETTINGS_SECURE_CONNECTION_
     };
     h.context.remote.cancelDiagnosis = async request => { cancellations.push(request); return {}; };
     vm.runInContext([
+      section('function withSidebarRevision(', 'function configUndo('),
       section('function acceptSnapshot(', 'let readTask ='),
       section('function denyPrivateAccess(', 'async function refresh('),
       section('function cancelTest(', 'function cancelOwnedDiagnosis('),
@@ -1498,6 +1661,7 @@ function controlLifecycleStateHarness() {
   });
   // Use production snapshot ingestion, not the retry harness's sentinel state.
   vm.runInContext([
+    section('function withSidebarRevision(', 'function configUndo('),
     section('function acceptSnapshot(', 'let readTask ='),
     section('const STATUS_TEXT =', 'function rowState('),
     section('function rowState(', 'const RANK ='),
@@ -1512,6 +1676,59 @@ function controlLifecycleStateHarness() {
   };
   return h;
 }
+
+test('a sidebar-only read keeps the pending diagnosis and the open draft in their original lifetime', async () => {
+  const { context, state } = controlLifecycleStateHarness();
+  context.syncAll = () => {};
+  state.preferences.value = { grokEnabled: true, githubReadEnabled: false, sidebarShortcutEnabled: false,
+    sourceOrder: ['exa', 'tavily'], sourceEnabled: { exa: true, tavily: true } };
+  await context.refresh({ force: true });
+  const draft = { model: 'unsaved model' }, baseline = structuredClone(context.S.config);
+  context.D = { kind: 'card', draft, configBaseline: baseline };
+  context.S.testing = true;
+  context.S.diagnosticOperation = 'in-flight';
+  context.S.trace = { items: [{ id: 'grok', tone: 'run' }] };
+  const { secretEpoch, accessGeneration, stateGeneration } = context;
+  let render, finishRead;
+  const snapshot = { enabled: false, ready: true, available: true, saving: false, error: null, preferences: state.preferences };
+  Object.assign(context, {
+    listen() {}, listeners: new Set(), active: () => null,
+    sidebar: { getSnapshot: () => snapshot, subscribe(callback) { render = callback; return () => {}; } },
+  });
+  vm.runInContext(section('function bindSidebar()', 'function init()'), context);
+  context.bindSidebar();
+  const normalRead = context.remote.preferences;
+  context.remote.preferences = () => new Promise(resolve => { finishRead = resolve; });
+  const stale = context.refresh({ force: true });
+  const previous = state.preferences;
+  state.preferences = { revision: 'display-only', value: { ...previous.value, sidebarShortcutEnabled: true } };
+  Object.assign(snapshot, { enabled: true, preferences: state.preferences });
+  render();
+  assert.equal(context.S.prefs, state.preferences);
+  finishRead(previous);
+  await stale;
+  assert.equal(context.S.prefs.revision, 'display-only');
+  assert.equal(context.S.testing, true);
+  assert.equal(context.S.diagnosticOperation, 'in-flight');
+  assert.equal(context.S.trace.items[0].tone, 'run');
+  assert.equal(context.secretEpoch, secretEpoch);
+  assert.equal(context.accessGeneration, accessGeneration);
+  assert.equal(context.stateGeneration, stateGeneration);
+  assert.equal(context.D.draft, draft);
+  assert.equal(context.D.configBaseline, baseline);
+  for (const change of [{ grokEnabled: false }, { githubReadEnabled: true }, { sourceOrder: ['tavily', 'exa'] },
+    { sourceEnabled: { exa: false, tavily: true } }, { futurePreference: true }]) {
+    snapshot.preferences = { revision: 'other-settings', value: { ...state.preferences.value, ...change } };
+    render();
+    assert.equal(context.S.prefs.revision, 'display-only');
+  }
+  let cancelled = false;
+  context.cancelTest = () => { cancelled = true; };
+  context.remote.preferences = normalRead;
+  state.preferences = { revision: 'source-change', value: { ...state.preferences.value, grokEnabled: false } };
+  await context.refresh({ force: true });
+  assert.equal(cancelled, true);
+});
 
 test('starting after historical release completion stays neutral until the current runtime is ready', async () => {
   for (const available of [true, false]) {

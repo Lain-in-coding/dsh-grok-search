@@ -6,6 +6,7 @@ import { COMPATIBILITY_REPORT, COMPATIBILITY_DESCRIPTORS } from '../src/core/com
 import { createSettingsCodec } from '../src/core/settings-codec.mjs';
 import { createSourceChain } from '../src/core/source-chain.mjs';
 import { createCompatibilityView } from '../src/ui/compatibility-view.mjs';
+import { createSidebarShortcut, createSidebarTheme } from '../src/ui/sidebar-shortcut.mjs';
 import { createRuntimeCompatibility } from '../src/core/runtime-compat.mjs';
 
 const report = overrides => ({
@@ -372,7 +373,7 @@ function clientHarness({ unavailable = [], delayedSlots = [], failedSlots = [], 
   };
   const context = vm.createContext({
     window: { __ModuleLoader__: { load(value) { factory = value.factory; } } },
-    codec: createSettingsCodec, createSourceChain, COMPATIBILITY_VIEW: createCompatibilityView,
+    codec: createSettingsCodec, createSourceChain, createSidebarShortcut, createSidebarTheme, COMPATIBILITY_VIEW: createCompatibilityView,
     ROUTE_CONTROLLER: () => {
       routeCreates++;
       return { setTheme() {}, dispose() { routeDisposes++; } };

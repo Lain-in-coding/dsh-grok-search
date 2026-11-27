@@ -1,6 +1,6 @@
-async page => {
+async (page, { sidebarOnly = false } = {}) => {
   const run = await page.evaluate(async () => (await fetch('/begin', { method: 'POST' })).json());
-  const results = [], errors = [];
+  const results = [], errors = [], sidebarMeasurements = [];
   let fatal = null, failure, screenshotError;
   page.on('pageerror', error => errors.push(String(error)));
   const check = (name, actual, expected = true) => {
@@ -23,7 +23,232 @@ async page => {
     await page.locator('#overlay').waitFor({ state: 'hidden' });
   };
   const refresh = async () => { await page.evaluate(() => window.harness.refresh()); };
-  try {
+  const checkSidebarPage = async () => {
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await state('returning');
+    const detail = page.locator('[data-dsg-route]:not([data-dsg-shortcut-panel])');
+    const detailFrame = () => detail.evaluate(host => {
+      const root = host.shadowRoot, card = root.querySelector('#routeCard'), log = root.querySelector('#logCard');
+      const style = getComputedStyle(card);
+      return { width: host.clientWidth, border: style.borderTop, radius: style.borderTopLeftRadius,
+        logAfterRoute: log.previousElementSibling === card, scrollTab: root.querySelector('#stageViewport')?.tabIndex ?? -1,
+        liveFill: getComputedStyle(root.querySelector('#stage .row[data-id=grok]')).backgroundColor,
+        restingFill: getComputedStyle(root.querySelector('#stage .row[data-st=on]')).backgroundColor };
+    });
+    const plainFrame = await detailFrame();
+    check('ordinary details retain their route frame, separate log and no diagram tab stop',
+      plainFrame.logAfterRoute && plainFrame.scrollTab < 0 && parseFloat(plainFrame.radius) > 0 && parseFloat(plainFrame.border) > 0);
+    check('the sidebar active fill does not leak into ordinary details', plainFrame.liveFill, plainFrame.restingFill);
+    const toggle = page.getByRole('switch', { name: '允许在侧边栏显示', exact: true });
+    await page.locator('#sidebarShortcutSwitch[aria-busy=false][aria-disabled=false]').waitFor();
+    await toggle.click();
+    await page.locator('#sidebarShortcutSwitch[aria-checked=true][aria-busy=false]').waitFor();
+    const showPage = name => page.evaluate(name => window.harness.showPage(name), name);
+    await showPage('panel');
+    const panel = page.locator('[data-dsg-shortcut-panel]');
+    await panel.locator('#routeCard[data-s]:not([data-s=load])').waitFor();
+    check('main registration renders one shortcut workbench', await panel.locator('.shortcut-workbench').count(), 1);
+    const workbench = panel.locator('.shortcut-workbench'), viewport = panel.locator('#stageViewport');
+    check('one intro and one route share the workbench; one log follows outside it', await workbench.evaluate(bench => {
+      const root = bench.getRootNode(), log = root.querySelector('#logCard');
+      return bench.querySelectorAll('.plugin-intro').length === 1 && bench.querySelectorAll('#routeCard').length === 1
+        && root.querySelectorAll('#logCard').length === 1 && !bench.contains(log)
+        && !!(bench.compareDocumentPosition(log) & Node.DOCUMENT_POSITION_FOLLOWING);
+    }));
+    await page.mouse.move(0, 0);
+    const live = panel.locator('#stage .row[data-id=grok][data-st=live]');
+    await page.emulateMedia({ colorScheme: 'light' });
+    const mountedSurface = await panel.locator('.dsg-surface').elementHandle();
+    const checkMountedTheme = async (name, theme) => {
+      await page.waitForFunction(({ surface, theme }) => surface.isConnected && surface.dataset.theme === theme,
+        { surface: mountedSurface, theme }, { timeout: 4000 });
+      check(name, await mountedSurface.evaluate(node => node.querySelector('.dsg-root').dataset.theme), theme);
+    };
+    await page.evaluate(async () => {
+      document.documentElement.setAttribute('data-ds-theme-source', 'system');
+      document.body.setAttribute('data-ds-dark-theme', '');
+      await window.harness.themeAvailable(false);
+    });
+    await checkMountedTheme('without theme service, host dark overrides the light OS on the same panel', 'dark');
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await page.evaluate(() => document.body.removeAttribute('data-ds-dark-theme'));
+    await checkMountedTheme('removing the host dark marker selects host light even with a dark OS', 'light');
+    await page.evaluate(() => document.documentElement.removeAttribute('data-ds-theme-source'));
+    await checkMountedTheme('without host markers or service the mounted panel uses the OS again', 'dark');
+    await page.evaluate(() => window.harness.themeAvailable(true));
+    await checkMountedTheme('returning theme service takes precedence without remounting', 'light');
+    await mountedSurface.dispose();
+    await page.emulateMedia({ colorScheme: null });
+    for (const theme of ['dark', 'light']) {
+      await page.evaluate(theme => window.harness.theme(theme), theme);
+      await panel.locator(`.dsg-surface[data-theme=${theme}]`).waitFor();
+      await panel.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      check(`${theme}: workbench and standalone log have the same 18px/1px frame`, await workbench.evaluate(bench => {
+        const frame = getComputedStyle(bench), log = getComputedStyle(bench.getRootNode().querySelector('#logCard'));
+        return ['TopLeft', 'TopRight', 'BottomLeft', 'BottomRight'].every(corner =>
+          [frame, log].every(style => style[`border${corner}Radius`] === '18px'))
+          && ['Top', 'Right', 'Bottom', 'Left'].every(side => [frame, log].every(style =>
+            style[`border${side}Width`] === '1px' && style[`border${side}Style`] === 'solid')
+            && frame[`border${side}Color`] === log[`border${side}Color`])
+          && getComputedStyle(bench.querySelector('#routeCard')).borderTopWidth === '0px';
+      }));
+      const paint = await live.evaluate(active => {
+        const resting = active.getRootNode().querySelector('#stage .row[data-st=on]');
+        const context = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+        const pixel = element => {
+          context.clearRect(0, 0, 1, 1);
+          context.fillStyle = getComputedStyle(element).backgroundColor;
+          context.fillRect(0, 0, 1, 1);
+          return Array.from(context.getImageData(0, 0, 1, 1).data);
+        };
+        const style = getComputedStyle(active);
+        return { live: pixel(active), resting: pixel(resting), fill: style.backgroundColor, restingFill: getComputedStyle(resting).backgroundColor,
+          focusWithin: active.matches(':focus-within'), outline: style.outline, token: style.getPropertyValue('--row-fill') };
+      });
+      sidebarMeasurements.push({ theme, paint });
+      const [red, green, blue, alpha] = paint.live, [baseRed, baseGreen, baseBlue] = paint.resting;
+      check(`${theme}: unfocused active source has a blue tint relative to a resting source`,
+        !paint.focusWithin && (paint.outline.includes('none') || paint.outline.includes(' 0px'))
+        && alpha > 0 && blue > red && blue - red > baseBlue - baseRed && blue - green > baseBlue - baseGreen);
+    }
+    const measure = async width => {
+      const geometry = await panel.evaluate(host => {
+        const root = host.shadowRoot, bench = root.querySelector('.shortcut-workbench'), log = root.querySelector('#logCard');
+        const diagram = root.querySelector('#stageViewport'), left = host.getBoundingClientRect().left + host.clientLeft;
+        const right = left + host.clientWidth, bounds = element => element.getBoundingClientRect();
+        const inside = element => !element.getClientRects().length || bounds(element).left >= left - 1 && bounds(element).right <= right + 1;
+        const containers = [document.documentElement, host, ...root.querySelectorAll(
+          '.dsg-surface,.dsg-root,.route-scroll,.shortcut-workbench,.plugin-intro,.intro-illustration,#routeCard,.rc-head,.rc-foot,#logCard,.lc-head')];
+        return { available: host.clientWidth, gutters: [bench, log].flatMap(element =>
+          [Math.round(bounds(element).left - left), Math.round(right - bounds(element).right)]),
+          overflow: containers.filter(element => element.scrollWidth > element.clientWidth + 1).map(element => element.id || element.className || element.tagName),
+          controlsFit: [...root.querySelectorAll('.intro-source,#sidebarShortcutSwitch,#testBtn,.rc-foot button,.lc-head button')].every(inside),
+          diagramOverflow: diagram.scrollWidth - diagram.clientWidth, tail: Math.round(bounds(diagram).right - bounds(root.querySelector('#colList')).right) };
+      });
+      sidebarMeasurements.push({ width, ...geometry });
+      const gutter = geometry.available <= 700 ? 12 : 20;
+      check(`${width}: panel and log fill available width with ${gutter}px side gutters`, geometry.gutters, Array(4).fill(gutter));
+      check(`${width}: page, intro, route header/footer and log do not scroll horizontally`, geometry.overflow, []);
+      check(`${width}: non-diagram controls remain inside the panel`, geometry.controlsFit);
+      return geometry;
+    };
+    const desktop = await measure(1440);
+    check('desktop canvas exceeds the ordinary detail width and uses its right-hand space',
+      desktop.available > plainFrame.width && desktop.diagramOverflow <= 1 && desktop.tail >= 0 && desktop.tail <= 40);
+    const hostSlot = page.locator('#preview');
+    await hostSlot.evaluate(slot => { slot.style.width = '680px'; });
+    const constrained = await measure('680px slot in 1440px window');
+    check('an independently narrowed host slot exercises the small gutter without resizing the window', constrained.available <= 700);
+    await hostSlot.evaluate(slot => slot.style.removeProperty('width'));
+    for (const width of [701, 700]) {
+      await page.setViewportSize({ width, height: 900 });
+      await measure(width);
+    }
+    const tabTo = async locator => {
+      for (let stops = 0; stops < 50; stops++) {
+        await page.keyboard.press('Tab');
+        if (await locator.evaluate(node => node.getRootNode().activeElement === node && node.matches(':focus-visible'))) return true;
+      }
+      return false;
+    };
+    const focusPaint = () => live.evaluate(row => [row, row.querySelector('.row-main')].map(element => {
+      const style = getComputedStyle(element);
+      return [style.outline, style.boxShadow, style.borderColor];
+    }));
+    const plainPaint = await focusPaint();
+    check('native Tab reaches the active source button', await tabTo(live.locator('.row-main')));
+    check('keyboard focus paints a distinct indicator on the active source', JSON.stringify(await focusPaint()) !== JSON.stringify(plainPaint));
+    await page.keyboard.press('Enter');
+    await page.locator('#dialog').waitFor();
+    await page.evaluate(() => window.harness.unmount());
+    check('unmount with a dialog open removes the panel, dialog and its portal', await page.locator('[data-dsg-shortcut-panel],#dialog,[data-dsg-layer]').count(), 0);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await showPage('panel');
+    await panel.locator('#routeCard[data-s]:not([data-s=load])').waitFor();
+    check('reopening the registered panel creates just one workbench and portal',
+      [await workbench.count(), await page.locator('[data-dsg-layer]').count(), await page.locator('#overlay').isVisible()], [1, 1, false]);
+    const narrow = await measure(390);
+    check('only the narrow diagram needs horizontal scrolling', narrow.diagramOverflow > 20);
+    check('the focusable scrollport owns live and historical graphs', await viewport.evaluate(port =>
+      port.tabIndex === 0 && ['auto', 'scroll'].includes(getComputedStyle(port).overflowX)
+      && port.querySelector('#stage')?.parentElement === port && port.querySelector('#historyStage')?.parentElement === port));
+    check('native Tab reaches the diagram scrollport', await tabTo(viewport));
+    const start = await viewport.evaluate(port => port.scrollLeft);
+    await page.keyboard.press('ArrowRight');
+    await page.waitForFunction(start => document.querySelector('[data-dsg-shortcut-panel]').shadowRoot.querySelector('#stageViewport').scrollLeft > start + 5, start);
+    const sensitiveCalls = () => read(() => window.harness.state.calls.filter(call =>
+      ['reveal', 'revealWithIdentity', 'diagnoseProvider', 'accountQuota', 'save', 'saveWithIdentity', 'savePreferences', 'clearSearchLog'].includes(call.method)).length);
+    const beforeReplay = await sensitiveCalls();
+    await page.evaluate(() => {
+      window.harness.configure({ logs: [{ id: 'search-log-1', at: 1800000000000, kind: 'ok', served: 'grok', q: 'sidebar replay geometry' }] });
+      window.harness.refresh();
+    });
+    const replay = panel.locator('#logCard [data-log-replay]');
+    await replay.waitFor();
+    check('a populated narrow log does not widen the log card or page', await panel.locator('#logCard').evaluate(log =>
+      [log, log.getRootNode().host, document.documentElement].every(element => element.scrollWidth <= element.clientWidth + 1)));
+    await replay.click();
+    await viewport.locator('#historyStage').waitFor();
+    const aligned = () => viewport.evaluate(port => {
+      const pairs = [['#stage', '#historyStage'], ['#nodeDsh', '[data-history-node=dsh]'],
+        ['#nodeHub', '[data-history-node=hub]'], ['.row[data-id=grok]', '[data-history-node=grok]']];
+      const delta = pairs.map(([source, history]) => {
+        const original = port.querySelector(source).getBoundingClientRect(), overlay = port.querySelector(history).getBoundingClientRect();
+        return Math.max(...['left', 'right', 'top', 'bottom'].map(side => Math.abs(overlay[side] - original[side])));
+      });
+      return { scrollLeft: port.scrollLeft, delta };
+    });
+    const firstReplay = await aligned();
+    sidebarMeasurements.push({ firstReplay });
+    check('replay at a nonzero keyboard scroll offset aligns the stage, host, hub and served row',
+      firstReplay.scrollLeft > start + 5 && firstReplay.delta.every(delta => delta <= 1.5));
+    await viewport.hover();
+    await page.mouse.wheel(100, 0);
+    await page.waitForFunction(previous => document.querySelector('[data-dsg-shortcut-panel]').shadowRoot.querySelector('#stageViewport').scrollLeft > previous + 2, firstReplay.scrollLeft);
+    const movedReplay = await aligned();
+    sidebarMeasurements.push({ movedReplay });
+    check('horizontal wheel movement keeps replay nodes registered to live geometry', movedReplay.delta.every(delta => delta <= 1.5));
+    await panel.locator('#historyStop').click();
+    await viewport.locator('#historyStage').waitFor({ state: 'hidden' });
+    await card('exa');
+    await page.locator('input[data-k=url]').click();
+    await page.evaluate(() => {
+      window.harness.configure({ logs: [], capabilities: { secretsAllowed: false, transport: 'restricted', reason: 'fixture' } });
+      window.harness.refresh();
+    });
+    await panel.locator('.banner:has-text("仅显示脱敏")').waitFor();
+    check('permission changes retain keyboard focus inside the open dialog', await page.locator('#dialog').evaluate(dialog =>
+      dialog.contains(dialog.getRootNode().activeElement)));
+    await close();
+    await card('tavily');
+    check('restricted panel keeps credentials and their destination locked',
+      await page.locator('[data-a=eye]').first().isDisabled() && await page.locator('[data-a=copy]').first().isDisabled()
+      && !await page.locator('input[data-k=url]').isEditable());
+    check('a restricted configured field does not advertise an unavailable reveal',
+      !/点击查看/.test(await page.locator('input[data-k="keys.0"]').getAttribute('placeholder')));
+    await close();
+    check('replay and restricted inspection send no secret, diagnosis or write RPCs', await sensitiveCalls(), beforeReplay);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await showPage('detail');
+    await state('returning');
+    check('ordinary details restore their original frame, log, width, fill and tab order', await detailFrame(), plainFrame);
+    check('returning to details leaves no sidebar host or duplicate overlay layer',
+      [await panel.count(), await page.locator('[data-dsg-layer]').count()], [0, 1]);
+    await card('exa');
+    await page.locator('input[data-k=url]').fill('https://draft.invalid');
+    await page.evaluate(() => window.harness.transport(null));
+    check('disconnect immediately removes the open draft, its layer and the old settings',
+      [await page.locator('[data-dsg-layer]').count(), await detail.locator('#routeCard').count()], [0, 0]);
+    await page.evaluate(() => window.harness.transport(1));
+    await detail.locator('#routeCard:not([data-s=load])').waitFor();
+    await card('exa');
+    check('a reused RPC proxy starts a fresh dialog without the retired draft',
+      await page.locator('input[data-k=url]').inputValue() !== 'https://draft.invalid');
+    await close();
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+  };
+  const checkDetailPage = async () => {
     await page.setViewportSize({ width: 1440, height: 1000 });
     await state('returning');
     check('approved intro has five independently linked official provider logos',
@@ -31,6 +256,11 @@ async page => {
       ['https://grok.com/', 'https://tavily.com/', 'https://exa.ai/', 'https://firecrawl.dev/', 'https://tinyfish.ai/']);
     check('intro repository link follows the tagline', await page.locator('.intro-title .intro-github').getAttribute('href'),
       'https://github.com/Lain-in-coding/dsh-grok-search');
+    const shortcut = page.locator('.intro-topline').getByRole('switch', { name: '允许在侧边栏显示', exact: true });
+    check('intro sidebar switch is a named native button', await shortcut.evaluate(node => node.tagName), 'BUTTON');
+    await page.locator('#sidebarShortcutSwitch[aria-busy=false]').waitFor();
+    check('intro sidebar switch has no persistent help or success status',
+      await page.locator('#shortcutSetting').innerText().then(text => text.trim()), '允许在侧边栏显示');
     const projectLink = page.locator('[data-dsg-project] a');
     const projectTip = page.locator('[data-dsg-project] [role=tooltip]');
     check('one title project badge', await page.locator('[data-dsg-project]').count(), 1);
@@ -1075,9 +1305,16 @@ async page => {
     await page.evaluate(() => { for (let i = 0; i < 4; i++) window.harness.remount(); });
     await page.locator('#routeCard:not([data-s=load])').waitFor();
     check('repeated mounts keep one layer', await page.locator('[data-dsg-layer]').count(), 1);
+    await page.evaluate(() => window.harness.stopClient());
+    check('plugin stop removes its layer before the host unmounts the detail slot',
+      [await page.locator('[data-dsg-route]').count(), await page.locator('[data-dsg-layer]').count()], [1, 0]);
     await page.evaluate(() => window.harness.unmount());
     check('unmount removes layer', await page.locator('[data-dsg-layer]').count(), 0);
     check('unmount removes route DOM', await page.locator('#routeCard').count(), 0);
+  };
+  try {
+    await checkSidebarPage();
+    if (!sidebarOnly) await checkDetailPage();
     check('no page errors', errors.length, 0);
   } catch (error) {
     failure = error;
@@ -1087,9 +1324,10 @@ async page => {
     catch (error) { screenshotError = String(error); }
   }
   const summary = { runId: run.runId, scope: 'generated production client + offline synthetic host shim; not Desktop or paid-provider evidence',
+    cases: sidebarOnly ? 'sidebar' : 'sidebar-and-details',
     command: 'playwright-cli run-code --filename=test/ui-route-browser.js',
     passed: results.filter(result => result.passed).length, failed: results.filter(result => !result.passed).length,
-    pageErrors: errors, fatal, results, ...(screenshotError ? { screenshotError } : {}) };
+    pageErrors: errors, fatal, results, sidebarMeasurements, ...(screenshotError ? { screenshotError } : {}) };
   try {
     const evidence = await page.evaluate(async summary => {
       const response = await fetch('/evidence', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(summary) });

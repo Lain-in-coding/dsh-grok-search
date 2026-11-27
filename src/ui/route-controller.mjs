@@ -5,7 +5,7 @@ import { NUM, normCard, normHub, validateHub, joinSentences } from './route-form
  * Bundled with its browser modules; lifecycle and DOM stay mount-local.
  * root/layer belong to this mount, never the host document's selector namespace.
  */
-export function createRouteController({ root, layer, remote, logos, sourceChain, memory = {}, logMemory = null, createSearchLogView, createQuotaView, dark = false }) {
+export function createRouteController({ root, layer, remote, logos, sourceChain, sidebar = null, memory = {}, logMemory = null, createSearchLogView, createQuotaView, dark = false }) {
 // Remount state belongs to one settings connection, not a different server or identity.
 if (memory.remote !== remote) {
   for (const key of Object.keys(memory)) delete memory[key];
@@ -183,7 +183,7 @@ const HUB_FIELDS = { extra: 'default_extra_sources', fallback: 'fallback_sources
   cache: 'cache_size', maxChars: 'response_max_chars' };
 const S = {
   loading: true, busy: false, testing: false, plugin: true,
-  config: null, prefs: null, control: null, program: null, pluginInfo: null, capabilities: null, rpcError: null,
+  config: null, prefs: null, sidebarPrefs: null, control: null, program: null, pluginInfo: null, capabilities: null, rpcError: null,
   cfgExists: false, readBanner: false, readDismissed: memory.readDismissed === true,
   prov: blankProv(), order: [...SUPP],
   hub: { extra: 3, fallback: 5, timeout: 60, cache: 256, maxChars: 45000, budget: 120, exeOverride: '', cfgOverride: '' },
@@ -225,6 +225,7 @@ function providerIdentity(id, fields, p) {
   }), p.mode, p.authReadOnly]);
 }
 function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true, trustedConfigUpdate = false } = {}) {
+  preferences = withSidebarRevision(preferences);
   const fields = snapshot.config?.fields || {}, oldOrder = S.order.join();
   const runtimeChanged = JSON.stringify([S.program, S.control?.phase, S.control?.available, S.control?.error])
     !== JSON.stringify([snapshot.program, snapshot.control?.phase, snapshot.control?.available, snapshot.control?.error]);
@@ -280,7 +281,7 @@ function acceptSnapshot(snapshot, preferences, { first = false, keepTrace = true
     // revealed credential or enabled copy action on a restricted connection.
     const top = $('.dlg-body', dlg)?.scrollTop || 0;
     D.show = {};
-    renderCard();
+    renderCard(true);
     const body = $('.dlg-body', dlg);
     if (body) body.scrollTop = top;
   } else if (runtimeChanged && D?.kind === 'hub' && !S.busy && !dialogBusy()) {
@@ -317,7 +318,7 @@ function denyPrivateAccess(error) {
     if (D.githubOperation) void remote.cancelDiagnosis({ operationId: D.githubOperation }).catch(() => {});
     const top = $('.dlg-body', dlg)?.scrollTop || 0;
     D.show = {};
-    renderCard();
+    renderCard(true);
     const body = $('.dlg-body', dlg);
     if (body) body.scrollTop = top;
   }
@@ -551,8 +552,10 @@ async function savePreference(id, on) {
     if (disposed) return;
     try {
       const revision = S.prefs.revision;
-      const result = await remote.savePreferences({ expectedRevision: revision,
-        value: { ...S.prefs.value, [key]: on } });
+      const value = { ...S.prefs.value, [key]: on };
+      delete value.sidebarShortcutEnabled;
+      const saved = await remote.savePreferences({ expectedRevision: revision, value });
+      const result = disposed ? saved : withSidebarRevision(saved);
       if (!disposed) {
         if (accessAtStart !== accessGeneration || S.prefs.revision !== revision && S.prefs.revision !== result.revision) {
           throw Object.assign(new Error('插件开关可能已保存，但当前状态或连接已变化；请重新读取确认，不要重复操作。'),
@@ -567,9 +570,10 @@ async function savePreference(id, on) {
       return result;
     } catch (error) {
       if (attempt || error?.code !== 'PREFERENCES_CONFLICT' || disposed || accessAtStart !== accessGeneration) throw error;
-      const current = await remote.preferences();
+      const read = await remote.preferences();
       if (disposed) return;
       if (accessAtStart !== accessGeneration) throw error;
+      const current = withSidebarRevision(read);
       stateGeneration++;
       snapshotSignature = null;
       S.prefs = current;
@@ -578,6 +582,15 @@ async function savePreference(id, on) {
       if (readEnabled(current, id) !== readEnabled(starting, id)) throw error;
     }
   }
+}
+function withSidebarRevision(prefs) {
+  const confirmed = S.sidebarPrefs;
+  if (!prefs?.value || !confirmed || confirmed.revision === prefs.revision) return prefs;
+  const keys = new Set([...Object.keys(prefs.value), ...Object.keys(confirmed.value)]);
+  for (const key of keys) {
+    if (key !== 'sidebarShortcutEnabled' && JSON.stringify(prefs.value[key]) !== JSON.stringify(confirmed.value[key])) return prefs;
+  }
+  return confirmed;
 }
 function configUndo(receipt) {
   if (!receipt?.undo || !S.capabilities?.secretsAllowed) return undefined;
@@ -2188,7 +2201,8 @@ function keyIn(k, v, ph, o = {}) {
   const cp = `<button type="button" class="icon-btn" data-a="copy" data-k="${k}" aria-label="复制密钥"${unavailable ? ' disabled' : ''}>${svg('copy')}</button>`;
   const del = o.del ? `<button type="button" class="icon-btn" data-a="del-key" data-i="${o.i}" aria-label="删除这个 Key"${ro ? ' disabled' : ''}>${svg('trash')}</button>` : '';
   const aria = o.aria ? ` aria-label="${o.aria}"` : '';
-  return `<div class="input${ro ? ' is-readonly' : ''}"><input id="${fid(k)}" type="${shown ? 'text' : 'password'}" class="mono" data-k="${k}" value="${isHidden ? '' : esc(v)}" placeholder="${isHidden ? ro ? '已配置 · 点击查看' : '已配置 · 点击查看或编辑' : esc(ph || '')}" spellcheck="false" autocomplete="off"${aria}${isHidden ? ' data-hidden="true" readonly' : ro ? ' readonly' : ''}><span class="in-act">${eye}${cp}${del}</span></div>`;
+  const placeholder = !isHidden ? esc(ph || '') : unavailable ? '已配置 · 当前不可查看' : ro ? '已配置 · 点击查看' : '已配置 · 点击查看或编辑';
+  return `<div class="input${ro ? ' is-readonly' : ''}"><input id="${fid(k)}" type="${shown ? 'text' : 'password'}" class="mono" data-k="${k}" value="${isHidden ? '' : esc(v)}" placeholder="${placeholder}" spellcheck="false" autocomplete="off"${aria}${isHidden ? ' data-hidden="true" readonly' : ro ? ' readonly' : ''}><span class="in-act">${eye}${cp}${del}</span></div>`;
 }
 function chip(k, v, label, cur) {
   return `<button type="button" class="chip" data-a="pick" data-k="${k}" data-v="${esc(v)}" aria-pressed="${(cur || '').trim() === v}"${fieldReadOnly(k) ? ' disabled' : ''}>${esc(label)}</button>`;
@@ -2869,7 +2883,9 @@ function syncHeadSwitch() {
   if (h.pending) { sw.setAttribute('aria-disabled', 'true'); sw.title = '在下方填写后自动打开'; }
   else { sw.removeAttribute('aria-disabled'); sw.removeAttribute('title'); }
 }
-function renderCard() {
+function renderCard(keepFocus = false) {
+  const focused = keepFocus && active();
+  const restore = focused && dlg.contains(focused);
   const id = D.id;
   const m = META[id];
   const p = D.draft;
@@ -2886,6 +2902,10 @@ function renderCard() {
   const form = $('.dlg-form', dlg);
   if (form) form.addEventListener('submit', (e) => e.preventDefault());
   refreshDialog();
+  if (restore) {
+    const field = focused.id && dlg.querySelector('#' + CSS.escape(focused.id));
+    (field && !field.disabled ? field : $('[data-a=close]', dlg)).focus({ preventScroll: true });
+  }
 }
 function openCard(id, opt = {}) {
   if (S.loading || S.busy || !META[id]) return;
@@ -3471,6 +3491,47 @@ $('#bannerSlot').addEventListener('click', (e) => {
 });
 $('#nodeHub').addEventListener('click', (e) => openHub({ from: e.currentTarget }));
 
+function bindSidebar() {
+  if (!sidebar) return;
+  const setting = $('#shortcutSetting'), toggle = $('#sidebarShortcutSwitch');
+  const feedback = $('#sidebarShortcutFeedback'), retry = $('#shortcutRetry');
+  const canToggle = state => state.ready === true && state.available === true && !state.saving && !state.error;
+  const canRetry = state => !state.saving && (state.error === 'read'
+    || state.error === 'save' && state.available === true);
+  function render() {
+    if (disposed) return;
+    const state = sidebar.getSnapshot();
+    const checked = state.enabled === true;
+    const confirmed = state.preferences;
+    S.sidebarPrefs = state.ready && !state.error && confirmed?.value && typeof confirmed.revision === 'string'
+      && confirmed.revision && (confirmed.value.sidebarShortcutEnabled === true) === checked ? confirmed : null;
+    S.prefs = withSidebarRevision(S.prefs);
+    const pending = state.saving === true || (!state.ready && state.available === true && !state.error);
+    const failed = !pending && (state.error === 'read' || state.error === 'save');
+    const message = pending ? (state.saving ? '正在保存侧栏设置…' : '正在读取侧栏设置…')
+      : failed ? (state.error === 'save' ? `保存未获确认，上次确认：${checked ? '显示' : '隐藏'}。` : '未能读取侧栏设置。') : '';
+    setting.dataset.pending = String(pending);
+    setting.dataset.error = String(failed);
+    toggle.setAttribute('aria-checked', String(checked));
+    toggle.setAttribute('aria-busy', String(pending));
+    toggle.setAttribute('aria-disabled', String(!canToggle(state)));
+    if (feedback.textContent !== message) feedback.textContent = message;
+    if (!failed && active() === retry) toggle.focus({ preventScroll: true });
+    retry.hidden = !failed;
+    retry.disabled = !canRetry(state);
+    retry.textContent = state.error === 'save' ? '重新保存' : '重新读取';
+  }
+  listen(toggle, 'click', () => {
+    if (!disposed && canToggle(sidebar.getSnapshot())) void sidebar.toggle();
+  });
+  listen(retry, 'click', () => {
+    if (!disposed && canRetry(sidebar.getSnapshot())) void sidebar.retry();
+  });
+  listeners.add(sidebar.subscribe(render));
+  render();
+  setting.hidden = false;
+}
+
 function init() {
   logView = createSearchLogView({ $, $$, active, S, card, layer, listen, remote, uuid, clone, esc, svg, tile,
     logoSrc, isDark, reduced, META, SUPP, setTimeout, clearTimeout, requestAnimationFrame, cancelAnimationFrame,
@@ -3514,6 +3575,7 @@ function init() {
   quiet(900);
   buildRows(false);
   syncAll(true);
+  bindSidebar();
   void refresh({ first: true }).then(() => {
     if (disposed) return;
     animateRows(!memory.mounted);

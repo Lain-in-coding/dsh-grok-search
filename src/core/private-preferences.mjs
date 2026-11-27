@@ -10,11 +10,13 @@ const DEFAULTS = Object.freeze({
   grokEnabled: true,
   githubEnabled: true,
   githubReadEnabled: false,
+  sidebarShortcutEnabled: false,
   sourceOrder: SOURCES,
   sourceEnabled: Object.freeze({ tavily: true, exa: true, tinyfish: true, firecrawl: true }),
 });
 const digest = value => createHash('sha256').update(value).digest('hex');
 const fail = (code, message) => { throw new GrokSearchError(code, message); };
+const receipt = ({ value, revision }) => ({ value, revision });
 
 function validate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('PREFERENCES_INVALID', '插件偏好格式无效。');
@@ -36,6 +38,7 @@ function validate(value) {
     grokEnabled: value.grokEnabled,
     githubEnabled: value.githubEnabled ?? true,
     githubReadEnabled: value.githubReadEnabled ?? false,
+    sidebarShortcutEnabled: value.sidebarShortcutEnabled === true,
     sourceOrder: [...value.sourceOrder],
     sourceEnabled: Object.fromEntries(SOURCES.map(source => [source, value.sourceEnabled[source]])),
   };
@@ -43,13 +46,15 @@ function validate(value) {
 
 export function createPrivatePreferences({ path, fault }) {
   if (typeof path !== 'string' || !isAbsolute(path)) fail('PREFERENCES_PATH_INVALID', '偏好文件必须使用绝对路径。');
+  const searchIdentity = (value, generation) => JSON.stringify([path, generation, value.grokEnabled,
+    value.githubEnabled, value.githubReadEnabled, value.sourceOrder, value.sourceEnabled]);
   const read = () => {
     try {
       let stat;
       try { stat = lstatSync(path); }
       catch (error) {
         // Only an absent entry permits first-run defaults, never an unreadable or dangling link.
-        if (error.code === 'ENOENT') return { value: structuredClone(DEFAULTS), revision: 'missing' };
+        if (error.code === 'ENOENT') return { value: structuredClone(DEFAULTS), revision: 'missing', searchGeneration: null };
         throw error;
       }
       if (!stat.isFile() || stat.isSymbolicLink()) fail('PREFERENCES_PATH_UNSAFE', '偏好目标不是普通文件。');
@@ -57,8 +62,9 @@ export function createPrivatePreferences({ path, fault }) {
       const bytes = readFileSync(path);
       const text = bytes.toString('utf8');
       if (!Buffer.from(text).equals(bytes)) fail('PREFERENCES_READ_FAILED', '插件偏好必须使用 UTF-8。');
-      const value = validate(JSON.parse(text));
-      return { value, revision: digest(text) };
+      const stored = JSON.parse(text);
+      const value = validate(stored);
+      return { value, revision: digest(text), searchGeneration: typeof stored.searchGeneration === 'string' ? stored.searchGeneration : null };
     } catch (error) {
       if (error instanceof GrokSearchError) throw error;
       fail('PREFERENCES_READ_FAILED', '无法读取插件偏好。');
@@ -66,14 +72,20 @@ export function createPrivatePreferences({ path, fault }) {
   };
   return Object.freeze({
     snapshot() {
-      const current = read();
-      return { ...current, value: structuredClone(current.value) };
+      return receipt(read());
     },
-    save(expectedRevision, value) {
+    diagnosisSnapshot() {
+      const { value, searchGeneration } = read();
+      return { value, identity: searchIdentity(value, searchGeneration) };
+    },
+    save(expectedRevision, value, verify) {
       if (expectedRevision !== 'missing' && !/^[a-f0-9]{64}$/.test(expectedRevision ?? '')) {
         fail('PREFERENCES_REVISION_REQUIRED', '保存偏好前必须读取当前修订。');
       }
       validate(value);
+      if (Object.hasOwn(value, 'sidebarShortcutEnabled') && typeof value.sidebarShortcutEnabled !== 'boolean') {
+        fail('PREFERENCES_INVALID', '侧栏开关值无效。');
+      }
       const lockPath = path + '.dsh-grok-search.lock';
       let lock, stage, stageIdentity, published = false;
       try {
@@ -85,15 +97,21 @@ export function createPrivatePreferences({ path, fault }) {
         }
         const before = read();
         if (before.revision !== expectedRevision) fail('PREFERENCES_CONFLICT', '插件偏好已被其他窗口修改，请重新读取。');
-        // Older clients must not silently revoke or grant the new permission.
-        const next = validate({ ...value, githubReadEnabled: Object.hasOwn(value, 'githubReadEnabled')
-          ? value.githubReadEnabled : before.value.githubReadEnabled });
-        const text = JSON.stringify(next, null, 2) + '\n';
+        const next = validate({ ...value,
+          githubEnabled: Object.hasOwn(value, 'githubEnabled') ? value.githubEnabled : before.value.githubEnabled,
+          githubReadEnabled: Object.hasOwn(value, 'githubReadEnabled') ? value.githubReadEnabled : before.value.githubReadEnabled,
+          sidebarShortcutEnabled: Object.hasOwn(value, 'sidebarShortcutEnabled') ? value.sidebarShortcutEnabled : before.value.sidebarShortcutEnabled,
+        });
+        const searchChanged = searchIdentity(next, before.searchGeneration) !== searchIdentity(before.value, before.searchGeneration);
+        verify?.(before.value, next, searchChanged);
+        // Store-owned, not accepted from the RPC: A -> B -> A must retire tests even across writers.
+        const searchGeneration = searchChanged ? randomUUID() : before.searchGeneration;
+        const text = JSON.stringify(searchGeneration === null ? next : { ...next, searchGeneration }, null, 2) + '\n';
         const intendedRevision = digest(text);
         if (before.revision === intendedRevision) {
           const current = read();
           if (current.revision !== expectedRevision) fail('PREFERENCES_CONFLICT', '插件偏好已被其他窗口修改，请重新读取。');
-          return current;
+          return receipt(current);
         }
         stage = `${path}.${randomUUID()}.tmp`;
         const fd = openSync(stage, 'wx', 0o600);
@@ -114,7 +132,7 @@ export function createPrivatePreferences({ path, fault }) {
         fault?.('after-publish');
         const current = read();
         if (current.revision !== intendedRevision) fail('PREFERENCES_COMMIT_UNCERTAIN', '插件偏好写入后再次发生变化，请重新读取确认。');
-        return current;
+        return receipt(current);
       } catch (error) {
         if (published && error?.code !== 'PREFERENCES_COMMIT_UNCERTAIN') fail('PREFERENCES_COMMIT_UNCERTAIN', '插件偏好已写入，但回读未完成，请重新读取后确认。');
         if (error instanceof GrokSearchError) throw error;

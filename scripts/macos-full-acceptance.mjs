@@ -56,10 +56,12 @@ export const PUBLIC_MACOS_SUPPORT_FILES = Object.freeze([
   // Pack verifies the generated client in memory; transport must include its exact source inputs.
   'scripts/build-client.mjs', 'src/client.template.js',
   'src/ui/route-form.mjs', 'src/ui/route-controller.mjs', 'src/ui/search-log-view.mjs',
+  'src/ui/sidebar-shortcut.mjs',
   'src/ui/quota-view.mjs', 'src/ui/tool-route-view.mjs', 'src/ui/compatibility-view.mjs', 'src/ui/shared-styles.mjs',
   'src/ui/tool-route.css', 'src/ui/route.css', 'src/ui/search-log.css', 'src/ui/route-card.html', 'src/ui/route-layer.html',
   'src/assets/logos/deepseek-harness-settings.png', 'src/assets/logos/deepseek-harness-chat-light.png',
   'src/assets/logos/deepseek-harness-chat-dark.png', 'src/assets/logos/deepseek-whale.svg', 'src/assets/logos/grok.png',
+  'src/assets/logos/sidebar-r20-light.png', 'src/assets/logos/sidebar-r20-dark.png',
   'src/assets/logos/tavily-mark-black.svg', 'src/assets/logos/tavily-mark-offwhite.svg',
   'src/assets/logos/exa-logomark-blue.svg', 'src/assets/logos/exa-logomark-white.svg',
   'src/assets/logos/tinyfish-icon.svg', 'src/assets/logos/firecrawl-logo.svg',

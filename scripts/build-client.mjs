@@ -11,6 +11,8 @@ const logoFiles = {
   harness: 'deepseek-harness-settings.png',
   harnessChat: 'deepseek-harness-chat-light.png',
   harnessChatDark: 'deepseek-harness-chat-dark.png',
+  sidebarLight: 'sidebar-r20-light.png',
+  sidebarDark: 'sidebar-r20-dark.png',
   deepseek: 'deepseek-whale.svg',
   grok: 'grok.png',
   tavily: 'tavily-mark-black.svg',

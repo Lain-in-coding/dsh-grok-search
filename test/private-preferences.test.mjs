@@ -73,7 +73,9 @@ test('existing private preferences remain usable through a directory alias', () 
   const saved = store.save(before.revision, { ...before.value, grokEnabled: false });
   assert.equal(saved.value.grokEnabled, false);
   assert.equal(saved.value.githubReadEnabled, true);
-  assert.deepEqual(JSON.parse(readFileSync(join(outside, 'preferences.json'), 'utf8')), saved.value);
+  const { searchGeneration, ...stored } = JSON.parse(readFileSync(join(outside, 'preferences.json'), 'utf8'));
+  assert.equal(typeof searchGeneration, 'string');
+  assert.deepEqual(stored, saved.value);
   assert.equal(lstatSync(directory).isSymbolicLink(), true);
 });
 
@@ -107,6 +109,87 @@ test('new GitHub read consent defaults off and older clients cannot overwrite it
   const saved = store.save(enabled.revision, { ...oldClient, grokEnabled: false });
   assert.equal(saved.value.githubReadEnabled, true);
   assert.throws(() => store.save(saved.revision, { ...saved.value, githubReadEnabled: 'yes' }), { code: 'PREFERENCES_INVALID' });
+});
+
+test('missing or malformed sidebar choices read as off without rewriting or masking invalid search settings', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
+  const store = createPrivatePreferences({ path });
+  const { sidebarShortcutEnabled, ...legacy } = store.snapshot().value;
+  assert.equal(sidebarShortcutEnabled, false);
+  assert.equal(existsSync(path), false);
+  for (const fields of [{}, { sidebarShortcutEnabled: 'true' }, { sidebarShortcutEnabled: 1 }, { sidebarShortcutEnabled: null }]) {
+    const raw = JSON.stringify({ ...legacy, grokEnabled: false, githubReadEnabled: true, ...fields });
+    writeFileSync(path, raw);
+    assert.deepEqual(store.snapshot().value, { ...legacy, grokEnabled: false, githubReadEnabled: true, sidebarShortcutEnabled: false });
+    assert.equal(readFileSync(path, 'utf8'), raw);
+  }
+  writeFileSync(path, JSON.stringify({ ...legacy, grokEnabled: 'false', sidebarShortcutEnabled: 'true' }));
+  assert.throws(store.snapshot, { code: 'PREFERENCES_INVALID' });
+});
+
+test('sidebar changes use full-file CAS and legacy requests preserve both newer switches', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
+  const store = createPrivatePreferences({ path });
+  const first = store.snapshot();
+  const withConsent = store.save(first.revision, { ...first.value, githubReadEnabled: true });
+  const { sidebarShortcutEnabled, githubReadEnabled, ...legacy } = withConsent.value;
+  const enabled = store.save(withConsent.revision, { ...withConsent.value, sidebarShortcutEnabled: true });
+  const reopened = createPrivatePreferences({ path });
+  assert.deepEqual(reopened.snapshot(), enabled);
+  assert.notEqual(enabled.revision, withConsent.revision);
+  assert.throws(() => reopened.save(withConsent.revision, legacy), { code: 'PREFERENCES_CONFLICT' });
+  const saved = reopened.save(enabled.revision, { ...legacy, grokEnabled: false });
+  assert.equal(saved.value.sidebarShortcutEnabled, true);
+  assert.equal(saved.value.githubReadEnabled, true);
+  for (const invalid of [null, 'false', 1, undefined]) {
+    assert.throws(() => reopened.save(saved.revision, { ...saved.value, sidebarShortcutEnabled: invalid }), { code: 'PREFERENCES_INVALID' });
+  }
+  assert.deepEqual(store.snapshot(), saved);
+  const disabled = store.save(saved.revision, { ...saved.value, sidebarShortcutEnabled: false });
+  assert.equal(reopened.snapshot().value.sidebarShortcutEnabled, false);
+  assert.deepEqual(reopened.save(disabled.revision, disabled.value), disabled);
+});
+
+test('an older preference writer cannot reactivate a disabled GitHub diagnosis on a sidebar-only edit', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'dsh-pref-')), 'preferences.json');
+  const store = createPrivatePreferences({ path });
+  const initial = store.snapshot();
+  const saved = store.save(initial.revision, { ...initial.value, githubEnabled: false, githubReadEnabled: true });
+  const identity = store.diagnosisSnapshot().identity;
+  const { githubEnabled, githubReadEnabled, ...legacy } = saved.value;
+  const changed = store.save(saved.revision, { ...legacy, sidebarShortcutEnabled: true });
+  assert.deepEqual(changed.value, { ...saved.value, sidebarShortcutEnabled: true });
+  assert.equal(store.diagnosisSnapshot().identity, identity);
+});
+
+test('diagnostic identity tracks search settings and their ABA across writers, not sidebar changes or file formatting', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-pref-')), path = join(directory, 'preferences.json');
+  const reader = createPrivatePreferences({ path }), writer = createPrivatePreferences({ path });
+  const first = reader.snapshot(), identity = reader.diagnosisSnapshot().identity;
+  const enabled = writer.save(first.revision, { ...first.value, sidebarShortcutEnabled: true, searchGeneration: 'client-controlled' });
+  assert.equal(reader.diagnosisSnapshot().identity, identity);
+  assert.equal(Object.hasOwn(enabled.value, 'searchGeneration'), false);
+  const raw = JSON.parse(readFileSync(path, 'utf8'));
+  assert.equal(Object.hasOwn(raw, 'searchGeneration'), false);
+  writeFileSync(path, JSON.stringify(raw));
+  assert.equal(reader.diagnosisSnapshot().identity, identity);
+  assert.notEqual(reader.snapshot().revision, enabled.revision);
+  assert.throws(() => writer.save(enabled.revision, enabled.value), { code: 'PREFERENCES_CONFLICT' });
+  for (const delta of [{ grokEnabled: false }, { githubEnabled: false }, { githubReadEnabled: true },
+    { sourceOrder: [...raw.sourceOrder].reverse() }, { sourceEnabled: { ...raw.sourceEnabled, exa: false } }]) {
+    const before = reader.diagnosisSnapshot().identity;
+    const changed = writer.save(reader.snapshot().revision, { ...raw, ...delta });
+    assert.notEqual(reader.diagnosisSnapshot().identity, before);
+    writer.save(changed.revision, raw);
+    assert.notEqual(reader.diagnosisSnapshot().identity, before);
+    assert.deepEqual(reader.snapshot().value, enabled.value);
+  }
+  const current = reader.snapshot(), baseline = reader.diagnosisSnapshot().identity;
+  writer.save(current.revision, { ...current.value, sidebarShortcutEnabled: false, searchGeneration: 'client-controlled' });
+  assert.equal(reader.diagnosisSnapshot().identity, baseline);
+  const persisted = JSON.parse(readFileSync(path, 'utf8'));
+  writeFileSync(path, JSON.stringify({ ...persisted, grokEnabled: false }));
+  assert.notEqual(reader.diagnosisSnapshot().identity, baseline);
 });
 
 test('preference writers cooperate through an exclusive lock and never steal an abandoned one', () => {

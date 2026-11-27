@@ -10,6 +10,7 @@ import { createSettingsGateway, SETTINGS_DESCRIPTORS, inject } from '../src/sett
 import { SETTINGS_DESCRIPTORS as PURE_SETTINGS_DESCRIPTORS } from '../src/core/settings-contract.mjs';
 import { GrokSearchError } from '../src/core/errors.mjs';
 import { createSharedConfigStore } from '../src/core/shared-config.mjs';
+import { createPrivatePreferences } from '../src/core/private-preferences.mjs';
 import { createConnectionSecurity } from '../src/core/connection-security.mjs';
 import { createConfigLocationOpener } from '../src/core/config-opener.mjs';
 import { createSearchLog } from '../src/core/search-log.mjs';
@@ -145,9 +146,16 @@ test('production settings apply retains the explicit config path without a progr
 test('the legacy settings descriptor export shares the pure static contract', () => {
   assert.equal(SETTINGS_DESCRIPTORS, PURE_SETTINGS_DESCRIPTORS);
   assert.equal(SETTINGS_DESCRIPTORS.length, 28);
-  const legacy = SETTINGS_DESCRIPTORS.filter(row =>
-    !['saveWithIdentity', 'revealWithIdentity', 'restoreConfigWithIdentity'].includes(row.method));
+  const legacy = JSON.parse(JSON.stringify(SETTINGS_DESCRIPTORS.filter(row =>
+    !['saveWithIdentity', 'revealWithIdentity', 'restoreConfigWithIdentity'].includes(row.method))));
   assert.equal(legacy.length, 25);
+  for (const row of legacy.filter(row => ['preferences', 'savePreferences'].includes(row.method))) {
+    for (const codec of [row.result, ...row.parameters.map(parameter => parameter.codec)]) {
+      const value = codec.jsonSchema.properties.value;
+      assert.deepEqual(value.properties, { sidebarShortcutEnabled: { type: 'boolean' } });
+      delete value.properties;
+    }
+  }
   assert.equal(createHash('sha256').update(JSON.stringify(legacy)).digest('hex'),
     'a755d8697157ad8437a08f22cdf73eb90dafa33996fca0741c8b15f4fe3deb96');
 });
@@ -869,6 +877,105 @@ test('provider diagnosis pairs revision and effective identity in one read at ea
   assert.deepEqual(reads, { paired: 2, snapshot: 0, effective: 0 });
 });
 
+test('sidebar-only saves preserve provider and legacy diagnoses without touching GitHub or shared configuration', async () => {
+  let finish, calls = 0;
+  const wait = new Promise(resolve => { finish = resolve; });
+  const result = { provider: 'exa', status: 'ok', code: 'OK', message: 'ok' };
+  const gateway = diagnosticGateway({ sourceRouter: {
+    async diagnose() { calls++; await wait; return [result]; },
+    async diagnoseProvider() { calls++; await wait; return result; },
+  } });
+  const get = gateway.ctx.get;
+  let githubLookups = 0;
+  gateway.ctx.get = name => {
+    if (name === 'grokSearchGithub') githubLookups++;
+    return get(name);
+  };
+  const config = 'source_providers = ["exa"]\n';
+  writeFileSync(gateway._configPath(), config);
+  const configBefore = (await gateway.snapshot()).config;
+  const provider = gateway.diagnoseProvider({ provider: 'exa', expectedRevision: configBefore.revision, configIdentity: configBefore.quotaRevision });
+  const all = gateway.diagnose();
+  assert.equal(calls, 2);
+  const initial = await gateway.preferences();
+  assert.equal(initial.value.sidebarShortcutEnabled, false);
+  const saved = await gateway.savePreferences({ expectedRevision: initial.revision, value: { ...initial.value, sidebarShortcutEnabled: true } });
+  assert.equal(saved.value.sidebarShortcutEnabled, true);
+  assert.notEqual(saved.revision, initial.revision);
+  await assert.rejects(gateway.savePreferences({ expectedRevision: initial.revision, value: initial.value }), { code: 'PREFERENCES_CONFLICT' });
+  finish();
+  assert.deepEqual(await provider, result);
+  assert.deepEqual(await all, [result]);
+  const { sidebarShortcutEnabled, ...oldRequest } = saved.value;
+  assert.deepEqual(await gateway.savePreferences({ expectedRevision: saved.revision, value: oldRequest }), saved);
+  const completedIdentity = gateway.preferenceStore.diagnosisSnapshot().identity;
+  const hidden = await gateway.savePreferences({ expectedRevision: saved.revision, value: { ...saved.value, sidebarShortcutEnabled: false } });
+  assert.notEqual(hidden.revision, saved.revision);
+  assert.equal(gateway.preferenceStore.diagnosisSnapshot().identity, completedIdentity);
+  assert.deepEqual(await gateway.preferences(), hidden);
+  assert.deepEqual((await gateway.snapshot()).config, configBefore);
+  assert.equal(readFileSync(gateway._configPath(), 'utf8'), config);
+  assert.equal(existsSync(join(gateway.profileContext.dir, 'grok-search', 'config-history')), false);
+  assert.equal(githubLookups, 0);
+  assert.equal(calls, 2);
+});
+
+test('real search edits, reverted search edits and a different preference source retire both forms of diagnosis', async () => {
+  for (const change of ['search', 'search-aba', 'different-profile']) {
+    let finish;
+    const wait = new Promise(resolve => { finish = resolve; });
+    const gateway = diagnosticGateway({ sourceRouter: { diagnose: () => wait, diagnoseProvider: () => wait } });
+    const baseline = await gateway.preferences();
+    const pending = [gateway.diagnose(), gateway.diagnoseProvider({ provider: 'exa' })];
+    if (change === 'different-profile') {
+      gateway.preferenceStore = createPrivatePreferences({ path: join(gateway.profileContext.dir, 'second', 'preferences.json') });
+      assert.deepEqual(await gateway.preferences(), baseline);
+    } else {
+      const other = createPrivatePreferences({ path: join(gateway.profileContext.dir, 'grok-search', 'preferences.json') });
+      const changed = other.save(baseline.revision, { ...baseline.value, grokEnabled: false });
+      if (change === 'search-aba') assert.deepEqual(other.save(changed.revision, baseline.value).value, baseline.value);
+    }
+    finish();
+    await Promise.all(pending.map(task => assert.rejects(task, { code: 'CONFIG_CONFLICT' }, change)));
+    assert.equal(gateway.diagnostics.size, 0);
+  }
+});
+
+test('uncertain sidebar saves refresh GitHub only if consent also changed or can no longer be read', async () => {
+  for (const race of ['sidebar-only', 'external-consent', 'unreadable']) {
+    let syncs = 0;
+    const gateway = diagnosticGateway({ github: { sync() { syncs++; } } });
+    const path = join(gateway.profileContext.dir, 'grok-search', 'preferences.json');
+    gateway.preferenceStore = createPrivatePreferences({ path, fault(stage) {
+      if (stage !== 'after-publish') return;
+      if (race === 'external-consent') {
+        const stored = JSON.parse(readFileSync(path, 'utf8'));
+        writeFileSync(path, JSON.stringify({ ...stored, githubReadEnabled: true }));
+      } else if (race === 'unreadable') writeFileSync(path, '{');
+      throw new Error('synthetic readback interruption');
+    } });
+    const before = await gateway.preferences();
+    await assert.rejects(gateway.savePreferences({ expectedRevision: before.revision, value: { ...before.value, sidebarShortcutEnabled: true } }),
+      { code: 'PREFERENCES_COMMIT_UNCERTAIN' });
+    assert.equal(syncs, race === 'sidebar-only' ? 0 : 1);
+  }
+});
+
+test('sidebar saves do not grant GitHub consent or bypass its transport check', async () => {
+  let syncs = 0;
+  const gateway = diagnosticGateway({ github: { sync() { syncs++; } } });
+  gateway.security.requireSecret = () => { throw new GrokSearchError('SETTINGS_SECURE_CONNECTION_REQUIRED', 'Synthetic restricted connection.'); };
+  const first = await gateway.preferences();
+  const saved = await gateway.savePreferences({ expectedRevision: first.revision, value: { ...first.value, sidebarShortcutEnabled: true } });
+  assert.equal(saved.value.githubReadEnabled, false);
+  await assert.rejects(gateway.savePreferences({ expectedRevision: saved.revision, value: { ...saved.value, githubReadEnabled: true } }),
+    { code: 'SETTINGS_SECURE_CONNECTION_REQUIRED' });
+  await assert.rejects(gateway.savePreferences({ expectedRevision: saved.revision, value: { ...saved.value, sidebarShortcutEnabled: 'false' } }),
+    { code: 'SETTINGS_REQUEST_INVALID' });
+  assert.deepEqual(await gateway.preferences(), saved);
+  assert.equal(syncs, 0);
+});
+
 test('diagnostic completion rejects a new configuration path even if both files have identical content', async () => {
   const services = new Map();
   const gateway = diagnosticGateway({ services, sourceRouter: {
@@ -961,6 +1068,17 @@ test('cancel-before-dispatch tombstone rejects late diagnostics without sending 
   await assert.rejects(gateway.diagnoseProvider({ provider: 'exa', operationId: 'arbitrary' }), { code: 'SETTINGS_DIAGNOSIS_INVALID' });
   for (let i = 0; i < 40; i++) await gateway.cancelDiagnosis({ operationId: randomUUID() });
   assert.equal(gateway.cancelledDiagnostics.size, 32);
+});
+
+test('repeating a cancellation at capacity keeps other cancelled diagnoses from dispatching', async () => {
+  let calls = 0;
+  const gateway = diagnosticGateway({ sourceRouter: { diagnoseProvider: async () => { calls++; } } });
+  const operations = Array.from({ length: 32 }, () => randomUUID());
+  for (const operationId of operations) await gateway.cancelDiagnosis({ operationId });
+  await gateway.cancelDiagnosis({ operationId: operations.at(-1) });
+  await assert.rejects(gateway.diagnoseProvider({ provider: 'exa', operationId: operations[0] }),
+    { code: 'SETTINGS_DIAGNOSIS_CANCELLED' });
+  assert.equal(calls, 0);
 });
 
 test('source diagnostics fail closed after release barrier invalidation', async () => {
@@ -1653,7 +1771,7 @@ test('preferences are only the plugin-private DSH switches', async () => {
   // The shared chain lives in config.toml; it no longer leaks into preferences.
   writeFileSync(path, 'source_providers = ["firecrawl"]\ntavily_enabled = false\n');
   const current = await gateway.preferences();
-  assert.deepEqual(current.value, { ...stored, githubReadEnabled: false });
+  assert.deepEqual(current.value, { ...stored, githubReadEnabled: false, sidebarShortcutEnabled: false });
   const saved = await gateway.savePreferences({ expectedRevision: current.revision, value: { ...current.value, grokEnabled: true } });
   assert.equal(saved.value.grokEnabled, true);
   assert.equal(readFileSync(path, 'utf8'), 'source_providers = ["firecrawl"]\ntavily_enabled = false\n');

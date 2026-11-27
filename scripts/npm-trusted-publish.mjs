@@ -9,6 +9,7 @@ import { digest, packageFiles } from './lib/compatibility-program-checks.mjs';
 export const repository = 'Lain-in-coding/dsh-grok-search';
 const packageName = 'dsh-grok-search';
 const registry = 'https://registry.npmjs.org';
+const registryVerificationMs = 300_000;
 const apiRoot = `https://api.github.com/repos/${repository}`;
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const insist = (condition, code) => { if (!condition) fail(code); };
@@ -211,7 +212,7 @@ export async function publishAndVerify({ result, existing, path, env, expected, 
 } = {}) {
   result.uploadAccepted = false;
   result.registryDownloadVerified = false;
-  if (!existing) {
+  if (!existing && env.GITHUB_RUN_ATTEMPT === '1') {
     const latest = previousTags.latest?.match(/^(\d+)\.(\d+)\.(\d+)$/);
     insist(latest && latest.slice(1).map(Number).some((part, index, values) => {
       const target = expected.version.split('.').map(Number);
@@ -222,8 +223,12 @@ export async function publishAndVerify({ result, existing, path, env, expected, 
     const outcome = result.publishAttempt = await publish(path, env);
     if (outcome.startFailed) Object.assign(result, { published: false, uploadAccepted: false });
     else result.uploadAccepted = outcome.code === 0 && !outcome.signal && !outcome.timedOut ? true : null;
-  } else Object.assign(result, { alreadyPublished: true, published: null });
-  const deadline = now() + 180_000, signal = AbortSignal.timeout(180_000);
+  } else {
+    result.published = null;
+    if (existing) result.alreadyPublished = true;
+    else result.verificationOnly = true;
+  }
+  const deadline = now() + registryVerificationMs, signal = AbortSignal.timeout(registryVerificationMs);
   const withinDeadline = () => {
     signal.throwIfAborted();
     insist(now() < deadline, 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT');

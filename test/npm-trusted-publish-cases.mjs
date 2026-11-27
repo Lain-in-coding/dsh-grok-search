@@ -237,7 +237,7 @@ test('registry verification rejects altered archives and changes to next', () =>
   assert.throws(() => verifyRegistryPackage(metadata, bytes, product, before, before));
 });
 
-function publicationScenario({ visibleAfter = 0, tagsAfter = 0, badHash = false, next = '0.1.1',
+function publicationScenario({ visibleAfter = 0, tagsAfter = 0, badHash = false, next = '0.1.1', attempt = '1',
   outcome = { code: 0, signal: null, timedOut: false }, existing = false, lateArchive = false } = {}) {
   const { files, bytes, expected, sums } = fixture();
   const product = verifyFrozenPackage(bytes, sums, expected, path => files.get(path));
@@ -245,7 +245,7 @@ function publicationScenario({ visibleAfter = 0, tagsAfter = 0, badHash = false,
   const state = { elapsed: 0, uploads: 0, requests: 0, waits: [] };
   const metadata = { name: product.name, version: product.version,
     dist: { integrity: product.integrity, tarball: 'https://registry.npmjs.org/dsh-grok-search/-/synthetic.tgz' } };
-  const options = { result, existing, path: 'synthetic-frozen.tgz', env: {}, expected: product,
+  const options = { result, existing, path: 'synthetic-frozen.tgz', env: { GITHUB_RUN_ATTEMPT: attempt }, expected: product,
     previousTags: { latest: '0.4.1', next: '0.1.1' } };
   const dependencies = {
     now: () => state.elapsed,
@@ -275,7 +275,7 @@ function publicationScenario({ visibleAfter = 0, tagsAfter = 0, badHash = false,
       assert.equal(url, metadata.dist.tarball);
       assert.equal(limit, 16 * 1024 ** 2);
       assert.ok(signal instanceof AbortSignal);
-      if (lateArchive) state.elapsed = 180_001;
+      if (lateArchive) state.elapsed = 300_001;
       return badHash ? Buffer.from('synthetic-wrong-archive') : bytes;
     },
   };
@@ -293,11 +293,35 @@ test('accepted upload waits for a 120-second registry delay without uploading a 
   assert.equal(scenario.result.registryDownloadVerified, true);
 });
 
+test('registry visibility after 187 seconds still requires matching bytes and tags', async () => {
+  const scenario = publicationScenario({ visibleAfter: 187_000, tagsAfter: 191_000 });
+  await scenario.execute();
+  assert.equal(scenario.state.elapsed, 195_000);
+  assert.equal(scenario.state.uploads, 1);
+  assert.equal(scenario.result.registryDownloadVerified, true);
+});
+
+test('workflow reruns only read the registry even when the initial version lookup returned missing', async () => {
+  for (const visibleAfter of [10_000, Infinity]) {
+    const scenario = publicationScenario({ attempt: '2', visibleAfter });
+    if (visibleAfter === Infinity) {
+      await assert.rejects(scenario.execute(), { code: 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT' });
+      assert.equal(scenario.result.published, null);
+    } else {
+      await scenario.execute();
+      assert.equal(scenario.result.published, true);
+    }
+    assert.equal(scenario.state.uploads, 0);
+    assert.equal(scenario.result.uploadAccepted, false);
+    assert.equal(scenario.result.registryDownloadVerified, visibleAfter !== Infinity);
+  }
+});
+
 test('registry deadline preserves accepted upload and unknown visibility rather than claiming not published', async () => {
   const scenario = publicationScenario({ visibleAfter: Infinity });
   await assert.rejects(scenario.execute(), { code: 'NPM_CHANNEL_REGISTRY_VERIFICATION_TIMEOUT' });
-  assert.equal(scenario.state.elapsed, 180_000);
-  assert.equal(scenario.state.waits.length, 36);
+  assert.equal(scenario.state.elapsed, 300_000);
+  assert.equal(scenario.state.waits.length, 60);
   assert.equal(scenario.state.uploads, 1);
   assert.equal(scenario.result.uploadAccepted, true);
   assert.equal(scenario.result.published, null);

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
-  "packageVersion": "0.4.4",
-  "channel": "0.4.4 稳定性、异常恢复与发布完整性修复；实际发布状态以 npm latest 与 GitHub Release 为准",
+  "packageVersion": "0.4.5",
+  "channel": "0.4.5 可选侧栏入口、列表与侧栏图标、设置页布局；实际发布状态以 npm latest 与 GitHub Release 为准",
   "admission": {
     "minimum": "0.2.1-rc.2",
     "includePrerelease": true,
@@ -11,7 +11,7 @@
     "automaticOfficialFallback": false,
     "runtimeInitializationRequired": true
   },
-  "verificationBaseline": "0.4.4 保留既有卸载重装恢复修复，补齐接管同步重入与回调后的当前意图复核、已退出安装及维护锁的安全重试、旧宿主重载时的用户预算、设置权限与配置撤销，以及冻结包模块库存。保留官方 grok-search-rs 0.1.26 和原 A 版图标，不改变用户配置、搜索策略或最低兼容版本。本版验证以绑定最终发布包 SHA-256、宿主资产及入口的包外证据为准；0.4.3/0.4.2修复记录、0.4.1人工候选及0.4.0矩阵保留各自具名身份，不继承为本包完整矩阵或人工实测。",
+  "verificationBaseline": "0.4.5 侧栏功能候选（包内版本 0.4.4，SHA-256 12450d739cf07a9a7b14a686ab035a8141e95eaac9ac3f3ecdae216cd10967d5）在 Windows x64 的两个官方宿主后端 Web 界面（0.2.1-rc.2、0.2.2-rc.5）做过隔离安装与回环搜索，且在固定 0.2.2-rc.5 Desktop 通过用户人工验收。最终发布包单独绑定 SHA-256 与具名验证结果，不继承旧包的完整矩阵或人工验收身份。保留官方 grok-search-rs 0.1.26 与原搜索准入策略。",
   "supportPolicy": "达到硬下限直接初始化服务；未知或未来版本不要求确认，不运行主动兼容预检。实际故障按对应功能处理，可选异常不撤销已运行核心；未明确停用时禁止自动回退官方搜索。未测试不限制用户尝试，也不表示该版本已实测。",
   "verificationLevels": {
     "planned": "保留的验收计划，不代表已经执行。",
@@ -421,7 +421,7 @@
     "Windows 与 macOS 独立 CLI/Web 不属于当前完整验收计划"
   ],
   "notTested": [
-    "0.4.4 不声明重跑完整宿主矩阵；源码与浏览器回归不替代同包原生卸载、重装与冷启动验收。Windows 0.2.2-rc.5 同包隔离结果以绑定最终发布包精确哈希的包外证据为准，0.4.3/0.4.2记录、0.4.1候选人工记录和历史矩阵不自动继承给本包。",
+    "0.4.5 不声明重跑历史完整宿主矩阵。源码与浏览器回归不替代同包宿主验收；HTTP 回环搜索不代表真实付费接口成功。",
     "取消主动兼容预检、后续GitHub边界及发布前复审修复尚未做macOS实机复验；较早六版结果只属于引用基线。",
     "rc.4 Desktop按关键源码审查支持，不将该版本CLI/Web实测写成Windows或macOS发行包实测。",
     "原生Linux烟测不能替代WSL Ubuntu 22.04完整验收；其他系统和真实付费接口见historical.notTested。",
